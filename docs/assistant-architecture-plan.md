@@ -23,18 +23,18 @@ Repository observations refer to the local working copies inspected during the d
 
 ### Recommended architecture
 
-| Decision         | Recommendation                                                                                          | Reason                                                                          |
-| ---------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Read integration | Use Context Engine's REST API initially                                                                 | It already enforces employee scopes, record access, projection, and freshness.  |
-| Agent runtime    | One conversational agent inside an explicit workflow                                                    | Supports multiple tool turns while keeping evaluation and debugging manageable. |
-| Planning         | Add a short explicit plan for complex requests                                                          | Simple lookups can choose their next tool directly.                             |
-| Execution        | Application code executes approved tools                                                                | Identity, permissions, destinations, and side effects remain enforceable.       |
-| Verification     | Code checks every tool outcome; optional model review for complex answers                               | Persisted state and source evidence establish operational success.              |
-| Reminder rules   | Keep CRM rules in CRM-Automations                                                                       | Reuse the existing sync, ownership logic, and activity clocks.                  |
-| Delivery         | A durable notification queue consumed by Ramesh                                                         | Supports restarts, deduplication, failure tracking, and controlled retries.     |
-| Future writes    | Narrow commands through Twenty and the WAG backend                                                      | Preserve the systems that own business validation and records.                  |
-| Deployment       | Extend the existing worker with modules; retain the separate admin app                                  | These boundaries do not initially require more independently deployed services. |
-| Persistence      | Keep SQLite for WhatsApp session state initially; use private Postgres tables for shared workflow state | CRM-Automations and the bot need durable coordination.                          |
+| Decision         | Recommendation                                                                                          | Reason                                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Read integration | Scaffold Context Engine MCP services now; connect the worker later                                      | Reuses employee scopes, record access, projection, and freshness through the existing MCP catalogue. |
+| Agent runtime    | One conversational agent inside an explicit workflow                                                    | Supports multiple tool turns while keeping evaluation and debugging manageable.                      |
+| Planning         | Add a short explicit plan for complex requests                                                          | Simple lookups can choose their next tool directly.                                                  |
+| Execution        | Application code executes approved tools                                                                | Identity, permissions, destinations, and side effects remain enforceable.                            |
+| Verification     | Code checks every tool outcome; optional model review for complex answers                               | Persisted state and source evidence establish operational success.                                   |
+| Reminder rules   | Keep CRM rules in CRM-Automations                                                                       | Reuse the existing sync, ownership logic, and activity clocks.                                       |
+| Delivery         | A durable notification queue consumed by Ramesh                                                         | Supports restarts, deduplication, failure tracking, and controlled retries.                          |
+| Future writes    | Narrow commands through Twenty and the WAG backend                                                      | Preserve the systems that own business validation and records.                                       |
+| Deployment       | Extend the existing worker with modules; retain the separate admin app                                  | These boundaries do not initially require more independently deployed services.                      |
+| Persistence      | Keep SQLite for WhatsApp session state initially; use private Postgres tables for shared workflow state | CRM-Automations and the bot need durable coordination.                                               |
 
 These are design recommendations, not a record that every implementation choice has been approved or built. Model/provider selection, exact notification cadence, and write policies remain open.
 
@@ -186,11 +186,11 @@ The bot needs a narrow roster-resolution integration; this is new work. Use a no
 
 ### Employee credentials
 
-For an initial pilot, associate each employee with their own Context Engine credential through a secure setup flow. Verify that `/api/v1/context` returns the resolved employee ID. Store credentials encrypted, keep them out of messages/prompts/logs, and support expiry, replacement, revocation, and offboarding.
+For an initial pilot, associate each employee with their own Context Engine OAuth grant through a secure setup flow. Verify that the MCP `get_context` tool returns the resolved employee ID. Store credentials encrypted, keep them out of messages/prompts/logs, and support expiry, replacement, revocation, and offboarding.
 
 The employee-facing sign-in is the verified WhatsApp sender identity. Provision the matching Context Engine credential on the server; do not ask employees to paste API keys into WhatsApp. Phone recognition does not itself create a Context Engine credential, so this binding is required before the first scoped CRM request. A later authenticated delegation mechanism can replace per-employee credential provisioning while retaining the same authorisation boundary.
 
-Do not reuse one administrator credential for everyone's interactive requests. If MCP is adopted later, implement the full employee OAuth lifecycle. Background notification jobs use a separately authorised automation capability limited to their workflow and intended recipients.
+Do not reuse one administrator credential for everyone's interactive requests. The MCP client scaffold is implemented; the full employee OAuth enrollment, encrypted persistence and refresh lifecycle still needs an adapter. Background notification jobs use a separately authorised automation capability limited to their workflow and intended recipients.
 
 ### DM and group boundaries
 
@@ -428,7 +428,7 @@ src/modules/
 
 src/infrastructure/
   whatsapp/          Existing connection adapter plus controlled outbound delivery
-  context-engine/    Scoped REST client; optional MCP client later
+  context-engine/    Scoped MCP client and read-only domain services
   database/          Bot-owned repositories and migrations
   http/              Versioned operational and integration contracts
 ```
@@ -581,3 +581,55 @@ The production Supabase path now has explicit `ramesh-inbound-queue` and `ramesh
 Migration `202610010002` preserves the old job rows by renaming the table. The former `ramesh-message-jobs` name is a compatibility view for the pre-split deployment window. The explicit table names are used by all new runtime queries. Outbound availability timestamps are supported, but the current rows remain immediate quoted replies with the original message expiry; long-lived reminders and business-state revalidation are still separate future work.
 
 Local GUI/model evaluations remain SQLite-only. The queue migration, atomic handoff, crash recovery, lease fencing, due times, encryption, and existing-row preservation are exercised against an isolated local PostgreSQL instance with fake transports. See [the queue contract](supabase-message-queue.md) for table responsibilities, deployment order, and rollback limitations.
+
+## 20. Context Engine MCP service scaffold
+
+The reusable boundary is implemented inside this repository. It is not imported by `createApplication`, the two-node chat graph, or the local playground. No planner, worker or verifier agent is introduced in this step, and no live business read is enabled merely by deploying these files.
+
+| Module                                            | Responsibility                                                                                |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `src/app/context-engine.ts`                       | Explicit factory; constructing services opens no connection                                   |
+| `src/config/context-engine.ts`                    | Optional endpoint, total deadline, response-byte limit                                        |
+| `src/modules/context-engine/context.types.ts`     | Sender/employee grant contracts, resolver port, read-tool allowlist, evidence and safe errors |
+| `src/modules/context-engine/context.service.ts`   | CRM, supply and knowledge methods for a bound sender                                          |
+| `src/infrastructure/context-engine/mcp-client.ts` | MCP discovery/calls, employee binding, bounded transport and result validation                |
+
+The client uses `@modelcontextprotocol/client` 2.1.0, matching the inspected Context Engine client SDK. It uses Streamable HTTP at the configured `/mcp` URL. HTTPS is required except for explicit loopback development URLs. Requests stay on that exact URL and refuse redirects. No stdio processes, arbitrary HTTP tools, sampling, or consent automation are exposed. The [official TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) documents the client package and transport; Context Engine's [MCP catalogue](../../Context_Engine/src/lib/mcp.ts) and [OAuth implementation](../../Context_Engine/src/lib/mcp-oauth.ts) define the application-specific contracts.
+
+`ContextCredentialResolver.resolve` is an injected server-side port. Its future adapter must resolve a trusted WhatsApp phone/LID to exactly one current active employee, load that employee's encrypted grant, serialize refresh-token rotation, and return a valid short-lived MCP access token. The scaffold checks normalized phone binding, active status and token expiry, then verifies the server-reported employee ID via `get_context` before any business tool. REST keys are rejected. The default resolver returns no grant, so the integration stays closed until enrollment/storage is implemented. OAuth tokens and phone identity are never model-visible tool arguments.
+
+One connection and tool catalogue belong to one read operation. There is no cross-employee session, token cache or result cache. The server continues to revalidate current scopes and live record permissions on each read. The first service boundary accepts DMs only; group business reads need an explicit audience policy later. A claimed read-only annotation is insufficient on its own: the tool must also be in the local allowlist and the employee's discovered/scoped catalogue.
+
+Available service methods:
+
+| Family    | Methods / MCP tools                                                                      |
+| --------- | ---------------------------------------------------------------------------------------- |
+| Discovery | `discover`, `context` (`get_context`)                                                    |
+| CRM       | `filters`, `search`, `readLead`, `leadContext`, `summary`, `briefing`, `assessShortlist` |
+| Supply    | `filters`, `search`, `readWarehouse`, `summary`                                          |
+| Knowledge | `search`, `readPage`                                                                     |
+
+These map to fourteen existing read tools. The server's discovered input schemas remain the authoritative filter catalogue; service filters are passed through without guessing or coercing business values. Analytical reports, writes, arbitrary sends and HRMS tools are outside this initial allowlist. CRM-related context uses one lead ID and one of `notes`, `tasks`, `company` or `stage_history`.
+
+Successful calls preserve the Context Engine envelope: `source_path`, `status`, `data`, and `meta` including `requestId` and `generatedAt`. Nested cursors, source status, coverage, redactions, access scope, field evidence and verification flags survive unchanged. The client validates the envelope; interpreting and checking business evidence remains the future verifier's job. Tool text and record contents are data, not instructions. Errors expose stable codes such as `AUTH_REQUIRED`, `ACCESS_DENIED`, `TOOL_UNAVAILABLE`, `RATE_LIMITED`, `TIMEOUT` and `UNAVAILABLE`, without raw upstream bodies or SDK errors. No automatic retry or token refresh occurs inside a tool call.
+
+Future composition, after implementing the credential adapter:
+
+```ts
+import { loadContextEngineConfig } from './config/context-engine.js';
+import { createContextEngineServices } from './app/context-engine.js';
+
+// employeeCredentials is an application adapter, not an LLM-supplied credential.
+const context = createContextEngineServices(loadContextEngineConfig(), employeeCredentials);
+if (!context) throw new Error('Context Engine is not configured');
+const reads = context.forSender({ phoneE164: verifiedSenderPhone, audience: 'dm' });
+const evidence = await reads.crm.search(
+  { view: 'assigned', follow_up_status: 'today', limit: 10 },
+  runAbortSignal,
+);
+// Pass the evidence to the future verifier; retain nextCursor and source metadata.
+```
+
+Set `CONTEXT_MCP_URL` to the deployed Context Engine `/mcp` endpoint when wiring the feature. The total per-read deadline defaults to 30 seconds and the response limit to 1 MiB. No shared MCP token belongs in the environment. Deployment of this scaffold needs no new production environment setting because the current application does not instantiate it.
+
+Tests use the actual MCP SDK with fake HTTP responses. They cover the wire handshake, discovery and calls, employee mismatch, independent concurrent identities, missing/expired/inactive grants, REST-key rejection, group denial, scope filtering, write rejection, structured/text evidence, safe HTTP/tool failures, response bounds, cancellation and deadlines. They do not connect to Context Engine, read business data, or send WhatsApp messages.

@@ -20,6 +20,14 @@ The assistant currently chats and drafts text. CRM, supply, HRMS, reminder tools
 
 `OPENAI_MODEL` defaults to `gpt-5.6-terra`. The whole two-stage run has a 45-second deadline, each model response is capped at 800 output tokens, and the SDK permits one bounded retry. Configuration is in [.env.example](.env.example). No API key, request body, or conversation content is included in normal worker logs; stage timings and token counts are logged. Responses use `store: false`.
 
+## Context Engine MCP services
+
+The repository now includes a reusable MCP client and thin CRM, supply, and knowledge services. They are scaffolded for the future worker and are **not connected to the current chat graph**. `createContextEngineServices` in `src/app/context-engine.ts` is the composition point; it requires endpoint configuration and an employee credential resolver. The default resolver grants no access.
+
+Each read uses a fresh MCP connection, discovers permitted read tools, and checks `get_context.employee_id` against the verified employee before calling a business tool. Credentials are employee OAuth access tokens, never the REST key or a shared admin token. Results retain source IDs, cursors, freshness, access scope, and uncertainty for later verification. Requests have a total deadline, response-size limits, cancellation, and redacted errors. Tests exercise the real SDK with synthetic HTTP responses.
+
+See [the MCP service contract and integration example](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). Employee enrollment, phone/LID resolution, encrypted OAuth storage and refresh remain to be wired through the resolver. Planner, worker, and verifier agents are deliberately deferred.
+
 ## Agent evaluations
 
 ```sh
@@ -59,11 +67,13 @@ src/
   contracts/               Worker-owned v1 API types
   modules/greetings/       Eligibility, durable claim, generated reply handoff
   modules/assistant/       LangGraph, prompts, bounded memory and style guard
+  modules/context-engine/ Read-tool contract, credential port and domain services
   infrastructure/
     whatsapp/              SDK adapter, mapping, connection/retry management
     database/              Prisma repositories and encrypted auth storage
     http/                  Authenticated control/session API, bounded bodies
     openai/                Responses adapter, deadlines and redacted errors
+    context-engine/        Employee-scoped MCP transport and evidence validation
   lib/                     Logging, abortable pacing, bounded admission queue
 prisma/                    Local auth/admin SQLite schema and migrations
 supabase/migrations/       Prefixed PostgreSQL message-state/queue schema
