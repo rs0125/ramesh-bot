@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Worker checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: file:./ci.db
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run prisma:generate
+      # Tests use fake sessions and temporary databases; CI needs no WhatsApp credentials.
+      - run: npm run check
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Validate service and release entry point
+        run: |
+          sh -n deploy/ec2/wareongo-bot-deploy
+          systemd-analyze verify deploy/ec2/wareongo-bot.service

@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Bot-owned state on the worker's persistent volume; never the shared CRM database.
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Claim before sending so repeated messages.upsert events cannot send twice.
+// No message bodies, phone roster, CRM credentials, or lead data are stored.
+model Greeting {
+  chatId    String
+  messageId String
+  status    String   @default("CLAIMED")
+  createdAt DateTime @default(now())
+  repliedAt DateTime?
+
+  @@id([chatId, messageId])
+  @@index([createdAt])
+}
+
+// Baileys credentials and Signal keys are encrypted with an independently stored key.
+model WhatsAppAuthEntry {
+  category  String
+  keyId     String
+  encrypted String
+  updatedAt DateTime @updatedAt
+
+  @@id([category, keyId])
+}
+
+// Only hashes of signed browser session tokens reach the worker database.
+model AdminSession {
+  tokenHash String   @id
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}
+
+// A shared limit across Vercel instances. Keys are opaque hashes, never raw IPs.
+model LoginBucket {
+  key       String   @id
+  attempts  Int
+  expiresAt DateTime
+}
+
+// Operator intent survives a process restart or deployment.
+model BotSetting {
+  key   String @id
+  value String
+}

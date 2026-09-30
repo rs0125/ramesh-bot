@@ -1,0 +1,14 @@
+node_modules
+**/dist
+**/.next
+**/next-env.d.ts
+**/*.tsbuildinfo
+**/*.db*
+**/migrations
+.env*
+**/.env*
+.local
+package-lock.json
+playwright-report
+test-results
+.vercel

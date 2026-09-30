@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Deploy a tested main commit using the root-installed WareOnGo worker helper.",
+  "parameters": {
+    "Commit": {
+      "type": "String",
+      "description": "Full commit SHA from successful main CI.",
+      "allowedPattern": "^[0-9a-f]{40}$",
+      "interpolationType": "ENV_VAR"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "deploy",
+      "precondition": { "StringEquals": ["platformType", "Linux"] },
+      "inputs": {
+        "timeoutSeconds": "1800",
+        "runCommand": ["set -eu", "exec /usr/local/sbin/wareongo-bot-deploy \"$SSM_Commit\""]
+      }
+    }
+  ]
+}

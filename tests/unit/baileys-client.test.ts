@@ -1,0 +1,199 @@
+/** Connection lifecycle regression tests use fake sessions; no WhatsApp account is accessed. */
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { EventEmitter } from 'node:events';
+import pino from 'pino';
+import { DisconnectReason, type BaileysEventMap, type WAMessage } from '@whiskeysockets/baileys';
+import { BaileysClient } from '../../src/infrastructure/whatsapp/baileys-client.js';
+import type { WhatsAppSession } from '../../src/infrastructure/whatsapp/baileys-session.js';
+import { reconnectDelay } from '../../src/infrastructure/whatsapp/reconnect.policy.js';
+
+class FakeSession implements WhatsAppSession {
+  readonly events = new EventEmitter();
+  readonly botJids = ['10000000000@s.whatsapp.net'];
+  closed = false;
+  saved = 0;
+  on<K extends keyof BaileysEventMap>(event: K, handler: (value: BaileysEventMap[K]) => void) {
+    this.events.on(event, handler);
+    return () => {
+      this.events.off(event, handler);
+    };
+  }
+  async saveCredentials() {
+    this.saved++;
+  }
+  async reply(_message: WAMessage, _text: string) {}
+  async close() {
+    this.closed = true;
+    this.events.emit('creds.update', {});
+  }
+}
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+const message = (id: string): WAMessage => ({
+  key: { id, remoteJid: '20000000000@s.whatsapp.net' },
+  message: { conversation: 'hi' },
+  messageTimestamp: Date.now() / 1000,
+});
+
+test('stop drains admitted messages and final credential writes before closing', async () => {
+  const session = new FakeSession();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const seen: string[] = [];
+  const client = new BaileysClient({
+    createSession: async () => session,
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async (candidate) => {
+      seen.push(candidate.messageId);
+      await held;
+      assert.equal(session.closed, false);
+      return 'sent';
+    },
+  });
+  await client.start();
+  session.events.emit('messages.upsert', { type: 'append', messages: [message('history')] });
+  session.events.emit('messages.upsert', {
+    type: 'notify',
+    messages: [message('first'), message('second')],
+  });
+  await tick();
+  const stopping = client.stop();
+  session.events.emit('messages.upsert', { type: 'notify', messages: [message('too-late')] });
+  assert.equal(session.closed, false);
+  release();
+  await stopping;
+  assert.deepEqual(seen, ['first', 'second']);
+  assert.equal(session.closed, true);
+  assert.equal(session.saved, 1);
+  assert.equal(client.getStatus().state, 'stopped');
+  assert.equal(session.events.listenerCount('messages.upsert'), 0);
+});
+
+test('pairing state is transient, terminal logout requires manual reconnect, and reconnects can be stopped', async () => {
+  const sessions: FakeSession[] = [];
+  const client = new BaileysClient({
+    createSession: async () => {
+      const session = new FakeSession();
+      sessions.push(session);
+      return session;
+    },
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async () => 'sent',
+  });
+  await client.start();
+  const first = sessions[0]!;
+  first.events.emit('connection.update', { qr: 'synthetic-qr' });
+  assert.equal(client.getStatus().qr, 'synthetic-qr');
+  first.events.emit('connection.update', { connection: 'open' });
+  assert.equal(client.getStatus().qr, null);
+  first.events.emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: { error: { output: { statusCode: DisconnectReason.loggedOut } } },
+  });
+  assert.equal(client.getStatus().state, 'error');
+  await client.start();
+  assert.equal(sessions.length, 2);
+  assert.equal(first.closed, true);
+  sessions[1]!.events.emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: { error: { output: { statusCode: DisconnectReason.restartRequired } } },
+  });
+  assert.equal(client.getStatus().state, 'reconnecting');
+  await client.stop();
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  assert.equal(sessions.length, 2, 'stop cancels the scheduled reconnect');
+});
+
+test('reconnect delays are bounded and revoked sessions are terminal', () => {
+  assert.equal(reconnectDelay(undefined, 0), 1000);
+  assert.equal(reconnectDelay(undefined, 100), 30_000);
+  assert.equal(reconnectDelay(DisconnectReason.restartRequired, 5), 500);
+  assert.equal(reconnectDelay(DisconnectReason.connectionReplaced, 0), null);
+});
+
+test('a flood is bounded and admitted messages drain in order', async () => {
+  const session = new FakeSession();
+  const seen: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const client = new BaileysClient({
+    createSession: async () => session,
+    maxPendingMessages: 3,
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async (candidate) => {
+      seen.push(candidate.messageId);
+      await held;
+      return 'sent';
+    },
+  });
+  await client.start();
+  session.events.emit('messages.upsert', {
+    type: 'notify',
+    messages: Array.from({ length: 100 }, (_, id) => message(String(id))),
+  });
+  await tick();
+  assert.equal(client.getStatus().metrics.dropped, 97);
+  release();
+  await client.stop();
+  assert.deepEqual(seen, ['0', '1', '2']);
+});
+
+test('transient session creation failures continue retrying and can recover', async () => {
+  let attempts = 0;
+  const session = new FakeSession();
+  const client = new BaileysClient({
+    createSession: async () => {
+      if (++attempts < 3) throw new Error('network');
+      return session;
+    },
+    retryDelay: () => 5,
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async () => 'sent',
+  });
+  try {
+    await assert.rejects(client.start(), /network/);
+    for (let i = 0; i < 100 && attempts < 3; i++)
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(attempts, 3);
+    session.events.emit('connection.update', { connection: 'open' });
+    assert.equal(client.getStatus().state, 'connected');
+  } finally {
+    await client.stop();
+  }
+});
+
+test('credential failure closes the socket and prevents more replies', async () => {
+  const session = new FakeSession();
+  session.saveCredentials = async () => {
+    throw new Error('disk full');
+  };
+  let replies = 0;
+  const client = new BaileysClient({
+    createSession: async () => session,
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async () => {
+      replies++;
+      return 'sent';
+    },
+  });
+  await client.start();
+  session.events.emit('connection.update', { qr: 'private-qr' });
+  session.events.emit('creds.update', {});
+  await tick();
+  await tick();
+  session.events.emit('messages.upsert', { type: 'notify', messages: [message('after-failure')] });
+  assert.equal(client.getStatus().state, 'error');
+  assert.equal(client.getStatus().qr, null);
+  assert.equal(session.closed, true);
+  assert.equal(replies, 0);
+  await client.stop();
+});

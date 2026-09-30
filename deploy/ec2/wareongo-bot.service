@@ -1,0 +1,44 @@
+# Runs one WhatsApp session; code is read-only and mutable state survives code updates.
+[Unit]
+Description=WareOnGo WhatsApp bot worker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=wareongo-bot
+Group=wareongo-bot
+WorkingDirectory=/opt/wareongo-sales-bot/current
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/wareongo-sales-bot/worker.env
+EnvironmentFile=/opt/wareongo-sales-bot/current/release.env
+
+# State lives outside immutable releases; migrations are run by the deployment helper.
+StateDirectory=wareongo-sales-bot
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/node /opt/wareongo-sales-bot/current/dist/index.js
+Restart=on-failure
+RestartSec=5
+MemoryHigh=600M
+MemoryMax=768M
+MemorySwapMax=1G
+# Leave time for the worker's 10-second drain deadline before systemd intervenes.
+TimeoutStartSec=120
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+PrivateDevices=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wareongo-bot
+
+[Install]
+WantedBy=multi-user.target

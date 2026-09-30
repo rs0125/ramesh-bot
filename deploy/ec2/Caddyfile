@@ -1,0 +1,13 @@
+# Replace this hostname with the DNS name pointing to the EC2 public IP.
+# Caddy manages HTTPS; the worker keeps its bearer-token check behind this proxy.
+bot-worker.example.com {
+	@api path /v1/status /v1/control /v1/admin/attempt /v1/admin/session
+	handle @api {
+		reverse_proxy 127.0.0.1:3011
+	}
+
+	# No other worker routes are exposed. Access logging is intentionally not enabled.
+	handle {
+		respond "Not found" 404
+	}
+}

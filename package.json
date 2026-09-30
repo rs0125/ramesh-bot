@@ -1,0 +1,43 @@
+{
+  "name": "@wareongo/bot-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.16 <23"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/unit/*.test.ts tests/integration/*.test.ts deploy/tests/*.test.ts",
+    "check": "npm run prisma:validate && npm run typecheck && npm test && npm run build && npm run format:check",
+    "format": "prettier --write --ignore-unknown src tests scripts deploy .github *.json *.md docs",
+    "format:check": "prettier --check --ignore-unknown src tests scripts deploy .github *.json *.md docs",
+    "setup:local": "tsx scripts/setup-local.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "db:migrate": "prisma migrate deploy"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "prettier": "3.6.2",
+    "prisma": "6.19.3",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "@types/qrcode-terminal": "0.12.2"
+  },
+  "overrides": {
+    "@prisma/config": {
+      "deepmerge-ts": "8.0.0"
+    }
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "dotenv": "17.4.1",
+    "pino": "9.14.0",
+    "qrcode-terminal": "0.12.0"
+  }
+}
