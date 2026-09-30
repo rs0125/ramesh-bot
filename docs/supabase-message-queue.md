@@ -24,9 +24,10 @@ flowchart TD
     Save --> Store[(Supabase PostgreSQL)]
     Store --> Claim[Connected worker claims one job]
     Claim --> Processing[PROCESSING with a fenced lease]
-    Processing --> Delay[Random reply delay and age recheck]
+    Processing --> Agent[Optional LangGraph converser and formatter]
+    Agent --> Delay[Random reply delay and age recheck]
     Delay --> Marker[Commit SENDING before calling WhatsApp]
-    Marker --> Send[Send quoted hello through current Baileys session]
+    Marker --> Send[Send generated reply through current Baileys session]
     Send --> Success[SENT / job DONE]
     Send --> Uncertain[UNCERTAIN / job DEAD if delivery is ambiguous]
 ```
@@ -39,7 +40,7 @@ The consumer starts only after Baileys reports `connected`. Newly persisted work
 
 Job claims use `FOR UPDATE SKIP LOCKED`, a transaction-scoped account lock, and a unique index allowing one leased job per account. Each claim receives a new UUID lease token. A stale consumer cannot start or finalize work owned by a newer lease. Transactions finish before delay timers or network sends begin, so the Supabase transaction-pooler connection is not held during pacing.
 
-The lease duration is `REPLY_DELAY_MAX_MS + SEND_TIMEOUT_MS + 30000`, giving the current fixed greeting operation a bounded processing window. Long-running future LLM/CRM jobs would need a reviewed renewal/timeout design; this lease is not an unlimited execution window.
+The lease duration is the configured agent deadline (zero when no OpenAI key is configured) plus `REPLY_DELAY_MAX_MS + SEND_TIMEOUT_MS + 30000`. Generation is cancelled at the agent deadline or when the session disconnects; the lease includes time for pacing, sending, and database round trips. Future workflows that exceed that bounded window will need a reviewed renewal design.
 
 ## Message and job states
 

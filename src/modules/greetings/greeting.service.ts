@@ -6,6 +6,7 @@ import type {
   GreetingOutcome,
   GreetingRepository,
   Reply,
+  PrepareReply,
 } from './greeting.types.js';
 
 export class GreetingService {
@@ -14,6 +15,7 @@ export class GreetingService {
     private readonly maxMessageAgeMs: number,
     private readonly now: () => number = Date.now,
     private readonly waitBeforeReply: BeforeReply = async () => true,
+    private readonly prepareReply: PrepareReply = async () => ({ text: 'hello' }),
   ) {}
 
   /** The adapter supplies reply(), binding the destination to the triggering message. */
@@ -28,6 +30,7 @@ export class GreetingService {
     if (!(await this.repository.claim(key))) return 'duplicate';
 
     try {
+      const prepared = await this.prepareReply(message, signal);
       // Claim first so duplicate events never occupy another delay or send slot.
       // Cancelled/expired claims stay retained, preventing stale replay after reconnect.
       if (
@@ -36,8 +39,10 @@ export class GreetingService {
         !selectGreetingTarget(message, this.now(), this.maxMessageAgeMs)
       )
         return 'ignored';
-      await reply('hello');
+      await reply(prepared.text);
+      prepared.onSent?.();
     } catch (sendError) {
+      if (signal?.aborted) return 'ignored';
       try {
         await this.repository.markFailed(key);
       } catch (storageError) {

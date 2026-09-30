@@ -14,19 +14,31 @@ import { createReplyDelay } from '../lib/reply-delay.js';
 import { createMessagePool } from '../infrastructure/database/message-pool.js';
 import { MessageQueueRepository } from '../infrastructure/database/message-queue.repository.js';
 import { DurableMessages } from '../infrastructure/whatsapp/durable-messages.js';
+import { AssistantService } from '../modules/assistant/assistant.service.js';
+import { OpenAITextModel } from '../infrastructure/openai/text-model.js';
+import type { TextModel } from '../modules/assistant/assistant.types.js';
 
 export interface Application {
   start(): Promise<void>;
   stop(): Promise<void>;
 }
 
-// Test injection replaces only the transport; production always uses the real SDK factory.
+// Tests can replace the transport and model; production uses the configured adapters.
 export function createApplication(
   config: AppConfig,
   logger: Logger,
-  overrides: { createSession?: SessionFactory } = {},
+  overrides: { createSession?: SessionFactory; model?: TextModel } = {},
 ): Application {
   const db = createPrismaClient(config.databaseUrl);
+  const assistant = config.assistant
+    ? new AssistantService(
+        config.assistant,
+        overrides.model ?? new OpenAITextModel(config.assistant),
+        undefined,
+        (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
+      )
+    : undefined;
+  const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
   const messagePool = config.messageDatabase
     ? createMessagePool(config.messageDatabase, () =>
         logger.error('Message database connection failed'),
@@ -42,10 +54,15 @@ export function createApplication(
           encryptionKey: config.encryptionKey,
           maxAgeMs: config.whatsapp.maxMessageAgeMs,
           capacity: config.whatsapp.maxPendingMessages,
-          // Covers maximum pacing, send deadline, and database round trips without renewal.
-          leaseMs: config.whatsapp.replyDelay.maxMs + config.whatsapp.sendTimeoutMs + 30000,
+          // Covers the entire bounded graph, pacing, sending and database round trips.
+          leaseMs:
+            (config.assistant?.timeoutMs ?? 0) +
+            config.whatsapp.replyDelay.maxMs +
+            config.whatsapp.sendTimeoutMs +
+            30000,
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
+          prepareReply,
         })
       : undefined;
   const greetings = new GreetingService(
@@ -53,6 +70,7 @@ export function createApplication(
     config.whatsapp.maxMessageAgeMs,
     Date.now,
     createReplyDelay(config.whatsapp.replyDelay),
+    prepareReply,
   );
   const whatsapp = new BaileysClient({
     durableMessages,

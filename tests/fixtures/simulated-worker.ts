@@ -17,6 +17,7 @@ const config = loadConfig({
   ...process.env,
   // Browser fixtures must never inherit the real worker's Supabase connection.
   MESSAGE_DATABASE_URL: '',
+  OPENAI_API_KEY: '',
   REPLY_DELAY_MIN_MS: '0',
   REPLY_DELAY_MAX_MS: '0',
 });

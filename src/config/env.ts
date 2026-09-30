@@ -1,6 +1,7 @@
 /** Validates environment input once, before the application opens any resources. */
 import type { LevelWithSilent } from 'pino';
 import type { MessageDatabaseConfig } from '../infrastructure/database/message-pool.js';
+import { loadAssistantConfig, type AssistantConfig } from './assistant.js';
 
 export interface AppConfig {
   readonly databaseUrl: string;
@@ -11,6 +12,7 @@ export interface AppConfig {
   readonly api: { readonly host: string; readonly port: number; readonly token: string };
   readonly autoConnect: boolean;
   readonly messageDatabase?: MessageDatabaseConfig;
+  readonly assistant?: AssistantConfig;
   readonly whatsapp: {
     readonly maxMessageAgeMs: number;
     readonly maxPendingMessages: number;
@@ -83,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     encryptionKey,
     release,
     messageDatabase: messageDatabaseConfig(env),
+    assistant: loadAssistantConfig(env),
     whatsapp: {
       maxMessageAgeMs: maxAgeSeconds * 1000,
       maxPendingMessages,

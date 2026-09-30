@@ -36,5 +36,11 @@ export function toGreetingCandidate(
     isGroup,
     sentAtMs: Number(message.messageTimestamp ?? 0) * 1000,
     mentionsBot: mentions.some((jid) => identities.has(jidNormalizedUser(jid))),
+    text: text.trim(),
+    senderId: isGroup
+      ? message.key.participant
+        ? jidNormalizedUser(message.key.participant)
+        : undefined
+      : jidNormalizedUser(chatId),
   };
 }

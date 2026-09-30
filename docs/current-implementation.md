@@ -2,6 +2,8 @@
 
 Reviewed: **2026-10-01, Asia/Kolkata**.
 
+**Conversational extension, 1 October 2026:** the worker now supports an optional OpenAI Terra `converser → formatter` LangGraph flow in both reply paths. The original `hello` flow described below remains the no-key transport baseline. See the [current README](../README.md#safe-local-chat-playground) for the isolated SQLite playground, model configuration, memory limits, and live eval harness. Employee/CRM permissions and business tools remain future work; local playground/eval replies never go to WhatsApp.
+
 This document describes the code currently present in the `baileys-ramesh` worker and `baileys-ramesh-admin` admin checkouts, including reply pacing, QR rendering, and the Supabase message-state/queue implementation. It describes implemented behavior, configuration defaults, and deployment assets. It does not assert that every checked-in deployment asset is active in AWS or Vercel.
 
 The linked WhatsApp session now belongs to EC2; the earlier local pairing was retired. A read-only EC2 inspection confirmed the existing worker was connected before the Supabase cutover. The new four-table Supabase schema and dedicated runtime login have been provisioned and verified. The detailed storage contract, provisioning steps, and PostgreSQL tests are documented in [Supabase message state and reply queue](supabase-message-queue.md). Historical planning documents may describe earlier deployment stages.

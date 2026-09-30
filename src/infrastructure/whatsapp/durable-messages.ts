@@ -4,7 +4,11 @@ import { proto, type WAMessage } from '@whiskeysockets/baileys';
 import { authCipher } from '../database/auth-store.js';
 import { MessageQueueRepository, type MessageJob } from '../database/message-queue.repository.js';
 import { selectGreetingTarget } from '../../modules/greetings/greeting.policy.js';
-import type { BeforeReply, GreetingCandidate } from '../../modules/greetings/greeting.types.js';
+import type {
+  BeforeReply,
+  GreetingCandidate,
+  PrepareReply,
+} from '../../modules/greetings/greeting.types.js';
 import type { WhatsAppSession } from './baileys-session.js';
 import { toGreetingCandidate } from './message.mapper.js';
 
@@ -15,7 +19,13 @@ export interface DurableMessageOptions {
   leaseMs: number;
   pollMs: number;
   waitBeforeReply: BeforeReply;
+  prepareReply?: PrepareReply;
 }
+
+type DurableRepository = Pick<
+  MessageQueueRepository,
+  'enqueue' | 'claim' | 'releaseUnsent' | 'complete' | 'beginSend'
+>;
 
 export class DurableMessages {
   private readonly cipher;
@@ -23,7 +33,7 @@ export class DurableMessages {
   private revision = 0;
 
   constructor(
-    private readonly repository: MessageQueueRepository,
+    private readonly repository: DurableRepository,
     private readonly options: DurableMessageOptions,
   ) {
     this.cipher = authCipher(options.encryptionKey);
@@ -121,10 +131,13 @@ export class DurableMessages {
       const candidate = toGreetingCandidate(message, session.botJids);
       const eligible = () =>
         candidate && selectGreetingTarget(candidate, Date.now(), this.options.maxAgeMs);
-      if (!eligible()) {
+      if (!candidate || !eligible()) {
         await this.repository.complete(job, 'EXPIRED', 'no_longer_eligible');
         return;
       }
+      const prepared = this.options.prepareReply
+        ? await this.options.prepareReply(candidate, signal)
+        : { text: 'hello', onSent: undefined };
       if (!(await this.options.waitBeforeReply(signal)) || signal.aborted) {
         await this.repository.releaseUnsent(job, true);
         return;
@@ -143,7 +156,8 @@ export class DurableMessages {
         return;
       }
       sendInvoked = true;
-      await session.reply(message, 'hello');
+      await session.reply(message, prepared.text);
+      prepared.onSent?.();
       if (await this.repository.complete(job, 'SENT')) report('sent');
       else report('error');
     } catch {

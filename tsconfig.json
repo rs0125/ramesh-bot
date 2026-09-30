@@ -12,6 +12,6 @@
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts", "deploy/**/*.ts"],
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts", "evals/**/*.ts", "deploy/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

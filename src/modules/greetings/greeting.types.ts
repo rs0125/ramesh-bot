@@ -4,12 +4,14 @@ export interface GreetingKey {
   readonly messageId: string;
 }
 
-/** Minimal metadata needed for the greeting policy; message text stays in the adapter. */
+/** Trigger metadata plus optional conversation input populated by the WhatsApp mapper. */
 export interface GreetingCandidate extends GreetingKey {
   readonly sentAtMs: number;
   readonly fromMe: boolean;
   readonly isGroup: boolean;
   readonly mentionsBot: boolean;
+  readonly text?: string;
+  readonly senderId?: string;
 }
 
 export interface GreetingRepository {
@@ -21,6 +23,15 @@ export interface GreetingRepository {
 }
 
 export type Reply = (text: string) => Promise<void>;
+export interface PreparedReply {
+  text: string;
+  /** Called only after the transport accepts the reply. Never performs network work. */
+  onSent?: () => void;
+}
+export type PrepareReply = (
+  message: GreetingCandidate,
+  signal?: AbortSignal,
+) => Promise<PreparedReply>;
 /** False means the pending reply was cancelled before sending. */
 export type BeforeReply = (signal?: AbortSignal) => Promise<boolean>;
 export type GreetingOutcome = 'ignored' | 'duplicate' | 'sent';

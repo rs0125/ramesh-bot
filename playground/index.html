@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="playground-token" content="__PLAYGROUND_TOKEN__" />
+    <title>Ramesh · Chat playground</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">w.</span><span>WareOnGo <small>PLAYGROUND</small></span>
+        </div>
+        <div class="sidebar-heading">A little room to test Ramesh.</div>
+        <p class="muted">Try a conversation, change the tone, or pick up where you left off.</p>
+        <div class="contact selected">
+          <div class="avatar">R</div>
+          <div><strong>Ramesh</strong><small>Converser + formatter</small></div>
+          <span class="dot"></span>
+        </div>
+        <label for="sender">Speaking as</label>
+        <select id="sender">
+          <option value="me">You</option>
+          <option value="teammate">Test teammate</option>
+        </select>
+        <label for="audience">Conversation</label>
+        <select id="audience">
+          <option value="dm">Direct message</option>
+          <option value="group">Group @mention</option>
+        </select>
+        <p class="hint">Each identity and audience has its own short-term memory.</p>
+        <div class="safety">
+          <span class="safety-icon">◉</span>
+          <div>
+            <strong>Local sandbox</strong>
+            <p>SQLite + a fake chat transport. Nothing here goes to WhatsApp.</p>
+          </div>
+        </div>
+        <div class="model-label">
+          __MODEL__<br /><span>Real OpenAI calls · No CRM tools yet</span>
+        </div>
+      </aside>
+      <main class="chat">
+        <header class="chat-header">
+          <div class="avatar small">R</div>
+          <div>
+            <h1>Ramesh</h1>
+            <p><span class="dot"></span> Ready · local sandbox</p>
+          </div>
+          <button id="reset" class="quiet-button">New conversation</button>
+        </header>
+        <div
+          class="chat-body"
+          id="messages"
+          role="log"
+          aria-live="polite"
+          aria-label="Conversation"
+        >
+          <section class="empty" id="empty">
+            <div class="large-avatar">r.</div>
+            <h2>Say hello to Ramesh.</h2>
+            <p>Short replies. Plain words. A bit more human.</p>
+            <div class="suggestions">
+              <button data-message="hey Ramesh, what's up?">Start with a hello</button
+              ><button
+                data-message="Help me write a casual message asking a client when they're free for a call."
+              >
+                Draft a quick message</button
+              ><button data-message="yaar aaj kaafi hectic din tha">Try Hinglish</button>
+            </div>
+          </section>
+        </div>
+        <div class="run-info" id="run-info">Your messages stay in this simulated conversation.</div>
+        <form class="composer" id="composer">
+          <label class="sr-only" for="message">Message Ramesh</label
+          ><textarea
+            id="message"
+            placeholder="Message Ramesh…"
+            rows="1"
+            maxlength="6000"
+            autofocus
+          ></textarea
+          ><button id="send" type="submit" aria-label="Send message">↑</button>
+        </form>
+        <footer>
+          Enter to send <span>·</span> Shift + Enter for a new line <span>·</span> Replies use
+          OpenAI
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>
