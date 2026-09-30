@@ -37,4 +37,7 @@ jobs:
       - name: Validate service and release entry point
         run: |
           sh -n deploy/ec2/wareongo-bot-deploy
+          bash -n deploy/ec2/bootstrap.sh
+          # setup-node installs into the runner tool cache; production uses /usr/bin/node.
+          if [ ! -x /usr/bin/node ]; then sudo ln -s "$(command -v node)" /usr/bin/node; fi
           systemd-analyze verify deploy/ec2/wareongo-bot.service

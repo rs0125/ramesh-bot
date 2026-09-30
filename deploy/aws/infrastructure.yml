@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private Ramesh bot worker, SSM deployment, and encrypted backups. No inbound ports.
+
+# Existing networking and GitHub OIDC are reused; application resources belong to this stack.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: Reviewed Canonical Ubuntu 24.04 amd64 image
+  BootstrapCommit:
+    Type: String
+    AllowedPattern: '^[a-f0-9]{40}$'
+    Description: Reviewed commit containing the privileged one-time bootstrap script
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  GitHubSubject:
+    Type: String
+    AllowedPattern: '^repo:rs0125(@[0-9]+)?/ramesh-bot(@[0-9]+)?:environment:production$'
+    Description: Exact subject returned by the repository OIDC settings API, plus production environment
+
+Resources:
+  # A public address supplies outbound internet access. The empty ingress list keeps the API private.
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ramesh bot - outbound connectivity and SSM only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ramesh-bot-production
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'ramesh-bot-backups-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-database-snapshots
+            Status: Enabled
+            Prefix: daily/
+            ExpirationInDays: 14
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # Runtime/build services cannot reach IMDS. Only host management and the root backup service use this role.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: managed-instance-and-private-backups
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ramesh-bot/production/runtime'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${BackupBucket.Arn}/daily/*'
+                Condition:
+                  StringEquals:
+                    s3:x-amz-server-side-encryption: AES256
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    # Prevent a stack deletion/replacement from destroying a paired account and its live keys.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      CreditSpecification:
+        CPUCredits: standard
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref SecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            Encrypted: true
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: ramesh-bot-production
+        - Key: Project
+          Value: wareongo
+        - Key: Service
+          Value: ramesh-bot
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+          curl --fail --silent --show-error --location --retry 5 \
+            'https://raw.githubusercontent.com/rs0125/ramesh-bot/${BootstrapCommit}/deploy/ec2/bootstrap.sh' \
+            -o /root/ramesh-bot-bootstrap.sh
+          bash /root/ramesh-bot-bootstrap.sh '${BootstrapCommit}' '${AWS::Region}' '${BackupBucket}'
+
+  DeployDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: ramesh-bot-deploy
+      DocumentType: Command
+      DocumentFormat: JSON
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: '2.2'
+        description: Deploy only a reviewed main commit through the fixed root-owned helper.
+        parameters:
+          Commit:
+            type: String
+            allowedPattern: '^[0-9a-f]{40}$'
+            interpolationType: ENV_VAR
+        mainSteps:
+          - action: aws:runShellScript
+            name: deploy
+            precondition:
+              StringEquals: [platformType, Linux]
+            inputs:
+              timeoutSeconds: '1800'
+              runCommand:
+                - set -eu
+                - exec /usr/local/sbin/wareongo-bot-deploy "$SSM_Commit"
+
+  # CI can invoke only this document on this instance. It cannot bootstrap hosts or read their secrets.
+  GitHubRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Ref GitHubSubject
+      Policies:
+        - PolicyName: invoke-fixed-worker-release
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DeployDocument}'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}'
+              - Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: '*'
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  SecurityGroupId:
+    Value: !Ref SecurityGroup
+  GitHubRoleArn:
+    Value: !GetAtt GitHubRole.Arn
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  DeployDocumentName:
+    Value: !Ref DeployDocument

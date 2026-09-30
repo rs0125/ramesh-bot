@@ -1,0 +1,11 @@
+# Daily consistent snapshots, with bounded jitter to avoid synchronized account load.
+[Unit]
+Description=Daily WareOnGo bot backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

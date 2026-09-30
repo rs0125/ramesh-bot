@@ -1,0 +1,18 @@
+# Root owns the snapshot directory and can read the database; no application code runs here.
+[Unit]
+Description=Back up WareOnGo bot database to private S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/wareongo-sales-bot/backup.env
+ExecStart=/usr/bin/node --experimental-strip-types /usr/local/lib/wareongo-bot-deploy/ec2/backup.ts
+UMask=0077
+TimeoutStartSec=180
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/backups/wareongo-sales-bot /var/lib/wareongo-sales-bot

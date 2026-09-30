@@ -36,6 +36,8 @@ ProtectSystem=strict
 ProtectHome=true
 RestrictSUIDSGID=true
 PrivateDevices=true
+# The bot needs WhatsApp access, but never the host's AWS instance credentials.
+IPAddressDeny=169.254.169.254/32 fd00:ec2::254/128
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=wareongo-bot
