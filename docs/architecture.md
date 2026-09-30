@@ -1,36 +1,52 @@
 # Architecture and API
 
-The worker and Next.js admin are independent projects. The worker owns WhatsApp, SQLite, login-limit/session records, and the control API. The admin owns browser authentication UI, signed cookies and the server-side HTTP client. They share a documented protocol, not source code or npm dependencies.
+Reviewed **1 October 2026** through release `5eb14d0`. The worker and Next.js admin are independent projects. The worker owns WhatsApp, the two-node conversational graph, durable message queues, local authentication/admin state, and the control API. The admin owns browser authentication UI, signed cookies, and the server-side HTTP client. They share a documented protocol, not source code or npm dependencies.
 
 ```mermaid
 flowchart LR
-  Browser --> Admin[Next.js admin / Vercel]
-  Admin -->|HTTPS and private bearer token| API[Worker API / EC2]
+  Browser --> Admin[Next.js pairing admin]
+  Admin -->|Private bearer token over configured network path| API[Worker API / EC2]
   API --> Lifecycle[Baileys connection lifecycle]
-  Lifecycle --> Greeting[Greeting policy and durable claim]
   Lifecycle <-->|Persistent socket| WhatsApp
-  API --> DB[(Prisma / SQLite)]
-  Greeting --> DB
-  Lifecycle -->|Encrypted auth| DB
+  Lifecycle -->|Eligible messages| IN[(Supabase: ramesh-inbound-queue)]
+  IN --> Converser[LangGraph converser]
+  Converser --> Formatter[LangGraph formatter]
+  Formatter -->|Atomic handoff| OUT[(Supabase: ramesh-outbound-queue)]
+  OUT -->|Due saved replies| Lifecycle
+  Converser & Formatter --> OpenAI[OpenAI Responses / Terra]
+  API --> Local[(SQLite: auth, admin, settings)]
+  Lifecycle -->|Encrypted credentials and Signal keys| Local
 ```
+
+Supabase also holds the message ledger, transactional state history, and migration checksums. Both queue stages run in the existing worker and share one active lease per account; a long model run can delay other chats. The outbound sender uses saved text without regenerating it. Without an OpenAI key, the same delivery boundary uses `hello`.
+
+The MCP boundary is a separate, inactive scaffold: `createContextEngineServices` → employee-bound CRM/supply/knowledge services → Context Engine `/mcp`. It is not called by the current graph. Its default credential resolver grants no access; employee phone/LID resolution, OAuth enrollment/storage/refresh, and the planner/worker/verifier agents remain future work. The [consolidated architecture plan](assistant-architecture-plan.md) includes the user's system diagram and future flow.
+
+`npm run dev:chat` uses the same graph with isolated SQLite and captured browser replies at port 3012. It opens neither a WhatsApp socket nor a Supabase connection. The separate PostgreSQL integration suite verifies the production queue logic with fake delivery.
 
 ## Worker modules
 
-| Module                    | Responsibility                                                                        |
-| ------------------------- | ------------------------------------------------------------------------------------- |
-| `app`                     | Construct adapters, expose readiness, order shutdown and maintenance                  |
-| `config`                  | Validate secrets, limits, listener settings and release ID once                       |
-| `modules/greetings`       | Determine eligibility, claim before sending, preserve uncertain claims                |
-| `infrastructure/whatsapp` | Map SDK events, resolve bot identities, manage retries and bounded work               |
-| `infrastructure/database` | Atomic dedupe, encrypted credentials/keys, sessions, login limits and operator intent |
-| `infrastructure/http`     | Authenticate and validate fixed commands; expose no arbitrary-send tool               |
-| `contracts`               | Describe v1 response shapes; consumers independently validate them                    |
+| Module                          | Responsibility                                                                            |
+| ------------------------------- | ----------------------------------------------------------------------------------------- |
+| `app`                           | Construct adapters, expose readiness, order shutdown and maintenance                      |
+| `config`                        | Validate secrets, limits, listener settings and release ID once                           |
+| `modules/greetings`             | Determine eligibility, claim before sending, preserve uncertain claims                    |
+| `modules/assistant`             | Typed LangGraph state, converser/formatter prompts, bounded memory, and style guard       |
+| `modules/context-engine`        | Employee credential port, read-tool allowlist, and CRM/supply/knowledge services          |
+| `infrastructure/whatsapp`       | Map SDK events, resolve bot identities, manage retries and bounded work                   |
+| `infrastructure/database`       | SQLite auth/admin and PostgreSQL message ledger, queues, leases, and atomic reply handoff |
+| `infrastructure/openai`         | Responses API, model deadlines, cancellation, and safe errors                             |
+| `infrastructure/context-engine` | MCP discovery, employee checks, bounded transport, and evidence envelopes                 |
+| `infrastructure/http`           | Authenticate and validate fixed commands; expose no arbitrary-send tool                   |
+| `contracts`                     | Describe v1 response shapes; consumers independently validate them                        |
 
-Auth writes use AES-256-GCM with a random IV and row identity as additional authenticated data. Keys are encrypted before queued writes, then committed transactionally. The encryption key is outside the DB. SQLite plus a singleton systemd service fits the current one-account deployment; multiple replicas require explicit session ownership and a different storage design.
+Auth writes use AES-256-GCM with a random IV and row identity as additional authenticated data. Keys are encrypted before queued writes, then committed transactionally. Supabase pending input and finalized replies use separate authenticated payload categories. The encryption key is outside both databases. Terminal payloads are cleared; queue metadata and history expire after 30 days. Keep one active worker per linked account: queue leases do not implement distributed WhatsApp session ownership.
+
+Conversation memory is process-local, partitioned by chat and sender, bounded to six turns/16,000 characters per context, 200 contexts, and a 30-minute idle lifetime. It advances only after successful transport acceptance and resets on restart. There are no durable LangGraph checkpoints or business tools in the active graph.
 
 ## HTTP boundary
 
-Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Responses are JSON with `Cache-Control: private, no-store`. The server binds to loopback; Caddy exposes only the four exact API paths over HTTPS.
+Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Responses are JSON with `Cache-Control: private, no-store`. The server binds to loopback. Current EC2 access is through SSM; the security group has no inbound rules. The checked-in Caddy template can expose the four exact API paths over HTTPS in a later network rollout; it is not installed by the current stack.
 
 | Endpoint                 | Body / response                                                                                                                         |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -52,4 +68,6 @@ The admin defines its own API types and validates worker responses at runtime. P
 
 Browser requests reach Next.js, which verifies the signed cookie and its persisted session hash before calling the worker. Secrets stay in server modules. Origin checks protect mutations; cookies are HttpOnly, SameSite=Strict, and Secure on HTTPS. Logout revokes the stored token, including copied cookies. Password/signing-key rotation also invalidates sessions.
 
-The shared admin password is for the small operations surface. It does not implement employee identity or CRM scopes. The sender-to-employee mapping and organization-safe group policy remain in [CONTEXT.md](../CONTEXT.md). Reminder scheduling, CRM tools, LLM calls and proactive DMs are not implemented.
+The shared admin password is for the small operations surface. It does not implement employee identity or CRM scopes. The active graph can chat and draft text; it cannot retrieve business data, schedule reminders, or perform writes. The MCP scaffold permits scoped reads in DMs only when a valid employee resolver is supplied, with read-only tool discovery and server identity verification. No new public worker endpoint or production MCP setting is required by this scaffold.
+
+See [current implementation](current-implementation.md) for the full reference, [queue semantics](supabase-message-queue.md) for recovery and migration limits, and [EC2 operations](ec2-operations.md) for the live deployment layout.

@@ -2,6 +2,8 @@
 
 The worker repository is `baileys-ramesh`; the admin repository is `baileys-ramesh-admin`. Each installs, builds, tests and deploys independently. Only their versioned HTTP contract and matching API token connect them. The current EC2 installation uses private SSM access; see [EC2 operations](ec2-operations.md). The public HTTPS and Vercel sections below describe a later rollout.
 
+Reviewed **1 October 2026** through release `5eb14d0`: the conversational Terra graph, split Supabase queues, and inactive MCP scaffold have passed CI and deployed to EC2. The model settings are installed in the protected host environment and its SSM backup. This guide distinguishes that running private deployment from optional public hosting setup.
+
 The EC2 workflow follows the existing `../../warehouse-enricher` pattern: trusted successful main CI, exact commit selection, GitHub OIDC, a narrowly scoped SSM document, unprivileged builds, health checks, and rollback. Account/instance/repository identifiers are placeholders, not copies of another service's credentials.
 
 ## Hosting and network
@@ -10,7 +12,7 @@ Use Ubuntu 24.04 x86-64, system-wide Node.js 22.16+ in the 22 release line, npm,
 
 A `t3.micro` (1 GiB RAM) is a starting trial size for one lightly used account, not a measured capacity guarantee. Provision swap for on-instance builds and watch pairing/sync memory; use `t3.small` (2 GiB) if the small instance is constrained. The admin never builds on EC2. See [AWS T3 specifications](https://aws.amazon.com/ec2/instance-types/t3/). Use encrypted persistent EBS with enough space for three dependency installations, deployment backups and swap; 16–20 GiB is a reasonable initial allocation.
 
-Point a stable DNS name at the instance. Allow inbound 80/443 for Caddy; leave 3011 closed. SSM avoids an inbound SSH requirement. Outbound access is needed for GitHub/npm, SSM, WhatsApp and certificate issuance. Include public IPv4, disk and CPU-credit costs when estimating hosting. Require IMDSv2 and give the instance only its SSM-managed-instance permissions.
+For a later public HTTPS rollout, point a stable DNS name at the instance and allow inbound 80/443 for Caddy; leave 3011 closed. The current private stack does not do this. SSM avoids an inbound SSH requirement. Outbound access is needed for GitHub/npm, SSM, WhatsApp, Supabase, OpenAI, and certificate issuance when HTTPS is enabled. Include public IPv4, disk, model usage, and CPU-credit costs when estimating hosting. Require IMDSv2 and use the restricted instance role described by the stack, including its designated runtime parameter and backup prefix.
 
 ## One-time host setup
 
@@ -46,6 +48,14 @@ Caddy forwards only `/v1/status`, `/v1/control`, `/v1/admin/attempt`, and `/v1/a
 
 Verify that anonymous `https://WORKER_HOSTNAME/v1/status` returns 401 and `/healthz` returns 404. The worker itself remains bound to `127.0.0.1:3011`.
 
+## Model, queue, and MCP configuration
+
+`DATABASE_URL` stays a SQLite URL. `MESSAGE_DATABASE_URL` and `MESSAGE_DB_SSL_CA` connect to Supabase through the dedicated `ramesh_worker` login; keep `MESSAGE_ACCOUNT_ID` stable. Before a queue-dependent release, separately apply the ordered migrations using `npm run db:messages -- --env-file /path/to/admin-connection.env --apply`. First run without `--apply` for a rolled-back validation. The [queue guide](supabase-message-queue.md) documents permissions, cutover, and compatibility.
+
+`OPENAI_API_KEY` enables the two-stage LangGraph flow. Current nonsecret settings are `OPENAI_MODEL=gpt-5.6-terra`, `AGENT_TIMEOUT_MS=45000`, and `AGENT_MAX_OUTPUT_TOKENS=800`. Put the key only in the protected worker runtime configuration and encrypted Parameter Store backup; the admin does not need it. Changes to SSM do not automatically update the host environment. Follow the [runtime update procedure](ec2-operations.md#runtime-configuration), preserving the existing encryption key, API token, and database values.
+
+The MCP service scaffold is not wired into the running application, so this release needs no `CONTEXT_MCP_URL` or employee OAuth token on EC2. Later activation requires trusted phone/LID-to-employee resolution, per-employee enrollment, encrypted credentials and refresh, and explicit agent integration. A shared MCP token is not supported.
+
 ## GitHub OIDC and SSM
 
 Create a GitHub `production` environment limited to `main`. Protect main with the worker CI check and review for workflow/deployment changes. The workflow trusts only successful push/manual CI runs from this same repository; PR workflows cannot trigger deployment. It checks out the tested SHA and the host rejects a SHA that is no longer main.
@@ -70,9 +80,11 @@ No long-lived AWS keys belong in GitHub secrets. Once ready, set `EC2_DEPLOY_ENA
 
 The helper downloads the exact tested main commit, installs locked dependencies and compiles the worker in a separate staging directory while the old service runs. Builds have resource/time limits. Immutable releases live under `/opt/wareongo-sales-bot/releases/<SHA>-<ID>`, selected by atomic `current` and `previous` links.
 
-Before stopping the worker, it verifies migration history is unchanged and new migrations are conservative additions. Table rewrites, data migrations, triggers, new unique constraints and destructive SQL are rejected and need an explicit maintenance plan. This restriction makes automatic binary rollback possible. CI separately verifies migrations match the Prisma schema.
+Before stopping the worker, it verifies **SQLite Prisma** migration history is unchanged and new migrations are conservative additions. Table rewrites, data migrations, triggers, new unique constraints and destructive SQL are rejected and need an explicit maintenance plan. This restriction makes automatic binary rollback possible. CI separately verifies migrations match the Prisma schema. This guard does not apply or roll back Supabase migrations; those use the separate provisioner and immutable checksums.
 
 The helper then stops the old worker, creates a private SQLite backup (including committed WAL state), applies migrations as the runtime user, switches `current`, and starts the new worker. It requires stable local readiness for the expected SHA, the correct process working directory, and a 401 from unauthenticated status requests. These checks verify process/database/API health; actual WhatsApp connectivity is shown in the admin and still needs live-account validation.
+
+The split-queue release requires Supabase migration `202610010002`. Its compatibility view allows the previous sender to run during rollout. Once outbound rows exist, a pre-split binary cannot drain them; restore a split-aware release instead of moving replies back into inbound processing. Keep current delivery state and never automatically replay uncertain sends. EC2 SQLite backups do not back up these PostgreSQL rows.
 
 - Failure before stopping leaves the existing release running.
 - Migration failure before a new worker starts restores the consistent snapshot and restarts the old release.
@@ -93,6 +105,8 @@ The admin's CD remains disabled until `VERCEL_DEPLOY_ENABLED=true`. Its `vercel.
 
 ## Local evidence and remaining rollout checks
 
-Local checks cover real SQLite migrations, encrypted credentials/key batches, dedupe, HTTP controls, persistent pause, shared limits, copied-cookie revocation, queue bounds, failure recovery, rollback ordering and WAL backups. Browser tests run both against an independent API fixture and against the separately installed real worker with a simulated WhatsApp transport.
+Local checks cover real SQLite migrations, encrypted credentials/key batches, dedupe, HTTP controls, persistent pause, shared limits, copied-cookie revocation, queue bounds, failure recovery, rollback ordering and WAL backups. Isolated PostgreSQL tests cover the queue split, atomic handoff, preserved replies, lease fencing, due times, and populated-table upgrades. MCP tests use the real SDK with fake HTTP and employee grants. Browser tests run both against an independent API fixture and against the separately installed real worker with a simulated WhatsApp transport.
 
-Before production use, validate the actual EC2/SSM/IAM/Caddy path, memory under initial sync, off-instance recovery, and QR pairing/DM/group behavior with a dedicated test account. These external checks are not represented as completed by the local simulations. Conversational replies use the two-stage LangGraph flow when `OPENAI_API_KEY` is configured; see the [README](../README.md) for model settings and the isolated local playground. Sender-scoped CRM authorization and reminders remain future work.
+The current private EC2/SSM release path has succeeded. Public Caddy/Vercel connectivity, disaster-recovery rehearsal, and capacity under expanded business workloads are separate rollout checks. The latest scaffold release passed 81 worker tests including PostgreSQL, and the conversational evaluation passed 26/26 synthetic live-model trials. Local simulations and deploy readiness checks do not guarantee model quality or end-user WhatsApp delivery.
+
+Use `npm run dev:chat` and `npm run eval:agent` for model testing through isolated SQLite and captured delivery. Neither opens WhatsApp or Supabase; do not send production test messages as part of release verification. Sender-scoped CRM authorization, connected tools, planner/worker/verifier agents, reminders, and writes remain future work.

@@ -2,11 +2,11 @@
 
 Date: **1 October 2026**
 
-Status: **Draft proposal, based on repository inspection and primary-source research**
+Status: **Living design and implementation plan, updated through release `5eb14d0`**
 
 This document consolidates the discussion about moving WareOnGo's basic OpenClaw assistant functions into the in-house Baileys bot. It covers CRM and supply reads, the conversational agent loop, reminders and escalation, later writes, migration, and evaluation.
 
-Repository observations refer to the local working copies inspected during the discussion. Production deployments, credentials, scheduled jobs, and live source behaviour were not independently verified. Proposed modules, contracts, tables, and commands below are future work unless explicitly described as existing.
+The conversational pilot, separate inbound/outbound queues, and inactive MCP service scaffold are implemented and have passed CI and EC2 deployment. Sections 18–20 describe those delivered increments. The wider identity, tool-using agent, reminder, and write workflows remain proposed. Organisational source observations come from repository inspection; this does not establish current live CRM data or scheduler behavior. The [implementation reference](current-implementation.md) covers the running bot and the [operations guide](ec2-operations.md) covers its private EC2 deployment.
 
 ## 1. Requirements and recommended decisions
 
@@ -20,6 +20,10 @@ Repository observations refer to the local working copies inspected during the d
 - **Defer dedicated domain-backend read endpoints.** Reuse Context Engine's existing scoped database and live-source reads for the first version; migrating those reads behind CRM/WAG/HRMS backend APIs is later integration hygiene.
 - **Identify employees from their WhatsApp phone identity and the active employee roster.** Apply current employee permissions to every business operation; recognising a phone number does not grant organisation-wide access.
 - Preserve the employee-scoped access and organisation-safe group-output direction recorded in [CONTEXT.md](../CONTEXT.md).
+- Use **OpenAI `gpt-5.6-terra` with LangGraph**, initially only a converser and formatter. Build planner, worker, and verifier agents later.
+- Keep local conversation tests and the fake chat GUI on isolated **SQLite with captured delivery**. Test queue SQL separately against local PostgreSQL; do not send real WhatsApp test messages.
+- Keep explicit Supabase table names **`ramesh-inbound-queue`** and **`ramesh-outbound-queue`**. Scaffold Context Engine MCP services now without activating business reads.
+- Escalate SLA reminders to **assignee(s), then existing CRM admins**; no manager hierarchy is required for the first version.
 
 ### Recommended architecture
 
@@ -36,7 +40,7 @@ Repository observations refer to the local working copies inspected during the d
 | Deployment       | Extend the existing worker with modules; retain the separate admin app                                  | These boundaries do not initially require more independently deployed services.                      |
 | Persistence      | Keep SQLite for WhatsApp session state initially; use private Postgres tables for shared workflow state | CRM-Automations and the bot need durable coordination.                                               |
 
-These are design recommendations, not a record that every implementation choice has been approved or built. Model/provider selection, exact notification cadence, and write policies remain open.
+OpenAI Terra/LangGraph, the queue split, and MCP as the read integration boundary are selected. The graph currently has only two stages; employee enrollment and business workflows remain to be implemented. Exact notification cadence and write policies remain open.
 
 The deferred endpoint refactor applies to the internal implementation of business reads. Ramesh still calls bounded, employee-scoped Context Engine tools. Later CRM writes must use Twenty, and supply changes must preserve WAG's validation and review paths. HRMS remains a future integration whose capabilities and permissions need mapping.
 
@@ -69,15 +73,17 @@ The existing TypeScript worker provides:
 
 - DM and genuine group-mention eligibility, including bot phone/LID mention handling.
 - Encrypted Baileys credentials and Signal-key storage in SQLite through Prisma.
-- Durable greeting claims, reconnect handling, bounded queues, send deadlines, and cancellation of unsent replies.
+- Separate durable inbound/outbound queues, reconnect handling, bounded admission, send deadlines, and cancellation of unsent replies.
+- OpenAI Terra converser/formatter nodes, bounded process-local memory, an isolated SQLite chat GUI, and a live-model evaluation harness.
+- An inactive Context Engine MCP service scaffold with employee-grant checks and read-only tool discovery.
 - A separate Next.js admin application for pairing, status, and connection controls.
 - One send attempt per claimed greeting; uncertain sends retain the claim. This is not a delivery guarantee.
 
-The latest inspected working copy also contains an optional PostgreSQL message/job repository, encrypted inbound payloads, leases, restart recovery, and explicit uncertain-send handling. It is wired into the existing greeting flow and still sends the literal `hello`. These local changes are a foundation for durable processing, not an implemented conversational inbox/outbox or general reminder dispatcher; their production deployment was not verified.
+Production uses PostgreSQL message state, encrypted inbound/outbound payloads, leases, restart recovery, and explicit uncertain-send handling. The agent atomically saves the final reply in `ramesh-outbound-queue`; the sender delivers the stored text without another model call. The original `hello` remains only the no-key fallback. This supports immediate quoted replies, not yet general reminders or proactive notifications. Both queue migrations are provisioned and the implementation has deployed successfully.
 
 The domain handler receives a `GreetingCandidate`, now extended with text and the transport sender ID for the first conversational implementation. Its reply callback is bound to the original chat. The optional two-node LangGraph flow and bounded in-process conversation history are described in section 18. Employee authorisation, business tools, durable conversation checkpoints, and proactive notification delivery remain future work.
 
-Processing is currently serialised, including the durable greeting consumer. Once model calls are added, a slow request would hold up other conversations unless per-conversation processing and outbound pacing are separated.
+Processing is currently serialised per account across the two queue stages. A slow model request can hold up other conversations. Separate table responsibilities do not yet introduce independent processes or concurrent agent runs; per-conversation ordering with bounded concurrency is a later extension.
 
 Sources: [composition root](../src/app/application.ts), [message mapper](../src/infrastructure/whatsapp/message.mapper.ts), [greeting contract](../src/modules/greetings/greeting.types.ts), [WhatsApp client](../src/infrastructure/whatsapp/baileys-client.ts), [session adapter](../src/infrastructure/whatsapp/baileys-session.ts), [current implementation](current-implementation.md).
 
@@ -128,7 +134,7 @@ Sources: [current routing](../../../whatsapp-logistics-bot/src/routes/whatsapp.j
 
 ### System design from the discussion
 
-The diagram below was supplied during the discussion on 1 October 2026. It captures the first-version direction: durable inbound/outbound queues, one agent runtime, and employee-scoped business reads through the existing Context Engine. Dedicated domain-backend read endpoints remain deferred.
+The diagram below was supplied during the discussion on 1 October 2026. It captures the target direction: durable inbound/outbound queues, one agent runtime, and employee-scoped business reads through the existing Context Engine. The queues, converser, and formatter are implemented; the planner, tool worker, verifier, and employee identity/OAuth wiring remain deferred. Dedicated domain-backend read endpoints remain deferred.
 
 ![Ramesh system design: WhatsApp and Baileys, Supabase data and message queues, the conversational agent loop, and Context/MCP with employee-scoped access](assets/ramesh-system-design.png)
 
@@ -147,7 +153,7 @@ flowchart TD
     A[Separate admin console] --> B
     B -->|Persist inbound event| IN[(Inbound queue)]
     IN -->|Claim job| T[Agent runtime: identity, conversation, tools, verification, formatting]
-    T <-->|Scoped reads| C[Context Engine: REST or MCP]
+    T <-->|Scoped MCP reads| C[Context Engine]
     C --> CRM[CRM mirror and live Twenty reads]
     C --> S[Permitted WAG warehouse tables]
 
@@ -260,17 +266,17 @@ Keep the incoming-message freshness rule separate from workflow deadlines and re
 
 Use a focused catalogue over Context Engine, exposing relevant capabilities for the current employee and task. Each tool needs a distinct purpose, input validation, bounded output, consistent errors, and documented interpretation limits.
 
-| Capability                          | Existing Context Engine interface                                        |
-| ----------------------------------- | ------------------------------------------------------------------------ |
-| Identity/capability discovery       | `GET /api/v1/context`                                                    |
-| CRM search/filter/summary           | `/api/v1/crm/opportunities`, `/crm/filters`, `/crm/summary`              |
-| Lead detail and history             | `/api/v1/crm/opportunities/{id}` and its `/context` endpoint             |
-| CRM briefing                        | `GET /api/v1/crm/my-briefing`                                            |
-| Supply search/filter/summary/detail | `/api/v1/warehouses` and its related endpoints                           |
-| Lead-to-property comparison         | `/api/v1/crm/opportunities/{id}/assessment`; MCP tool `assess_shortlist` |
-| Reviewed company guidance           | `/api/v1/wiki/search` and `/wiki/pages/{id}`                             |
+| Capability                          | Existing Context Engine interface                                               |
+| ----------------------------------- | ------------------------------------------------------------------------------- |
+| Identity/capability discovery       | `get_context`                                                                   |
+| CRM search/filter/summary           | `search_crm_leads`, `crm_filters`, `crm_summary`                                |
+| Lead detail and history             | `read_crm_lead`, `read_crm_lead_context`                                        |
+| CRM briefing                        | `crm_briefing`                                                                  |
+| Supply search/filter/summary/detail | `search_warehouses`, `warehouse_filters`, `warehouse_summary`, `read_warehouse` |
+| Lead-to-property comparison         | `assess_shortlist`                                                              |
+| Reviewed company guidance           | `search_knowledge`, `read_knowledge`                                            |
 
-The table's abbreviated related paths share the `/api/v1` prefix. REST is the recommended first adapter; MCP is an alternative adapter over the same read boundary.
+These are the MCP tools represented by the repository's read-only service scaffold. Context Engine also exposes related REST endpoints, but MCP is the selected Ramesh adapter. Services remain disconnected from the current chat graph; see section 20 for discovery, employee binding, and the callable service contract.
 
 The executor injects the actor, credential, run ID, and audience. Model-selected arguments contain domain inputs such as lead ID, city, area, or date filters. Do not expose arbitrary SQL, arbitrary HTTP destinations, shell execution, or a general send-message tool.
 
@@ -515,6 +521,8 @@ Code-based checks establish deterministic conditions. Model rubrics assess expla
 
 ## 16. Delivery milestones
 
+Delivered foundation: the two-node Terra/LangGraph conversational pilot, local SQLite GUI/evals, durable queue split, and inactive MCP service scaffold. These increments have passed worker CI and EC2 deployment. Employee credentials and the following business milestones are still pending.
+
 | Milestone                   | Deliverable                                                                                                   | Exit evidence                                                                                                                   |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | 1. Scoped CRM assistant     | Inbound identity, employee credential binding, bounded tool loop, personal CRM reads in DMs                   | Pilot employees can retrieve their assigned follow-ups and lead history; access, duplicates, and group routing pass checks      |
@@ -524,7 +532,7 @@ Code-based checks establish deterministic conditions. Model rubrics assess expla
 
 Extend operational visibility with each milestone rather than waiting until the final release. New notification schedules should begin in a non-sending preview mode for review of actual rule outcomes and recipients.
 
-The first complete interaction to implement is:
+The first business interaction to implement is:
 
 > A verified salesperson DMs “What follow-ups do I have today?” and receives their assigned leads through Context Engine, with the correct IST date interpretation and private delivery.
 
@@ -534,15 +542,15 @@ This establishes the identity, authorisation, execution, evidence, and response 
 
 The architecture is sufficient to begin the first CRM-read milestone. The remaining implementation contracts are:
 
-| Contract                   | Initial direction                                                                                                                              |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Identity and permissions   | Resolve trusted sender phone/LID to an active employee, bind that employee's Context credential, and enforce record scope and DM/group policy. |
-| Conversation state         | Keep context per employee and audience, retain referenced record IDs for follow-ups, and serialise work within each conversation.              |
-| Tool and response contract | Use a small typed catalogue, preserve freshness and coverage, verify tool outcomes, and give explicit clarification/unavailable responses.     |
-| Runtime limits             | Choose one model/provider for the pilot; configure step, deadline, retry and spend bounds, with optional planning and code-based verification. |
-| Durable processing         | Separate inbound processing from outbound transport; persist run outcomes, deduplicate events, lease jobs and distinguish uncertain sends.     |
-| Scheduled notifications    | Implement reminder tools and due-job checking; reuse CRM-Automations for breach discovery and assignee-to-admin escalation.                    |
-| Operational evidence       | Trace message to employee, tools, response and delivery; evaluate permissions, stale data, duplicate events and recovery before expansion.     |
+| Contract                   | Initial direction                                                                                                                                                                             |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identity and permissions   | Resolve trusted sender phone/LID to an active employee, bind that employee's Context credential, and enforce record scope and DM/group policy.                                                |
+| Conversation state         | Keep context per employee and audience, retain referenced record IDs for follow-ups, and serialise work within each conversation.                                                             |
+| Tool and response contract | Use a small typed catalogue, preserve freshness and coverage, verify tool outcomes, and give explicit clarification/unavailable responses.                                                    |
+| Runtime limits             | Terra and the two-node graph are selected; generation deadlines, output bounds, cancellation, and bounded retries exist. Add tool-step and per-person spend budgets when tools are connected. |
+| Durable processing         | Inbound/outbound queues, deduplication, leases, finalized replies, and uncertain sends are implemented. Durable conversational/tool-run checkpoints remain future work.                       |
+| Scheduled notifications    | Implement reminder tools and due-job checking; reuse CRM-Automations for breach discovery and assignee-to-admin escalation.                                                                   |
+| Operational evidence       | Trace message to employee, tools, response and delivery; evaluate permissions, stale data, duplicate events and recovery before expansion.                                                    |
 
 The following product and rollout choices remain open; notification-specific choices need resolution before that milestone, not before basic CRM reads:
 
@@ -554,7 +562,7 @@ The following product and rollout choices remain open; notification-specific cho
 - Which first write commands require confirmation, who can use them, and how conflicts are handled by the deployed Twenty version.
 - Retention periods and access controls for conversation data, tool evidence, and audit.
 - Which legacy reminders/tasks to migrate and the per-employee cutover plan.
-- Model/provider choice and whether evaluation demonstrates a benefit from explicit planning or a separate reviewer.
+- Whether evaluation demonstrates a benefit from explicit planning or a separate model reviewer when the deferred agents are built.
 
 The escalation destination order is already settled: **assignee(s), then existing CRM admins**.
 
@@ -563,6 +571,8 @@ The dedicated domain-backend read-endpoint refactor is explicitly deferred. The 
 ## 18. Implemented conversational pilot
 
 The first small implementation is `START → converser → formatter → END` using LangGraph's typed state schema and OpenAI Responses with `gpt-5.6-terra`. The graph prepares text only; the existing reply service or durable consumer owns delivery. Both transport paths use the same assistant service. The OpenAI key is server-side, and normal logs contain stage metrics rather than prompts or message bodies.
+
+The worker's protected EC2 environment and SSM SecureString backup contain the OpenAI configuration. The admin needs no model key. The initial live-model evaluation passed 26/26 trials across 13 synthetic cases; this evidence does not establish future CRM/tool quality.
 
 The converser handles the request with limited recent context. The formatter preserves facts and capability limits while producing short, natural WhatsApp language. A code guard removes em dashes. No CRM, supply, HRMS, reminder, browsing or write tools are connected yet, and the prompts explicitly state those limits. Recognising a transport sender is not the employee authorisation implementation planned in section 5.
 

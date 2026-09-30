@@ -1,12 +1,10 @@
 # WareOnGo WhatsApp bot: current implementation and architecture
 
-Reviewed: **2026-10-01, Asia/Kolkata**.
+Reviewed: **2026-10-01, Asia/Kolkata**, through worker release `5eb14d0`.
 
-**Conversational extension, 1 October 2026:** the worker now supports an optional OpenAI Terra `converser → formatter` LangGraph flow in both reply paths. The original `hello` flow described below remains the no-key transport baseline. See the [current README](../README.md#safe-local-chat-playground) for the isolated SQLite playground, model configuration, memory limits, and live eval harness. Employee/CRM permissions and business tools remain future work; local playground/eval replies never go to WhatsApp.
+This reference describes the released two-node OpenAI Terra conversation flow, separate Supabase queues, inactive Context Engine MCP service scaffold, and independent pairing admin. It covers implemented behavior and deployment assets; the larger [architecture plan](assistant-architecture-plan.md) identifies future agents and business workflows.
 
-This document describes the code currently present in the `baileys-ramesh` worker and `baileys-ramesh-admin` admin checkouts, including reply pacing, QR rendering, and the Supabase message-state/queue implementation. It describes implemented behavior, configuration defaults, and deployment assets. It does not assert that every checked-in deployment asset is active in AWS or Vercel.
-
-The linked WhatsApp session now belongs to EC2; the earlier local pairing was retired. A read-only EC2 inspection confirmed the existing worker was connected before the Supabase cutover. The base Supabase message-state schema and dedicated runtime login have been provisioned and verified. The detailed storage contract, provisioning steps, and PostgreSQL tests are documented in [Supabase message state and reply queue](supabase-message-queue.md). Historical planning documents may describe earlier deployment stages.
+The linked WhatsApp session belongs to EC2; the earlier local pairing is retired. Supabase migrations `202610010001` and `202610010002` are provisioned. CI and EC2 deployment succeeded for the conversational, queue-split, and MCP scaffold changes. The EC2 API remains private; the Caddy/Vercel network rollout is not implied by those deployments. Local playground/evaluation replies use fake delivery and never go to WhatsApp.
 
 ## Contents
 
@@ -17,6 +15,8 @@ The linked WhatsApp session now belongs to EC2; the earlier local pairing was re
 - [Startup and process lifecycle](#startup-and-process-lifecycle)
 - [WhatsApp connection and pairing](#whatsapp-connection-and-pairing)
 - [Incoming message and reply pipeline](#incoming-message-and-reply-pipeline)
+- [Conversational graph and local playground](#conversational-graph-and-local-playground)
+- [Context Engine service scaffold](#context-engine-service-scaffold)
 - [Reply pacing and cancellation](#reply-pacing-and-cancellation)
 - [Persistence and delivery semantics](#persistence-and-delivery-semantics)
 - [Admin application and authentication](#admin-application-and-authentication)
@@ -29,19 +29,22 @@ The linked WhatsApp session now belongs to EC2; the earlier local pairing was re
 
 ## Purpose and scope
 
-The current product is a small WhatsApp bot intended for internal sales-team use. It responds with the literal text `hello` to qualifying direct messages and actual group mentions of the linked bot account.
+The current product is a WhatsApp bot intended for internal sales-team use. It responds conversationally to qualifying text DMs and actual group mentions of the linked account. OpenAI Responses with `gpt-5.6-terra` powers a LangGraph converser and formatter; `hello` remains the fallback when no API key is configured.
 
 The implementation already includes:
 
 - A persistent WhatsApp connection through Baileys.
 - QR pairing, encrypted credential persistence, and automatic reconnection for transient failures.
-- A bounded admission buffer, durable PostgreSQL reply queue, lease recovery, and persistent duplicate suppression.
+- A bounded admission buffer, separate PostgreSQL inbound/outbound queues, atomic finalized-reply handoff, lease recovery, and persistent duplicate suppression.
+- Two thin conversational stages, bounded memory, generation deadlines/cancellation, and reply-style enforcement.
+- A capture-only SQLite chat GUI and repeated live-model evaluation harness.
+- Employee-scoped MCP read services with fake-server tests, ready for future integration.
 - A configurable random delay before each eligible reply.
 - Cancellation of pending timers, recovery of unsent jobs after reconnect, and conservative handling of uncertain sends.
 - A separate authenticated admin application for pairing, status, and session controls.
 - Local tests, independent CI/CD workflows, and EC2 provisioning, release, and backup assets.
 
-The implementation does **not** yet include employee verification, an employee/group allowlist, CRM access, LLM calls, conversation memory, reminders, CRM writes, or arbitrary outbound messaging. Internal use is the intended operating context; it is not currently enforced through employee authorization. Any qualifying incoming DM can trigger a greeting.
+The active bot does **not** yet include employee verification, an employee/group allowlist, connected business tools, planner/worker/verifier agents, reminders, CRM writes, or arbitrary outbound messaging. Internal use is the intended operating context; it is not enforced through employee authorization. Any qualifying incoming DM can trigger a conversational reply. The MCP scaffold is not imported by the running graph and grants no access without a credential adapter.
 
 ## System topology
 
@@ -50,13 +53,17 @@ flowchart LR
     WA[WhatsApp servers] <-->|Persistent outbound WebSocket| Session[Baileys session adapter]
     subgraph Worker[Persistent Node.js worker on EC2]
         Session -->|SDK events| Client[Connection lifecycle and bounded admission]
-        Client --> Queue[Durable message consumer and pacing]
-        Queue -->|Quoted reply| Session
+        Client -->|Persist eligible event| IN[(ramesh-inbound-queue)]
+        IN --> Graph[LangGraph: converser then formatter]
+        Graph -->|Atomic reply handoff| OUT[(ramesh-outbound-queue)]
+        OUT --> Sender[Due-time claim and pacing]
+        Sender -->|Saved quoted reply| Session
         Session <-->|Encrypted auth and Signal keys| Local[(Local SQLite)]
         API[Worker control API] --> Client
         API <-->|Admin sessions and settings| Local
     end
-    Queue <-->|State, jobs and history| PG[(Supabase PostgreSQL)]
+    IN & OUT <-->|Ledger and transition history| PG[(Supabase PostgreSQL)]
+    Graph <-->|Bounded model calls| OpenAI[OpenAI Responses / Terra]
     Browser[Operator browser] <-->|Cookie-authenticated requests| Admin[Next.js admin server]
     Admin <-->|Private bearer-token API| API
 ```
@@ -67,6 +74,7 @@ The two applications have different lifetimes:
 | ----------- | ---------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
 | Worker      | `127.0.0.1:3011` | WhatsApp socket, bot behavior, SQLite state, control API           | Must remain running to receive and respond to messages |
 | Admin       | `127.0.0.1:3010` | Operator login, dashboard, QR rendering, server-side worker client | Browser can be closed without stopping the bot         |
+| Playground  | `127.0.0.1:3012` | Fake chat UI, isolated SQLite, real model calls, captured replies  | Optional development process; never owns WhatsApp      |
 
 The worker initiates the connection to WhatsApp. Messages arrive through that established connection. There is no inbound WhatsApp HTTP webhook and no application loop that polls WhatsApp for new messages.
 
@@ -80,6 +88,9 @@ Versions below are pinned in the current package manifests, not a claim about th
 | ---------------------- | --------------------------------------------------------------------------------- |
 | Runtime                | Node.js `>=22.16 <23`; TypeScript; ECMAScript modules                             |
 | WhatsApp transport     | `@whiskeysockets/baileys` `7.0.0-rc14`                                            |
+| Agent runtime          | `@langchain/langgraph` `1.4.18`, typed two-node state graph                       |
+| Model client           | `openai` `7.25.0`, Responses API, `gpt-5.6-terra` default                         |
+| MCP scaffold           | `@modelcontextprotocol/client` `2.1.0`, Streamable HTTP                           |
 | Worker database        | SQLite/Prisma `6.19.3` for auth/admin; PostgreSQL/`pg` `8.16.3` for messages/jobs |
 | Worker HTTP server     | Node's built-in `node:http`                                                       |
 | Logging                | Pino `9.14.0`                                                                     |
@@ -104,6 +115,13 @@ The application follows a layered structure: domain behavior depends on small in
 | [`src/app/application.ts`](../src/app/application.ts)                                                         | Constructs and connects adapters/services; owns startup, cleanup, and persistent operator intent         |
 | [`src/app/process.ts`](../src/app/process.ts)                                                                 | Handles process signals and failures, with a bounded shutdown deadline                                   |
 | [`src/config/env.ts`](../src/config/env.ts)                                                                   | Parses and validates runtime settings before resources are opened                                        |
+| [`src/modules/assistant/assistant.graph.ts`](../src/modules/assistant/assistant.graph.ts)                     | Converser/formatter graph and fixed execution limits                                                     |
+| [`src/modules/assistant/assistant.service.ts`](../src/modules/assistant/assistant.service.ts)                 | Prepares replies, combines cancellation/deadlines, commits accepted conversation turns                   |
+| [`src/modules/assistant/conversation-memory.ts`](../src/modules/assistant/conversation-memory.ts)             | Bounded chat-and-sender memory with expiry                                                               |
+| [`src/infrastructure/openai/text-model.ts`](../src/infrastructure/openai/text-model.ts)                       | Responses adapter, bounded retries/output, and redacted model failures                                   |
+| [`src/app/context-engine.ts`](../src/app/context-engine.ts)                                                   | Explicit, inactive composition point for future MCP services                                             |
+| [`src/modules/context-engine/context.service.ts`](../src/modules/context-engine/context.service.ts)           | Employee-bound CRM, supply, and knowledge read services                                                  |
+| [`src/infrastructure/context-engine/mcp-client.ts`](../src/infrastructure/context-engine/mcp-client.ts)       | MCP transport, scope/identity checks, and source-evidence envelopes                                      |
 | [`src/infrastructure/whatsapp/baileys-session.ts`](../src/infrastructure/whatsapp/baileys-session.ts)         | Creates the real SDK socket; supplies auth storage, reply deadlines, and group metadata caching          |
 | [`src/infrastructure/whatsapp/baileys-client.ts`](../src/infrastructure/whatsapp/baileys-client.ts)           | Owns connection state, subscriptions, message admission, cancellation, reconnects, and transient metrics |
 | [`src/infrastructure/whatsapp/message.mapper.ts`](../src/infrastructure/whatsapp/message.mapper.ts)           | Converts supported SDK messages into the greeting module's small input contract                          |
@@ -130,7 +148,7 @@ Consequently, `GreetingService` does not import Baileys or Prisma. It can be tes
 
 1. `src/index.ts` loads the repository-root `.env`. In compiled execution, its relative path still resolves from `dist/index.js` to the repository/release root.
 2. `loadConfig()` validates secrets, database URL, numeric limits, and flags.
-3. The application constructs Prisma, the greeting service, Baileys client, admin-session storage, and control server.
+3. The application constructs Prisma, the configured assistant/model adapter, greeting service, optional PostgreSQL repository/consumer, Baileys client, admin-session storage, and control server. It does not construct the inactive MCP services.
 4. `start()` verifies local SQLite access and checks the durable-storage activation marker. If enabled, it verifies the PostgreSQL schema/runtime login, imports old greeting claims without jobs, cleans stale work, and records `message-storage=postgres`. Missing Supabase configuration after activation fails startup.
 5. Expired admin sessions/login buckets and old greeting claims are cleaned.
 6. The worker starts its HTTP listener.
@@ -229,12 +247,15 @@ sequenceDiagram
     WA->>C: messages.upsert, type notify
     C->>C: Map supported text/caption and actual mentions
     C->>Q: Persist eligible incoming message
-    Q->>PG: Atomic dedupe + message and READY job insertion
+    Q->>PG: Atomic dedupe + message and READY inbound insertion
     Note over Q,PG: Pending payload is encrypted; commit establishes durability
-    Q->>PG: Claim one job with a new lease token
-    Q->>Q: Decode message, check eligibility, random delay
+    Q->>PG: Claim inbound with a new lease token
+    Q->>Q: Decode, check eligibility, run converser and formatter
+    Q->>PG: Atomic inbound DONE + saved outbound + READY_TO_SEND
+    Q->>PG: Claim due outbound with a new lease token
+    Q->>Q: Decode saved reply, random delay
     Q->>PG: Recheck lease/expiry and commit SENDING
-    Q->>WA: Quoted hello through current connected session
+    Q->>WA: Saved quoted reply through current connected session
     Q->>PG: SENT, or UNCERTAIN if sending may have occurred
     Note over Q,PG: Terminal payload is cleared; state history remains
 ```
@@ -243,7 +264,7 @@ The SDK listener accepts only `type === 'notify'` from the current running sessi
 
 The mapper supports phone DMs (`@s.whatsapp.net`), LID DMs (`@lid`), and groups (`@g.us`). It unwraps content and accepts nonempty conversation/extended text or image/video captions. Reactions, protocol traffic, and captionless media do not trigger a greeting. Real structured bot mentions are required in groups; typing the display name is insufficient. No media understanding is implemented.
 
-The minimal `GreetingCandidate` contract contains `chatId`, `messageId`, `sentAtMs`, `fromMe`, `isGroup`, and `mentionsBot`. In durable mode, the original protobuf message is additionally encrypted and persisted for reconstructing the quoted reply after restart. It also carries text and the normalized sender identity for conversation isolation; employee authorization remains future work.
+The `GreetingCandidate` contract carries chat/message/sender IDs, text, time, own-message and group/mention flags. In durable mode, the original protobuf message is additionally encrypted and persisted for reconstructing the quoted reply after restart. The sender ID separates conversation context; it does not establish an employee identity or CRM permissions.
 
 Eligible messages are not from the bot itself, meet the group-mention rule, and fall within `MAX_MESSAGE_AGE_SECONDS` (normally five minutes), allowing 60 seconds of forward clock skew. Eligibility is checked again before sending. Recent offline-sync `notify` events can qualify; `notify` alone does not prove real-time arrival.
 
@@ -253,7 +274,27 @@ One job is leased per account. The consumer starts only after Baileys reports `c
 
 The agent atomically completes inbound processing and saves its encrypted final text in `ramesh-outbound-queue`. The sender then claims that saved reply (or `hello` without an API key), quoting the reconstructed triggering message. Delivery retries never regenerate saved output. DMs stay in the DM; group replies stay in the same group. There is no arbitrary-send HTTP endpoint. See [queue states and recovery](supabase-message-queue.md#message-and-job-states) for the lease and uncertainty rules.
 
-Fresh development databases without `MESSAGE_DATABASE_URL` retain the original `GreetingService` path: policy → SQLite claim → delay → send. An activated worker cannot silently return to that mode.
+Fresh development databases without `MESSAGE_DATABASE_URL` use the `GreetingService` path: policy → SQLite claim → graph when configured → delay → send. It has no separate durable inbound/outbound tables. An activated production worker cannot silently return to that mode.
+
+## Conversational graph and local playground
+
+The graph is `START → converser → formatter → END`. Both nodes use the same model adapter. The converser handles the request with recent context; the formatter preserves facts and uncertainty while making the reply suitable for WhatsApp. Prompts prohibit pretending to have business tools or completed actions. A final code guard removes em dashes. Planner, worker, and verifier nodes are intentionally deferred.
+
+Input is capped at 6,000 characters, output defaults to 800 tokens per model response, and the whole graph has a 45-second deadline with one bounded SDK retry. Generation also observes session cancellation. OpenAI calls use the fixed official endpoint and `store: false`. Ordinary logs record stage timings and token counts, not prompts, responses, or keys.
+
+Memory is partitioned by chat and sender: at most six turns and 16,000 characters per context, 200 contexts, and a 30-minute idle expiry. It advances only after the transport accepts a reply and resets on process restart. Supabase preserves the queued input/final output, not conversation checkpoints. A crash before handoff may repeat generation; saved outbound replies survive restart without another model call.
+
+Run `npm run dev:chat` for the fake chat GUI at `http://127.0.0.1:3012`. It exercises the mapper, SQLite claims, and graph with synthetic identities and a captured sender. `.local/playground.db` is separately migrated on startup. The command ignores production SQLite/Supabase connection settings, never loads linked-device credentials, and creates no WhatsApp socket. **New conversation** clears the selected context's process-local memory. Real OpenAI calls require a local key and incur model usage.
+
+## Context Engine service scaffold
+
+`createContextEngineServices(config, credentials)` builds reusable CRM, supply, and knowledge services. It is not imported by `createApplication`, the graph, or the playground. No production MCP environment update is required for this release. Setting `CONTEXT_MCP_URL` alone does not activate business reads.
+
+The future caller supplies trusted phone identity and audience to `forSender()`. A server-side `ContextCredentialResolver` supplies that active employee's valid OAuth access token. The default resolver returns no grant. Phone/LID resolution, enrollment, encrypted token storage, serialized refresh, and offboarding remain to be implemented. Tokens and identity are never model-provided arguments.
+
+Each request uses a fresh MCP connection, validates the employee reported by `get_context`, and intersects the local read allowlist, server tool annotations, and granted scopes. Group business reads and writes are denied. The fixed `/mcp` URL requires HTTPS except on loopback; redirects and arbitrary destinations are rejected. Total deadline defaults to 30 seconds, response limit to 1 MiB, with cancellation and safe error codes. Calls do not automatically retry or refresh credentials.
+
+Results preserve source paths, request IDs, timestamps, cursors, coverage, access scope, uncertainty, and field evidence. The scaffold validates the envelope; a future verifier must assess its business meaning. See [the full service contract and integration example](assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold).
 
 ## Reply pacing and cancellation
 
@@ -441,23 +482,28 @@ The browser uses a session cookie to reach Next.js. Next.js uses the private bea
 
 Source: [`src/config/env.ts`](../src/config/env.ts) and [`.env.example`](../.env.example). The entry point loads the worker's `.env`; existing process environment values take precedence.
 
-| Variable                  | Default / requirement                                      | Effect                                                                               |
-| ------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `DATABASE_URL`            | Required SQLite `file:` URL; local example `file:./dev.db` | Bot-owned database; relative local paths resolve against the Prisma schema directory |
-| `AUTH_ENCRYPTION_KEY`     | Required canonical base64url encoding of 32 random bytes   | Encrypts WhatsApp credentials and Signal keys                                        |
-| `WORKER_API_TOKEN`        | Required, at least 32 characters                           | Authenticates server-to-server worker requests                                       |
-| `WORKER_HOST`             | `127.0.0.1`                                                | HTTP bind address; other addresses are accepted by the parser                        |
-| `WORKER_PORT`             | `3011`, integer 1–65535                                    | HTTP port                                                                            |
-| `WHATSAPP_AUTO_CONNECT`   | `false`; literal `true` or `false`                         | Initial startup preference until an operator choice has been saved                   |
-| `LOG_LEVEL`               | `info`                                                     | One of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`                  |
-| `MAX_MESSAGE_AGE_SECONDS` | `300`, positive integer, at most 86400                     | Eligibility window for incoming messages                                             |
-| `MAX_PENDING_MESSAGES`    | `100`, positive integer, at most 1000                      | Total admitted message work, including the active item                               |
-| `SEND_TIMEOUT_MS`         | `15000`, positive integer, at most 60000                   | Reply send deadline and SDK default query timeout                                    |
-| `SHUTDOWN_TIMEOUT_MS`     | `10000`, positive integer, at most 300000                  | Process-level shutdown deadline                                                      |
-| `REPLY_DELAY_MIN_MS`      | `1500`, nonnegative integer                                | Lower inclusive reply-delay bound                                                    |
-| `REPLY_DELAY_MAX_MS`      | `4000`, nonnegative integer, at most 60000                 | Upper inclusive reply-delay bound; must be at least the minimum                      |
-| `PRINT_QR`                | `false`; literal `true` or `false`                         | Optional terminal QR output for local pairing                                        |
-| `RELEASE_SHA`             | `development` or a 40-character lowercase hexadecimal SHA  | Release identity returned by readiness checks                                        |
+| Variable                  | Default / requirement                                      | Effect                                                                                  |
+| ------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `DATABASE_URL`            | Required SQLite `file:` URL; local example `file:./dev.db` | Bot-owned database; relative local paths resolve against the Prisma schema directory    |
+| `AUTH_ENCRYPTION_KEY`     | Required canonical base64url encoding of 32 random bytes   | Encrypts WhatsApp credentials/Signal keys and pending PostgreSQL message/reply payloads |
+| `OPENAI_API_KEY`          | Optional secret; configured in production                  | Enables the two-node conversational flow                                                |
+| `OPENAI_MODEL`            | `gpt-5.6-terra`                                            | Model for both stages                                                                   |
+| `AGENT_TIMEOUT_MS`        | `45000`                                                    | Total generation deadline                                                               |
+| `AGENT_MAX_OUTPUT_TOKENS` | `800`                                                      | Maximum output per model response                                                       |
+| `PLAYGROUND_PORT`         | `3012`                                                     | Loopback port for the separate fake chat command                                        |
+| `WORKER_API_TOKEN`        | Required, at least 32 characters                           | Authenticates server-to-server worker requests                                          |
+| `WORKER_HOST`             | `127.0.0.1`                                                | HTTP bind address; other addresses are accepted by the parser                           |
+| `WORKER_PORT`             | `3011`, integer 1–65535                                    | HTTP port                                                                               |
+| `WHATSAPP_AUTO_CONNECT`   | `false`; literal `true` or `false`                         | Initial startup preference until an operator choice has been saved                      |
+| `LOG_LEVEL`               | `info`                                                     | One of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`                     |
+| `MAX_MESSAGE_AGE_SECONDS` | `300`, positive integer, at most 86400                     | Eligibility window for incoming messages                                                |
+| `MAX_PENDING_MESSAGES`    | `100`, positive integer, at most 1000                      | Total admitted message work, including the active item                                  |
+| `SEND_TIMEOUT_MS`         | `15000`, positive integer, at most 60000                   | Reply send deadline and SDK default query timeout                                       |
+| `SHUTDOWN_TIMEOUT_MS`     | `10000`, positive integer, at most 300000                  | Process-level shutdown deadline                                                         |
+| `REPLY_DELAY_MIN_MS`      | `1500`, nonnegative integer                                | Lower inclusive reply-delay bound                                                       |
+| `REPLY_DELAY_MAX_MS`      | `4000`, nonnegative integer, at most 60000                 | Upper inclusive reply-delay bound; must be at least the minimum                         |
+| `PRINT_QR`                | `false`; literal `true` or `false`                         | Optional terminal QR output for local pairing                                           |
+| `RELEASE_SHA`             | `development` or a 40-character lowercase hexadecimal SHA  | Release identity returned by readiness checks                                           |
 
 For example, these nonsecret settings select the current pacing behavior:
 
@@ -471,6 +517,8 @@ MAX_PENDING_MESSAGES=100
 The worker reads configuration once at startup. `npm run dev` runs `tsx src/index.ts` without watch mode; code and environment changes require restarting that process.
 
 The additional message-store variables are `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`, `MESSAGE_ACCOUNT_ID` (default `primary`), and `MESSAGE_QUEUE_POLL_MS` (default 5000, range 250–30000). The connection must use the dedicated `ramesh_worker` login. Keep `DATABASE_URL` as SQLite. Full configuration and migration commands are in the [Supabase queue guide](supabase-message-queue.md#authentication-and-configuration).
+
+The inactive MCP factory accepts `CONTEXT_MCP_URL`, `CONTEXT_MCP_TIMEOUT_MS` (30000; range 1000–60000), and `CONTEXT_MCP_MAX_RESPONSE_BYTES` (1048576; range 16384–4194304). Its URL must be an exact `/mcp` endpoint with no user info, query, or fragment. There is no shared MCP token environment setting. See [`src/config/context-engine.ts`](../src/config/context-engine.ts).
 
 ### Admin environment
 
@@ -531,7 +579,7 @@ Use the authenticated dashboard to inspect connection state and activity. Stoppi
 | QR scanned but replies do not start         | Wait for `connected`; inspect activity for auth-storage errors, replacement, or revoked-session events                     |
 | DM receives no reply                        | Supported text/caption, sender is not the bot itself, recent timestamp, connection state, queue saturation, existing claim |
 | Group receives no reply                     | A real mention of a normalized bot phone-number/LID identity is required; typing the display name is insufficient          |
-| Reply takes longer than four seconds        | The global queue may contain earlier work; random delay is only one part of total latency                                  |
+| Reply takes longer than four seconds        | Earlier queued work and two model stages add latency before the final randomized delay                                     |
 | Repeated message event gets no second reply | Expected: the database claim suppresses repeated attempts, including uncertain sends                                       |
 | Restart stays disconnected                  | The persisted operator preference overrides `WHATSAPP_AUTO_CONNECT`                                                        |
 | Encrypted auth can no longer be loaded      | Correct database and encryption key must remain paired; malformed/unreadable state fails closed                            |
@@ -542,11 +590,11 @@ Pino provides structured process logs. The logger redacts the configured paths `
 
 The Baileys child logger is constrained to `warn` unless logging is entirely silent. Raising the application level to `debug` does not enable unrestricted SDK debug output. Terminal QR output is opt-in through `PRINT_QR`.
 
-Recurring work includes hourly database retention cleanup and the connected consumer’s idle PostgreSQL queue polling/recovery. WhatsApp keepalives belong to the SDK, dashboard status polling belongs to the browser, and reconnection timers belong to the connection manager. There is no CRM polling loop, reminder scheduler, or background LLM worker today.
+Recurring work includes hourly database retention cleanup and the connected consumer's idle PostgreSQL queue polling/recovery. Model generation runs while processing inbound jobs. WhatsApp keepalives belong to the SDK, dashboard status polling belongs to the browser, and reconnection timers belong to the connection manager. There is no CRM polling loop, reminder scheduler, or independently deployed model worker.
 
 ## Deployment and recovery assets
 
-This section describes checked-in automation and its assumptions. A live EC2 inspection confirmed the private worker and backup timer were active before the Supabase cutover; template contents alone do not establish deployment state. See [Supabase cutover requirements](supabase-message-queue.md#authentication-and-configuration) for the additional runtime configuration and sender pause.
+This section describes checked-in automation and its assumptions. The conversational flow, split queues, and inactive MCP scaffold have passed CI and deployed to the private EC2 worker. A previous host inspection also confirmed its backup timer was active. See [EC2 operations](ec2-operations.md) for current access/configuration and [Supabase cutover requirements](supabase-message-queue.md#authentication-and-configuration) for the separate queue migrations.
 
 ### Hosting split and network assumptions
 
@@ -609,9 +657,9 @@ The [worker deployment workflow](../.github/workflows/deploy.yml) runs after suc
 The release sequence in [`release-core.ts`](../deploy/release-core.ts) and [`ec2-release.ts`](../deploy/ec2-release.ts) is:
 
 1. Prepare dependencies and build as the isolated build user while the old worker stays running. Runtime credentials are not passed to dependency install hooks/build scripts.
-2. Verify the target commit and migration compatibility. Existing migrations are immutable; automatic deployment accepts only conservatively checked additions.
+2. Verify the target commit and SQLite migration compatibility. Existing migrations are immutable; automatic deployment accepts only conservatively checked Prisma additions. Supabase migrations are provisioned separately before a release requires them.
 3. Stop the existing worker and take a consistent SQLite snapshot.
-4. Apply migrations as the runtime user.
+4. Apply SQLite Prisma migrations as the runtime user.
 5. Atomically select the new release and start it.
 6. Verify readiness for the exact release SHA, the running process/release location, and that unauthenticated status access is still rejected.
 7. Record the successful release and retain the current, previous, and one additional older release.
@@ -650,17 +698,20 @@ Admin runtime secrets and the reachable worker URL must be configured in the hos
 
 The worker test command includes unit, SQLite/HTTP integration, real PostgreSQL queue integration, and deployment tests. CI starts an isolated PostgreSQL 17 service; local PostgreSQL tests require `TEST_MESSAGE_DATABASE_URL`, as documented in the [Podman instructions](supabase-message-queue.md#verification).
 
-| Area                    | Behaviors covered                                                                                                               |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Message mapping         | Phone/LID addressing, normalized mentions, wrapped content, supported captions, ignored message types                           |
-| Greeting policy/service | Eligibility, deduplication before waiting, expiry after waiting, cancellation without sending, retained claims                  |
-| Reply delay             | Inclusive bounds, injected randomness/waiting, cancellation, configuration validation                                           |
-| Client lifecycle        | Ordering, queue overflow, stop/drain behavior, final credential updates, connection loss, auth failures, reconnect cancellation |
-| Database claims         | Concurrent/repeated claims and retention of uncertain send outcomes                                                             |
-| Authentication storage  | Binary serialization, encryption, tamper/wrong-key rejection, atomic writes and failure handling                                |
-| HTTP/admin access       | Bearer authentication, bounded requests, controls, persistent sessions, logout, atomic login limits                             |
-| Application lifecycle   | Readiness and persistence of operator connection intent                                                                         |
-| Deployment/recovery     | Commit/migration guards, release ordering, rollback before/after candidate start, SQLite snapshots containing WAL state         |
+| Area                    | Behaviors covered                                                                                                                      |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Message mapping         | Phone/LID addressing, normalized mentions, wrapped content, supported captions, ignored message types                                  |
+| Greeting policy/service | Eligibility, deduplication before waiting, expiry after waiting, cancellation without sending, retained claims                         |
+| Reply delay             | Inclusive bounds, injected randomness/waiting, cancellation, configuration validation                                                  |
+| Client lifecycle        | Ordering, queue overflow, stop/drain behavior, final credential updates, connection loss, auth failures, reconnect cancellation        |
+| Database claims         | Concurrent/repeated claims and retention of uncertain send outcomes                                                                    |
+| Split queues            | Atomic handoff, saved-reply recovery, due times, encryption, lease fencing, upgrade preservation, and restricted grants                |
+| Assistant graph         | Stage order, style guard, cancellation, context isolation, failed generation, and memory after transport acceptance                    |
+| MCP services            | Real SDK with fake HTTP: discovery, employee/scope checks, concurrent isolation, evidence, response limits, safe errors, and deadlines |
+| Authentication storage  | Binary serialization, encryption, tamper/wrong-key rejection, atomic writes and failure handling                                       |
+| HTTP/admin access       | Bearer authentication, bounded requests, controls, persistent sessions, logout, atomic login limits                                    |
+| Application lifecycle   | Readiness and persistence of operator connection intent                                                                                |
+| Deployment/recovery     | Commit/migration guards, release ordering, rollback before/after candidate start, SQLite snapshots containing WAL state                |
 
 The worker's [`tests/fixtures/simulated-worker.ts`](../tests/fixtures/simulated-worker.ts) uses a fake WhatsApp session with an isolated database. Its reply-delay range is set to zero so browser integration scenarios do not incur real pacing delays; dedicated tests cover the delay behavior itself.
 
@@ -695,27 +746,28 @@ Browser tests require a built admin and an installed compatible Chromium, as des
 BOT_WORKER_DIR=../baileys-ramesh npm run test:e2e
 ```
 
-Automated tests validate controlled failure paths and application behavior. The separate local QR pairing and user-confirmed `hello` exchange provide evidence of a real connection/reply path, not proof of unattended operation or current cloud deployment health.
+The scaffold release passed **81 worker tests**, including the isolated PostgreSQL suite, with zero failures/skips; its GitHub CI and EC2 deployment also succeeded. The earlier live-model evaluation passed **26/26 trials** across 13 synthetic cases. The latest documentation-only pass does not rerun paid evaluations or send real WhatsApp messages.
+
+For nondeterministic model checks, run `npm run eval:agent -- --trials 3`; a held-out split is available with `--split holdout`. Each trial uses fresh conversation state and isolated SQLite with fake delivery. Mechanical checks cover stage completion, persisted outcomes, length, em dashes, stock phrases, and clarification where required. A schema-validated Terra judge checks relevance, naturalness, fidelity, and capability honesty. Reports under `.local/evals/` retain drafts, final replies, reasons, prompt/dataset hashes, latency, and token usage. Review transcripts as well as scores: synthetic coverage and a same-model judge do not guarantee quality on real tasks. This paid suite is separate from CI.
 
 ## Current limitations and extension boundaries
 
 The existing split between domain services, transport adapters, and repositories is a useful base for additional sales-team workflows. The following boundaries explain what would have to change; the additions in the right column are **not implemented**.
 
-| Current implementation                                                       | Extension boundary                                                                                                                           |
-| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| Every eligible DM can trigger a greeting                                     | Resolve the sender to a verified employee and enforce employee/group access rules before retrieving business information                     |
-| Domain input contains IDs, time, and mention flags only                      | Introduce a richer incoming-message contract containing text and the actual group participant identity                                       |
-| Fixed `hello` response                                                       | Add intent routing and business use cases under `src/modules/`, keeping WhatsApp SDK objects in adapters                                     |
-| No CRM or model calls                                                        | Add independently testable context/CRM/model adapters with explicit timeouts and authorization context                                       |
-| Group replies stay in the triggering group                                   | Define which information is permitted in shared channels before returning employee-specific CRM results                                      |
-| One durable leased reply job per account                                     | Introduce per-conversation ordering and bounded parallelism if slow business operations become common                                        |
-| Durable greeting jobs recover before sending and preserve uncertain outcomes | Design separate workflow state and idempotency for future CRM/LLM side effects; WhatsApp delivery remains uncertain across the send boundary |
-| Single account/session owner                                                 | Add account isolation and exclusive session ownership before introducing multiple accounts or replicas                                       |
-| Shared operator password                                                     | Introduce named operator identities and roles if the admin needs individual accountability or differentiated permissions                     |
-| In-memory metrics and 30 recent events                                       | Add durable operational telemetry and delivery-status tracking if those become product requirements                                          |
-| Caption text only for media                                                  | Add explicitly authorized media download/processing before supporting documents, voice, or image understanding                               |
-| No scheduler or outbound workflow                                            | Implement reminder/job scheduling separately from SDK keepalives and admin status polling                                                    |
+| Current implementation                                                         | Extension boundary                                                                                                       |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| Every eligible DM can trigger a conversational reply                           | Resolve the sender to an active verified employee before business reads                                                  |
+| Converser and formatter with bounded process-local memory                      | Add optional planning, tool execution, evidence verification, and durable conversation state as needed                   |
+| MCP read services scaffolded but inactive                                      | Implement employee OAuth lifecycle, then wire scoped reads through the future worker                                     |
+| Group replies stay in the triggering group                                     | Define which information is permitted in shared channels before returning employee-specific CRM results                  |
+| One durable leased reply job per account                                       | Introduce per-conversation ordering and bounded parallelism if slow business operations become common                    |
+| Separate inbound/outbound queues preserve final replies and uncertain outcomes | Add durable workflow/action state and idempotency for future business side effects                                       |
+| Single account/session owner                                                   | Add account isolation and exclusive session ownership before introducing multiple accounts or replicas                   |
+| Shared operator password                                                       | Introduce named operator identities and roles if the admin needs individual accountability or differentiated permissions |
+| In-memory metrics and 30 recent events                                         | Add durable operational telemetry and delivery-status tracking if those become product requirements                      |
+| Caption text only for media                                                    | Add explicitly authorized media download/processing before supporting documents, voice, or image understanding           |
+| Outbound due timestamps support immediate quoted replies with incoming expiry  | Add long-lived reminder intents, cancellation, recipient checks, and due-time business revalidation                      |
 
-The neighboring Context Engine and CRM automation work are potential integration points, not modules that this bot currently invokes. [`CONTEXT.md`](../CONTEXT.md) preserves the product direction and rough authorization plan. Employee identity, employee-scoped credentials, and a distinction between shared company knowledge and private CRM results still need to be carried through an implemented request path.
+The current chat graph does not invoke Context Engine or CRM-Automations. The service scaffold establishes the future MCP boundary. [`CONTEXT.md`](../CONTEXT.md) preserves the product decisions: employee-scoped CRM reads first, supply next, then reminders/escalation and controlled writes. Escalations go to assignee(s), then existing CRM admins. Dedicated domain-backend read endpoints remain deferred.
 
-The most direct next increment is a verified employee message flowing through a richer domain contract to one read-only business operation, with the existing connection, claim, pacing, and reply infrastructure around it. Multiple active worker replicas should not be pointed at the same linked account: the current code has no distributed session lease or active/passive ownership protocol.
+The next business increment is a verified employee message flowing through the MCP services to one read-only operation, with evidence verification and private delivery. Planner, worker, and verifier agents are explicitly deferred to later work. Multiple active worker replicas should not be pointed at the same linked account: the current code has no distributed session lease or active/passive ownership protocol.

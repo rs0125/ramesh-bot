@@ -1,8 +1,10 @@
 # WareOnGo WhatsApp worker
 
-Standalone TypeScript service for the sales team's WhatsApp bot. With an OpenAI key configured, a two-node LangGraph flow produces conversational replies to text DMs and real group @mentions: **converser → formatter**, using `gpt-5.6-terra`. Without a key, the original `hello` behavior remains available. Group replies stay in the triggering group; there is no arbitrary-send endpoint. Supabase stores durable message state and reply jobs; Prisma/SQLite retains encrypted WhatsApp auth and admin state.
+Standalone TypeScript service for the sales team's WhatsApp bot. With an OpenAI key configured, a two-node LangGraph flow produces conversational replies to text DMs and real group @mentions: **converser → formatter**, using `gpt-5.6-terra`. Without a key, the original `hello` behavior remains available. Group replies stay in the triggering group; there is no arbitrary-send endpoint. Supabase stores durable message state and separate `ramesh-inbound-queue` and `ramesh-outbound-queue` tables; Prisma/SQLite retains encrypted WhatsApp auth and admin state.
 
 The Next.js admin lives in the **separate [ramesh-bot-admin repository](https://github.com/rs0125/ramesh-bot-admin)**, with its own dependencies, lockfile and Vercel workflow. These local checkouts are named `baileys-ramesh` and `baileys-ramesh-admin`; cloned directories can use any names. It talks to this worker through the authenticated `/v1` HTTP API. Neither project imports or builds the other.
+
+Documentation reviewed on **1 October 2026** through release `5eb14d0`. The conversational flow and queue split are deployed. The MCP services are scaffolded but inactive; planner, worker, verifier, employee credential enrollment, reminders, and business writes are deferred. The [architecture plan](docs/assistant-architecture-plan.md) contains the supplied system diagram, organisational context, decisions, research, and next milestones.
 
 ## Safe local chat playground
 
@@ -67,10 +69,10 @@ src/
   contracts/               Worker-owned v1 API types
   modules/greetings/       Eligibility, durable claim, generated reply handoff
   modules/assistant/       LangGraph, prompts, bounded memory and style guard
-  modules/context-engine/ Read-tool contract, credential port and domain services
+  modules/context-engine/  Read-tool contract, credential port and domain services
   infrastructure/
     whatsapp/              SDK adapter, mapping, connection/retry management
-    database/              Prisma repositories and encrypted auth storage
+    database/              SQLite auth/admin and PostgreSQL queue repositories
     http/                  Authenticated control/session API, bounded bodies
     openai/                Responses adapter, deadlines and redacted errors
     context-engine/        Employee-scoped MCP transport and evidence validation
@@ -80,8 +82,8 @@ supabase/migrations/       Prefixed PostgreSQL message-state/queue schema
 scripts/                   Local setup and capture-only chat playground
 playground/                Local chat interface assets
 evals/                     Repeated live-model scenarios and structured quality judging
-tests/                    Unit/integration tests and fake WhatsApp process
-deploy/                   EC2/SSM templates, release helper and rollback tests
+tests/                     Unit/integration tests and fake WhatsApp process
+deploy/                    EC2/SSM templates, release helper and rollback tests
 .github/workflows/         Independent worker CI and EC2 CD
 ```
 
@@ -99,7 +101,7 @@ Each module has an entry comment describing its responsibility. Imports do not o
 - Bounds the message/control queues and HTTP bodies, caps send time, attempts to finish active sends within the shutdown deadline, and clears obsolete QR codes.
 - Persists admin session hashes, logout revocation and login limits centrally, so Vercel instances share them. The admin password is an operational control; employee/CRM authorization remains a plan.
 
-See [.env.example](.env.example) for settings. Back up `AUTH_ENCRYPTION_KEY` separately from the SQLite database; losing it prevents reuse of the paired session. Keep one active worker per linked account. This schema is owned by the bot and must not be applied to the CRM database.
+See [.env.example](.env.example) for settings. Back up `AUTH_ENCRYPTION_KEY` separately from both databases; losing it prevents reuse of the paired session and pending encrypted payloads. Keep one active worker per linked account. Apply the Prisma schema only to the bot's local SQLite database; the separate prefixed PostgreSQL migrations own the Supabase message tables without changing CRM business tables.
 
 Read [Supabase setup, state semantics, and queue recovery](docs/supabase-message-queue.md) before configuring `MESSAGE_DATABASE_URL`. Keep `DATABASE_URL` as SQLite. Fresh development databases without a message connection retain the original SQLite greeting mode; after Supabase is enabled, a persistent marker prevents silent fallback. Legacy greeting claims are imported without creating send jobs. The browser test fixture does not use the production Supabase connection.
 
@@ -125,5 +127,19 @@ Build the admin and install Playwright Chromium first, as described in its READM
 CI/CD follows the neighboring `warehouse-enricher` repository: successful main CI → GitHub OIDC → restricted SSM document → exact tested commit → stable health/authentication checks and rollback. CD is gated by `EC2_DEPLOY_ENABLED=true`. EC2 owns the live paired session; the earlier local pairing has been retired. A first Supabase cutover requires separately provisioning its tables/runtime configuration and pausing the sender while changing storage. Do not run the retired local pairing alongside EC2.
 
 Read the [detailed current implementation and architecture](docs/current-implementation.md) for the complete message flow, admin/API contracts, persistence, pacing, deployment assumptions, tests, and extension boundaries. Additional references: [deployment and recovery](docs/deployment-vercel-ec2.md), [architecture/API overview](docs/architecture.md), and the preserved [product context and rough authorization plan](CONTEXT.md).
+
+## Documentation map
+
+| Document                                                           | Use it for                                                                               |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| [Current implementation](docs/current-implementation.md)           | Running behavior, source map, limits, API contracts, and test evidence                   |
+| [Architecture and API](docs/architecture.md)                       | Compact topology and application boundaries                                              |
+| [Assistant architecture plan](docs/assistant-architecture-plan.md) | Consolidated system design, MCP service contract, deferred agents, reminders, and writes |
+| [Supabase queues](docs/supabase-message-queue.md)                  | Exact table names, atomic handoff, recovery, migrations, and local PostgreSQL tests      |
+| [EC2 operations](docs/ec2-operations.md)                           | Current private deployment, SSM tunnel, runtime configuration, and backups               |
+| [Deployment guide](docs/deployment-vercel-ec2.md)                  | Independent release automation and the future public HTTPS/Vercel rollout                |
+| [Product context](CONTEXT.md)                                      | Confirmed decisions, organisational sources, and earlier options                         |
+
+The fake chat GUI uses local port **3012**; the documented SSM tunnel uses **3013**. The pairing admin at **3010** is an operations surface and is separate from the fake chat GUI.
 
 Dependency note: the Prisma config dependency overrides `deepmerge-ts` to patched version 8 for [GHSA-ggr8-5vv4-36mx](https://github.com/advisories/GHSA-ggr8-5vv4-36mx). Schema generation, migration deployment and migration diff are covered by local checks; remove the override when the upstream Prisma dependency includes the fix.

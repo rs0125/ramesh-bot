@@ -1,5 +1,7 @@
 # Supabase inbound and outbound queues
 
+Reviewed **1 October 2026** through release `5eb14d0`. The split queues and migrations `202610010001` / `202610010002` are deployed. This is the transport queue contract; the broader [architecture plan](assistant-architecture-plan.md) covers future reminder and tool workflows.
+
 The worker persists incoming WhatsApp messages, finalized outgoing replies, and state history in the existing WareOnGo Supabase PostgreSQL database. The five application tables use the literal `ramesh-` prefix and live in `public`. SQL identifiers containing the hyphen must be double-quoted.
 
 WhatsApp still pushes messages through the Baileys connection. The worker polls **its own PostgreSQL queue**, not WhatsApp. The admin browser's separate status polling is unchanged.
@@ -41,6 +43,8 @@ Admission is serialized in a small bounded in-memory buffer. Eligible work becom
 Enqueue atomically deduplicates `(account_id, chat_id, whatsapp_message_id)`, checks capacity across both stages, and inserts the message and inbound row. A duplicate remains a duplicate even when the queue is full. A failed job insert rolls back its message row and state event. After generation, a second transaction inserts one encrypted outbound reply, marks inbound `DONE`, and advances the message to `READY_TO_SEND`. Either all three changes commit or none do. The sender never calls the model.
 
 Both stages run in the existing process and start only after Baileys reports `connected`. Each loop checks due outbound work first, then inbound, preserving normal conversation order. Newly persisted work wakes it immediately. When idle, it checks every five seconds by default, so restarts and recovered leases do not depend on another incoming message. Database errors back off up to 30 seconds. These are application database operations, not extra WhatsApp requests.
+
+The active agent is the two-node OpenAI Terra converser/formatter, with `hello` as the no-key fallback. Planner, worker, and verifier agents are deferred. The Context Engine MCP service scaffold is disconnected from this consumer: current queue payloads do not grant CRM access or carry employee OAuth tokens. Introducing tool runs or reminders will require their own workflow/authorization state.
 
 Claims use `FOR UPDATE SKIP LOCKED`, an account transaction lock, and one-active-lease indexes on each queue. Inside that same lock the repository checks both queues, so an inbound and outbound lease cannot overlap for one account through this application. Every claim receives a new UUID lease token. Stale or expired owners cannot hand off, start sending, or finalize newer work. Transactions finish before model calls, timers, or sends, so the transaction-pooler connection is not held during those operations.
 
@@ -123,6 +127,8 @@ For EC2, add those runtime values to the protected worker environment and its en
 For the queue split, apply migration `202610010002` before deploying the new worker. The compatibility view supports the previously deployed SQL during this window. Deploying new code without the migration fails startup readiness. Once outbound rows exist, rolling back to the pre-split worker leaves them preserved but undelivered; restore a split-aware worker to drain them. Do not move saved replies back into the inbound queue or automatically resend uncertain rows. The alias can be removed in a later migration after the pre-split rollback window closes.
 
 EC2 SQLite snapshots cover auth/admin/local settings, not PostgreSQL jobs. Supabase backup/PITR settings were not changed or verified by this feature. Retain the authentication encryption key separately so pending encrypted payloads remain recoverable.
+
+Production runtime values must stay synchronized between the root-protected host environment and the encrypted SSM backup. Changing the SSM parameter alone does not reload the worker. See [EC2 runtime configuration](ec2-operations.md#runtime-configuration) for the update procedure; keep model keys out of database provisioning credentials and keep the admin's token separate from employee business access.
 
 ## Verification
 
