@@ -1,5 +1,6 @@
 /** Real PostgreSQL tests are restricted to an explicitly named local test database. */
 import { randomBytes } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { Pool } from 'pg';
 import { applyMessageSchema } from '../../scripts/message-schema.js';
 
@@ -44,8 +45,20 @@ export async function temporaryMessageDatabase(migrate = applyMessageSchema) {
     async close() {
       await runtime.end();
       await admin.end();
-      await control.query(`DROP DATABASE "${name}" WITH (FORCE)`);
-      await control.end();
+      try {
+        // pg-pool can finish before PostgreSQL observes the socket close. FORCE
+        // races that shutdown and emits a late fatal error on a closing client.
+        const deadline = Date.now() + 5000;
+        while (
+          (await control.query('SELECT 1 FROM pg_stat_activity WHERE datname=$1', [name])).rowCount
+        ) {
+          if (Date.now() >= deadline) throw new Error('Test database connections did not close');
+          await sleep(25);
+        }
+        await control.query(`DROP DATABASE "${name}"`);
+      } finally {
+        await control.end();
+      }
     },
   };
 }
