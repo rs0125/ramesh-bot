@@ -1,6 +1,6 @@
 # Independent Vercel and EC2 deployments
 
-The worker repository is `baileys-ramesh`; the admin repository is `baileys-ramesh-admin`. Each installs, builds, tests and deploys independently. Only their versioned HTTP contract and matching API token connect them. These instructions prepare a future rollout; no AWS/Vercel resources have been provisioned or live WhatsApp pairing tested.
+The worker repository is `baileys-ramesh`; the admin repository is `baileys-ramesh-admin`. Each installs, builds, tests and deploys independently. Only their versioned HTTP contract and matching API token connect them. The current EC2 installation uses private SSM access; see [EC2 operations](ec2-operations.md). The public HTTPS and Vercel sections below describe a later rollout.
 
 The EC2 workflow follows the existing `../../warehouse-enricher` pattern: trusted successful main CI, exact commit selection, GitHub OIDC, a narrowly scoped SSM document, unprivileged builds, health checks, and rollback. Account/instance/repository identifiers are placeholders, not copies of another service's credentials.
 
