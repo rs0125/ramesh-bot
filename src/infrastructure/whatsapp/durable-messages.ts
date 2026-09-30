@@ -1,4 +1,4 @@
-/** Persists incoming work, then consumes it only while a WhatsApp session is connected. */
+/** Drains separate agent-input and delivery queues while a WhatsApp session is connected. */
 import { randomUUID } from 'node:crypto';
 import { proto, type WAMessage } from '@whiskeysockets/baileys';
 import { authCipher } from '../database/auth-store.js';
@@ -24,13 +24,21 @@ export interface DurableMessageOptions {
 
 type DurableRepository = Pick<
   MessageQueueRepository,
-  'enqueue' | 'claim' | 'releaseUnsent' | 'complete' | 'beginSend'
+  | 'enqueue'
+  | 'claimInbound'
+  | 'handoff'
+  | 'claimOutbound'
+  | 'releaseUnsent'
+  | 'complete'
+  | 'beginSend'
 >;
 
 export class DurableMessages {
   private readonly cipher;
   private wake?: () => void;
   private revision = 0;
+  // Conversation memory is intentionally process-local. Persisted reply text survives restarts.
+  private readonly sentCallbacks = new Map<string, { expiresAt: number; run: () => void }>();
 
   constructor(
     private readonly repository: DurableRepository,
@@ -90,7 +98,12 @@ export class DurableMessages {
     while (!signal.aborted) {
       const revision = this.revision;
       try {
-        const job = await this.repository.claim(this.options.leaseMs);
+        for (const [id, callback] of this.sentCallbacks)
+          if (callback.expiresAt <= Date.now()) this.sentCallbacks.delete(id);
+        // Deliver the previous reply before generating more work, preserving conversation order.
+        const job =
+          (await this.repository.claimOutbound(this.options.leaseMs)) ??
+          (await this.repository.claimInbound(this.options.leaseMs));
         if (job) await this.process(job, session, signal, report);
         else await this.idle(signal, revision);
         failures = 0;
@@ -125,6 +138,7 @@ export class DurableMessages {
         message = proto.WebMessageInfo.decode(wire) as WAMessage;
       } catch {
         await this.repository.complete(job, 'FAILED', 'invalid_encrypted_payload');
+        this.sentCallbacks.delete(job.id);
         report('error');
         return;
       }
@@ -133,17 +147,54 @@ export class DurableMessages {
         candidate && selectGreetingTarget(candidate, Date.now(), this.options.maxAgeMs);
       if (!candidate || !eligible()) {
         await this.repository.complete(job, 'EXPIRED', 'no_longer_eligible');
+        this.sentCallbacks.delete(job.id);
         return;
       }
-      const prepared = this.options.prepareReply
-        ? await this.options.prepareReply(candidate, signal)
-        : { text: 'hello', onSent: undefined };
+      if (job.direction === 'inbound') {
+        const prepared = this.options.prepareReply
+          ? await this.options.prepareReply(candidate, signal)
+          : { text: 'hello', onSent: undefined };
+        if (signal.aborted) {
+          await this.repository.releaseUnsent(job, true);
+          return;
+        }
+        if (!eligible()) {
+          await this.repository.complete(job, 'EXPIRED', 'message_too_old');
+          return;
+        }
+        if (!prepared.text.trim() || prepared.text.length > 16000) {
+          await this.repository.complete(job, 'FAILED', 'invalid_generated_reply');
+          report('error');
+          return;
+        }
+        const payload = this.cipher.seal('outbound-reply', job.id, prepared.text);
+        if (await this.repository.handoff(job, payload)) {
+          if (prepared.onSent)
+            this.sentCallbacks.set(job.id, {
+              expiresAt: candidate.sentAtMs + this.options.maxAgeMs,
+              run: prepared.onSent,
+            });
+        } else await this.repository.releaseUnsent(job);
+        return;
+      }
+      let reply: unknown;
+      try {
+        reply = this.cipher.open('outbound-reply', job.id, job.replyPayload ?? '');
+        if (typeof reply !== 'string' || !reply.trim() || reply.length > 16000)
+          throw new Error('Invalid saved reply');
+      } catch {
+        await this.repository.complete(job, 'FAILED', 'invalid_encrypted_reply');
+        this.sentCallbacks.delete(job.id);
+        report('error');
+        return;
+      }
       if (!(await this.options.waitBeforeReply(signal)) || signal.aborted) {
         await this.repository.releaseUnsent(job, true);
         return;
       }
       if (!eligible()) {
         await this.repository.complete(job, 'EXPIRED', 'message_too_old');
+        this.sentCallbacks.delete(job.id);
         return;
       }
       // Persist the point of no safe automatic retry BEFORE invoking the SDK.
@@ -156,16 +207,19 @@ export class DurableMessages {
         return;
       }
       sendInvoked = true;
-      await session.reply(message, prepared.text);
-      prepared.onSent?.();
+      await session.reply(message, reply);
+      this.sentCallbacks.get(job.id)?.run();
+      this.sentCallbacks.delete(job.id);
       if (await this.repository.complete(job, 'SENT')) report('sent');
       else report('error');
     } catch {
       // After the callback is invoked, a network/DB error cannot prove non-delivery.
       // If even this write fails, SENDING is recovered as UNCERTAIN when its lease expires.
       try {
-        if (sendInvoked) await this.repository.complete(job, 'UNCERTAIN', 'send_or_status_failed');
-        else await this.repository.releaseUnsent(job, signal.aborted);
+        if (sendInvoked) {
+          this.sentCallbacks.delete(job.id);
+          await this.repository.complete(job, 'UNCERTAIN', 'send_or_status_failed');
+        } else await this.repository.releaseUnsent(job, signal.aborted);
       } catch {
         /* Durable lease recovery owns work whose final write could not complete. */
       }

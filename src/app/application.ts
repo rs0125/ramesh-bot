@@ -150,7 +150,7 @@ export function createApplication(
             create: { key: 'message-storage', value: 'postgres' },
             update: { value: 'postgres' },
           });
-          logger.info('Message state and reply queue use PostgreSQL');
+          logger.info('Message state, inbound queue and outbound queue use PostgreSQL');
         }
         await adminAccess.clean();
         if (stopped) return;

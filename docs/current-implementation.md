@@ -6,7 +6,7 @@ Reviewed: **2026-10-01, Asia/Kolkata**.
 
 This document describes the code currently present in the `baileys-ramesh` worker and `baileys-ramesh-admin` admin checkouts, including reply pacing, QR rendering, and the Supabase message-state/queue implementation. It describes implemented behavior, configuration defaults, and deployment assets. It does not assert that every checked-in deployment asset is active in AWS or Vercel.
 
-The linked WhatsApp session now belongs to EC2; the earlier local pairing was retired. A read-only EC2 inspection confirmed the existing worker was connected before the Supabase cutover. The new four-table Supabase schema and dedicated runtime login have been provisioned and verified. The detailed storage contract, provisioning steps, and PostgreSQL tests are documented in [Supabase message state and reply queue](supabase-message-queue.md). Historical planning documents may describe earlier deployment stages.
+The linked WhatsApp session now belongs to EC2; the earlier local pairing was retired. A read-only EC2 inspection confirmed the existing worker was connected before the Supabase cutover. The base Supabase message-state schema and dedicated runtime login have been provisioned and verified. The detailed storage contract, provisioning steps, and PostgreSQL tests are documented in [Supabase message state and reply queue](supabase-message-queue.md). Historical planning documents may describe earlier deployment stages.
 
 ## Contents
 
@@ -243,15 +243,15 @@ The SDK listener accepts only `type === 'notify'` from the current running sessi
 
 The mapper supports phone DMs (`@s.whatsapp.net`), LID DMs (`@lid`), and groups (`@g.us`). It unwraps content and accepts nonempty conversation/extended text or image/video captions. Reactions, protocol traffic, and captionless media do not trigger a greeting. Real structured bot mentions are required in groups; typing the display name is insufficient. No media understanding is implemented.
 
-The minimal `GreetingCandidate` contract contains `chatId`, `messageId`, `sentAtMs`, `fromMe`, `isGroup`, and `mentionsBot`. In durable mode, the original protobuf message is additionally encrypted and persisted for reconstructing the quoted reply after restart. Text and group participant identity are not yet exposed through a richer business-domain contract.
+The minimal `GreetingCandidate` contract contains `chatId`, `messageId`, `sentAtMs`, `fromMe`, `isGroup`, and `mentionsBot`. In durable mode, the original protobuf message is additionally encrypted and persisted for reconstructing the quoted reply after restart. It also carries text and the normalized sender identity for conversation isolation; employee authorization remains future work.
 
 Eligible messages are not from the bot itself, meet the group-mention rule, and fall within `MAX_MESSAGE_AGE_SECONDS` (normally five minutes), allowing 60 seconds of forward clock skew. Eligibility is checked again before sending. Recent offline-sync `notify` events can qualify; `notify` alone does not prove real-time arrival.
 
-`ramesh-messages` enforces uniqueness per account/chat/message. Enqueue and the `ramesh-message-jobs` insertion commit together. The default capacity of 100 bounds active/pending durable jobs as well as the separate admission buffer. Full admission or durable capacity increases `dropped`. An abrupt crash before persistence commits can still lose an incoming event.
+`ramesh-messages` enforces uniqueness per account/chat/message. Enqueue and the `ramesh-inbound-queue` insertion commit together. The default capacity of 100 bounds active/pending durable jobs as well as the separate admission buffer. Full admission or durable capacity increases `dropped`. An abrupt crash before persistence commits can still lose an incoming event.
 
 One job is leased per account. The consumer starts only after Baileys reports `connected`, wakes on new work, and polls the database every five seconds when idle. The current global ordering across chats remains; a slow job holds up later replies. Database connections are released during pacing and sending.
 
-The adapter sends literal `hello`, quoting the reconstructed triggering message. DMs stay in the DM; group replies stay in the same group. There is no arbitrary-send HTTP endpoint. See [queue states and recovery](supabase-message-queue.md#message-and-job-states) for the lease and uncertainty rules.
+The agent atomically completes inbound processing and saves its encrypted final text in `ramesh-outbound-queue`. The sender then claims that saved reply (or `hello` without an API key), quoting the reconstructed triggering message. Delivery retries never regenerate saved output. DMs stay in the DM; group replies stay in the same group. There is no arbitrary-send HTTP endpoint. See [queue states and recovery](supabase-message-queue.md#message-and-job-states) for the lease and uncertainty rules.
 
 Fresh development databases without `MESSAGE_DATABASE_URL` retain the original `GreetingService` path: policy → SQLite claim → delay → send. An activated worker cannot silently return to that mode.
 
@@ -265,9 +265,9 @@ delay = minMs + floor(random() × (maxMs - minMs + 1))
 
 The default inclusive range is 1,500–4,000 ms. This delays each reply; it does not combine messages into a debounce batch. Total latency also includes preceding queued work. The worker rechecks message age and fenced lease ownership before committing the `SENDING` marker and invoking Baileys.
 
-Each WhatsApp session owns an `AbortController`. Stop, connection loss, and fatal auth-storage errors cancel its consumer/timers. In durable mode, already-admitted events finish their persistence step, and work known not to have been sent is released back to `QUEUED`. A new connection can resume it while it remains eligible. Already-started sends are awaited subject to send/process deadlines; interrupted sends become `UNCERTAIN` and are not retried.
+Each WhatsApp session owns an `AbortController`. Stop, connection loss, and fatal auth-storage errors cancel its consumer/timers. In durable mode, already-admitted events finish their persistence step, and work known not to have been sent is released to `QUEUED` for inbound work or `READY_TO_SEND` for saved outbound replies. A new connection can resume it while it remains eligible. Already-started sends are awaited subject to send/process deadlines; interrupted sends become `UNCERTAIN` and are not retried.
 
-The lease window is the maximum configured delay plus the send timeout plus 30 seconds. A new UUID token fences each lease; expired pre-send work can be recovered, but an expired `SENDING` marker cannot be automatically replayed. The original SQLite-only development path retains cancelled `CLAIMED` rows instead of requeuing them.
+The lease window includes the configured agent deadline, maximum reply delay, send timeout, and 30 seconds of database margin. A new UUID token fences each lease; expired pre-send work can be recovered, but an expired `SENDING` marker cannot be automatically replayed. The original SQLite-only development path retains cancelled `CLAIMED` rows instead of requeuing them.
 
 Pacing smooths traffic; it does not guarantee avoidance of platform restrictions. No fake typing, randomized SDK heartbeat, account rotation, or message-polling camouflage is implemented.
 
@@ -278,7 +278,8 @@ The implementation has two stores with separate responsibilities.
 | Store/table                           | Responsibility                                                                  |
 | ------------------------------------- | ------------------------------------------------------------------------------- |
 | Supabase `ramesh-messages`            | Message identity, state, expiry, encrypted pending payload, completion metadata |
-| Supabase `ramesh-message-jobs`        | Durable reply jobs, availability, leases, attempts, terminal queue outcomes     |
+| Supabase `ramesh-inbound-queue`       | Durable agent-input jobs, leases, attempts, processing outcomes                 |
+| Supabase `ramesh-outbound-queue`      | Encrypted finalized replies, due times, delivery leases and outcomes            |
 | Supabase `ramesh-message-events`      | Transactional state-transition history                                          |
 | Supabase `ramesh-schema-migrations`   | Version/checksum of the separately provisioned PostgreSQL schema                |
 | SQLite `WhatsAppAuthEntry`            | Encrypted linked-device credentials and Signal keys                             |
@@ -286,11 +287,11 @@ The implementation has two stores with separate responsibilities.
 | SQLite `BotSetting`                   | Operator connection intent and `message-storage=postgres` activation marker     |
 | SQLite `Greeting`                     | Retained legacy claims; used only by the original development fallback          |
 
-Sources: [PostgreSQL migration](../supabase/migrations/202610010001_message_queue.sql), [SQLite schema](../prisma/schema.prisma), [queue repository](../src/infrastructure/database/message-queue.repository.ts), [durable consumer](../src/infrastructure/whatsapp/durable-messages.ts).
+Sources: [queue split migration](../supabase/migrations/202610010002_split_queues.sql), [SQLite schema](../prisma/schema.prisma), [queue repository](../src/infrastructure/database/message-queue.repository.ts), [durable consumer](../src/infrastructure/whatsapp/durable-messages.ts).
 
 On startup, local legacy claims are imported idempotently without creating jobs. Old successful claims become `SENT`; other claims become `UNCERTAIN`. The dedupe key includes the stable account namespace. Removing the PostgreSQL configuration after activation fails startup.
 
-The normal state progression is `QUEUED → PROCESSING → SENDING → SENT`. `EXPIRED` and pre-send `FAILED` are terminal; possible delivery is `UNCERTAIN`. Terminal jobs remain inspectable as `DONE` or `DEAD`. These names describe application state, not WhatsApp delivery/read receipts. The worker does not implement exactly-once delivery or automatically resend uncertain outcomes.
+The normal state progression is `QUEUED → PROCESSING → READY_TO_SEND → SENDING → SENT`. `EXPIRED` and pre-send `FAILED` are terminal; possible delivery is `UNCERTAIN`. Terminal jobs remain inspectable as `DONE` or `DEAD`. These names describe application state, not WhatsApp delivery/read receipts. The worker does not implement exactly-once delivery or automatically resend uncertain outcomes.
 
 Queued protobuf payloads are encrypted with AES-256-GCM and a fresh 12-byte IV, authenticated against their row UUID and a distinct category. Terminal transitions clear the payload; metadata and event history remain for 30 days. Pending payloads are capped at 256 KiB before encryption. PostgreSQL cleanup never deletes eligible active work merely because a process restarted.
 

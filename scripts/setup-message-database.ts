@@ -65,7 +65,8 @@ async function main() {
         checked: true,
         tables: [
           'ramesh-messages',
-          'ramesh-message-jobs',
+          'ramesh-inbound-queue',
+          'ramesh-outbound-queue',
           'ramesh-message-events',
           'ramesh-schema-migrations',
         ],

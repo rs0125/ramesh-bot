@@ -5,7 +5,7 @@ import { applyMessageSchema } from '../../scripts/message-schema.js';
 
 export const postgresTestsEnabled = !!process.env.TEST_MESSAGE_DATABASE_URL;
 
-export async function temporaryMessageDatabase() {
+export async function temporaryMessageDatabase(migrate = applyMessageSchema) {
   const url = new URL(process.env.TEST_MESSAGE_DATABASE_URL ?? '');
   if (
     !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ||
@@ -29,7 +29,7 @@ export async function temporaryMessageDatabase() {
       await db.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${role}`);
     }
     await db.query('CREATE TABLE public.unrelated_crm_guard (id integer)');
-    await applyMessageSchema(db, password);
+    await migrate(db, password);
     await db.query('COMMIT');
   } finally {
     db.release();

@@ -24,13 +24,20 @@ async function simulate(
   const queue = new DurableMessages(
     {
       async enqueue(id, _message, payload) {
-        stored = { id, payload, token: 'fake-lease', attempts: 1 };
+        stored = { id, payload, token: 'fake-lease', attempts: 1, direction: 'inbound' };
         return 'queued';
       },
-      async claim() {
+      async claimInbound() {
         if (claimed) return null;
         claimed = true;
         return stored!;
+      },
+      async handoff(_job, replyPayload) {
+        stored = { ...stored!, direction: 'outbound', replyPayload };
+        return true;
+      },
+      async claimOutbound() {
+        return stored?.direction === 'outbound' ? stored : null;
       },
       async beginSend() {
         sendStarted = true;

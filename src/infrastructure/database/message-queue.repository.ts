@@ -4,11 +4,18 @@ import type { Pool, PoolClient } from 'pg';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
 
 export type TerminalState = 'SENT' | 'EXPIRED' | 'FAILED' | 'UNCERTAIN';
+export type QueueDirection = 'inbound' | 'outbound';
+const queueTable = (direction: QueueDirection) =>
+  direction === 'inbound' ? 'public."ramesh-inbound-queue"' : 'public."ramesh-outbound-queue"';
+const readyState = (direction: QueueDirection) =>
+  direction === 'inbound' ? 'QUEUED' : 'READY_TO_SEND';
 export interface MessageJob {
   id: string;
   token: string;
   payload: string;
   attempts: number;
+  direction: QueueDirection;
+  replyPayload?: string;
 }
 interface OwnedRow {
   id: string;
@@ -25,7 +32,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610010001'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610010002'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -76,8 +83,8 @@ export class MessageQueueRepository {
       )
         return 'duplicate';
       const count = await db.query(
-        `SELECT count(*)::int AS count FROM public."ramesh-message-jobs"
-        WHERE account_id=$1 AND state IN ('READY','LEASED')`,
+        `SELECT count(*)::int AS count FROM public."ramesh-messages"
+        WHERE account_id=$1 AND state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')`,
         [this.accountId],
       );
       if (count.rows[0].count >= capacity) return 'full';
@@ -96,7 +103,7 @@ export class MessageQueueRepository {
         ],
       );
       await db.query(
-        `INSERT INTO public."ramesh-message-jobs" (message_id,account_id) VALUES ($1,$2)`,
+        `INSERT INTO public."ramesh-inbound-queue" (message_id,account_id) VALUES ($1,$2)`,
         [id, this.accountId],
       );
       return 'queued';
@@ -105,113 +112,168 @@ export class MessageQueueRepository {
 
   private async finish(
     db: PoolClient,
-    id: string,
+    job: Pick<MessageJob, 'id' | 'direction'>,
     state: TerminalState,
     reason: string | null,
   ): Promise<void> {
     await db.query(
-      `UPDATE public."ramesh-message-jobs" SET state=$3,lease_token=NULL,lease_until=NULL,updated_at=clock_timestamp()
+      `UPDATE ${queueTable(job.direction)} SET state=$3,lease_token=NULL,lease_until=NULL,updated_at=clock_timestamp()
       WHERE message_id=$1 AND account_id=$2`,
-      [id, this.accountId, ['SENT', 'EXPIRED'].includes(state) ? 'DONE' : 'DEAD'],
+      [job.id, this.accountId, ['SENT', 'EXPIRED'].includes(state) ? 'DONE' : 'DEAD'],
+    );
+    await db.query(
+      `UPDATE public."ramesh-outbound-queue" SET payload_encrypted=NULL WHERE message_id=$1 AND account_id=$2`,
+      [job.id, this.accountId],
     );
     await db.query(
       `UPDATE public."ramesh-messages" SET state=$3,reason=$4,payload_encrypted=NULL,
       finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND account_id=$2`,
-      [id, this.accountId, state, reason],
+      [job.id, this.accountId, state, reason],
     );
   }
 
   private async requeue(
     db: PoolClient,
-    id: string,
+    job: MessageJob,
     reason: string,
     delayMs: number,
   ): Promise<void> {
     await db.query(
-      `UPDATE public."ramesh-message-jobs" SET state='READY',lease_token=NULL,lease_until=NULL,
+      `UPDATE ${queueTable(job.direction)} SET state='READY',lease_token=NULL,lease_until=NULL,
       available_at=clock_timestamp()+$3*interval '1 millisecond',updated_at=clock_timestamp()
       WHERE message_id=$1 AND account_id=$2`,
-      [id, this.accountId, delayMs],
+      [job.id, this.accountId, delayMs],
     );
     await db.query(
-      `UPDATE public."ramesh-messages" SET state='QUEUED',reason=$3,updated_at=clock_timestamp()
+      `UPDATE public."ramesh-messages" SET state=$4,reason=$3,updated_at=clock_timestamp()
       WHERE id=$1 AND account_id=$2`,
-      [id, this.accountId, reason],
+      [job.id, this.accountId, reason, readyState(job.direction)],
     );
   }
 
   private async recover(db: PoolClient): Promise<void> {
-    // Batch recovery avoids one network round trip per expired message after a long pause.
-    await db.query(
-      `WITH expired AS (
+    for (const direction of ['inbound', 'outbound'] as const) {
+      const table = queueTable(direction);
+      const ready = readyState(direction);
+      // This also conservatively recovers legacy SENDING leases in the renamed inbound table.
+      await db.query(
+        `WITH expired AS (
       SELECT m.id,CASE WHEN m.state='SENDING' THEN 'UNCERTAIN'
-        WHEN j.attempts>=j.max_attempts THEN 'FAILED' ELSE 'QUEUED' END AS next_state
-      FROM public."ramesh-message-jobs" j JOIN public."ramesh-messages" m ON m.id=j.message_id
+        WHEN j.attempts>=j.max_attempts THEN 'FAILED' ELSE $2 END AS next_state
+      FROM ${table} j JOIN public."ramesh-messages" m ON m.id=j.message_id
       WHERE j.account_id=$1 AND j.state='LEASED' AND j.lease_until<=clock_timestamp() FOR UPDATE OF j,m
     ), changed AS (
       UPDATE public."ramesh-messages" m SET state=e.next_state,
         reason=CASE e.next_state WHEN 'UNCERTAIN' THEN 'send_interrupted' WHEN 'FAILED' THEN 'attempts_exhausted' ELSE 'lease_expired' END,
-        payload_encrypted=CASE WHEN e.next_state='QUEUED' THEN m.payload_encrypted ELSE NULL END,
-        finished_at=CASE WHEN e.next_state='QUEUED' THEN NULL ELSE clock_timestamp() END,
+        payload_encrypted=CASE WHEN e.next_state=$2 THEN m.payload_encrypted ELSE NULL END,
+        finished_at=CASE WHEN e.next_state=$2 THEN NULL ELSE clock_timestamp() END,
         updated_at=clock_timestamp() FROM expired e WHERE m.id=e.id RETURNING m.id,m.state
-    ) UPDATE public."ramesh-message-jobs" j SET state=CASE WHEN c.state='QUEUED' THEN 'READY' ELSE 'DEAD' END,
+    ) UPDATE ${table} j SET state=CASE WHEN c.state=$2 THEN 'READY' ELSE 'DEAD' END,
       lease_token=NULL,lease_until=NULL,available_at=clock_timestamp(),updated_at=clock_timestamp()
+      ${direction === 'outbound' ? ',payload_encrypted=CASE WHEN c.state=$2 THEN j.payload_encrypted ELSE NULL END' : ''}
       FROM changed c WHERE j.message_id=c.id`,
-      [this.accountId],
-    );
-    await db.query(
-      `WITH stale AS (
+        [this.accountId, ready],
+      );
+      await db.query(
+        `WITH stale AS (
       UPDATE public."ramesh-messages" m SET state='EXPIRED',reason='message_too_old',payload_encrypted=NULL,
         finished_at=clock_timestamp(),updated_at=clock_timestamp()
-      FROM public."ramesh-message-jobs" j WHERE j.message_id=m.id AND m.account_id=$1
+      FROM ${table} j WHERE j.message_id=m.id AND m.account_id=$1
         AND j.state='READY' AND m.expires_at<=clock_timestamp() RETURNING m.id
-    ) UPDATE public."ramesh-message-jobs" j SET state='DONE',updated_at=clock_timestamp()
+    ) UPDATE ${table} j SET state='DONE',updated_at=clock_timestamp()
+      ${direction === 'outbound' ? ',payload_encrypted=NULL' : ''}
       FROM stale s WHERE j.message_id=s.id`,
-      [this.accountId],
-    );
+        [this.accountId],
+      );
+    }
   }
 
-  async claim(leaseMs: number): Promise<MessageJob | null> {
+  claimInbound(leaseMs: number) {
+    return this.claim('inbound', leaseMs);
+  }
+  claimOutbound(leaseMs: number) {
+    return this.claim('outbound', leaseMs);
+  }
+
+  private async claim(direction: QueueDirection, leaseMs: number): Promise<MessageJob | null> {
     return this.transaction(async (db) => {
       await this.recover(db);
       if (
         (
           await db.query(
-            `SELECT 1 FROM public."ramesh-message-jobs" WHERE account_id=$1 AND state='LEASED'`,
+            `SELECT 1 FROM public."ramesh-inbound-queue" WHERE account_id=$1 AND state='LEASED'
+             UNION ALL SELECT 1 FROM public."ramesh-outbound-queue" WHERE account_id=$1 AND state='LEASED'`,
             [this.accountId],
           )
         ).rowCount
       )
         return null;
-      const next = await db.query<{ id: string; payload: string; attempts: number }>(
+      const next = await db.query<{
+        id: string;
+        payload: string;
+        attempts: number;
+        replyPayload?: string;
+      }>(
         `SELECT m.id,m.payload_encrypted AS payload,j.attempts
-        FROM public."ramesh-message-jobs" j JOIN public."ramesh-messages" m ON m.id=j.message_id
+        ${direction === 'outbound' ? ',j.payload_encrypted AS "replyPayload"' : ''}
+        FROM ${queueTable(direction)} j JOIN public."ramesh-messages" m ON m.id=j.message_id
         WHERE j.account_id=$1 AND j.state='READY' AND j.available_at<=clock_timestamp()
-        ORDER BY j.created_at,j.message_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`,
+        ORDER BY j.available_at,j.created_at,j.message_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`,
         [this.accountId],
       );
       const row = next.rows[0];
       if (!row) return null;
       const token = randomUUID();
       await db.query(
-        `UPDATE public."ramesh-message-jobs" SET state='LEASED',lease_token=$2,
+        `UPDATE ${queueTable(direction)} SET state='LEASED',lease_token=$2,
         lease_until=clock_timestamp()+$3*interval '1 millisecond',attempts=attempts+1,updated_at=clock_timestamp()
         WHERE message_id=$1`,
         [row.id, token, leaseMs],
       );
       await db.query(
-        `UPDATE public."ramesh-messages" SET state='PROCESSING',reason=NULL,updated_at=clock_timestamp() WHERE id=$1`,
-        [row.id],
+        `UPDATE public."ramesh-messages" SET state=$2,reason=NULL,updated_at=clock_timestamp() WHERE id=$1`,
+        [row.id, direction === 'inbound' ? 'PROCESSING' : 'READY_TO_SEND'],
       );
-      return { ...row, token, attempts: row.attempts + 1 };
+      return { ...row, direction, token, attempts: row.attempts + 1 };
+    });
+  }
+
+  /** Commit the final reply and inbound completion together, before the sender can see it. */
+  async handoff(job: MessageJob, replyPayload: string, availableAt = new Date()): Promise<boolean> {
+    if (job.direction !== 'inbound') return false;
+    return this.transaction(async (db) => {
+      const row = await this.owned(db, job);
+      if (!row || row.state !== 'PROCESSING') return false;
+      const fresh = await db.query(
+        `SELECT 1 FROM public."ramesh-messages" WHERE id=$1 AND expires_at>clock_timestamp()`,
+        [job.id],
+      );
+      if (!fresh.rowCount) {
+        await this.finish(db, job, 'EXPIRED', 'message_too_old');
+        return false;
+      }
+      await db.query(
+        `INSERT INTO public."ramesh-outbound-queue" (message_id,account_id,payload_encrypted,available_at) VALUES ($1,$2,$3,$4)`,
+        [job.id, this.accountId, replyPayload, availableAt],
+      );
+      await db.query(
+        `UPDATE public."ramesh-inbound-queue" SET state='DONE',lease_token=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE message_id=$1`,
+        [job.id],
+      );
+      await db.query(
+        `UPDATE public."ramesh-messages" SET state='READY_TO_SEND',reason=NULL,updated_at=clock_timestamp() WHERE id=$1`,
+        [job.id],
+      );
+      return true;
     });
   }
 
   async beginSend(job: MessageJob): Promise<boolean> {
+    if (job.direction !== 'outbound') return false;
     return this.transaction(async (db) => {
       const result = await db.query(
         `UPDATE public."ramesh-messages" m SET state='SENDING',updated_at=clock_timestamp()
-        FROM public."ramesh-message-jobs" j WHERE m.id=$1 AND m.account_id=$2 AND m.state='PROCESSING'
+        FROM public."ramesh-outbound-queue" j WHERE m.id=$1 AND m.account_id=$2 AND m.state='READY_TO_SEND'
         AND j.message_id=m.id AND j.state='LEASED' AND j.lease_token=$3
         AND j.lease_until>clock_timestamp() AND m.expires_at>clock_timestamp() RETURNING m.id`,
         [job.id, this.accountId, job.token],
@@ -223,9 +285,9 @@ export class MessageQueueRepository {
   private async owned(db: PoolClient, job: MessageJob): Promise<OwnedRow | undefined> {
     return (
       await db.query<OwnedRow>(
-        `SELECT m.id,m.state,j.attempts,j.max_attempts FROM public."ramesh-message-jobs" j
+        `SELECT m.id,m.state,j.attempts,j.max_attempts FROM ${queueTable(job.direction)} j
       JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.message_id=$1 AND j.account_id=$2
-      AND j.state='LEASED' AND j.lease_token=$3 FOR UPDATE OF j,m`,
+      AND j.state='LEASED' AND j.lease_token=$3 AND j.lease_until>clock_timestamp() FOR UPDATE OF j,m`,
         [job.id, this.accountId, job.token],
       )
     ).rows[0];
@@ -238,8 +300,9 @@ export class MessageQueueRepository {
   ): Promise<boolean> {
     return this.transaction(async (db) => {
       const row = await this.owned(db, job);
-      if (!row || (state === 'SENT' && row.state !== 'SENDING')) return false;
-      await this.finish(db, job.id, state, reason);
+      if (!row || (state === 'SENT' && (job.direction !== 'outbound' || row.state !== 'SENDING')))
+        return false;
+      await this.finish(db, job, state, reason);
       return true;
     });
   }
@@ -250,16 +313,16 @@ export class MessageQueueRepository {
       const row = await this.owned(db, job);
       if (!row) return;
       if (!paused && row.attempts >= row.max_attempts)
-        await this.finish(db, job.id, 'FAILED', 'attempts_exhausted');
+        await this.finish(db, job, 'FAILED', 'attempts_exhausted');
       else {
         if (paused)
           await db.query(
-            `UPDATE public."ramesh-message-jobs" SET attempts=greatest(0,attempts-1) WHERE message_id=$1`,
+            `UPDATE ${queueTable(job.direction)} SET attempts=greatest(0,attempts-1) WHERE message_id=$1`,
             [job.id],
           );
         await this.requeue(
           db,
-          job.id,
+          job,
           paused ? 'connection_paused' : 'processing_retry',
           paused ? 0 : Math.min(30000, 1000 * 2 ** row.attempts),
         );
