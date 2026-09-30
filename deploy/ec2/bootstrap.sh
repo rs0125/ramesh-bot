@@ -12,7 +12,7 @@ bucket=${3:?Expected private backup bucket}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq ca-certificates curl gnupg git openssh-client tar util-linux awscli sqlite3
+apt-get install -y -qq ca-certificates curl gnupg git openssh-client tar util-linux unzip sqlite3
 install -d -m 0755 /etc/apt/keyrings
 curl --fail --silent --show-error --retry 5 https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/wareongo-nodesource.asc
 gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg /tmp/wareongo-nodesource.asc
@@ -48,6 +48,18 @@ trap 'rm -rf "$bootstrap_dir"' EXIT
 curl --fail --silent --show-error --location --retry 5 "https://codeload.github.com/rs0125/ramesh-bot/tar.gz/$sha" -o "$bootstrap_dir/source.tar.gz"
 tar --extract --gzip --no-same-owner --file="$bootstrap_dir/source.tar.gz" --directory="$bootstrap_dir"
 source_dir="$bootstrap_dir/ramesh-bot-$sha"
+# Ubuntu's minimal repositories do not ship AWS CLI v2. Verify AWS's official installer.
+if [[ ! -x /usr/bin/aws ]]; then
+  curl --fail --silent --show-error --retry 5 https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$bootstrap_dir/awscliv2.zip"
+  curl --fail --silent --show-error --retry 5 https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip.sig -o "$bootstrap_dir/awscliv2.zip.sig"
+  install -d -m 0700 "$bootstrap_dir/gnupg"
+  gpg --batch --homedir "$bootstrap_dir/gnupg" --import "$source_dir/deploy/aws/aws-cli-public-key.asc"
+  aws_key_fingerprint=$(gpg --batch --homedir "$bootstrap_dir/gnupg" --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')
+  [[ "$aws_key_fingerprint" == FB5DB77FD5C118B80511ADA8A6310ACC4672475C ]]
+  gpg --batch --homedir "$bootstrap_dir/gnupg" --verify "$bootstrap_dir/awscliv2.zip.sig" "$bootstrap_dir/awscliv2.zip"
+  unzip -q "$bootstrap_dir/awscliv2.zip" -d "$bootstrap_dir"
+  "$bootstrap_dir/aws/install" --bin-dir /usr/bin --install-dir /usr/local/aws-cli
+fi
 install -o root -g root -m 0644 "$source_dir"/deploy/{ec2-release,release-core,sqlite-backup}.ts /usr/local/lib/wareongo-bot-deploy/
 install -o root -g root -m 0644 "$source_dir/deploy/ec2/backup.ts" /usr/local/lib/wareongo-bot-deploy/ec2/
 install -o root -g root -m 0755 "$source_dir/deploy/ec2/wareongo-bot-deploy" /usr/local/sbin/wareongo-bot-deploy
