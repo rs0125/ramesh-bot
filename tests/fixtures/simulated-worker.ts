@@ -12,7 +12,14 @@ import { createAuthStore } from '../../src/infrastructure/database/auth-store.js
 import { jsonBody } from '../../src/infrastructure/http/json-body.js';
 import type { WhatsAppSession } from '../../src/infrastructure/whatsapp/baileys-session.js';
 
-const config = loadConfig();
+// Dedicated unit tests exercise pacing; browser scenarios do not need real-time delays.
+const config = loadConfig({
+  ...process.env,
+  // Browser fixtures must never inherit the real worker's Supabase connection.
+  MESSAGE_DATABASE_URL: '',
+  REPLY_DELAY_MIN_MS: '0',
+  REPLY_DELAY_MAX_MS: '0',
+});
 const stateDir = process.env.E2E_STATE_DIR;
 if (!stateDir || !stateDir.includes('wareongo-e2e-'))
   throw new Error('Missing isolated test directory');

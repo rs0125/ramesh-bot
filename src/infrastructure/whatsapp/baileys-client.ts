@@ -12,18 +12,26 @@ import { toGreetingCandidate } from './message.mapper.js';
 import { disconnectCode, reconnectDelay } from './reconnect.policy.js';
 import { SerialQueue } from '../../lib/serial-queue.js';
 import { AuthStorageError } from '../database/auth-store.js';
+import type { DurableMessages } from './durable-messages.js';
 
 interface ClientOptions {
   createSession: SessionFactory;
-  handleMessage(message: GreetingCandidate, reply: Reply): Promise<GreetingOutcome>;
+  handleMessage(
+    message: GreetingCandidate,
+    reply: Reply,
+    signal: AbortSignal,
+  ): Promise<GreetingOutcome>;
   onQr(qr: string): void;
   logger: Logger;
   maxPendingMessages?: number;
   retryDelay?: typeof reconnectDelay;
+  durableMessages?: DurableMessages;
 }
 
 export class BaileysClient {
   private session?: WhatsAppSession;
+  private replies?: AbortController;
+  private consuming?: Promise<void>;
   private unsubscribe: Array<() => void> = [];
   private running = false;
   private opening?: Promise<void>;
@@ -68,10 +76,11 @@ export class BaileysClient {
     }
   }
 
-  /** Stop accepting messages, drain accepted work, then close the socket and save auth. */
+  /** Cancel unsent replies, finish any active send, then close the socket and save auth. */
   stop(): Promise<void> {
     if (this.closing) return this.closing;
     this.running = false;
+    this.replies?.abort();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.update('disconnecting', 'Disconnecting WhatsApp');
@@ -105,6 +114,8 @@ export class BaileysClient {
       return;
     }
     this.session = session;
+    const replies = new AbortController();
+    this.replies = replies;
     this.unsubscribe = [
       session.on('connection.update', (update) => this.connectionChanged(session, update)),
       session.on('creds.update', () => {
@@ -116,11 +127,17 @@ export class BaileysClient {
           });
       }),
       session.on('messages.upsert', (event) => {
-        if (event.type !== 'notify' || !this.running || this.session !== session) return;
+        if (
+          event.type !== 'notify' ||
+          !this.running ||
+          this.session !== session ||
+          replies.signal.aborted
+        )
+          return;
         // A single chain preserves order across batches; no unobserved async event work.
         for (const message of event.messages) {
           const admitted = this.messages.push(
-            () => this.processMessages(session, [message]),
+            () => this.processMessages(session, [message], replies.signal),
             (error) => this.options.logger.error({ err: error }, 'Message processing failed'),
           );
           if (!admitted) this.status.metrics.dropped++;
@@ -142,8 +159,27 @@ export class BaileysClient {
     if (update.connection === 'open') {
       this.reconnectAttempts = 0;
       this.update('connected', 'WhatsApp connected');
+      if (this.options.durableMessages && this.replies && !this.consuming) {
+        this.consuming = this.options.durableMessages.consume(
+          session,
+          this.replies.signal,
+          (outcome) => {
+            if (outcome === 'sent') {
+              this.status.metrics.replied++;
+              this.record('Replied hello');
+            } else {
+              this.status.metrics.errors++;
+              this.options.logger.error(
+                'Durable message queue operation failed; inspect stored state',
+              );
+              this.record('Message queue needs attention; see worker logs', 'error');
+            }
+          },
+        );
+      }
     }
     if (update.connection !== 'close') return;
+    this.replies?.abort();
     this.scheduleReconnect(disconnectCode(update.lastDisconnect?.error));
   }
 
@@ -172,6 +208,7 @@ export class BaileysClient {
     if (this.storageFailed) return;
     this.storageFailed = true;
     this.running = false;
+    this.replies?.abort();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.options.logger.error({ err: error }, 'Could not persist WhatsApp authentication');
@@ -188,30 +225,50 @@ export class BaileysClient {
       });
   }
 
-  private async processMessages(session: WhatsAppSession, messages: WAMessage[]): Promise<void> {
+  private async processMessages(
+    session: WhatsAppSession,
+    messages: WAMessage[],
+    signal: AbortSignal,
+  ): Promise<void> {
     for (const message of messages) {
-      if (session !== this.session || this.storageFailed) return;
+      // Durable mode finishes persisting already-admitted events even after a disconnect.
+      if (
+        session !== this.session ||
+        (!this.options.durableMessages && (this.storageFailed || signal.aborted))
+      )
+        return;
       try {
         const candidate = toGreetingCandidate(message, session.botJids);
         if (!candidate) continue;
         this.status.metrics.received++;
-        const outcome = await this.options.handleMessage(candidate, (text) =>
-          session.reply(message, text),
-        );
+        const outcome = this.options.durableMessages
+          ? await this.options.durableMessages.enqueue(message, candidate)
+          : await this.options.handleMessage(
+              candidate,
+              (text) => session.reply(message, text),
+              signal,
+            );
         if (outcome === 'sent') {
           this.status.metrics.replied++;
           this.record('Replied hello');
         }
         if (outcome === 'duplicate') this.status.metrics.duplicates++;
+        if (outcome === 'full') this.status.metrics.dropped++;
       } catch (error) {
         this.status.metrics.errors++;
-        this.options.logger.error({ err: error }, 'Greeting failed; claim retained');
+        if (this.options.durableMessages)
+          this.options.logger.error('Could not persist incoming message');
+        else this.options.logger.error({ err: error }, 'Greeting failed; claim retained');
         this.record('A greeting failed; see worker logs', 'error');
       }
     }
   }
 
   private async retireSession(): Promise<void> {
+    this.replies?.abort();
+    this.replies = undefined;
+    await this.consuming;
+    this.consuming = undefined;
     const session = this.session;
     this.session = undefined;
     try {

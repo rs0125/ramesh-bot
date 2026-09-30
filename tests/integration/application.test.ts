@@ -97,3 +97,23 @@ test('readiness, durable disconnect, and admin sessions survive new application 
     await temporary.close();
   }
 });
+
+test('removing Supabase configuration cannot silently reactivate SQLite greeting sends', async () => {
+  const temporary = await temporaryDatabase();
+  await temporary.db.botSetting.create({ data: { key: 'message-storage', value: 'postgres' } });
+  const config = loadConfig({
+    DATABASE_URL: `file:${temporary.path}`,
+    AUTH_ENCRYPTION_KEY: randomBytes(32).toString('base64url'),
+    WORKER_API_TOKEN: 'x'.repeat(32),
+    LOG_LEVEL: 'silent',
+  });
+  const app = createApplication(config, pino({ level: 'silent' }), {
+    createSession: async () => assert.fail('No WhatsApp session may be opened'),
+  });
+  try {
+    await assert.rejects(app.start(), /MESSAGE_DATABASE_URL is required/);
+  } finally {
+    await app.stop();
+    await temporary.close();
+  }
+});

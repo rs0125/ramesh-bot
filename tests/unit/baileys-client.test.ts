@@ -7,6 +7,9 @@ import { DisconnectReason, type BaileysEventMap, type WAMessage } from '@whiskey
 import { BaileysClient } from '../../src/infrastructure/whatsapp/baileys-client.js';
 import type { WhatsAppSession } from '../../src/infrastructure/whatsapp/baileys-session.js';
 import { reconnectDelay } from '../../src/infrastructure/whatsapp/reconnect.policy.js';
+import { createReplyDelay } from '../../src/lib/reply-delay.js';
+import { GreetingService } from '../../src/modules/greetings/greeting.service.js';
+import { MemoryGreetingRepository } from '../fixtures/greeting-repository.js';
 
 class FakeSession implements WhatsAppSession {
   readonly events = new EventEmitter();
@@ -35,7 +38,7 @@ const message = (id: string): WAMessage => ({
   messageTimestamp: Date.now() / 1000,
 });
 
-test('stop drains admitted messages and final credential writes before closing', async () => {
+test('stop finishes active work, skips queued messages, and saves final credentials', async () => {
   const session = new FakeSession();
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
@@ -65,7 +68,7 @@ test('stop drains admitted messages and final credential writes before closing',
   assert.equal(session.closed, false);
   release();
   await stopping;
-  assert.deepEqual(seen, ['first', 'second']);
+  assert.deepEqual(seen, ['first']);
   assert.equal(session.closed, true);
   assert.equal(session.saved, 1);
   assert.equal(client.getStatus().state, 'stopped');
@@ -109,8 +112,22 @@ test('pairing state is transient, terminal logout requires manual reconnect, and
 });
 
 test('reconnect delays are bounded and revoked sessions are terminal', () => {
-  assert.equal(reconnectDelay(undefined, 0), 1000);
-  assert.equal(reconnectDelay(undefined, 100), 30_000);
+  assert.equal(
+    reconnectDelay(undefined, 0, () => 0),
+    500,
+  );
+  assert.equal(
+    reconnectDelay(undefined, 0, () => 1 - Number.EPSILON),
+    1000,
+  );
+  assert.equal(
+    reconnectDelay(undefined, 100, () => 0),
+    15_000,
+  );
+  assert.equal(
+    reconnectDelay(undefined, 100, () => 1 - Number.EPSILON),
+    30_000,
+  );
   assert.equal(reconnectDelay(DisconnectReason.restartRequired, 5), 500);
   assert.equal(reconnectDelay(DisconnectReason.connectionReplaced, 0), null);
 });
@@ -141,9 +158,58 @@ test('a flood is bounded and admitted messages drain in order', async () => {
   await tick();
   assert.equal(client.getStatus().metrics.dropped, 97);
   release();
+  await tick();
   await client.stop();
   assert.deepEqual(seen, ['0', '1', '2']);
 });
+
+for (const cause of ['stop', 'connection loss', 'storage failure'] as const) {
+  test(`${cause} cancels delayed replies and skips queued messages`, async () => {
+    const session = new FakeSession();
+    const repository = new MemoryGreetingRepository();
+    const service = new GreetingService(
+      repository,
+      300_000,
+      Date.now,
+      createReplyDelay({ minMs: 60_000, maxMs: 60_000 }),
+    );
+    session.reply = async () => {
+      assert.fail('pending replies must be cancelled');
+    };
+    const client = new BaileysClient({
+      createSession: async () => session,
+      logger: pino({ level: 'silent' }),
+      onQr() {},
+      handleMessage: (candidate, reply, signal) => service.handle(candidate, reply, signal),
+    });
+    await client.start();
+    session.events.emit('messages.upsert', {
+      type: 'notify',
+      messages: [message('waiting'), message('queued')],
+    });
+    await tick();
+    assert.equal(repository.claims.size, 1);
+    if (cause === 'connection loss') {
+      session.events.emit('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: DisconnectReason.connectionLost } } },
+      });
+    } else if (cause === 'storage failure') {
+      session.saveCredentials = async () => {
+        throw new Error('disk full');
+      };
+      session.events.emit('creds.update', {});
+    } else {
+      await client.stop();
+    }
+    await tick();
+    assert.equal(client.getStatus().metrics.replied, 0);
+    assert.equal(client.getStatus().metrics.errors, 0);
+    assert.deepEqual([...repository.claims.values()], ['CLAIMED']);
+    await client.stop();
+    assert.equal(session.closed, true);
+  });
+}
 
 test('transient session creation failures continue retrying and can recover', async () => {
   let attempts = 0;

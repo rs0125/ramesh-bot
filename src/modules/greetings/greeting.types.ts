@@ -21,4 +21,6 @@ export interface GreetingRepository {
 }
 
 export type Reply = (text: string) => Promise<void>;
+/** False means the pending reply was cancelled before sending. */
+export type BeforeReply = (signal?: AbortSignal) => Promise<boolean>;
 export type GreetingOutcome = 'ignored' | 'duplicate' | 'sent';

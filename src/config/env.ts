@@ -1,5 +1,6 @@
 /** Validates environment input once, before the application opens any resources. */
 import type { LevelWithSilent } from 'pino';
+import type { MessageDatabaseConfig } from '../infrastructure/database/message-pool.js';
 
 export interface AppConfig {
   readonly databaseUrl: string;
@@ -9,10 +10,12 @@ export interface AppConfig {
   readonly release: string;
   readonly api: { readonly host: string; readonly port: number; readonly token: string };
   readonly autoConnect: boolean;
+  readonly messageDatabase?: MessageDatabaseConfig;
   readonly whatsapp: {
     readonly maxMessageAgeMs: number;
     readonly maxPendingMessages: number;
     readonly sendTimeoutMs: number;
+    readonly replyDelay: { readonly minMs: number; readonly maxMs: number };
     readonly printQr: boolean;
   };
 }
@@ -24,6 +27,15 @@ function positiveInteger(env: NodeJS.ProcessEnv, key: string, fallback: number):
   if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${key} must be a positive integer`);
   }
+  return value;
+}
+
+function nonNegativeInteger(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 0)
+    throw new Error(`${key} must be a non-negative integer`);
   return value;
 }
 
@@ -51,6 +63,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (maxPendingMessages > 1000) throw new Error('MAX_PENDING_MESSAGES must be at most 1000');
   const sendTimeoutMs = positiveInteger(env, 'SEND_TIMEOUT_MS', 15_000);
   if (sendTimeoutMs > 60_000) throw new Error('SEND_TIMEOUT_MS must be at most 60000');
+  const replyDelay = {
+    minMs: nonNegativeInteger(env, 'REPLY_DELAY_MIN_MS', 1500),
+    maxMs: nonNegativeInteger(env, 'REPLY_DELAY_MAX_MS', 4000),
+  };
+  if (replyDelay.minMs > replyDelay.maxMs || replyDelay.maxMs > 60_000)
+    throw new Error(
+      'Reply delay must satisfy 0 <= REPLY_DELAY_MIN_MS <= REPLY_DELAY_MAX_MS <= 60000',
+    );
   const maxAgeSeconds = positiveInteger(env, 'MAX_MESSAGE_AGE_SECONDS', 300);
   if (maxAgeSeconds > 86_400) throw new Error('MAX_MESSAGE_AGE_SECONDS must be at most 86400');
   const shutdownTimeoutMs = positiveInteger(env, 'SHUTDOWN_TIMEOUT_MS', 10_000);
@@ -62,15 +82,38 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     shutdownTimeoutMs,
     encryptionKey,
     release,
+    messageDatabase: messageDatabaseConfig(env),
     whatsapp: {
       maxMessageAgeMs: maxAgeSeconds * 1000,
       maxPendingMessages,
       sendTimeoutMs,
+      replyDelay,
       printQr: booleanValue(env, 'PRINT_QR', false),
     },
     api: apiConfig(env),
     autoConnect: booleanValue(env, 'WHATSAPP_AUTO_CONNECT', false),
   };
+}
+
+function messageDatabaseConfig(env: NodeJS.ProcessEnv): MessageDatabaseConfig | undefined {
+  if (!env.MESSAGE_DATABASE_URL?.trim()) return undefined;
+  let url: URL;
+  try {
+    url = new URL(env.MESSAGE_DATABASE_URL);
+  } catch {
+    throw new Error('MESSAGE_DATABASE_URL must be a PostgreSQL URL');
+  }
+  if (
+    !['postgres:', 'postgresql:'].includes(url.protocol) ||
+    decodeURIComponent(url.username).split('.')[0] !== 'ramesh_worker'
+  )
+    throw new Error('MESSAGE_DATABASE_URL must use the dedicated ramesh_worker PostgreSQL login');
+  const accountId = env.MESSAGE_ACCOUNT_ID ?? 'primary';
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(accountId)) throw new Error('Invalid MESSAGE_ACCOUNT_ID');
+  const pollMs = positiveInteger(env, 'MESSAGE_QUEUE_POLL_MS', 5000);
+  if (pollMs < 250 || pollMs > 30000)
+    throw new Error('MESSAGE_QUEUE_POLL_MS must be between 250 and 30000');
+  return { url: url.toString(), ca: env.MESSAGE_DB_SSL_CA, accountId, pollMs };
 }
 
 function booleanValue(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {

@@ -10,6 +10,10 @@ import { createSessionFactory } from '../infrastructure/whatsapp/baileys-session
 import { GreetingService } from '../modules/greetings/greeting.service.js';
 import { PrismaAdminAccess } from '../infrastructure/database/admin-access.js';
 import type { SessionFactory } from '../infrastructure/whatsapp/baileys-session.js';
+import { createReplyDelay } from '../lib/reply-delay.js';
+import { createMessagePool } from '../infrastructure/database/message-pool.js';
+import { MessageQueueRepository } from '../infrastructure/database/message-queue.repository.js';
+import { DurableMessages } from '../infrastructure/whatsapp/durable-messages.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -23,11 +27,35 @@ export function createApplication(
   overrides: { createSession?: SessionFactory } = {},
 ): Application {
   const db = createPrismaClient(config.databaseUrl);
+  const messagePool = config.messageDatabase
+    ? createMessagePool(config.messageDatabase, () =>
+        logger.error('Message database connection failed'),
+      )
+    : undefined;
+  const messageRepository =
+    messagePool && config.messageDatabase
+      ? new MessageQueueRepository(messagePool, config.messageDatabase.accountId)
+      : undefined;
+  const durableMessages =
+    messageRepository && config.messageDatabase
+      ? new DurableMessages(messageRepository, {
+          encryptionKey: config.encryptionKey,
+          maxAgeMs: config.whatsapp.maxMessageAgeMs,
+          capacity: config.whatsapp.maxPendingMessages,
+          // Covers maximum pacing, send deadline, and database round trips without renewal.
+          leaseMs: config.whatsapp.replyDelay.maxMs + config.whatsapp.sendTimeoutMs + 30000,
+          pollMs: config.messageDatabase.pollMs,
+          waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
+        })
+      : undefined;
   const greetings = new GreetingService(
     new PrismaGreetingRepository(db),
     config.whatsapp.maxMessageAgeMs,
+    Date.now,
+    createReplyDelay(config.whatsapp.replyDelay),
   );
   const whatsapp = new BaileysClient({
+    durableMessages,
     createSession:
       overrides.createSession ??
       createSessionFactory(
@@ -39,7 +67,7 @@ export function createApplication(
         ),
         config.whatsapp.sendTimeoutMs,
       ),
-    handleMessage: (message, reply) => greetings.handle(message, reply),
+    handleMessage: (message, reply, signal) => greetings.handle(message, reply, signal),
     logger: logger.child({ module: 'whatsapp' }),
     maxPendingMessages: config.whatsapp.maxPendingMessages,
     onQr: (qr) => {
@@ -74,6 +102,7 @@ export function createApplication(
       health: async () => {
         if (!ready) throw new Error('Worker not ready');
         await db.$queryRaw`SELECT 1`;
+        await messageRepository?.health();
         return { release: config.release };
       },
     },
@@ -88,6 +117,23 @@ export function createApplication(
       if (stopped) return Promise.reject(new Error('Application is stopping'));
       return (starting ??= (async () => {
         await db.greeting.count(); // Check connectivity and migrations before exposing controls.
+        const storage = await db.botSetting.findUnique({ where: { key: 'message-storage' } });
+        if (storage?.value === 'postgres' && !messageRepository)
+          throw new Error(
+            'MESSAGE_DATABASE_URL is required after durable message storage has been enabled',
+          );
+        if (messageRepository) {
+          await messageRepository.health();
+          // Existing local claims suppress replies after the storage transition too.
+          await messageRepository.importLegacy(await db.greeting.findMany());
+          await messageRepository.clean();
+          await db.botSetting.upsert({
+            where: { key: 'message-storage' },
+            create: { key: 'message-storage', value: 'postgres' },
+            update: { value: 'postgres' },
+          });
+          logger.info('Message state and reply queue use PostgreSQL');
+        }
         await adminAccess.clean();
         if (stopped) return;
         await api.start(config.api.host, config.api.port);
@@ -95,6 +141,7 @@ export function createApplication(
         maintenance = setInterval(() => {
           cleaning = cleaning
             .then(() => adminAccess.clean())
+            .then(() => messageRepository?.clean())
             .catch((error) => logger.error({ err: error }, 'State cleanup failed'));
         }, 3_600_000);
         maintenance.unref();
@@ -119,6 +166,7 @@ export function createApplication(
           } finally {
             await cleaning;
             await db.$disconnect();
+            await messagePool?.end();
           }
         }
       })());
