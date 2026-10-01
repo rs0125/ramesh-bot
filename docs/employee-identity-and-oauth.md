@@ -1,5 +1,7 @@
 # Employee identity and Context Engine OAuth
 
+> The preferred Ramesh integration is now [signed Context Engine access](signed-context-auth.md), which needs no employee OAuth enrollment or grant storage. This document describes the retained optional OAuth adapter and its recovery procedures. Trusted phone/LID and roster rules still apply.
+
 Implemented on **1 October 2026**. This is the concrete adapter behind `ContextCredentialResolver`, ready for the future tool worker. The conversational graph still contains only converser and formatter. Unknown users can chat; neither chat text nor phone recognition alone authorizes business reads. No planner, worker, verifier, reminder, or write tools are activated by this increment.
 
 ## Trust boundary

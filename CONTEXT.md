@@ -1,6 +1,6 @@
 # Ramesh: product context and decisions
 
-Initial context captured on **2026-09-30**; implementation status updated on **2026-10-01** through the identity/OAuth increment. This preserves product decisions and earlier options. See the [implementation reference](docs/current-implementation.md) for current behavior and the [consolidated architecture plan](docs/assistant-architecture-plan.md) for the supplied system design, research, and roadmap.
+Initial context captured on **2026-09-30**; updated on **2026-10-01** through signed Context Engine access. This preserves earlier options; the [implementation reference](docs/current-implementation.md) and [architecture plan](docs/assistant-architecture-plan.md) describe the current direction.
 
 ## Current scope
 
@@ -14,7 +14,7 @@ Supabase now holds `ramesh-inbound-queue`, `ramesh-outbound-queue`, message stat
 
 Local chat testing uses the isolated SQLite playground at `http://127.0.0.1:3012`; it captures replies without opening WhatsApp or connecting to Supabase. Live model evaluations also use fake delivery. Queue integration tests use a separate local PostgreSQL database, never the production queue. **Do not send real WhatsApp test messages or start a second process with the production pairing.**
 
-CRM, supply, and knowledge MCP services are scaffolded in this repository but are not wired into the graph. The default credential resolver grants no access. A concrete adapter now implements trusted phone/LID resolution, active employee checks, PKCE enrollment, encrypted OAuth storage, serialized refresh, expiry and revocation. Unknown users can chat without business access. Planner/worker/verifier agents, reminders, SLA notifications, and writes remain future work. Dedicated CRM/WAG/HRMS backend read endpoints are deferred; the existing Context Engine remains the intended read boundary.
+CRM, supply and knowledge services remain outside the active graph. `createSignedEmployeeContextAccess` now supplies trusted phone/LID resolution, live active-employee checks and signed requests to the parallel Context Engine endpoint. No employee OAuth enrollment is needed. Unknown users can chat without business access. Planner/worker/verifier, reminders and writes remain future work; dedicated domain endpoints remain deferred.
 
 ## Intended product
 
@@ -27,12 +27,12 @@ The harness should own WhatsApp connections, trigger rules, scheduling, permissi
 The user's direction: **scope authorization to the person messaging the bot, and allow only open-to-the-organisation information in group chats**.
 
 1. Resolve the authenticated sender's phone/JID to an active `VerifiedNumber` employee. Resolve WhatsApp LIDs through trustworthy protocol mappings; never infer an identity from a display name or message text.
-2. Use that person's Context Engine credentials for personal CRM reads. Do not use a single administrator token for all employees. Treat the credential mapping and OAuth lifecycle as server-side concerns.
+2. Use the resolved immutable employee ID and current permissions for personal reads. A service signature authenticates Ramesh; Context Engine independently authorizes the employee. The model cannot choose an actor.
 3. Keep group output to help, generic acknowledgements, and an explicitly reviewed organisation-wide knowledge source. An employee's personal CRM access does not make their lead data safe to publish to a group.
 4. Route personal CRM results and reminder details to the requesting employee's DM. Tools should not accept arbitrary destinations or a user-selected identity.
 5. Recheck active employee status and permissions when executing work. A future group knowledge policy also needs to consider guest/external group members: open within the organisation does not mean public.
 
-The active conversational graph does not look up employees or load business credentials. The MCP scaffold enforces a supplied employee grant, DM audience, tool allowlist, and server identity match. The trusted identity and credential adapters are implemented through `createEmployeeContextAccess`; explicit worker integration and pilot enrollment remain separate steps. See the [enrollment runbook](docs/employee-identity-and-oauth.md).
+The active conversational graph does not load business credentials. The inactive services enforce trusted identity, DM audience, read allowlists and server identity match. Explicit worker integration remains a separate step. See [signed access](docs/signed-context-auth.md); the legacy OAuth factory is optional.
 
 ## Selected AI and MCP direction
 
@@ -48,7 +48,7 @@ Earlier options, retained for context:
 - Cap steps, tokens, and per-person daily spend. Keep API keys server-side. Audit triggers, tool calls, results, and responses with suitable access controls and retention; use representative, sanitized runs as a regression set.
 - Ground CRM answers in successful tool results, citing returned lead IDs/links and exposing missing or stale data rather than guessing.
 
-**Repo finding:** `/mcp` accepts employee OAuth access tokens (`wog_mcp_at_…`), not raw employee REST keys (`wog_ctx_…`). Access tokens last up to 15 minutes; refresh grants are bounded by the employee key/grant expiry. The concrete adapter implements enrollment, encrypted storage, serialized rotation, revocation, and current roster checks. Real enrollment uses explicit consent and an owned callback; a shared static token is not the integration contract.
+**Current contract:** `/mcp` retains Claude OAuth. `/mcp/ramesh` accepts first-party Ed25519 request signatures with exact employee, method, URL, body digest, short expiry and one-use nonce. Context Engine independently checks current roster permissions. It stores only nonce hashes/expiry for this path; no employee grant is required.
 
 ## Transport options discussed
 
@@ -85,4 +85,4 @@ Paths below are relative to this folder. The initial organisational inspection w
 
 CRM-Automations uses Supabase `pg_cron`/`pg_net` to call secret-protected HTTP workers. Its “meaningful update” clock combines manual business-field changes with separate note/task activity streams; Twenty's generic `updatedAt` is not a substitute. The bot should reuse those clocks and the existing sync rather than create another poller.
 
-Next: configure the owned OAuth callback, enroll pilot employees, then wire the existing identity/OAuth and MCP services into private CRM reads with evidence verification when worker development resumes. Supply assistance follows. Reminder tools and due-time evaluation come later, reusing CRM-Automations' rules and the settled escalation order: **assignee(s), then existing CRM admins**. The outbound queue is already present; long-lived reminder state, cancellation, recipient checks, and escalation scheduling are not. Keep bot-owned migrations separate from shared business schemas.
+Next: configure the service keys/replay storage, then wire trusted identity and scoped services into one private read with evidence verification when worker development resumes. Supply assistance follows. Reminder tools and due-time checks come later, reusing CRM-Automations rules and **assignee(s), then existing CRM admins** escalation. Long-lived reminder state, cancellation and recipient rechecks remain to build.

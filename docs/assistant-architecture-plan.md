@@ -2,11 +2,11 @@
 
 Date: **1 October 2026**
 
-Status: **Living design and implementation plan, updated through the identity/OAuth increment**
+Status: **Living design and implementation plan, updated through signed Context Engine access**
 
 This document consolidates the discussion about moving WareOnGo's basic OpenClaw assistant functions into the in-house Baileys bot. It covers CRM and supply reads, the conversational agent loop, reminders and escalation, later writes, migration, and evaluation.
 
-The conversational pilot, separate inbound/outbound queues, and inactive MCP service scaffold are implemented and have passed CI and EC2 deployment. Sections 18–20 describe those increments. Trusted employee identity and encrypted OAuth lifecycle adapters are now implemented; section 21 describes their boundary and enrollment requirements. Tool-using agents, reminders, and writes remain proposed. Organisational source observations come from repository inspection; this does not establish current live CRM data or scheduler behavior. The [implementation reference](current-implementation.md) covers the running bot and the [operations guide](ec2-operations.md) covers its private EC2 deployment.
+The conversational pilot, separate inbound/outbound queues and inactive MCP services are implemented. Sections 18–20 describe those foundations. Section 21 preserves the optional OAuth adapter; section 22 defines the preferred signed first-party integration with no employee enrollment. Tool-using agents, reminders and writes remain proposed. Repository observations do not establish current live CRM or scheduler behavior.
 
 ## 1. Requirements and recommended decisions
 
@@ -40,7 +40,7 @@ The conversational pilot, separate inbound/outbound queues, and inactive MCP ser
 | Deployment       | Extend the existing worker with modules; retain the separate admin app                                  | These boundaries do not initially require more independently deployed services.                      |
 | Persistence      | Keep SQLite for WhatsApp session state initially; use private Postgres tables for shared workflow state | CRM-Automations and the bot need durable coordination.                                               |
 
-OpenAI Terra/LangGraph, the queue split, and MCP as the read integration boundary are selected. The graph currently has only two stages. Employee identity and OAuth enrollment are implemented as separate services/commands; live pilot consent, callback setup, and business workflows remain. Exact notification cadence and write policies remain open.
+OpenAI Terra/LangGraph, the queue split and MCP reads are selected. The graph has only two stages. Trusted identity and signed request services are implemented separately and remain disconnected from it. Service-key setup and future worker integration replace employee OAuth enrollment. Exact notification cadence and write policies remain open.
 
 The deferred endpoint refactor applies to the internal implementation of business reads. Ramesh still calls bounded, employee-scoped Context Engine tools. Later CRM writes must use Twenty, and supply changes must preserve WAG's validation and review paths. HRMS remains a future integration whose capabilities and permissions need mapping.
 
@@ -76,7 +76,7 @@ The existing TypeScript worker provides:
 - Separate durable inbound/outbound queues, reconnect handling, bounded admission, send deadlines, and cancellation of unsent replies.
 - OpenAI Terra converser/formatter nodes, bounded process-local memory, an isolated SQLite chat GUI, and a live-model evaluation harness.
 - An inactive Context Engine MCP service scaffold with employee-grant checks and read-only tool discovery.
-- Trusted phone/LID resolution to the active roster and an encrypted OAuth adapter with PKCE enrollment, serialized rotation, expiry, and revocation.
+- Trusted phone/LID resolution to the active roster and a signed request adapter; the earlier OAuth lifecycle implementation remains optional.
 - A separate Next.js admin application for pairing, status, and connection controls.
 - One send attempt per claimed greeting; uncertain sends retain the claim. This is not a delivery guarantee.
 
@@ -99,7 +99,7 @@ Context Engine already exposes read-only REST and MCP interfaces for:
 
 Current access rules distinguish ordinary employees from Analysts and roster admins. Standard employee CRM visibility is based on verified creation or assignment; Analysts/admins can have all-lead access. Warehouse access requires the appropriate dashboard/admin capability. Credentials narrow current permissions.
 
-The REST API accepts employee context keys. The MCP endpoint accepts employee OAuth access tokens; using MCP requires grant provisioning, token refresh, expiry, and revocation handling. A raw REST key is not interchangeable with an MCP access token.
+The REST API accepts employee context keys. Claude retains OAuth at `/mcp`. Ramesh uses a parallel `/mcp/ramesh` route with signed employee-scoped requests, current roster authorization and a Supabase nonce cache. A raw REST key is not an MCP credential.
 
 The service also returns source status, bounded results, redacted narrative context, and uncertainty evidence. The inspected implementation refuses CRM reads when the opportunity sync is unhealthy or older than 30 minutes; note/task stream degradation is reported separately.
 
@@ -135,7 +135,7 @@ Sources: [current routing](../../../whatsapp-logistics-bot/src/routes/whatsapp.j
 
 ### System design from the discussion
 
-The diagram below was supplied during the discussion on 1 October 2026. It captures the target direction: durable inbound/outbound queues, one agent runtime, and employee-scoped business reads through the existing Context Engine. The queues, converser, and formatter are implemented; the planner, tool worker, verifier, and employee identity/OAuth wiring remain deferred. Dedicated domain-backend read endpoints remain deferred.
+The diagram below was supplied on 1 October 2026. It captures durable queues, one agent runtime and employee-scoped reads through Context Engine. The queues, converser, formatter, identity resolver and signed credential adapter are implemented; tool-using agents and their graph integration remain deferred. Dedicated domain read endpoints remain deferred.
 
 ![Ramesh system design: WhatsApp and Baileys, Supabase data and message queues, the conversational agent loop, and Context/MCP with employee-scoped access](assets/ramesh-system-design.png)
 
@@ -193,11 +193,11 @@ The roster-resolution adapter is implemented: a normalized phone must match exac
 
 ### Employee credentials
 
-For an initial pilot, associate each employee with their own Context Engine OAuth grant through a secure setup flow. Verify that the MCP `get_context` tool returns the resolved employee ID. Store credentials encrypted, keep them out of messages/prompts/logs, and support expiry, replacement, revocation, and offboarding.
+For the first-party pilot, use `createSignedEmployeeContextAccess`. A service private key signs each request with the trusted employee identity, body, endpoint, time window and nonce. Context Engine verifies the public key and independently checks the live employee and current permissions. Verify `get_context.employee_id` before business tools. No employee OAuth grant, callback or refresh-token table is required.
 
-The employee-facing sign-in is the verified WhatsApp sender identity. Provision the matching Context Engine credential on the server; do not ask employees to paste API keys into WhatsApp. Phone recognition does not itself create a Context Engine credential, so this binding is required before the first scoped CRM request. A later authenticated delegation mechanism can replace per-employee credential provisioning while retaining the same authorisation boundary.
+The employee-facing identity is the trusted WhatsApp sender. Phone recognition alone cannot authenticate an arbitrary API caller: a valid service signature is also required. The signing key stays on the worker and is inaccessible to the model. The public key is registered only for bounded read scopes. A compromised service key can assert employees, so this design trusts the gateway and requires protected hosts, key rotation and live permission checks.
 
-Do not reuse one administrator credential for everyone's interactive requests. `EmployeeContextCredentials` now implements PKCE enrollment, encrypted persistence, fenced refresh rotation, expiry, revocation, and exact-token invalidation after MCP 401s. Live enrollment needs an owned allowlisted callback and explicit employee consent. Background notification jobs will use a separately authorised automation capability limited to their workflow and intended recipients; employee grants do not automatically authorize proactive sends.
+Claude keeps its existing employee OAuth flow; the older Ramesh OAuth adapter remains optional. Supabase stores only nonce hashes and expiry for signed replay protection. Current identity is checked on each request. Background reminders still need a separately authorized automation workflow, due-time recipient checks and delivery policy; service authentication alone does not authorize proactive sends.
 
 ### DM and group boundaries
 
@@ -522,7 +522,7 @@ Code-based checks establish deterministic conditions. Model rubrics assess expla
 
 ## 16. Delivery milestones
 
-Delivered foundation: the two-node Terra/LangGraph conversational pilot, local SQLite GUI/evals, durable queue split, and inactive MCP service scaffold. These increments have passed worker CI and EC2 deployment. The identity/OAuth adapter is now implemented and tested. Owned callback setup, actual pilot enrollment, and the following business milestones remain.
+Delivered foundation: two-node Terra/LangGraph conversation, isolated SQLite GUI/evals, separate Supabase message queues, inactive MCP services, trusted employee identity and signed first-party credentials. Service configuration and explicit worker/verifier integration precede the following business milestones. Employee OAuth enrollment is not required for the selected path.
 
 | Milestone                   | Deliverable                                                                                                   | Exit evidence                                                                                                                   |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -605,9 +605,9 @@ The reusable boundary is implemented inside this repository. It is not imported 
 | `src/modules/context-engine/context.service.ts`   | CRM, supply and knowledge methods for a bound sender                                          |
 | `src/infrastructure/context-engine/mcp-client.ts` | MCP discovery/calls, employee binding, bounded transport and result validation                |
 
-The client uses `@modelcontextprotocol/client` 2.1.0, matching the inspected Context Engine client SDK. It uses Streamable HTTP at the configured `/mcp` URL. HTTPS is required except for explicit loopback development URLs. Requests stay on that exact URL and refuse redirects. No stdio processes, arbitrary HTTP tools, sampling, or consent automation are exposed. The [official TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) documents the client package and transport; Context Engine's [MCP catalogue](../../Context_Engine/src/lib/mcp.ts) and [OAuth implementation](../../Context_Engine/src/lib/mcp-oauth.ts) define the application-specific contracts.
+The client uses `@modelcontextprotocol/client` 2.1.0 and Streamable HTTP. Signed credentials require `/mcp/ramesh`; optional OAuth credentials require `/mcp`. HTTPS is required except on loopback. Requests stay on the configured URL and refuse redirects; stdio processes, arbitrary HTTP tools, sampling and consent automation are not exposed.
 
-`ContextCredentialResolver.resolve` is an injected server-side port, now implemented by `EmployeeContextCredentials`. `createEmployeeContextAccess` derives a trusted WhatsApp phone/LID, resolves one current active employee, loads that employee's encrypted grant, serializes rotation, and returns a valid short-lived MCP access token. The MCP client checks normalized phone binding, active status and token expiry, then verifies the server-reported employee ID via `get_context` before any business tool. REST keys are rejected. The lower-level factory still defaults to no grant, and the chat graph remains disconnected. OAuth tokens and phone identity are never model-visible tool arguments.
+`ContextCredentialResolver.resolve` is a server-side port implemented by `SignedEmployeeCredentials` for the selected path and `EmployeeContextCredentials` for optional legacy OAuth. The signed factory derives the trusted sender and active employee, rechecks them per POST, and signs a short-lived body-bound request. The MCP client checks binding/expiry and verifies the server employee through `get_context` before any business tool. Identity and secrets stay outside model arguments; the graph remains disconnected.
 
 One connection and tool catalogue belong to one read operation. There is no cross-employee session, token cache or result cache. The server continues to revalidate current scopes and live record permissions on each read. The first service boundary accepts DMs only; group business reads need an explicit audience policy later. A claimed read-only annotation is insufficient on its own: the tool must also be in the local allowlist and the employee's discovered/scoped catalogue.
 
@@ -641,11 +641,13 @@ const evidence = await reads.crm.search(
 // Pass the evidence to the future verifier; retain nextCursor and source metadata.
 ```
 
-Set `CONTEXT_MCP_URL` to the deployed Context Engine `/mcp` endpoint when wiring the feature. The total per-read deadline defaults to 30 seconds and the response limit to 1 MiB. No shared MCP token belongs in the environment. Deployment of this scaffold needs no new production environment setting because the current application does not instantiate it.
+Configure `CONTEXT_MCP_URL` as the deployed `/mcp/ramesh` endpoint and `CONTEXT_RAMESH_SIGNING_KEY_JSON` in the private worker environment. Context Engine needs the public registration and nonce migration. Calls default to a 30-second deadline and 1 MiB response cap. The current graph does not instantiate these services, so settings alone do not activate reads.
 
 Tests use the actual MCP SDK with fake HTTP responses. They cover the wire handshake, discovery and calls, employee mismatch, independent concurrent identities, missing/expired/inactive grants, REST-key rejection, group denial, scope filtering, write rejection, structured/text evidence, safe HTTP/tool failures, response bounds, cancellation and deadlines. They do not connect to Context Engine, read business data, or send WhatsApp messages.
 
-## 21. Implemented identity and OAuth adapter
+## 21. Retained optional identity and OAuth adapter
+
+This earlier implementation remains available for compatibility. Section 22 supersedes its enrollment requirement for normal Ramesh use.
 
 `createEmployeeContextAccess` composes the live employee roster resolver, transport-owned phone/LID mapping, encrypted SQLite store, fixed-origin OAuth client, and existing MCP services. It does not add stages to LangGraph. Unknown users retain ordinary conversation access; unknown, inactive, ambiguous, unenrolled, expired, or revoked identities receive no business credential. Business reads remain DM-only.
 
@@ -654,3 +656,13 @@ The operator starts PKCE enrollment for a roster employee. After explicit consen
 Refresh uses persistent versions and a lease so independent local processes rotate once. Ambiguous refresh results are never replayed. Revocation stops local access before contacting the server, survives restart, and prevents late enrollment/refresh from restoring access. The adapter rechecks the current roster and scopes stay controlled by Context Engine. No shared admin token, automatic consent, or public credential-export endpoint is added.
 
 The [identity/OAuth runbook](employee-identity-and-oauth.md) contains the full trust diagram, table contract, provisioning and enrollment commands, expiry/revocation rules, recovery procedure, and composition example. Tests use synthetic identities/tokens with real SQLite/PostgreSQL and the actual MCP SDK. Live pilot setup still needs an owned allowlisted callback and employee consent; callback hosting, admin enrollment UI, and background revocation scheduling are not part of this increment. Planner, worker, verifier, reminders, and writes remain deferred.
+
+## 22. Signed first-party Context Engine access
+
+`createSignedEmployeeContextAccess` is the selected composition. Trusted WhatsApp phone/LID → one active immutable employee ID → fresh Ed25519 signature → `/mcp/ramesh` → current employee authorization and the existing tools. Claude continues using OAuth at `/mcp`.
+
+Each POST binds issuer, audience, employee, canonical phone, DM audience, HTTP method, exact endpoint, body digest, at-most-60-second lifetime and one-use UUID. Context Engine pins the algorithm/type/key, rejects forged/tampered/expired/replayed requests, and rechecks live identity and scopes within business transactions. Only knowledge, warehouse and CRM reads are eligible. A Supabase primary key atomically enforces nonce uniqueness across instances. Stored replay state contains only hashes and expiry.
+
+No employee OAuth enrollment or refresh storage is needed. SQLite remains the existing linked-device/LID store; old optional OAuth tables are retained without destructive cleanup. The private signing key stays in the protected worker environment. Key overlap supports rotation; removing registrations requires deployment on the server, while employee deactivation uses live roster checks. Gateway/private-key compromise can assert employees, which is the trust boundary of this first-party integration.
+
+The [signed access runbook](signed-context-auth.md) covers configuration, rollout and tests. Synthetic integration tests exercise real JOSE and MCP code, employee/LID checks, no OAuth writes and denied forwarding. Context Engine tests additionally cover real PostgreSQL privileges and replay races. The conversational graph, dummy GUI and evals still have no business tools. Planner, worker, verifier, reminders and writes remain deferred.

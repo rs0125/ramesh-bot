@@ -54,17 +54,18 @@ Readiness checks validate the process, release, and configured databases without
 
 `/etc/wareongo-sales-bot/worker.env` is root-owned mode `0600`. Parameter Store `/ramesh-bot/production/runtime` is a `SecureString` containing the encrypted JSON backup of runtime values. The process reads the host environment on startup; changing Parameter Store alone does not update or restart the worker. Bootstrap preserves an existing host environment, and ordinary releases do not replace it.
 
-| Setting                                       | Production role                                                                            |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `DATABASE_URL`                                | Persistent SQLite auth/admin database                                                      |
-| `AUTH_ENCRYPTION_KEY`, `WORKER_API_TOKEN`     | Existing encryption and private API credentials; preserve across updates                   |
-| `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`   | Dedicated Supabase login and verified TLS                                                  |
-| `MESSAGE_ACCOUNT_ID`                          | Stable message/deduplication namespace                                                     |
-| `OPENAI_API_KEY`                              | Server-side model key; configured without copying it into Git or the admin                 |
-| `OPENAI_MODEL`                                | `gpt-5.6-terra`                                                                            |
-| `AGENT_TIMEOUT_MS`, `AGENT_MAX_OUTPUT_TOKENS` | `45000` and `800`                                                                          |
-| `CONTEXT_MCP_*`                               | Not required by the inactive service scaffold; no shared employee token                    |
-| `CONTEXT_OAUTH_REDIRECT_URI`                  | Needed only for explicit employee enrollment; owned callback allowlisted by Context Engine |
+| Setting                                       | Production role                                                                     |
+| --------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `DATABASE_URL`                                | Persistent SQLite auth/admin database                                               |
+| `AUTH_ENCRYPTION_KEY`, `WORKER_API_TOKEN`     | Existing encryption and private API credentials; preserve across updates            |
+| `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`   | Dedicated Supabase login and verified TLS                                           |
+| `MESSAGE_ACCOUNT_ID`                          | Stable message/deduplication namespace                                              |
+| `OPENAI_API_KEY`                              | Server-side model key; configured without copying it into Git or the admin          |
+| `OPENAI_MODEL`                                | `gpt-5.6-terra`                                                                     |
+| `AGENT_TIMEOUT_MS`, `AGENT_MAX_OUTPUT_TOKENS` | `45000` and `800`                                                                   |
+| `CONTEXT_MCP_*`                               | Not required by the inactive service scaffold; no shared employee token             |
+| `CONTEXT_RAMESH_SIGNING_KEY_JSON`             | Protected service private-key JSON, used by the future signed factory               |
+| `CONTEXT_OAUTH_REDIRECT_URI`                  | Optional legacy OAuth enrollment only; owned callback allowlisted by Context Engine |
 
 For an authorized AWS CLI environment update, read the current SecureString into protected memory/a private temporary file, merge only the intended fields, and preserve all other values. Write the complete merged JSON through `aws ssm put-parameter --cli-input-json file://...` as `SecureString`; avoid secret values in command arguments, logs, or terminal output. Check the expected parameter version before overwriting. Then install the matching host environment atomically with root ownership/mode `0600`, keeping a protected backup. Verify field presence and nonsecret settings, and restart through the normal release process or a controlled service restart. Do not print the decrypted parameter or `worker.env`.
 
@@ -73,7 +74,7 @@ Supabase migrations are separate from release automation. Migrations `2026100100
 ## State and recovery
 
 - Live SQLite database: `/var/lib/wareongo-sales-bot/bot.db`, private to `wareongo-bot`.
-- The identity increment adds encrypted `ContextOAuthGrant`, `ContextOAuthEnrollment`, and `ContextOAuthRevocation` tables through the normal additive Prisma migration. Preserve the existing encryption key and account namespace. After restoring an old grant snapshot, revoke/re-enroll instead of replaying potentially consumed refresh tokens.
+- The retained optional OAuth adapter has encrypted `ContextOAuthGrant`, `ContextOAuthEnrollment`, and `ContextOAuthRevocation` tables through the normal additive Prisma migration. Preserve the existing encryption key and account namespace. After restoring an old grant snapshot, revoke/re-enroll instead of replaying potentially consumed refresh tokens.
 - Supabase: `ramesh-messages`, `ramesh-inbound-queue`, `ramesh-outbound-queue`, `ramesh-message-events`, and `ramesh-schema-migrations`; these are outside the EC2 SQLite snapshots.
 - Runtime secrets: `/etc/wareongo-sales-bot/worker.env`, root-only; a separate encrypted copy lives in Parameter Store at `/ramesh-bot/production/runtime`.
 - Daily consistent database snapshots: the stack's private S3 bucket, `daily/`, encrypted with SSE-S3, expiring after 14 days.
@@ -84,7 +85,7 @@ For restoration, stop the original worker first, retrieve the database snapshot 
 
 Supabase backup/PITR settings were not changed or verified by the queue feature. Preserve pending message/final-reply encryption keys and the current message ledger across recovery. Never automatically resend `UNCERTAIN` rows. Rolling back to a pre-split worker preserves existing outbound rows but cannot deliver them; a split-aware release is needed to drain them.
 
-The identity/OAuth services are ready for explicit composition but are not called by the conversational graph. No production environment update is needed to ship them. Before a live pilot, provision the four roster SELECT columns and owned callback, then run enrollment as the SQLite runtime user with a protected environment file. A pending remote revocation remains denied locally and needs `context:auth retry-revocations`; there is no scheduler for it yet. See the [identity/OAuth runbook](employee-identity-and-oauth.md).
+Signed identity services are ready for explicit composition through `createSignedEmployeeContextAccess`; the conversational graph does not invoke them. Configure the protected service signing key and `/mcp/ramesh` endpoint after the Context Engine rollout. Four-column roster SELECT is required; employee OAuth enrollment is not. See [signed operations](signed-context-auth.md). The optional old OAuth CLI and its recovery commands remain documented separately.
 
 Stack termination protection is enabled. The instance and backup bucket are retained on deletion/replacement. Removing the stack therefore does **not** stop billing for retained resources; inventory and explicitly retire them during decommissioning. Do not replace a paired instance without stopping its old worker.
 

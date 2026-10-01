@@ -171,13 +171,24 @@ export class ContextEngineMcpClient implements ContextToolGateway {
         grant.employeeId <= 0 ||
         !Number.isFinite(grant.expiresAtMs) ||
         grant.expiresAtMs <= Date.now() + this.config.timeoutMs ||
-        !/^wog_mcp_at_[A-Za-z0-9_-]{43}$/.test(grant.accessToken)
+        ('kind' in grant
+          ? grant.kind !== 'signed-request' || typeof grant.authorize !== 'function'
+          : !/^wog_mcp_at_[A-Za-z0-9_-]{43}$/.test(grant.accessToken))
       )
         throw new ContextEngineError('AUTH_REQUIRED');
-      activeGrant = grant;
+      const signed = 'kind' in grant ? grant : undefined;
+      const bearer = 'accessToken' in grant ? grant : undefined;
+      if (
+        (signed && !this.config.endpoint.endsWith('/mcp/ramesh')) ||
+        (bearer && !this.config.endpoint.endsWith('/mcp'))
+      )
+        throw new ContextEngineError('ACCESS_DENIED');
+      activeGrant = bearer;
       const request = { signal, timeout: this.config.timeoutMs };
       const transport = new StreamableHTTPClientTransport(new URL(this.config.endpoint), {
-        requestInit: { headers: { Authorization: `Bearer ${grant.accessToken}` } },
+        requestInit: bearer
+          ? { headers: { Authorization: `Bearer ${bearer.accessToken}` } }
+          : undefined,
         onInsufficientScope: 'throw',
         reconnectionOptions: {
           maxRetries: 0,
@@ -186,8 +197,10 @@ export class ContextEngineMcpClient implements ContextToolGateway {
           reconnectionDelayGrowFactor: 1,
         },
         fetch: async (input, init) => {
-          const outgoing = new Request(input, init);
+          let outgoing = new Request(input, init);
           if (outgoing.url !== this.config.endpoint) throw new ContextEngineError('ACCESS_DENIED');
+          if (signed && outgoing.method === 'POST')
+            outgoing = await signed.authorize(outgoing, signal);
           const response = await this.fetcher(outgoing, {
             redirect: 'error',
             signal: AbortSignal.any([signal, outgoing.signal]),

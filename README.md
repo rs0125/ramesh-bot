@@ -4,7 +4,7 @@ Standalone TypeScript service for the sales team's WhatsApp bot. With an OpenAI 
 
 The Next.js admin lives in the **separate [ramesh-bot-admin repository](https://github.com/rs0125/ramesh-bot-admin)**, with its own dependencies, lockfile and Vercel workflow. These local checkouts are named `baileys-ramesh` and `baileys-ramesh-admin`; cloned directories can use any names. It talks to this worker through the authenticated `/v1` HTTP API. Neither project imports or builds the other.
 
-Documentation reviewed on **1 October 2026**, including the employee identity and OAuth adapters. The conversational flow and queue split are deployed. The MCP services and credential lifecycle are implemented but disconnected from the chat graph; planner, worker, verifier, reminders, and business writes are deferred. The [architecture plan](docs/assistant-architecture-plan.md) contains the supplied system diagram, organisational context, decisions, research, and next milestones.
+Documentation reviewed on **1 October 2026**, including trusted employee identity and signed Context Engine access. The conversational flow and separate Supabase queues are deployed. The MCP services remain disconnected from the chat graph; planner, worker, verifier, reminders and writes are deferred. The [architecture plan](docs/assistant-architecture-plan.md) contains the system diagram, organisational context, research and next milestones.
 
 The inbox addition requires migration `202610010003_inbox.sql` before deploying this worker, followed by the matching admin update. Editing this checkout does not roll it out. See [inbox, context, and operator sends](docs/supabase-message-queue.md#inbox-context-and-operator-sends).
 
@@ -28,11 +28,11 @@ The assistant currently chats and drafts text. CRM, supply, HRMS, reminder tools
 
 The repository now includes a reusable MCP client and thin CRM, supply, and knowledge services. They are scaffolded for the future worker and are **not connected to the current chat graph**. `createContextEngineServices` in `src/app/context-engine.ts` is the composition point; it requires endpoint configuration and an employee credential resolver. The default resolver grants no access.
 
-Each read uses a fresh MCP connection, discovers permitted read tools, and checks `get_context.employee_id` against the verified employee before calling a business tool. Credentials are employee OAuth access tokens, never the REST key or a shared admin token. Results retain source IDs, cursors, freshness, access scope, and uncertainty for later verification. Requests have a total deadline, response-size limits, cancellation, and redacted errors. Tests exercise the real SDK with synthetic HTTP responses.
+Each read uses a fresh MCP connection, discovers permitted read tools and checks `get_context.employee_id` against the verified employee before a business tool. The preferred adapter signs employee-scoped requests to `/mcp/ramesh` with a service key; Context Engine independently enforces current employee permissions. Results retain source IDs, cursors, freshness, access scope and uncertainty. Transport deadlines, response limits, cancellation and redacted errors apply.
 
-`createEmployeeContextAccess` now supplies the concrete resolver: trusted phone or reciprocal Baileys LID mapping → one active `VerifiedNumber` employee → that employee's encrypted OAuth grant. It implements PKCE enrollment, employee-ID verification, serialized refresh rotation, expiry, revocation, and live roster rechecks. Unknown users can chat but receive no business credential; group business reads remain denied.
+`createSignedEmployeeContextAccess` supplies the preferred resolver: trusted phone or reciprocal Baileys LID mapping → one active `VerifiedNumber` employee → a fresh signed request. No employee OAuth enrollment or refresh storage is needed. Unknown users can chat without business access; group business reads are denied. The earlier OAuth adapter remains available for compatibility.
 
-See [employee identity, enrollment, and operations](docs/employee-identity-and-oauth.md) and [the MCP service contract](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). Operator commands are `npm run db:identity` and `npm run context:auth`. Live enrollment requires an owned, allowlisted callback and employee consent. The current chat graph and fake GUI do not invoke these adapters. Planner, worker, and verifier agents remain deferred.
+See [signed identity and operations](docs/signed-context-auth.md) and [the MCP service contract](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). `npm run db:identity` provisions the restricted roster read. Claude keeps its separate OAuth connector. The graph and fake GUI do not invoke business adapters.
 
 ## Agent evaluations
 
@@ -105,11 +105,11 @@ Each module has an entry comment describing its responsibility. Imports do not o
 - Model generation shares the session cancellation signal. The durable lease includes the graph deadline, pacing, send timeout and database margin. Eligibility is checked again after generation and before sending. Short-term memory is updated only after the transport accepts the reply. This first version retains serial processing per account; long model runs can delay other chats.
 - Persists Baileys credentials and Signal keys in Prisma using AES-256-GCM with authenticated row identities. Atomic key batches fail closed; a storage failure closes the socket.
 - Bounds the message/control queues and HTTP bodies, caps send time, attempts to finish active sends within the shutdown deadline, and clears obsolete QR codes.
-- Persists admin session hashes, logout revocation and login limits centrally, so Vercel instances share them. The admin password is an operational control; employee CRM authority comes from the separate roster/OAuth adapter when future tools are connected.
+- Persists admin session hashes, logout revocation and login limits centrally, so Vercel instances share them. The admin password is an operational control; employee CRM authority comes from the separate trusted-identity/signed-request adapter when future tools are connected.
 
 See [.env.example](.env.example) for settings. Back up `AUTH_ENCRYPTION_KEY` separately from both databases; losing it prevents reuse of the paired session and pending encrypted payloads. Keep one active worker per linked account. Apply the Prisma schema only to the bot's local SQLite database; the separate prefixed PostgreSQL migrations own the Supabase message tables without changing CRM business tables.
 
-SQLite also stores encrypted employee OAuth grants and enrollment/revocation state. After restoring old credentials, revoke/re-enroll affected grants instead of replaying potentially consumed refresh tokens. The roster provisioner adds SELECT for only four `VerifiedNumber` columns; it performs no business-row writes.
+SQLite retains the previously shipped encrypted OAuth tables for the optional legacy adapter. Signed access does not use them; its SQLite dependency is the existing encrypted Baileys LID/auth store. Context Engine keeps only short-lived replay hashes in Supabase. The worker roster provisioner grants SELECT on four employee columns and makes no business-row changes.
 
 Read [Supabase setup, state semantics, and queue recovery](docs/supabase-message-queue.md) before configuring `MESSAGE_DATABASE_URL`. Keep `DATABASE_URL` as SQLite. Fresh development databases without a message connection retain the original SQLite greeting mode; after Supabase is enabled, a persistent marker prevents silent fallback. Legacy greeting claims are imported without creating send jobs. The browser test fixture does not use the production Supabase connection.
 
@@ -144,6 +144,7 @@ Read the [detailed current implementation and architecture](docs/current-impleme
 | [Architecture and API](docs/architecture.md)                       | Compact topology and application boundaries                                              |
 | [Assistant architecture plan](docs/assistant-architecture-plan.md) | Consolidated system design, MCP service contract, deferred agents, reminders, and writes |
 | [Supabase queues](docs/supabase-message-queue.md)                  | Exact table names, atomic handoff, recovery, migrations, and local PostgreSQL tests      |
+| [Signed Context Engine access](docs/signed-context-auth.md)        | Preferred first-party identity, signing, keys and replay protection                      |
 | [Employee identity and OAuth](docs/employee-identity-and-oauth.md) | Trusted sender mapping, encrypted grants, enrollment commands, expiry, and revocation    |
 | [EC2 operations](docs/ec2-operations.md)                           | Current private deployment, SSM tunnel, runtime configuration, and backups               |
 | [Deployment guide](docs/deployment-vercel-ec2.md)                  | Independent release automation and the future public HTTPS/Vercel rollout                |

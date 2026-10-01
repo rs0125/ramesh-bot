@@ -21,10 +21,10 @@ export function loadContextEngineConfig(
     url.password ||
     url.search ||
     url.hash ||
-    url.pathname !== '/mcp'
+    !['/mcp', '/mcp/ramesh'].includes(url.pathname)
   )
     throw new Error(
-      'CONTEXT_MCP_URL must be an HTTPS /mcp endpoint (HTTP is allowed only on loopback)',
+      'CONTEXT_MCP_URL must be an HTTPS /mcp or /mcp/ramesh endpoint (HTTP is allowed only on loopback)',
     );
   const integer = (key: string, fallback: number, min: number, max: number) => {
     const raw = env[key] ?? String(fallback);

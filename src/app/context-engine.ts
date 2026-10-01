@@ -16,6 +16,10 @@ import {
   type EmployeeRoster,
 } from '../modules/identity/employee-identity.js';
 import { EmployeeContextCredentials } from '../modules/context-engine/employee-credentials.js';
+import {
+  SignedEmployeeCredentials,
+  type ContextSigningConfig,
+} from '../infrastructure/context-engine/request-credentials.js';
 
 export function createContextEngineServices(
   config: ContextEngineConfig | undefined,
@@ -73,6 +77,41 @@ export function createEmployeeContextAccess(
       );
     },
   );
+  const whatsapp = new WhatsAppEmployeeResolver(
+    dependencies.db,
+    dependencies.encryptionKey,
+    identities,
+  );
+  const services = new ContextEngineServices(
+    new ContextEngineMcpClient(config, credentials, dependencies.fetcher),
+  );
+  return {
+    identities,
+    credentials,
+    whatsapp,
+    async forMessage(
+      message: Pick<WAMessage, 'key'>,
+      signal = AbortSignal.timeout(config.timeoutMs),
+    ) {
+      const resolved = await whatsapp.resolve(message, signal);
+      return resolved?.sender.audience === 'dm' ? services.forSender(resolved.sender) : null;
+    },
+  };
+}
+
+/** Preferred Ramesh integration: service signatures + live roster, with no employee OAuth storage. */
+export function createSignedEmployeeContextAccess(
+  config: ContextEngineConfig,
+  dependencies: {
+    db: PrismaClient;
+    encryptionKey: string;
+    roster: EmployeeRoster;
+    signing: ContextSigningConfig;
+    fetcher?: typeof fetch;
+  },
+) {
+  const identities = new EmployeeIdentityResolver(dependencies.roster);
+  const credentials = new SignedEmployeeCredentials(config, identities, dependencies.signing);
   const whatsapp = new WhatsAppEmployeeResolver(
     dependencies.db,
     dependencies.encryptionKey,

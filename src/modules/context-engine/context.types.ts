@@ -12,13 +12,26 @@ export interface EmployeeContextGrant {
   expiresAtMs: number;
 }
 
-/** Application-owned roster + encrypted OAuth adapter. Resolve current access on every call.
- * EmployeeContextCredentials implements durable serialized rotation; never return a REST API key.
+/** Application-owned live roster + signed requests (or the optional OAuth adapter).
+ * Resolve current access on every call; never return a REST API key.
  * Phone input must come from the verified transport identity, never message text or an LLM.
  */
 export interface ContextCredentialResolver {
-  resolve(sender: ContextSender, signal: AbortSignal): Promise<EmployeeContextGrant | null>;
+  resolve(
+    sender: ContextSender,
+    signal: AbortSignal,
+  ): Promise<EmployeeContextGrant | EmployeeRequestGrant | null>;
   invalidate?(grant: EmployeeContextGrant): Promise<void>;
+}
+
+/** First-party service identity, bound to an employee. The signer never reaches an agent or tool argument. */
+export interface EmployeeRequestGrant {
+  kind: 'signed-request';
+  employeeId: number;
+  phoneE164: string;
+  active: boolean;
+  expiresAtMs: number;
+  authorize(request: Request, signal: AbortSignal): Promise<Request>;
 }
 
 export const CONTEXT_READ_TOOLS = {

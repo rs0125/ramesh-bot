@@ -1,8 +1,8 @@
 # WareOnGo WhatsApp bot: current implementation and architecture
 
-Reviewed: **2026-10-01, Asia/Kolkata**, through the employee identity/OAuth increment.
+Reviewed: **2026-10-01, Asia/Kolkata**, through trusted identity and signed Context Engine access.
 
-This reference describes the two-node OpenAI Terra conversation flow, separate Supabase queues, inactive Context Engine MCP services, concrete identity/OAuth adapters, and independent pairing admin. It covers implemented behavior and deployment assets; the larger [architecture plan](assistant-architecture-plan.md) identifies future agents and business workflows.
+This reference describes the two-node OpenAI Terra flow, separate Supabase queues, inactive Context Engine services, trusted identity and signed request adapters, optional legacy OAuth adapter, and independent pairing admin. The [architecture plan](assistant-architecture-plan.md) records future agents and workflows.
 
 The linked WhatsApp session belongs to EC2; the earlier local pairing is retired. Supabase migrations `202610010001` and `202610010002` are provisioned. CI and EC2 deployment succeeded for the conversational, queue-split, and MCP scaffold changes. The EC2 API remains private; the Caddy/Vercel network rollout is not implied by those deployments. Local playground/evaluation replies use fake delivery and never go to WhatsApp.
 
@@ -39,13 +39,13 @@ The implementation already includes:
 - Two thin conversational stages, bounded memory, generation deadlines/cancellation, and reply-style enforcement.
 - A capture-only SQLite chat GUI and repeated live-model evaluation harness.
 - Employee-scoped MCP read services with fake-server tests, ready for future integration.
-- Trusted phone/LID resolution to an active employee and an encrypted, refreshable, revocable OAuth grant, with operator enrollment commands.
+- Trusted phone/LID resolution to an active employee and fresh signed Context Engine requests, with no per-employee OAuth enrollment.
 - A configurable random delay before each eligible reply.
 - Cancellation of pending timers, recovery of unsent jobs after reconnect, and conservative handling of uncertain sends.
 - A separate authenticated admin application for pairing, status, and session controls.
 - Local tests, independent CI/CD workflows, and EC2 provisioning, release, and backup assets.
 
-The active graph does **not** include connected business tools, planner/worker/verifier agents, reminders, or CRM writes. Any qualifying incoming DM can trigger a conversational reply. The new identity/OAuth adapter denies business credentials to unknown, inactive, ambiguous, or unenrolled senders, and its services deny group reads. It is explicitly composed for the future worker and is not imported by the running conversational graph. Operator sends remain restricted to existing inbox chats.
+The active graph does **not** include business tools, planner/worker/verifier agents, reminders or CRM writes. Qualifying DMs can trigger conversation. The signed identity adapter denies business credentials to unknown, inactive or ambiguous senders, and its services deny group reads. It is explicitly composed for a future worker; the running graph does not import it. Operator sends remain restricted to existing inbox chats.
 
 ## System topology
 
@@ -291,9 +291,9 @@ Run `npm run dev:chat` for the fake chat GUI at `http://127.0.0.1:3012`. It exer
 
 `createContextEngineServices(config, credentials)` builds reusable CRM, supply, and knowledge services. It is not imported by `createApplication`, the graph, or the playground. No production MCP environment update is required for this release. Setting `CONTEXT_MCP_URL` alone does not activate business reads.
 
-`createEmployeeContextAccess` supplies the concrete `ContextCredentialResolver` implementation. It composes trusted phone/reciprocal LID resolution, a live `VerifiedNumber` roster adapter, encrypted local credential storage, PKCE enrollment, serialized refresh, expiry, and revocation. `forMessage()` derives identity from the original Baileys key; every MCP call rechecks employee binding. The lower-level factory still defaults to no grant. Tokens and identity are never model-provided arguments. See the [enrollment and integration runbook](employee-identity-and-oauth.md).
+`createSignedEmployeeContextAccess` supplies the preferred `ContextCredentialResolver`. It composes trusted phone/reciprocal LID mapping, a live roster, request signer and scoped services. `forMessage()` derives identity from the original Baileys key and each POST rechecks employee binding. Identity and keys are never model arguments. See [signed access](signed-context-auth.md); the earlier OAuth factory remains optional.
 
-Each request uses a fresh MCP connection, validates the employee reported by `get_context`, and intersects the local read allowlist, server tool annotations, and granted scopes. Group business reads and writes are denied. The fixed `/mcp` URL requires HTTPS except on loopback; redirects and arbitrary destinations are rejected. Total deadline defaults to 30 seconds, response limit to 1 MiB, with cancellation and safe error codes. The resolver refreshes expiring credentials before use; MCP failures do not replay calls. A 401 invalidates the matching local token without revoking a newer rotation.
+Each read uses a fresh MCP connection, verifies `get_context`, and intersects the local allowlist, server read-only annotations and employee scopes. Group reads and writes are denied. Signed credentials require the exact HTTPS `/mcp/ramesh` endpoint; the optional OAuth adapter requires `/mcp`. Redirects are rejected. Calls have bounded duration/response size, cancellation and safe errors; failed calls are not automatically retried.
 
 Results preserve source paths, request IDs, timestamps, cursors, coverage, access scope, uncertainty, and field evidence. The scaffold validates the envelope; a future verifier must assess its business meaning. See [the full service contract and integration example](assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold).
 
@@ -317,20 +317,20 @@ Pacing smooths traffic; it does not guarantee avoidance of platform restrictions
 
 The implementation has two stores with separate responsibilities.
 
-| Store/table                           | Responsibility                                                                  |
-| ------------------------------------- | ------------------------------------------------------------------------------- |
-| Supabase `ramesh-messages`            | Message identity, state, expiry, encrypted pending payload, completion metadata |
-| Supabase `ramesh-inbound-queue`       | Durable agent-input jobs, leases, attempts, processing outcomes                 |
-| Supabase `ramesh-outbound-queue`      | Encrypted finalized replies, due times, delivery leases and outcomes            |
-| Supabase `ramesh-message-events`      | Transactional state-transition history                                          |
-| Supabase `ramesh-schema-migrations`   | Version/checksum of the separately provisioned PostgreSQL schema                |
-| SQLite `WhatsAppAuthEntry`            | Encrypted linked-device credentials and Signal keys                             |
-| SQLite `ContextOAuthGrant`            | Encrypted employee OAuth tokens/binding, grant state, version and refresh lease |
-| SQLite `ContextOAuthEnrollment`       | Encrypted PKCE attempt, target binding, one-use state and expiry                |
-| SQLite `ContextOAuthRevocation`       | Encrypted candidate tokens awaiting remote revocation                           |
-| SQLite `AdminSession` / `LoginBucket` | Revocable browser sessions and shared login limits                              |
-| SQLite `BotSetting`                   | Operator connection intent and `message-storage=postgres` activation marker     |
-| SQLite `Greeting`                     | Retained legacy claims; used only by the original development fallback          |
+| Store/table                           | Responsibility                                                                                           |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Supabase `ramesh-messages`            | Message identity, state, expiry, encrypted pending payload, completion metadata                          |
+| Supabase `ramesh-inbound-queue`       | Durable agent-input jobs, leases, attempts, processing outcomes                                          |
+| Supabase `ramesh-outbound-queue`      | Encrypted finalized replies, due times, delivery leases and outcomes                                     |
+| Supabase `ramesh-message-events`      | Transactional state-transition history                                                                   |
+| Supabase `ramesh-schema-migrations`   | Version/checksum of the separately provisioned PostgreSQL schema                                         |
+| SQLite `WhatsAppAuthEntry`            | Encrypted linked-device credentials and Signal keys                                                      |
+| SQLite `ContextOAuthGrant`            | Optional legacy adapter: encrypted employee OAuth tokens/binding, grant state, version and refresh lease |
+| SQLite `ContextOAuthEnrollment`       | Optional legacy adapter: encrypted PKCE attempt, target binding, one-use state and expiry                |
+| SQLite `ContextOAuthRevocation`       | Optional legacy adapter: encrypted candidate tokens awaiting remote revocation                           |
+| SQLite `AdminSession` / `LoginBucket` | Revocable browser sessions and shared login limits                                                       |
+| SQLite `BotSetting`                   | Operator connection intent and `message-storage=postgres` activation marker                              |
+| SQLite `Greeting`                     | Retained legacy claims; used only by the original development fallback                                   |
 
 Sources: [queue split migration](../supabase/migrations/202610010002_split_queues.sql), [SQLite schema](../prisma/schema.prisma), [queue repository](../src/infrastructure/database/message-queue.repository.ts), [durable consumer](../src/infrastructure/whatsapp/durable-messages.ts).
 
@@ -342,7 +342,7 @@ Queued protobuf payloads are encrypted with AES-256-GCM and a fresh 12-byte IV, 
 
 WhatsApp auth records continue to use AES-256-GCM with category/key ID as authenticated data, versioned encrypted strings, and Baileys `BufferJSON` serialization. Credential snapshots are captured before serialized writes; Signal-key batches are atomic, reads await preceding writes, and reads are chunked in groups of 200 IDs. App-state synchronization keys are reconstructed into protobuf form. Invalid/unreadable auth fails closed instead of resetting the account identity.
 
-`AUTH_ENCRYPTION_KEY` is stored separately from both databases. Losing it prevents reuse of linked-device credentials, OAuth grants, and encrypted message payloads. Chat IDs, WhatsApp message IDs, and timing/state metadata are not encrypted columns. Employee OAuth secrets use separate SQLite tables and authenticated namespaces; they are not stored in message tables, prompts, logs, or the admin browser. A restored OAuth snapshot may contain consumed refresh tokens and requires revocation/re-enrollment.
+`AUTH_ENCRYPTION_KEY` is stored separately from the databases. Losing it prevents reuse of linked-device credentials and encrypted message payloads, as well as optional legacy OAuth state. Signed access uses its separate private signing key and creates no OAuth rows. Chat/message IDs and timing/state metadata are not encrypted columns. Legacy OAuth restores may contain consumed refresh tokens and need their separate revocation/re-enrollment procedure.
 
 All new tables enable RLS and deny the browser API roles. The runtime uses a dedicated PostgreSQL login, verified TLS, and a pool of at most two connections. Existing inherited `PUBLIC` extension privileges are described in the [queue security notes](supabase-message-queue.md#authentication-and-configuration); no shared extension grants are changed.
 
@@ -524,9 +524,9 @@ The worker reads configuration once at startup. `npm run dev` runs `tsx src/inde
 
 The additional message-store variables are `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`, `MESSAGE_ACCOUNT_ID` (default `primary`), and `MESSAGE_QUEUE_POLL_MS` (default 5000, range 250–30000). The connection must use the dedicated `ramesh_worker` login. Keep `DATABASE_URL` as SQLite. Full configuration and migration commands are in the [Supabase queue guide](supabase-message-queue.md#authentication-and-configuration).
 
-The separate enrollment CLI needs `CONTEXT_MCP_URL`, optional MCP deadline/response bounds, and `CONTEXT_OAUTH_REDIRECT_URI` in a protected environment file. Its callback origin must be allowed by Context Engine. `npm run db:identity` provisions SELECT on four roster columns. The conversational application needs no new environment values until tools are explicitly connected. See [identity/OAuth configuration](employee-identity-and-oauth.md#operator-commands).
+For signed access, use `CONTEXT_MCP_URL` and protected `CONTEXT_RAMESH_SIGNING_KEY_JSON`; no OAuth callback is required. `npm run db:identity` provisions SELECT on four roster columns. Context Engine needs its public-key configuration and replay migration. These settings are not consumed by the current conversational graph. See [signed access configuration](signed-context-auth.md).
 
-The inactive MCP factory accepts `CONTEXT_MCP_URL`, `CONTEXT_MCP_TIMEOUT_MS` (30000; range 1000–60000), and `CONTEXT_MCP_MAX_RESPONSE_BYTES` (1048576; range 16384–4194304). Its URL must be an exact `/mcp` endpoint with no user info, query, or fragment. There is no shared MCP token environment setting. See [`src/config/context-engine.ts`](../src/config/context-engine.ts).
+The inactive MCP factory accepts `CONTEXT_MCP_URL`, `CONTEXT_MCP_TIMEOUT_MS` (30000; range 1000–60000), and `CONTEXT_MCP_MAX_RESPONSE_BYTES` (1048576; range 16384–4194304). The endpoint is exactly `/mcp/ramesh` for signatures or `/mcp` for optional OAuth, with no user info/query/fragment. `loadContextSigningConfig` reads the strict private-key JSON. No employee bearer token is shared.
 
 ### Admin environment
 
@@ -766,7 +766,7 @@ The existing split between domain services, transport adapters, and repositories
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Every eligible DM can trigger a conversational reply                           | Resolve the sender to an active verified employee before business reads                                                  |
 | Converser and formatter with bounded process-local memory                      | Add optional planning, tool execution, evidence verification, and durable conversation state as needed                   |
-| MCP services and identity/OAuth adapters implemented but inactive in chat      | Configure the callback, enroll pilot employees, then wire scoped reads through the future worker                         |
+| Signed identity/MCP services implemented but inactive in chat                  | Configure the service keys and server nonce cache, then wire scoped reads through the future worker                      |
 | Group replies stay in the triggering group                                     | Define which information is permitted in shared channels before returning employee-specific CRM results                  |
 | One durable leased reply job per account                                       | Introduce per-conversation ordering and bounded parallelism if slow business operations become common                    |
 | Separate inbound/outbound queues preserve final replies and uncertain outcomes | Add durable workflow/action state and idempotency for future business side effects                                       |
@@ -778,4 +778,4 @@ The existing split between domain services, transport adapters, and repositories
 
 The current chat graph does not invoke Context Engine or CRM-Automations. The service scaffold establishes the future MCP boundary. [`CONTEXT.md`](../CONTEXT.md) preserves the product decisions: employee-scoped CRM reads first, supply next, then reminders/escalation and controlled writes. Escalations go to assignee(s), then existing CRM admins. Dedicated domain-backend read endpoints remain deferred.
 
-The next business increment is pilot enrollment followed by a verified employee message flowing through the MCP services to one read-only operation, with evidence verification and private delivery. Planner, worker, and verifier agents are explicitly deferred to later work. Identity/OAuth checks pass with synthetic HTTP and real isolated SQLite/PostgreSQL, without real employee enrollment or WhatsApp test sends. Multiple active worker replicas should not be pointed at the same linked account: the current code has no distributed session lease or active/passive ownership protocol.
+The next business increment is wiring a verified employee message through the signed MCP services to one read operation, with evidence verification and private delivery. No employee enrollment is needed. Planner, worker and verifier remain deferred. Tests use synthetic identities and isolated SQLite/PostgreSQL without WhatsApp test sends. Multiple workers still lack a distributed linked-device ownership lease.
