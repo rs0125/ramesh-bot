@@ -17,6 +17,7 @@ import { DurableMessages } from '../infrastructure/whatsapp/durable-messages.js'
 import { AssistantService } from '../modules/assistant/assistant.service.js';
 import { OpenAITextModel } from '../infrastructure/openai/text-model.js';
 import type { TextModel } from '../modules/assistant/assistant.types.js';
+import { InboxRepository } from '../infrastructure/database/inbox.repository.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -30,15 +31,6 @@ export function createApplication(
   overrides: { createSession?: SessionFactory; model?: TextModel } = {},
 ): Application {
   const db = createPrismaClient(config.databaseUrl);
-  const assistant = config.assistant
-    ? new AssistantService(
-        config.assistant,
-        overrides.model ?? new OpenAITextModel(config.assistant),
-        undefined,
-        (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
-      )
-    : undefined;
-  const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
   const messagePool = config.messageDatabase
     ? createMessagePool(config.messageDatabase, () =>
         logger.error('Message database connection failed'),
@@ -48,6 +40,20 @@ export function createApplication(
     messagePool && config.messageDatabase
       ? new MessageQueueRepository(messagePool, config.messageDatabase.accountId)
       : undefined;
+  const inboxRepository =
+    messagePool && config.messageDatabase
+      ? new InboxRepository(messagePool, config.messageDatabase.accountId, config.encryptionKey)
+      : undefined;
+  const assistant = config.assistant
+    ? new AssistantService(
+        config.assistant,
+        overrides.model ?? new OpenAITextModel(config.assistant),
+        undefined,
+        (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
+        inboxRepository ? (message) => inboxRepository.context(message) : undefined,
+      )
+    : undefined;
+  const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
   const durableMessages =
     messageRepository && config.messageDatabase
       ? new DurableMessages(messageRepository, {
@@ -74,6 +80,7 @@ export function createApplication(
   );
   const whatsapp = new BaileysClient({
     durableMessages,
+    observeMessage: (message) => assistant?.observeMessage(message),
     createSession:
       overrides.createSession ??
       createSessionFactory(
@@ -117,6 +124,10 @@ export function createApplication(
     config.api.token,
     {
       adminAccess,
+      inbox: inboxRepository,
+      sendMessage: durableMessages
+        ? (id, chatId, text) => durableMessages.sendAsAdmin(id, chatId, text)
+        : undefined,
       health: async () => {
         if (!ready) throw new Error('Worker not ready');
         await db.$queryRaw`SELECT 1`;
@@ -150,7 +161,7 @@ export function createApplication(
             create: { key: 'message-storage', value: 'postgres' },
             update: { value: 'postgres' },
           });
-          logger.info('Message state, inbound queue and outbound queue use PostgreSQL');
+          logger.info('Inbox, conversation context, and message queues use PostgreSQL');
         }
         await adminAccess.clean();
         if (stopped) return;

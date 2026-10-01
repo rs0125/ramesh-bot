@@ -27,3 +27,33 @@ export interface BotStatus {
   };
   events: BotEvent[];
 }
+
+export interface Conversation {
+  chatId: string;
+  name: string;
+  isGroup: boolean;
+  lastMessage: string;
+  lastMessageAt: string;
+}
+export interface InboxMessage {
+  id: string;
+  chatId: string;
+  text: string;
+  senderId: string | null;
+  senderName: string;
+  direction: 'inbound' | 'outbound';
+  source: 'whatsapp' | 'assistant' | 'admin';
+  mentionsBot: boolean;
+  at: string;
+  status: string;
+  kind: string;
+}
+export interface InboxPage {
+  messages: InboxMessage[];
+  nextCursor: string | null;
+}
+export interface ConversationPage {
+  conversations: Conversation[];
+  nextCursor: string | null;
+  groupRepliesRequireMention: boolean;
+}

@@ -1,9 +1,16 @@
-/** Small authenticated control API. It exposes no credentials or arbitrary messaging endpoint. */
+/** Authenticated controls and inbox. Operator sends are limited to received conversations. */
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { BotStatus } from '../../contracts/admin-api.js';
 import type { AdminAccess } from '../database/admin-access.js';
 import { HttpError, jsonBody } from './json-body.js';
+import {
+  decodeInboxCursor,
+  validChatId,
+  validRequestId,
+  type InboxRepository,
+} from '../database/inbox.repository.js';
+import type { DurableMessages } from '../whatsapp/durable-messages.js';
 
 export interface BotControl {
   getStatus(): BotStatus;
@@ -14,6 +21,8 @@ export interface BotControl {
 interface ServerOptions {
   adminAccess?: AdminAccess;
   health?: () => Promise<{ release: string }>;
+  inbox?: Pick<InboxRepository, 'conversations' | 'messages'>;
+  sendMessage?: DurableMessages['sendAsAdmin'];
 }
 
 export function createAdminServer(bot: BotControl, token: string, options: ServerOptions = {}) {
@@ -47,6 +56,48 @@ export function createAdminServer(bot: BotControl, token: string, options: Serve
     }
     if (request.method === 'GET' && request.url === '/v1/status') {
       send(response, 200, bot.getStatus());
+      return;
+    }
+    const url = new URL(request.url ?? '/', 'http://worker.local');
+    if (
+      request.method === 'GET' &&
+      ['/v1/inbox/conversations', '/v1/inbox/messages'].includes(url.pathname)
+    ) {
+      if (!options.inbox) throw new HttpError(503, 'Supabase inbox is not configured');
+      const cursor = url.searchParams.get('cursor');
+      try {
+        decodeInboxCursor(cursor);
+      } catch {
+        throw new HttpError(400, 'Invalid inbox cursor');
+      }
+      if (url.pathname === '/v1/inbox/conversations')
+        send(response, 200, await options.inbox.conversations(cursor));
+      else {
+        const chatId = url.searchParams.get('chatId');
+        if (!validChatId(chatId)) throw new HttpError(400, 'Invalid conversation');
+        send(response, 200, await options.inbox.messages(chatId, cursor));
+      }
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/inbox/send') {
+      if (!options.sendMessage) throw new HttpError(503, 'Supabase inbox is not configured');
+      const { requestId, chatId, text } = await jsonBody(request, 24576);
+      if (
+        !validRequestId(requestId) ||
+        !validChatId(chatId) ||
+        typeof text !== 'string' ||
+        !text.trim() ||
+        text.trim().length > 4000
+      )
+        throw new HttpError(400, 'Choose a conversation and enter 1–4000 characters');
+      if (bot.getStatus().state !== 'connected')
+        throw new HttpError(409, 'Connect WhatsApp before sending');
+      const result = await options.sendMessage(requestId, chatId, text.trim());
+      if (result === 'unknown_chat') throw new HttpError(404, 'Conversation not found');
+      if (result === 'conflict')
+        throw new HttpError(409, 'Message request conflicts with an earlier request');
+      if (result === 'full') throw new HttpError(429, 'Message queue is full; try again shortly');
+      send(response, 202, { requestId, status: result });
       return;
     }
     if (request.method === 'POST' && request.url === '/v1/admin/attempt') {

@@ -8,7 +8,7 @@ import type {
   Reply,
 } from '../../modules/greetings/greeting.types.js';
 import type { SessionFactory, WhatsAppSession } from './baileys-session.js';
-import { toGreetingCandidate } from './message.mapper.js';
+import { toGreetingCandidate, toInboxCandidate } from './message.mapper.js';
 import { disconnectCode, reconnectDelay } from './reconnect.policy.js';
 import { SerialQueue } from '../../lib/serial-queue.js';
 import { AuthStorageError } from '../database/auth-store.js';
@@ -26,6 +26,7 @@ interface ClientOptions {
   maxPendingMessages?: number;
   retryDelay?: typeof reconnectDelay;
   durableMessages?: DurableMessages;
+  observeMessage?: (message: GreetingCandidate) => void;
 }
 
 export class BaileysClient {
@@ -166,7 +167,7 @@ export class BaileysClient {
           (outcome) => {
             if (outcome === 'sent') {
               this.status.metrics.replied++;
-              this.record('Replied hello');
+              this.record('Message sent as Ramesh');
             } else {
               this.status.metrics.errors++;
               this.options.logger.error(
@@ -238,19 +239,28 @@ export class BaileysClient {
       )
         return;
       try {
-        const candidate = toGreetingCandidate(message, session.botJids);
+        let candidate = toInboxCandidate(message, session.botJids);
         if (!candidate) continue;
+        if (candidate.fromMe) continue;
+        if (candidate.isGroup && session.chatName) {
+          const chatName = await session.chatName(candidate.chatId).catch(() => undefined);
+          if (chatName) candidate = { ...candidate, chatName: chatName.slice(0, 256) };
+        }
         this.status.metrics.received++;
         const outcome = this.options.durableMessages
           ? await this.options.durableMessages.enqueue(message, candidate)
-          : await this.options.handleMessage(
-              candidate,
-              (text) => session.reply(message, text),
-              signal,
-            );
+          : toGreetingCandidate(message, session.botJids)
+            ? await this.options.handleMessage(
+                candidate,
+                (text) => session.reply(message, text),
+                signal,
+              )
+            : 'ignored';
+        if (!this.options.durableMessages && outcome === 'ignored')
+          this.options.observeMessage?.(candidate);
         if (outcome === 'sent') {
           this.status.metrics.replied++;
-          this.record('Replied hello');
+          this.record('Message sent as Ramesh');
         }
         if (outcome === 'duplicate') this.status.metrics.duplicates++;
         if (outcome === 'full') this.status.metrics.dropped++;

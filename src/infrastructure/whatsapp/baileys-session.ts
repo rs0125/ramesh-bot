@@ -16,6 +16,8 @@ export interface WhatsAppSession {
   ): () => void;
   saveCredentials(): Promise<void>;
   reply(message: WAMessage, text: string): Promise<void>;
+  sendText?(chatId: string, text: string): Promise<void>;
+  chatName?(chatId: string): Promise<string | undefined>;
   close(): Promise<void>;
 }
 
@@ -30,6 +32,14 @@ export function createSessionFactory(
   return async (onFatal) => {
     const auth = await createAuthStore(db, encryptionKey, (error) => onFatal?.(error));
     const groups = new Map<string, { value: GroupMetadata; expiresAt: number }>();
+    const groupMetadata = async (id: string) => {
+      const cached = groups.get(id);
+      if (cached && cached.expiresAt > Date.now()) return cached.value;
+      const value = await socket.groupMetadata(id);
+      if (groups.size >= 200) groups.delete(groups.keys().next().value!);
+      groups.set(id, { value, expiresAt: Date.now() + 300_000 });
+      return value;
+    };
     const socket = makeWASocket({
       auth: auth.state,
       logger,
@@ -38,14 +48,7 @@ export function createSessionFactory(
       // Keep the SDK's initial sync: it supplies LID mappings required for group mentions.
       connectTimeoutMs: 20_000,
       defaultQueryTimeoutMs: sendTimeoutMs,
-      cachedGroupMetadata: async (id) => {
-        const cached = groups.get(id);
-        if (cached && cached.expiresAt > Date.now()) return cached.value;
-        const value = await socket.groupMetadata(id);
-        if (groups.size >= 200) groups.delete(groups.keys().next().value!);
-        groups.set(id, { value, expiresAt: Date.now() + 300_000 });
-        return value;
-      },
+      cachedGroupMetadata: groupMetadata,
     });
     socket.ev.on('groups.update', (updates) => {
       for (const update of updates) if (update.id) groups.delete(update.id);
@@ -53,6 +56,24 @@ export function createSessionFactory(
     socket.ev.on('group-participants.update', ({ id }) => {
       groups.delete(id);
     });
+
+    const send = async (chatId: string, text: string, quoted?: WAMessage) => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          socket.sendMessage(chatId, { text }, quoted ? { quoted } : {}),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              const error = new Error('WhatsApp send timed out; delivery is uncertain');
+              void socket.end(error).catch(() => undefined);
+              reject(error);
+            }, sendTimeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
 
     return {
       // Evaluate on each access: Baileys can learn the account's LID after pairing.
@@ -64,23 +85,10 @@ export function createSessionFactory(
         return () => socket.ev.off(event, handler);
       },
       saveCredentials: () => auth.saveCredentials(),
-      async reply(message, text) {
-        let timer: NodeJS.Timeout | undefined;
-        try {
-          await Promise.race([
-            socket.sendMessage(message.key.remoteJid!, { text }, { quoted: message }),
-            new Promise<never>((_, reject) => {
-              timer = setTimeout(() => {
-                const error = new Error('WhatsApp send timed out; delivery is uncertain');
-                void socket.end(error).catch(() => undefined);
-                reject(error);
-              }, sendTimeoutMs);
-            }),
-          ]);
-        } finally {
-          if (timer) clearTimeout(timer);
-        }
-      },
+      reply: (message, text) => send(message.key.remoteJid!, text, message),
+      sendText: (chatId, text) => send(chatId, text),
+      chatName: async (chatId) =>
+        chatId.endsWith('@g.us') ? (await groupMetadata(chatId)).subject : undefined,
       async close() {
         try {
           await socket.end(undefined);

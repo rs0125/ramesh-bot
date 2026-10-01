@@ -38,7 +38,7 @@ test('local DM/group replies persist in SQLite, deduplicate and keep histories s
     await chat.send({ ...input, group: true, sender: 'me', messageId: 'three' });
     assert.equal(calls[4]!.messages.length, 1);
     await chat.send({ ...input, group: true, sender: 'teammate', messageId: 'four' });
-    assert.equal(calls[6]!.messages.length, 1);
+    assert.equal(calls[6]!.messages.length, 3, 'participants share their group conversation');
     assert.equal(await temp.db.greeting.count(), 4);
     assert.equal(
       await temp.db.whatsAppAuthEntry.count(),

@@ -2,7 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { AssistantConfig } from '../../config/assistant.js';
 import type { GreetingCandidate, PreparedReply } from '../greetings/greeting.types.js';
-import type { AgentTrace, TextModel } from './assistant.types.js';
+import type { AgentTrace, ChatMessage, TextModel } from './assistant.types.js';
 import { buildAssistantGraph } from './assistant.graph.js';
 import { ConversationMemory } from './conversation-memory.js';
 import { PROMPT_VERSION } from './prompts.js';
@@ -20,15 +20,30 @@ export class AssistantService {
     model: TextModel,
     private readonly memory = new ConversationMemory(),
     private readonly observe: (trace: AgentTrace) => void = () => {},
+    private readonly readHistory?: (message: GreetingCandidate) => Promise<ChatMessage[]>,
   ) {
     this.graph = buildAssistantGraph(model);
   }
 
   private key(message: GreetingCandidate): string | undefined {
-    if (message.isGroup && !message.senderId) return undefined;
-    return createHash('sha256')
-      .update(JSON.stringify([message.chatId, message.senderId ?? message.chatId]))
-      .digest('hex');
+    return createHash('sha256').update(message.chatId).digest('hex');
+  }
+
+  /** Local development fallback; production reads the durable inbox instead. */
+  observeMessage(message: GreetingCandidate) {
+    if (this.readHistory || message.fromMe || !message.text) return;
+    const key = this.key(message);
+    if (key) this.memory.observe(key, this.input(message));
+  }
+
+  private input(message: GreetingCandidate): string {
+    return message.isGroup
+      ? JSON.stringify({
+          sender: message.senderName ?? message.senderId ?? 'Unknown sender',
+          senderId: message.senderId,
+          text: message.text,
+        })
+      : (message.text?.trim() ?? '');
   }
 
   clear(message: GreetingCandidate) {
@@ -69,10 +84,16 @@ export class AssistantService {
     const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
     const key = this.key(message);
     try {
+      const history = this.readHistory
+        ? await this.readHistory(message)
+        : key
+          ? this.memory.get(key)
+          : [];
+      combined.throwIfAborted();
       const result = await this.graph.invoke(
         {
-          input,
-          history: key ? this.memory.get(key) : [],
+          input: this.input(message),
+          history,
           audience: message.isGroup ? 'group' : 'dm',
         },
         { signal: combined, recursionLimit: 4 },
@@ -85,7 +106,7 @@ export class AssistantService {
         draft: result.draft,
         onSent: () => {
           if (!remembered && key) {
-            this.memory.remember(key, input, result.reply);
+            this.memory.remember(key, this.input(message), result.reply);
             remembered = true;
           }
         },

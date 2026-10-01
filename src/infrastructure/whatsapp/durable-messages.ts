@@ -1,5 +1,5 @@
 /** Drains separate agent-input and delivery queues while a WhatsApp session is connected. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { proto, type WAMessage } from '@whiskeysockets/baileys';
 import { authCipher } from '../database/auth-store.js';
 import { MessageQueueRepository, type MessageJob } from '../database/message-queue.repository.js';
@@ -11,6 +11,7 @@ import type {
 } from '../../modules/greetings/greeting.types.js';
 import type { WhatsAppSession } from './baileys-session.js';
 import { toGreetingCandidate } from './message.mapper.js';
+import { toInboxCandidate } from './message.mapper.js';
 
 export interface DurableMessageOptions {
   encryptionKey: string;
@@ -31,7 +32,8 @@ type DurableRepository = Pick<
   | 'releaseUnsent'
   | 'complete'
   | 'beginSend'
->;
+> &
+  Partial<Pick<MessageQueueRepository, 'enqueueAdmin'>>;
 
 export class DurableMessages {
   private readonly cipher;
@@ -50,8 +52,13 @@ export class DurableMessages {
   async enqueue(
     message: WAMessage,
     candidate: GreetingCandidate,
-  ): Promise<'queued' | 'duplicate' | 'full' | 'ignored'> {
-    if (!selectGreetingTarget(candidate, Date.now(), this.options.maxAgeMs)) return 'ignored';
+  ): Promise<'queued' | 'duplicate' | 'full' | 'ignored' | 'observed'> {
+    if (candidate.fromMe || !Number.isFinite(candidate.sentAtMs) || candidate.sentAtMs <= 0)
+      return 'ignored';
+    // Admission/archival is independent of automatic reply eligibility.
+    const replyEligible =
+      !!selectGreetingTarget(candidate, Date.now(), this.options.maxAgeMs) &&
+      !!toGreetingCandidate(message, []);
     const wire = proto.WebMessageInfo.encode(message).finish();
     if (wire.byteLength > 262144) throw new Error('Incoming message exceeds durable payload limit');
     const id = randomUUID();
@@ -62,6 +69,41 @@ export class DurableMessages {
       payload,
       this.options.maxAgeMs,
       this.options.capacity,
+      {
+        replyEligible,
+        content: this.cipher.seal('inbox', id, {
+          text: candidate.text ?? '',
+          senderId: candidate.senderId ?? null,
+          senderName: candidate.senderName || candidate.senderId?.split('@')[0] || 'Unknown sender',
+          chatName: candidate.chatName ?? null,
+          kind: candidate.kind ?? 'text',
+        }),
+      },
+    );
+    if (result === 'queued') {
+      this.revision++;
+      this.wake?.();
+    }
+    return result;
+  }
+
+  async sendAsAdmin(id: string, chatId: string, text: string) {
+    if (!this.repository.enqueueAdmin) throw new Error('Inbox storage unavailable');
+    const result = await this.repository.enqueueAdmin(
+      id,
+      chatId,
+      this.cipher.seal('inbox', id, {
+        text,
+        senderId: null,
+        senderName: 'Ramesh',
+        chatName: null,
+        kind: 'text',
+      }),
+      this.cipher.seal('outbound-reply', id, text),
+      this.options.capacity,
+      createHash('sha256')
+        .update(JSON.stringify([chatId, text]))
+        .digest('hex'),
     );
     if (result === 'queued') {
       this.revision++;
@@ -131,26 +173,30 @@ export class DurableMessages {
         await this.repository.releaseUnsent(job, true);
         return;
       }
-      let message: WAMessage;
+      let message: WAMessage | undefined;
+      const manual = job.origin === 'admin';
       try {
-        const wire = this.cipher.open('message', job.id, job.payload);
-        if (!Buffer.isBuffer(wire)) throw new Error('Invalid queued message');
-        message = proto.WebMessageInfo.decode(wire) as WAMessage;
+        if (!manual) {
+          const wire = this.cipher.open('message', job.id, job.payload);
+          if (!Buffer.isBuffer(wire)) throw new Error('Invalid queued message');
+          message = proto.WebMessageInfo.decode(wire) as WAMessage;
+        }
       } catch {
         await this.repository.complete(job, 'FAILED', 'invalid_encrypted_payload');
         this.sentCallbacks.delete(job.id);
         report('error');
         return;
       }
-      const candidate = toGreetingCandidate(message, session.botJids);
+      const candidate = message ? toInboxCandidate(message, session.botJids) : null;
       const eligible = () =>
-        candidate && selectGreetingTarget(candidate, Date.now(), this.options.maxAgeMs);
-      if (!candidate || !eligible()) {
+        manual || (candidate && selectGreetingTarget(candidate, Date.now(), this.options.maxAgeMs));
+      if (!eligible()) {
         await this.repository.complete(job, 'EXPIRED', 'no_longer_eligible');
         this.sentCallbacks.delete(job.id);
         return;
       }
       if (job.direction === 'inbound') {
+        if (!candidate) throw new Error('Missing inbound message');
         const prepared = this.options.prepareReply
           ? await this.options.prepareReply(candidate, signal)
           : { text: 'hello', onSent: undefined };
@@ -175,6 +221,11 @@ export class DurableMessages {
               run: prepared.onSent,
             });
         } else await this.repository.releaseUnsent(job);
+        return;
+      }
+      if (manual && (!job.chatId || !session.sendText)) {
+        await this.repository.complete(job, 'FAILED', 'manual_send_unavailable');
+        report('error');
         return;
       }
       let reply: unknown;
@@ -207,7 +258,8 @@ export class DurableMessages {
         return;
       }
       sendInvoked = true;
-      await session.reply(message, reply);
+      if (manual) await session.sendText!(job.chatId!, reply);
+      else await session.reply(message!, reply);
       this.sentCallbacks.get(job.id)?.run();
       this.sentCallbacks.delete(job.id);
       if (await this.repository.complete(job, 'SENT')) report('sent');

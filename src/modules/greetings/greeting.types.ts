@@ -12,6 +12,9 @@ export interface GreetingCandidate extends GreetingKey {
   readonly mentionsBot: boolean;
   readonly text?: string;
   readonly senderId?: string;
+  readonly senderName?: string;
+  readonly chatName?: string;
+  readonly kind?: string;
 }
 
 export interface GreetingRepository {

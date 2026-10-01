@@ -40,13 +40,13 @@ The MCP boundary is a separate, inactive scaffold: `createContextEngineServices`
 | `infrastructure/http`           | Authenticate and validate fixed commands; expose no arbitrary-send tool                   |
 | `contracts`                     | Describe v1 response shapes; consumers independently validate them                        |
 
-Auth writes use AES-256-GCM with a random IV and row identity as additional authenticated data. Keys are encrypted before queued writes, then committed transactionally. Supabase pending input and finalized replies use separate authenticated payload categories. The encryption key is outside both databases. Terminal payloads are cleared; queue metadata and history expire after 30 days. Keep one active worker per linked account: queue leases do not implement distributed WhatsApp session ownership.
+Auth writes use AES-256-GCM with a random IV and row identity as additional authenticated data. Supabase pending input, inbox content, and finalized replies use distinct authenticated categories. The key is outside both databases. Terminal transport payloads are cleared, while encrypted inbox text and metadata expire after 30 days. Keep one active worker per linked account: queue leases do not implement distributed WhatsApp session ownership.
 
-Conversation memory is process-local, partitioned by chat and sender, bounded to six turns/16,000 characters per context, 200 contexts, and a 30-minute idle lifetime. It advances only after successful transport acceptance and resets on restart. There are no durable LangGraph checkpoints or business tools in the active graph.
+With Supabase configured, recent context comes from the persistent inbox: up to 40 preceding rows and 16,000 characters, partitioned by account/chat. All group participants share history, including untagged messages; DMs and other groups stay separate. Only successfully sent replies enter context. The isolated SQLite playground retains bounded process-local memory. There are no durable LangGraph checkpoints or business tools in the active graph. Migration `202610010003` must precede deployment of this inbox-aware worker.
 
 ## HTTP boundary
 
-Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Responses are JSON with `Cache-Control: private, no-store`. The server binds to loopback. Current EC2 access is through SSM; the security group has no inbound rules. The checked-in Caddy template can expose the four exact API paths over HTTPS in a later network rollout; it is not installed by the current stack.
+Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Responses are JSON with `Cache-Control: private, no-store`. The server binds to loopback. Current EC2 access is through SSM; the security group has no inbound rules. The checked-in Caddy template allowlists the control, session, and inbox paths for a later HTTPS rollout; it is not installed by the current stack.
 
 | Endpoint                 | Body / response                                                                                                                         |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -57,6 +57,8 @@ Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Respon
 | `POST /v1/admin/session` | `{ "action": "create" \| "verify" \| "revoke", "tokenHash": "<SHA256>", "expiresAt": 0 }`; expiry milliseconds required only for create |
 
 Create/revoke return `{ "ok": true }`; verify returns `{ "active": true/false }`. Sessions last at most eight hours. Login attempts are limited to 10 per 60-second bucket. The admin supplies an HMAC of the trusted client IP; raw IPs are not persisted. Outside Vercel, requests share one bucket until a trusted proxy policy is explicitly implemented.
+
+The inbox adds `GET /v1/inbox/conversations`, `GET /v1/inbox/messages?chatId=...` (both cursor-paginated), and `POST /v1/inbox/send` with `{ requestId, chatId, text }`. Sending requires an existing received chat, connected WhatsApp, a UUID, and 1–4,000 characters. It goes straight to the durable outbound queue. See [inbox behavior and rollout](supabase-message-queue.md#inbox-context-and-operator-sends).
 
 States: `stopped`, `connecting`, `pairing`, `connected`, `reconnecting`, `disconnecting`, `error`. Metrics: `received`, `replied`, `duplicates`, `errors`, `dropped`. Event fields: `at`, `level` (`info` or `error`), `message`. Counters/activity reset when the process restarts; credentials, claims and disconnect preference persist.
 

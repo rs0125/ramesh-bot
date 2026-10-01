@@ -50,7 +50,7 @@ test('both graph stages execute, formatter receives draft, and the final em-dash
   assert.equal(reply.trace.stages.length, 2);
 });
 
-test('unsent replies never enter memory; sent history is bounded and isolated by sender and audience', async () => {
+test('unsent replies never enter memory; group history is shared by participants and isolated by chat', async () => {
   const { model, calls } = fake();
   const agent = new AssistantService(config, model);
   const original = message({
@@ -67,12 +67,38 @@ test('unsent replies never enter memory; sent history is bounded and isolated by
   await agent.prepare({ ...original, messageId: 'm3', text: 'continue' });
   assert.equal(calls[4]!.messages.length, 3, 'commit is idempotent');
   await agent.prepare({ ...original, senderId: 'bob@lid' });
-  assert.equal(calls[6]!.messages.length, 1);
+  assert.equal(calls[6]!.messages.length, 3);
+  assert.equal(JSON.parse(calls[6]!.messages[0]!.content).senderId, 'alice@lid');
   await agent.prepare(message({ senderId: 'alice@lid' }));
   assert.equal(calls[8]!.messages.length, 1);
   agent.clear(original);
   await agent.prepare(original);
   assert.equal(calls[10]!.messages.length, 1);
+});
+
+test('untagged group context can be observed without invoking a model', async () => {
+  const { model, calls } = fake();
+  const agent = new AssistantService(config, model);
+  agent.observeMessage(
+    message({
+      isGroup: true,
+      chatId: 'group@g.us',
+      senderId: 'alice@lid',
+      text: 'The visit is at 10.',
+    }),
+  );
+  assert.equal(calls.length, 0);
+  await agent.prepare(
+    message({
+      isGroup: true,
+      chatId: 'group@g.us',
+      senderId: 'bob@lid',
+      mentionsBot: true,
+      text: 'When is the visit?',
+    }),
+  );
+  assert.equal(calls[0]!.messages.length, 2);
+  assert.match(calls[0]!.messages[0]!.content, /The visit is at 10/);
 });
 
 test('memory expires and evicts older conversations and complete turns', () => {

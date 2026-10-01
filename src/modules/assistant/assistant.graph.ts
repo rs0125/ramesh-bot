@@ -6,7 +6,7 @@ import { CONVERSER_PROMPT, FORMATTER_PROMPT } from './prompts.js';
 import { finishReply } from './style.js';
 
 export const AssistantState = new StateSchema({
-  input: z.string().min(1).max(6000),
+  input: z.string().min(1).max(40000),
   history: z.array(z.object({ role: z.enum(['user', 'assistant']), content: z.string() })),
   audience: z.enum(['dm', 'group']),
   draft: z.string().default(''),

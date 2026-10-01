@@ -15,6 +15,7 @@ import { BaileysClient } from '../../src/infrastructure/whatsapp/baileys-client.
 import { authCipher } from '../../src/infrastructure/database/auth-store.js';
 import { applyMessageSchema } from '../../scripts/message-schema.js';
 import { postgresTestsEnabled, temporaryMessageDatabase } from '../fixtures/message-database.js';
+import { checkInbox } from '../fixtures/inbox-checks.js';
 
 const candidate = (id: string = randomUUID()): GreetingCandidate => ({
   chatId: '20000000000@s.whatsapp.net',
@@ -71,6 +72,7 @@ test(
         )
       ).rows;
     try {
+      await checkInbox(t, database, key);
       await t.test('migration is repeatable; runtime and API access are restricted', async () => {
         const client = await database.admin.connect();
         try {

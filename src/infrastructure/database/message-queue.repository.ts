@@ -16,6 +16,8 @@ export interface MessageJob {
   attempts: number;
   direction: QueueDirection;
   replyPayload?: string;
+  origin?: 'whatsapp' | 'admin';
+  chatId?: string;
 }
 interface OwnedRow {
   id: string;
@@ -32,7 +34,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610010002'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610010003'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -70,7 +72,8 @@ export class MessageQueueRepository {
     payload: string,
     maxAgeMs: number,
     capacity: number,
-  ): Promise<'queued' | 'duplicate' | 'full'> {
+    inbox?: { content: string; replyEligible: boolean },
+  ): Promise<'queued' | 'duplicate' | 'full' | 'observed'> {
     return this.transaction(async (db) => {
       if (
         (
@@ -82,16 +85,23 @@ export class MessageQueueRepository {
         ).rowCount
       )
         return 'duplicate';
-      const count = await db.query(
-        `SELECT count(*)::int AS count FROM public."ramesh-messages"
+      const eligible = inbox?.replyEligible ?? true;
+      const count = eligible
+        ? await db.query(
+            `SELECT count(*)::int AS count FROM public."ramesh-messages"
         WHERE account_id=$1 AND state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')`,
-        [this.accountId],
-      );
-      if (count.rows[0].count >= capacity) return 'full';
+            [this.accountId],
+          )
+        : undefined;
+      const full = (count?.rows[0].count ?? 0) >= capacity;
+      if (full && !inbox) return 'full';
+      const queued = eligible && !full;
       await db.query(
         `INSERT INTO public."ramesh-messages"
-        (id,account_id,chat_id,whatsapp_message_id,sent_at,expires_at,state,payload_encrypted)
-        VALUES ($1,$2,$3,$4,$5,$6,'QUEUED',$7)`,
+        (id,account_id,chat_id,whatsapp_message_id,sent_at,expires_at,state,payload_encrypted,
+         content_encrypted,mentions_bot,finished_at,reason)
+        VALUES ($1,$2,$3,$4,$5,$6,$8,$7,$9,$10,
+          CASE WHEN $8='OBSERVED' THEN clock_timestamp() ELSE NULL END,$11)`,
         [
           id,
           this.accountId,
@@ -99,12 +109,72 @@ export class MessageQueueRepository {
           message.messageId,
           new Date(message.sentAtMs),
           new Date(message.sentAtMs + maxAgeMs),
-          payload,
+          queued ? payload : null,
+          queued ? 'QUEUED' : 'OBSERVED',
+          inbox?.content ?? null,
+          message.mentionsBot,
+          full ? 'queue_full' : null,
         ],
       );
+      if (!queued) return full ? 'full' : 'observed';
       await db.query(
         `INSERT INTO public."ramesh-inbound-queue" (message_id,account_id) VALUES ($1,$2)`,
         [id, this.accountId],
+      );
+      return 'queued';
+    });
+  }
+
+  /** An operator request goes directly to the existing outbound queue, atomically and idempotently. */
+  async enqueueAdmin(
+    id: string,
+    chatId: string,
+    content: string,
+    replyPayload: string,
+    capacity: number,
+    fingerprint: string,
+  ): Promise<'queued' | 'duplicate' | 'full' | 'unknown_chat' | 'conflict'> {
+    return this.transaction(async (db) => {
+      const existing = (
+        await db.query(
+          `SELECT chat_id,origin,request_fingerprint FROM public."ramesh-messages" WHERE account_id=$1 AND id=$2`,
+          [this.accountId, id],
+        )
+      ).rows[0];
+      if (existing)
+        return existing.origin === 'admin' &&
+          existing.chat_id === chatId &&
+          existing.request_fingerprint === fingerprint
+          ? 'duplicate'
+          : 'conflict';
+      // Destinations must come from the actual received inbox, never an arbitrary JID.
+      if (
+        !(
+          await db.query(
+            `SELECT 1 FROM public."ramesh-messages" WHERE account_id=$1 AND chat_id=$2
+         AND origin='whatsapp' AND content_encrypted IS NOT NULL LIMIT 1`,
+            [this.accountId, chatId],
+          )
+        ).rowCount
+      )
+        return 'unknown_chat';
+      const count = await db.query(
+        `SELECT count(*)::int AS count FROM public."ramesh-messages"
+         WHERE account_id=$1 AND state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')`,
+        [this.accountId],
+      );
+      if (count.rows[0].count >= capacity) return 'full';
+      await db.query(
+        `INSERT INTO public."ramesh-messages"
+        (id,account_id,chat_id,whatsapp_message_id,sent_at,expires_at,state,payload_encrypted,
+         origin,content_encrypted,reply_encrypted,reply_created_at,request_fingerprint)
+        VALUES ($1,$2,$3,$4,clock_timestamp(),clock_timestamp()+interval '5 minutes',
+          'READY_TO_SEND',$5,'admin',$6,$5,clock_timestamp(),$7)`,
+        [id, this.accountId, chatId, `admin:${id}`, replyPayload, content, fingerprint],
+      );
+      await db.query(
+        `INSERT INTO public."ramesh-outbound-queue" (message_id,account_id,payload_encrypted) VALUES ($1,$2,$3)`,
+        [id, this.accountId, replyPayload],
       );
       return 'queued';
     });
@@ -214,7 +284,7 @@ export class MessageQueueRepository {
         attempts: number;
         replyPayload?: string;
       }>(
-        `SELECT m.id,m.payload_encrypted AS payload,j.attempts
+        `SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId"
         ${direction === 'outbound' ? ',j.payload_encrypted AS "replyPayload"' : ''}
         FROM ${queueTable(direction)} j JOIN public."ramesh-messages" m ON m.id=j.message_id
         WHERE j.account_id=$1 AND j.state='READY' AND j.available_at<=clock_timestamp()
@@ -261,8 +331,9 @@ export class MessageQueueRepository {
         [job.id],
       );
       await db.query(
-        `UPDATE public."ramesh-messages" SET state='READY_TO_SEND',reason=NULL,updated_at=clock_timestamp() WHERE id=$1`,
-        [job.id],
+        `UPDATE public."ramesh-messages" SET state='READY_TO_SEND',reason=NULL,
+         reply_encrypted=$2,reply_created_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1`,
+        [job.id, replyPayload],
       );
       return true;
     });
@@ -365,7 +436,7 @@ export class MessageQueueRepository {
       await this.recover(db);
       await db.query(
         `DELETE FROM public."ramesh-messages" WHERE account_id=$1
-        AND finished_at < clock_timestamp()-interval '30 days' AND state IN ('SENT','EXPIRED','FAILED','UNCERTAIN')`,
+        AND finished_at < clock_timestamp()-interval '30 days' AND state IN ('OBSERVED','SENT','EXPIRED','FAILED','UNCERTAIN')`,
         [this.accountId],
       );
     });

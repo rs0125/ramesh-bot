@@ -75,11 +75,25 @@ There is no automatic retry of a message whose send callback has been invoked. T
 
 Queued messages are encoded with Baileys' `WebMessageInfo` protobuf and encrypted with AES-256-GCM using the existing `AUTH_ENCRYPTION_KEY`. The ciphertext is authenticated against the message row UUID and a distinct `message` category. The original message can then be reconstructed for a quoted reply after restart.
 
-The outbound row stores the final text separately with authenticated category `outbound-reply` and the same message UUID. Moving ciphertext between rows or payload categories fails authentication. Terminal transitions clear both ciphertexts. Process-local conversation memory is committed only after successful sending; it still resets on restart.
+The outbound row stores final text with authenticated category `outbound-reply` and the same message UUID. Moving ciphertext between rows or payload categories fails authentication. Terminal transitions clear temporary transport ciphertexts. The inbox retains encrypted text independently in `content_encrypted` and `reply_encrypted`, so completed messages remain readable and usable as context across restarts.
 
 Outbound `available_at` is a durable due time and the sender never claims a future row early. This version emits immediate replies only. It retains the incoming message's expiry and quoted destination: a long-lived reminder scheduler, recipient authorization, cancellation, and due-time business-state checks remain future work. Setting a distant timestamp alone does not implement reminders.
 
-Payloads larger than 256 KiB before encryption are rejected. Terminal transitions clear the encrypted payload. Chat IDs, WhatsApp message IDs, states, timestamps, and reason codes remain as metadata. Terminal records, jobs, and their event history expire after 30 days through application cleanup. Initial/hourly maintenance also expires stale ready work and recovers abandoned leases.
+Payloads larger than 256 KiB before encryption are rejected. Terminal transitions clear temporary transport payloads, retaining encrypted inbox content and metadata. Terminal records (including observed messages), jobs, and their event history expire after 30 days through application cleanup. Initial/hourly maintenance also expires stale ready work and recovers abandoned leases.
+
+## Inbox, context, and operator sends
+
+Migration [202610010003_inbox.sql](../supabase/migrations/202610010003_inbox.sql) adds encrypted inbox content, archived replies, mention flags, and message origin to the existing `ramesh-messages` table. Existing restricted-role grants and RLS still apply. Text, captions, sender names, and group names are encrypted under `AUTH_ENCRYPTION_KEY`; captionless media is represented by a label, without file download or transcription.
+
+Every supported incoming notification is archived before reply filtering. Untagged group messages, stale notifications, and messages observed while reply capacity is full use `OBSERVED`, with no reply job. Reading does not invoke a model. `GROUP_REPLIES_REQUIRE_MENTION = true` in [group-policy.ts](../src/config/group-policy.ts) controls automatic replies only; `false` allows replies to untagged group text too. Own-message echoes, reactions, protocol traffic, and historical sync batches are excluded.
+
+The assistant reads up to 40 preceding inbox rows in the same account/chat, with a 16,000-character context budget and 6,000-character cap per historical message. Group participants share history with speaker labels; other groups and DMs never enter it. The triggering message is supplied once and later messages/replies are excluded. Only `SENT` output enters context. Queued, failed, expired, and uncertain output remains visible with its status. The isolated SQLite playground retains a bounded memory fallback. No LangGraph checkpoints are introduced.
+
+Endpoints: `GET /v1/inbox/conversations?cursor=...`, `GET /v1/inbox/messages?chatId=...&cursor=...`, and `POST /v1/inbox/send`. All require worker authentication. The send body is `{ "requestId": "<UUID>", "chatId": "<existing chat>", "text": "..." }`, with 1–4,000 nonblank characters and a 24 KiB JSON limit. WhatsApp must be connected to submit. Destinations must have received inbox history. The browser retains the UUID on uncertain HTTP results; reuse with different text or a different chat is rejected. HTTP 202 means durably queued, not delivered.
+
+Operator sends bypass generation and enter the existing outbound queue atomically with their inbox row. They have a five-minute send window, normal pacing, fenced leases, and the same `SENDING`/`UNCERTAIN` protections as automatic replies. `SENT` means SDK acceptance, not a delivery/read receipt. Manual sends do not disable automatic replies.
+
+Apply migration `202610010003` with the existing provisioner before deploying the worker, then deploy the matching admin. Startup checks this migration. Completed text cleared by older releases cannot be reconstructed; pending pre-upgrade work has no inbox content and is not automatically backfilled. Once operator sends exist, keep an inbox-aware worker to drain them: a pre-inbox consumer cannot interpret their payload. Supabase migration and deployment are separate from local implementation/testing.
 
 The following remain in the worker's existing SQLite database:
 

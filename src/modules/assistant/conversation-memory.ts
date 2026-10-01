@@ -1,4 +1,4 @@
-/** Bounded, short-lived context. Only replies accepted by the transport are remembered. */
+/** Local fallback: bounded incoming context and replies accepted by the transport. */
 import type { ChatMessage } from './assistant.types.js';
 
 export class ConversationMemory {
@@ -20,11 +20,18 @@ export class ConversationMemory {
   }
 
   remember(key: string, input: string, reply: string) {
-    const messages: ChatMessage[] = [
-      ...this.get(key),
+    this.append(key, [
       { role: 'user' as const, content: input },
       { role: 'assistant' as const, content: reply },
-    ].slice(-12);
+    ]);
+  }
+
+  observe(key: string, input: string) {
+    this.append(key, [{ role: 'user', content: input.slice(0, 6000) }]);
+  }
+
+  private append(key: string, additions: ChatMessage[]) {
+    const messages = [...this.get(key), ...additions].slice(-12);
     while (messages.reduce((size, message) => size + message.content.length, 0) > 16_000)
       messages.splice(0, 2);
     this.entries.delete(key);

@@ -272,7 +272,7 @@ Eligible messages are not from the bot itself, meet the group-mention rule, and 
 
 One job is leased per account. The consumer starts only after Baileys reports `connected`, wakes on new work, and polls the database every five seconds when idle. The current global ordering across chats remains; a slow job holds up later replies. Database connections are released during pacing and sending.
 
-The agent atomically completes inbound processing and saves its encrypted final text in `ramesh-outbound-queue`. The sender then claims that saved reply (or `hello` without an API key), quoting the reconstructed triggering message. Delivery retries never regenerate saved output. DMs stay in the DM; group replies stay in the same group. There is no arbitrary-send HTTP endpoint. See [queue states and recovery](supabase-message-queue.md#message-and-job-states) for the lease and uncertainty rules.
+The agent atomically completes inbound processing and saves its encrypted final text in `ramesh-outbound-queue`. The sender claims that saved reply (or `hello` without an API key), quoting the triggering message. Retries never regenerate saved output. DMs stay in the DM; group replies stay in the group. The authenticated admin can also enqueue manual text to existing received conversations. See [inbox, context, and operator sends](supabase-message-queue.md#inbox-context-and-operator-sends) for migration `202610010003`, retention, the reply-policy toggle, and delivery semantics.
 
 Fresh development databases without `MESSAGE_DATABASE_URL` use the `GreetingService` path: policy → SQLite claim → graph when configured → delay → send. It has no separate durable inbound/outbound tables. An activated production worker cannot silently return to that mode.
 
@@ -282,7 +282,7 @@ The graph is `START → converser → formatter → END`. Both nodes use the sam
 
 Input is capped at 6,000 characters, output defaults to 800 tokens per model response, and the whole graph has a 45-second deadline with one bounded SDK retry. Generation also observes session cancellation. OpenAI calls use the fixed official endpoint and `store: false`. Ordinary logs record stage timings and token counts, not prompts, responses, or keys.
 
-Memory is partitioned by chat and sender: at most six turns and 16,000 characters per context, 200 contexts, and a 30-minute idle expiry. It advances only after the transport accepts a reply and resets on process restart. Supabase preserves the queued input/final output, not conversation checkpoints. A crash before handoff may repeat generation; saved outbound replies survive restart without another model call.
+With Supabase configured, the encrypted inbox supplies up to 40 preceding rows and 16,000 characters of context. Participants share their group's history, including untagged messages; other groups and DMs stay separate. Successfully sent replies, including admin messages, enter context; failed/uncertain output does not. History survives restart and expires after 30 days. The isolated SQLite playground still uses bounded process-local memory. Supabase history is not a LangGraph checkpoint. A crash before handoff may repeat generation; saved outbound replies survive restart without another model call.
 
 Run `npm run dev:chat` for the fake chat GUI at `http://127.0.0.1:3012`. It exercises the mapper, SQLite claims, and graph with synthetic identities and a captured sender. `.local/playground.db` is separately migrated on startup. The command ignores production SQLite/Supabase connection settings, never loads linked-device credentials, and creates no WhatsApp socket. **New conversation** clears the selected context's process-local memory. Real OpenAI calls require a local key and incur model usage.
 
@@ -467,12 +467,14 @@ Application responses include JSON content type, `Cache-Control: private, no-sto
 
 ### Browser-facing admin API
 
-| Method and path         | Authentication and behavior                                                                       |
-| ----------------------- | ------------------------------------------------------------------------------------------------- |
-| `POST /api/session`     | Origin check, password verification, worker-backed limit, session issuance                        |
-| `DELETE /api/session`   | Origin check, persisted revocation, cookie removal                                                |
-| `GET /api/bot/status`   | Valid signed cookie and active worker session; proxies worker status                              |
-| `POST /api/bot/control` | Valid session, origin check, maximum 1 KiB JSON body; proxies one of the three supported controls |
+| Method and path         | Authentication and behavior                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- |
+| `POST /api/session`     | Origin check, password verification, worker-backed limit, session issuance                           |
+| `DELETE /api/session`   | Origin check, persisted revocation, cookie removal                                                   |
+| `GET /api/bot/status`   | Valid signed cookie and active worker session; proxies worker status                                 |
+| `POST /api/bot/control` | Valid session, origin check, maximum 1 KiB JSON body; proxies one of the three supported controls    |
+| `GET /api/bot/inbox`    | Valid session; lists conversations or messages for `chatId`, with optional pagination `cursor`       |
+| `POST /api/bot/inbox`   | Valid session and origin; enqueues text as Ramesh to an existing conversation, with idempotency UUID |
 
 The browser uses a session cookie to reach Next.js. Next.js uses the private bearer token to reach the worker. Those are separate authentication boundaries.
 
@@ -566,7 +568,7 @@ Use the authenticated dashboard to inspect connection state and activity. Stoppi
 | `errors`     | Message-processing exceptions and durable queue operation failures                                     |
 | `dropped`    | Incoming work rejected by the admission buffer or durable pending-job capacity                         |
 
-`received` can include own messages, unmentioned group messages, and stale text that are subsequently ignored. It is not the number of authorized employee requests. `dropped` is not a total of every ignored or cancelled message. All counters and the activity list reset with the process.
+`received` includes unmentioned group messages, stale notifications, and media labels saved in the inbox; it excludes own-message echoes and protocol traffic. It is not the number of authorized employee requests. `dropped` is not a total of every ignored or cancelled message. All counters and the activity list reset with the process; the Supabase inbox does not.
 
 `startedAt` records client construction time. `updatedAt` tracks connection-state changes; it is not a timestamp of the last message or a complete heartbeat metric. Status snapshots are copied before being returned so API consumers do not mutate internal state.
 

@@ -3,8 +3,12 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { PoolClient } from 'pg';
 
-export const MESSAGE_SCHEMA_VERSION = '202610010002';
-const migrations = ['202610010001_message_queue.sql', '202610010002_split_queues.sql'];
+export const MESSAGE_SCHEMA_VERSION = '202610010003';
+const migrations = [
+  '202610010001_message_queue.sql',
+  '202610010002_split_queues.sql',
+  '202610010003_inbox.sql',
+];
 
 /** dotenv expands \n itself; normalize an already-escaped CA before quoting it again. */
 export function messageRuntimeEnv(url: string, ca = ''): string {
