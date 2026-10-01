@@ -1,6 +1,6 @@
 # Ramesh: product context and decisions
 
-Initial context captured on **2026-09-30**; implementation status updated on **2026-10-01** through release `5eb14d0`. This preserves product decisions and earlier options. See the [implementation reference](docs/current-implementation.md) for current behavior and the [consolidated architecture plan](docs/assistant-architecture-plan.md) for the supplied system design, research, and roadmap.
+Initial context captured on **2026-09-30**; implementation status updated on **2026-10-01** through the identity/OAuth increment. This preserves product decisions and earlier options. See the [implementation reference](docs/current-implementation.md) for current behavior and the [consolidated architecture plan](docs/assistant-architecture-plan.md) for the supplied system design, research, and roadmap.
 
 ## Current scope
 
@@ -14,7 +14,7 @@ Supabase now holds `ramesh-inbound-queue`, `ramesh-outbound-queue`, message stat
 
 Local chat testing uses the isolated SQLite playground at `http://127.0.0.1:3012`; it captures replies without opening WhatsApp or connecting to Supabase. Live model evaluations also use fake delivery. Queue integration tests use a separate local PostgreSQL database, never the production queue. **Do not send real WhatsApp test messages or start a second process with the production pairing.**
 
-CRM, supply, and knowledge MCP services are scaffolded in this repository but are not wired into the graph. The default credential resolver grants no access. Employee enrollment, phone/LID mapping, encrypted OAuth storage/refresh, planner/worker/verifier agents, reminders, SLA notifications, and writes remain future work. Dedicated CRM/WAG/HRMS backend read endpoints are deferred; the existing Context Engine remains the intended read boundary.
+CRM, supply, and knowledge MCP services are scaffolded in this repository but are not wired into the graph. The default credential resolver grants no access. A concrete adapter now implements trusted phone/LID resolution, active employee checks, PKCE enrollment, encrypted OAuth storage, serialized refresh, expiry and revocation. Unknown users can chat without business access. Planner/worker/verifier agents, reminders, SLA notifications, and writes remain future work. Dedicated CRM/WAG/HRMS backend read endpoints are deferred; the existing Context Engine remains the intended read boundary.
 
 ## Intended product
 
@@ -32,7 +32,7 @@ The user's direction: **scope authorization to the person messaging the bot, and
 4. Route personal CRM results and reminder details to the requesting employee's DM. Tools should not accept arbitrary destinations or a user-selected identity.
 5. Recheck active employee status and permissions when executing work. A future group knowledge policy also needs to consider guest/external group members: open within the organisation does not mean public.
 
-The active conversational graph does not yet look up employees or load business credentials. The MCP scaffold enforces a supplied employee grant, DM audience, tool allowlist, and server identity match; the trusted identity and credential-lifecycle adapters still need implementation.
+The active conversational graph does not look up employees or load business credentials. The MCP scaffold enforces a supplied employee grant, DM audience, tool allowlist, and server identity match. The trusted identity and credential adapters are implemented through `createEmployeeContextAccess`; explicit worker integration and pilot enrollment remain separate steps. See the [enrollment runbook](docs/employee-identity-and-oauth.md).
 
 ## Selected AI and MCP direction
 
@@ -48,7 +48,7 @@ Earlier options, retained for context:
 - Cap steps, tokens, and per-person daily spend. Keep API keys server-side. Audit triggers, tool calls, results, and responses with suitable access controls and retention; use representative, sanitized runs as a regression set.
 - Ground CRM answers in successful tool results, citing returned lead IDs/links and exposing missing or stale data rather than guessing.
 
-**Repo finding:** `/mcp` accepts employee OAuth access tokens (`wog_mcp_at_…`), not raw employee REST keys (`wog_ctx_…`). Access tokens last up to 15 minutes; refresh grants are bounded by the employee key/grant expiry. The scaffold validates employee binding and expiry. Provisioning, encrypted storage, serialized refresh, revocation, and offboarding still need implementation; a shared static token is not the integration contract.
+**Repo finding:** `/mcp` accepts employee OAuth access tokens (`wog_mcp_at_…`), not raw employee REST keys (`wog_ctx_…`). Access tokens last up to 15 minutes; refresh grants are bounded by the employee key/grant expiry. The concrete adapter implements enrollment, encrypted storage, serialized rotation, revocation, and current roster checks. Real enrollment uses explicit consent and an owned callback; a shared static token is not the integration contract.
 
 ## Transport options discussed
 
@@ -85,4 +85,4 @@ Paths below are relative to this folder. The initial organisational inspection w
 
 CRM-Automations uses Supabase `pg_cron`/`pg_net` to call secret-protected HTTP workers. Its “meaningful update” clock combines manual business-field changes with separate note/task activity streams; Twenty's generic `updatedAt` is not a substitute. The bot should reuse those clocks and the existing sync rather than create another poller.
 
-Next: implement verified employee identity and OAuth lifecycle, then wire the existing MCP services into private CRM reads with evidence verification. Supply assistance follows. Reminder tools and due-time evaluation come later, reusing CRM-Automations' rules and the settled escalation order: **assignee(s), then existing CRM admins**. The outbound queue is already present; long-lived reminder state, cancellation, recipient checks, and escalation scheduling are not. Keep bot-owned migrations separate from shared business schemas.
+Next: configure the owned OAuth callback, enroll pilot employees, then wire the existing identity/OAuth and MCP services into private CRM reads with evidence verification when worker development resumes. Supply assistance follows. Reminder tools and due-time evaluation come later, reusing CRM-Automations' rules and the settled escalation order: **assignee(s), then existing CRM admins**. The outbound queue is already present; long-lived reminder state, cancellation, recipient checks, and escalation scheduling are not. Keep bot-owned migrations separate from shared business schemas.

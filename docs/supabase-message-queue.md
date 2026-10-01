@@ -98,6 +98,7 @@ Apply migration `202610010003` with the existing provisioner before deploying th
 The following remain in the worker's existing SQLite database:
 
 - Encrypted Baileys credentials and Signal keys.
+- Encrypted employee OAuth grants, PKCE enrollment attempts, and pending revocations in separate `ContextOAuth*` tables. See [identity and OAuth](employee-identity-and-oauth.md).
 - Admin session hashes and login rate limits.
 - Operator connection preference.
 - Legacy `Greeting` claims and the durable-storage activation marker.
@@ -111,6 +112,8 @@ Keep the account ID stable across restarts and deployments. This implementation 
 ## Authentication and configuration
 
 The runtime connects as `ramesh_worker`, a dedicated non-superuser login without role creation, database creation, replication, or RLS bypass. Its explicit application grants cover these five tables, the compatibility view, and the state-history trigger function. All five tables have RLS enabled; the view uses invoker security. Explicit `PUBLIC`, `anon`, `authenticated`, and `service_role` grants are removed for these objects; there is no browser-facing queue API.
+
+The employee resolver separately requires column-level SELECT on `public."VerifiedNumber"` for `id`, `phone_number`, `email`, and `is_active`. `npm run db:identity -- --env-file /private/admin.env --apply` provisions that narrow grant without changing roster rows or policies. This is additional to the queue grants; employee business access still comes through OAuth-scoped Context Engine tools. The admin browser receives no database credential.
 
 Existing database-wide `PUBLIC` privileges still apply to PostgreSQL logins. Inspection found inherited access to the existing PostGIS catalog tables/views and `net.http_request_queue` / `net._http_response`; this change does not modify those shared extension grants. The runtime login is therefore a scoped application login, not an assertion of complete isolation from every shared extension object.
 
@@ -140,7 +143,7 @@ For EC2, add those runtime values to the protected worker environment and its en
 
 For the queue split, apply migration `202610010002` before deploying the new worker. The compatibility view supports the previously deployed SQL during this window. Deploying new code without the migration fails startup readiness. Once outbound rows exist, rolling back to the pre-split worker leaves them preserved but undelivered; restore a split-aware worker to drain them. Do not move saved replies back into the inbound queue or automatically resend uncertain rows. The alias can be removed in a later migration after the pre-split rollback window closes.
 
-EC2 SQLite snapshots cover auth/admin/local settings, not PostgreSQL jobs. Supabase backup/PITR settings were not changed or verified by this feature. Retain the authentication encryption key separately so pending encrypted payloads remain recoverable.
+EC2 SQLite snapshots cover auth/admin/local settings and encrypted employee OAuth state, not PostgreSQL jobs. Supabase backup/PITR settings were not changed or verified by this feature. Retain the authentication encryption key separately so pending encrypted payloads remain recoverable. Revoke/re-enroll restored OAuth grants before reuse; old refresh tokens may already have been consumed.
 
 Production runtime values must stay synchronized between the root-protected host environment and the encrypted SSM backup. Changing the SSM parameter alone does not reload the worker. See [EC2 runtime configuration](ec2-operations.md#runtime-configuration) for the update procedure; keep model keys out of database provisioning credentials and keep the admin's token separate from employee business access.
 

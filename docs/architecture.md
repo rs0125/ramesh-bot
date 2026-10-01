@@ -1,6 +1,6 @@
 # Architecture and API
 
-Reviewed **1 October 2026** through release `5eb14d0`. The worker and Next.js admin are independent projects. The worker owns WhatsApp, the two-node conversational graph, durable message queues, local authentication/admin state, and the control API. The admin owns browser authentication UI, signed cookies, and the server-side HTTP client. They share a documented protocol, not source code or npm dependencies.
+Reviewed **1 October 2026** through the identity/OAuth increment. The worker and Next.js admin are independent projects. The worker owns WhatsApp, the two-node conversational graph, durable message queues, local authentication/admin/OAuth state, and the control API. The admin owns browser authentication UI, signed cookies, and the server-side HTTP client. They share a documented protocol, not source code or npm dependencies.
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,7 @@ flowchart LR
 
 Supabase also holds the message ledger, transactional state history, and migration checksums. Both queue stages run in the existing worker and share one active lease per account; a long model run can delay other chats. The outbound sender uses saved text without regenerating it. Without an OpenAI key, the same delivery boundary uses `hello`.
 
-The MCP boundary is a separate, inactive scaffold: `createContextEngineServices` → employee-bound CRM/supply/knowledge services → Context Engine `/mcp`. It is not called by the current graph. Its default credential resolver grants no access; employee phone/LID resolution, OAuth enrollment/storage/refresh, and the planner/worker/verifier agents remain future work. The [consolidated architecture plan](assistant-architecture-plan.md) includes the user's system diagram and future flow.
+The MCP boundary is separate from the active graph: `createEmployeeContextAccess` → trusted phone/LID and live employee roster → encrypted employee OAuth grant → CRM/supply/knowledge services → Context Engine `/mcp`. The adapter implements enrollment, refresh rotation, expiry and revocation. Unknown users can chat but receive no business credential, and group reads are denied. `createContextEngineServices` retains its closed default resolver. The planner/worker/verifier agents remain future work. See [identity/OAuth operations](employee-identity-and-oauth.md) and the [consolidated architecture plan](assistant-architecture-plan.md).
 
 `npm run dev:chat` uses the same graph with isolated SQLite and captured browser replies at port 3012. It opens neither a WhatsApp socket nor a Supabase connection. The separate PostgreSQL integration suite verifies the production queue logic with fake delivery.
 
@@ -33,6 +33,7 @@ The MCP boundary is a separate, inactive scaffold: `createContextEngineServices`
 | `modules/greetings`             | Determine eligibility, claim before sending, preserve uncertain claims                    |
 | `modules/assistant`             | Typed LangGraph state, converser/formatter prompts, bounded memory, and style guard       |
 | `modules/context-engine`        | Employee credential port, read-tool allowlist, and CRM/supply/knowledge services          |
+| `modules/identity`              | Canonical phone resolution to one active VerifiedNumber employee; no cached permissions   |
 | `infrastructure/whatsapp`       | Map SDK events, resolve bot identities, manage retries and bounded work                   |
 | `infrastructure/database`       | SQLite auth/admin and PostgreSQL message ledger, queues, leases, and atomic reply handoff |
 | `infrastructure/openai`         | Responses API, model deadlines, cancellation, and safe errors                             |
@@ -41,6 +42,8 @@ The MCP boundary is a separate, inactive scaffold: `createContextEngineServices`
 | `contracts`                     | Describe v1 response shapes; consumers independently validate them                        |
 
 Auth writes use AES-256-GCM with a random IV and row identity as additional authenticated data. Supabase pending input, inbox content, and finalized replies use distinct authenticated categories. The key is outside both databases. Terminal transport payloads are cleared, while encrypted inbox text and metadata expire after 30 days. Keep one active worker per linked account: queue leases do not implement distributed WhatsApp session ownership.
+
+Employee OAuth grants, PKCE attempts, and pending revocations use three separate encrypted SQLite tables. Grant rotation is fenced by durable versions and leases across local processes. The roster adapter uses the existing restricted PostgreSQL connection with SELECT on four employee columns; business reads still go through scoped MCP tools. No tokens enter the graph, browser, or inbox.
 
 With Supabase configured, recent context comes from the persistent inbox: up to 40 preceding rows and 16,000 characters, partitioned by account/chat. All group participants share history, including untagged messages; DMs and other groups stay separate. Only successfully sent replies enter context. The isolated SQLite playground retains bounded process-local memory. There are no durable LangGraph checkpoints or business tools in the active graph. Migration `202610010003` must precede deployment of this inbox-aware worker.
 

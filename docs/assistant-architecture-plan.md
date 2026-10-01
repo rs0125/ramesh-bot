@@ -2,11 +2,11 @@
 
 Date: **1 October 2026**
 
-Status: **Living design and implementation plan, updated through release `5eb14d0`**
+Status: **Living design and implementation plan, updated through the identity/OAuth increment**
 
 This document consolidates the discussion about moving WareOnGo's basic OpenClaw assistant functions into the in-house Baileys bot. It covers CRM and supply reads, the conversational agent loop, reminders and escalation, later writes, migration, and evaluation.
 
-The conversational pilot, separate inbound/outbound queues, and inactive MCP service scaffold are implemented and have passed CI and EC2 deployment. Sections 18–20 describe those delivered increments. The wider identity, tool-using agent, reminder, and write workflows remain proposed. Organisational source observations come from repository inspection; this does not establish current live CRM data or scheduler behavior. The [implementation reference](current-implementation.md) covers the running bot and the [operations guide](ec2-operations.md) covers its private EC2 deployment.
+The conversational pilot, separate inbound/outbound queues, and inactive MCP service scaffold are implemented and have passed CI and EC2 deployment. Sections 18–20 describe those increments. Trusted employee identity and encrypted OAuth lifecycle adapters are now implemented; section 21 describes their boundary and enrollment requirements. Tool-using agents, reminders, and writes remain proposed. Organisational source observations come from repository inspection; this does not establish current live CRM data or scheduler behavior. The [implementation reference](current-implementation.md) covers the running bot and the [operations guide](ec2-operations.md) covers its private EC2 deployment.
 
 ## 1. Requirements and recommended decisions
 
@@ -40,7 +40,7 @@ The conversational pilot, separate inbound/outbound queues, and inactive MCP ser
 | Deployment       | Extend the existing worker with modules; retain the separate admin app                                  | These boundaries do not initially require more independently deployed services.                      |
 | Persistence      | Keep SQLite for WhatsApp session state initially; use private Postgres tables for shared workflow state | CRM-Automations and the bot need durable coordination.                                               |
 
-OpenAI Terra/LangGraph, the queue split, and MCP as the read integration boundary are selected. The graph currently has only two stages; employee enrollment and business workflows remain to be implemented. Exact notification cadence and write policies remain open.
+OpenAI Terra/LangGraph, the queue split, and MCP as the read integration boundary are selected. The graph currently has only two stages. Employee identity and OAuth enrollment are implemented as separate services/commands; live pilot consent, callback setup, and business workflows remain. Exact notification cadence and write policies remain open.
 
 The deferred endpoint refactor applies to the internal implementation of business reads. Ramesh still calls bounded, employee-scoped Context Engine tools. Later CRM writes must use Twenty, and supply changes must preserve WAG's validation and review paths. HRMS remains a future integration whose capabilities and permissions need mapping.
 
@@ -76,12 +76,13 @@ The existing TypeScript worker provides:
 - Separate durable inbound/outbound queues, reconnect handling, bounded admission, send deadlines, and cancellation of unsent replies.
 - OpenAI Terra converser/formatter nodes, bounded process-local memory, an isolated SQLite chat GUI, and a live-model evaluation harness.
 - An inactive Context Engine MCP service scaffold with employee-grant checks and read-only tool discovery.
+- Trusted phone/LID resolution to the active roster and an encrypted OAuth adapter with PKCE enrollment, serialized rotation, expiry, and revocation.
 - A separate Next.js admin application for pairing, status, and connection controls.
 - One send attempt per claimed greeting; uncertain sends retain the claim. This is not a delivery guarantee.
 
 Production uses PostgreSQL message state, encrypted inbound/outbound payloads, leases, restart recovery, and explicit uncertain-send handling. The agent atomically saves the final reply in `ramesh-outbound-queue`; the sender delivers the stored text without another model call. The original `hello` remains only the no-key fallback. This supports immediate quoted replies, not yet general reminders or proactive notifications. Both queue migrations are provisioned and the implementation has deployed successfully.
 
-The domain handler receives a `GreetingCandidate`, now extended with text and the transport sender ID for the first conversational implementation. Its reply callback is bound to the original chat. The optional two-node LangGraph flow and bounded in-process conversation history are described in section 18. Employee authorisation, business tools, durable conversation checkpoints, and proactive notification delivery remain future work.
+The domain handler receives a `GreetingCandidate`, now extended with text and the transport sender ID for the first conversational implementation. Its reply callback is bound to the original chat. The optional two-node LangGraph flow and bounded in-process conversation history are described in section 18; the Supabase inbox now supplies persistent recent context in the running worker. Employee authorization adapters exist outside the graph. Connecting business tools, durable conversation checkpoints, and proactive notification delivery remain future work.
 
 Processing is currently serialised per account across the two queue stages. A slow model request can hold up other conversations. Separate table responsibilities do not yet introduce independent processes or concurrent agent runs; per-conversation ordering with bounded concurrency is a later extension.
 
@@ -188,7 +189,7 @@ Resolve:
 
 Use immutable employee IDs internally. A name in a message, WhatsApp display name, or model-generated phone number cannot establish identity. Resolve phone/LID aliases using trustworthy protocol information, and reject ambiguous or missing mappings. Baileys v7 documents separate phone/LID identifiers and alternate sender fields; group resolution must use the participant identity. [Baileys v7 migration guidance](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/migration/to-v7.0.0.md)
 
-The bot needs a narrow roster-resolution integration; this is new work. Use a normalised phone number matched to exactly one active roster entry. In groups, resolve the sending participant rather than the group JID. A stored identity link must not become a permanent cached permission grant. Revalidate active status and relevant permissions when executing work and delivering sensitive results.
+The roster-resolution adapter is implemented: a normalized phone must match exactly one active employee. LIDs require reciprocal mappings already persisted by Baileys; group identity uses the participant. The PostgreSQL adapter selects only four roster columns. Credential use rechecks immutable employee ID, current phone/email, and active status. No persistent identity cache grants permission. The future worker must also revalidate before delayed sensitive delivery.
 
 ### Employee credentials
 
@@ -196,7 +197,7 @@ For an initial pilot, associate each employee with their own Context Engine OAut
 
 The employee-facing sign-in is the verified WhatsApp sender identity. Provision the matching Context Engine credential on the server; do not ask employees to paste API keys into WhatsApp. Phone recognition does not itself create a Context Engine credential, so this binding is required before the first scoped CRM request. A later authenticated delegation mechanism can replace per-employee credential provisioning while retaining the same authorisation boundary.
 
-Do not reuse one administrator credential for everyone's interactive requests. The MCP client scaffold is implemented; the full employee OAuth enrollment, encrypted persistence and refresh lifecycle still needs an adapter. Background notification jobs use a separately authorised automation capability limited to their workflow and intended recipients.
+Do not reuse one administrator credential for everyone's interactive requests. `EmployeeContextCredentials` now implements PKCE enrollment, encrypted persistence, fenced refresh rotation, expiry, revocation, and exact-token invalidation after MCP 401s. Live enrollment needs an owned allowlisted callback and explicit employee consent. Background notification jobs will use a separately authorised automation capability limited to their workflow and intended recipients; employee grants do not automatically authorize proactive sends.
 
 ### DM and group boundaries
 
@@ -521,7 +522,7 @@ Code-based checks establish deterministic conditions. Model rubrics assess expla
 
 ## 16. Delivery milestones
 
-Delivered foundation: the two-node Terra/LangGraph conversational pilot, local SQLite GUI/evals, durable queue split, and inactive MCP service scaffold. These increments have passed worker CI and EC2 deployment. Employee credentials and the following business milestones are still pending.
+Delivered foundation: the two-node Terra/LangGraph conversational pilot, local SQLite GUI/evals, durable queue split, and inactive MCP service scaffold. These increments have passed worker CI and EC2 deployment. The identity/OAuth adapter is now implemented and tested. Owned callback setup, actual pilot enrollment, and the following business milestones remain.
 
 | Milestone                   | Deliverable                                                                                                   | Exit evidence                                                                                                                   |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -554,7 +555,7 @@ The architecture is sufficient to begin the first CRM-read milestone. The remain
 
 The following product and rollout choices remain open; notification-specific choices need resolution before that milestone, not before basic CRM reads:
 
-- Pilot employee cohort and secure credential enrolment/renewal flow.
+- Pilot employee cohort and owned callback origin; use the implemented enrollment/renewal flow.
 - Exact permitted group-knowledge scope and treatment of groups containing external members.
 - Whether personal briefing ownership uses strict current assignment only or an explicit unassigned-lead fallback.
 - Consistent SLA boundary semantics, missing-clock handling, and the policy distribution/versioning mechanism.
@@ -574,7 +575,7 @@ The first small implementation is `START → converser → formatter → END` us
 
 The worker's protected EC2 environment and SSM SecureString backup contain the OpenAI configuration. The admin needs no model key. The initial live-model evaluation passed 26/26 trials across 13 synthetic cases; this evidence does not establish future CRM/tool quality.
 
-The converser handles the request with limited recent context. The formatter preserves facts and capability limits while producing short, natural WhatsApp language. A code guard removes em dashes. No CRM, supply, HRMS, reminder, browsing or write tools are connected yet, and the prompts explicitly state those limits. Recognising a transport sender is not the employee authorisation implementation planned in section 5.
+The converser handles the request with limited recent context. The formatter preserves facts and capability limits while producing short, natural WhatsApp language. A code guard removes em dashes. No CRM, supply, HRMS, reminder, browsing or write tools are connected yet, and the prompts explicitly state those limits. Recognising a transport sender in conversation is separate from the employee authorization adapter in sections 5 and 21.
 
 Runtime controls include a total generation deadline, input/output limits, one SDK retry, a fixed two-node graph with a recursion cap, session cancellation, and a durable lease sized for the full generation/send budget. Memory is partitioned by chat and sender, bounded to six turns and 16,000 characters across at most 200 contexts, and expires after 30 idle minutes. It only records replies accepted by the transport and resets on process restart. Graph checkpoints and durable conversation memory are deferred; inbound work may repeat generation after a restart before the atomic handoff, while saved outbound replies survive restarts without regeneration.
 
@@ -606,7 +607,7 @@ The reusable boundary is implemented inside this repository. It is not imported 
 
 The client uses `@modelcontextprotocol/client` 2.1.0, matching the inspected Context Engine client SDK. It uses Streamable HTTP at the configured `/mcp` URL. HTTPS is required except for explicit loopback development URLs. Requests stay on that exact URL and refuse redirects. No stdio processes, arbitrary HTTP tools, sampling, or consent automation are exposed. The [official TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) documents the client package and transport; Context Engine's [MCP catalogue](../../Context_Engine/src/lib/mcp.ts) and [OAuth implementation](../../Context_Engine/src/lib/mcp-oauth.ts) define the application-specific contracts.
 
-`ContextCredentialResolver.resolve` is an injected server-side port. Its future adapter must resolve a trusted WhatsApp phone/LID to exactly one current active employee, load that employee's encrypted grant, serialize refresh-token rotation, and return a valid short-lived MCP access token. The scaffold checks normalized phone binding, active status and token expiry, then verifies the server-reported employee ID via `get_context` before any business tool. REST keys are rejected. The default resolver returns no grant, so the integration stays closed until enrollment/storage is implemented. OAuth tokens and phone identity are never model-visible tool arguments.
+`ContextCredentialResolver.resolve` is an injected server-side port, now implemented by `EmployeeContextCredentials`. `createEmployeeContextAccess` derives a trusted WhatsApp phone/LID, resolves one current active employee, loads that employee's encrypted grant, serializes rotation, and returns a valid short-lived MCP access token. The MCP client checks normalized phone binding, active status and token expiry, then verifies the server-reported employee ID via `get_context` before any business tool. REST keys are rejected. The lower-level factory still defaults to no grant, and the chat graph remains disconnected. OAuth tokens and phone identity are never model-visible tool arguments.
 
 One connection and tool catalogue belong to one read operation. There is no cross-employee session, token cache or result cache. The server continues to revalidate current scopes and live record permissions on each read. The first service boundary accepts DMs only; group business reads need an explicit audience policy later. A claimed read-only annotation is insufficient on its own: the tool must also be in the local allowlist and the employee's discovered/scoped catalogue.
 
@@ -621,9 +622,9 @@ Available service methods:
 
 These map to fourteen existing read tools. The server's discovered input schemas remain the authoritative filter catalogue; service filters are passed through without guessing or coercing business values. Analytical reports, writes, arbitrary sends and HRMS tools are outside this initial allowlist. CRM-related context uses one lead ID and one of `notes`, `tasks`, `company` or `stage_history`.
 
-Successful calls preserve the Context Engine envelope: `source_path`, `status`, `data`, and `meta` including `requestId` and `generatedAt`. Nested cursors, source status, coverage, redactions, access scope, field evidence and verification flags survive unchanged. The client validates the envelope; interpreting and checking business evidence remains the future verifier's job. Tool text and record contents are data, not instructions. Errors expose stable codes such as `AUTH_REQUIRED`, `ACCESS_DENIED`, `TOOL_UNAVAILABLE`, `RATE_LIMITED`, `TIMEOUT` and `UNAVAILABLE`, without raw upstream bodies or SDK errors. No automatic retry or token refresh occurs inside a tool call.
+Successful calls preserve the Context Engine envelope: `source_path`, `status`, `data`, and `meta` including `requestId` and `generatedAt`. Nested cursors, source status, coverage, redactions, access scope, field evidence and verification flags survive unchanged. The client validates the envelope; interpreting and checking business evidence remains the future verifier's job. Tool text and record contents are data, not instructions. Errors expose stable codes such as `AUTH_REQUIRED`, `ACCESS_DENIED`, `TOOL_UNAVAILABLE`, `RATE_LIMITED`, `TIMEOUT` and `UNAVAILABLE`, without raw upstream bodies or SDK errors. Credential resolution may refresh before use; failed MCP calls are not automatically retried.
 
-Future composition, after implementing the credential adapter:
+Explicit service composition after employee enrollment (the trusted transport composition is documented in section 21):
 
 ```ts
 import { loadContextEngineConfig } from './config/context-engine.js';
@@ -643,3 +644,13 @@ const evidence = await reads.crm.search(
 Set `CONTEXT_MCP_URL` to the deployed Context Engine `/mcp` endpoint when wiring the feature. The total per-read deadline defaults to 30 seconds and the response limit to 1 MiB. No shared MCP token belongs in the environment. Deployment of this scaffold needs no new production environment setting because the current application does not instantiate it.
 
 Tests use the actual MCP SDK with fake HTTP responses. They cover the wire handshake, discovery and calls, employee mismatch, independent concurrent identities, missing/expired/inactive grants, REST-key rejection, group denial, scope filtering, write rejection, structured/text evidence, safe HTTP/tool failures, response bounds, cancellation and deadlines. They do not connect to Context Engine, read business data, or send WhatsApp messages.
+
+## 21. Implemented identity and OAuth adapter
+
+`createEmployeeContextAccess` composes the live employee roster resolver, transport-owned phone/LID mapping, encrypted SQLite store, fixed-origin OAuth client, and existing MCP services. It does not add stages to LangGraph. Unknown users retain ordinary conversation access; unknown, inactive, ambiguous, unenrolled, expired, or revoked identities receive no business credential. Business reads remain DM-only.
+
+The operator starts PKCE enrollment for a roster employee. After explicit consent on Context Engine, the adapter validates the callback/state and checks `get_context.employee_id` before installing the grant. Access/refresh tokens, phone/email binding, and PKCE secrets use separate authenticated AES-GCM categories under the existing encryption key. Three new local tables hold grants, enrollment attempts, and pending revocations. The restricted PostgreSQL role gains SELECT on only `id`, `phone_number`, `email`, and `is_active` from `VerifiedNumber`.
+
+Refresh uses persistent versions and a lease so independent local processes rotate once. Ambiguous refresh results are never replayed. Revocation stops local access before contacting the server, survives restart, and prevents late enrollment/refresh from restoring access. The adapter rechecks the current roster and scopes stay controlled by Context Engine. No shared admin token, automatic consent, or public credential-export endpoint is added.
+
+The [identity/OAuth runbook](employee-identity-and-oauth.md) contains the full trust diagram, table contract, provisioning and enrollment commands, expiry/revocation rules, recovery procedure, and composition example. Tests use synthetic identities/tokens with real SQLite/PostgreSQL and the actual MCP SDK. Live pilot setup still needs an owned allowlisted callback and employee consent; callback hosting, admin enrollment UI, and background revocation scheduling are not part of this increment. Planner, worker, verifier, reminders, and writes remain deferred.

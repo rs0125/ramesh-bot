@@ -4,7 +4,7 @@ Standalone TypeScript service for the sales team's WhatsApp bot. With an OpenAI 
 
 The Next.js admin lives in the **separate [ramesh-bot-admin repository](https://github.com/rs0125/ramesh-bot-admin)**, with its own dependencies, lockfile and Vercel workflow. These local checkouts are named `baileys-ramesh` and `baileys-ramesh-admin`; cloned directories can use any names. It talks to this worker through the authenticated `/v1` HTTP API. Neither project imports or builds the other.
 
-Documentation reviewed on **1 October 2026** through release `5eb14d0`. The conversational flow and queue split are deployed. The MCP services are scaffolded but inactive; planner, worker, verifier, employee credential enrollment, reminders, and business writes are deferred. The [architecture plan](docs/assistant-architecture-plan.md) contains the supplied system diagram, organisational context, decisions, research, and next milestones.
+Documentation reviewed on **1 October 2026**, including the employee identity and OAuth adapters. The conversational flow and queue split are deployed. The MCP services and credential lifecycle are implemented but disconnected from the chat graph; planner, worker, verifier, reminders, and business writes are deferred. The [architecture plan](docs/assistant-architecture-plan.md) contains the supplied system diagram, organisational context, decisions, research, and next milestones.
 
 The inbox addition requires migration `202610010003_inbox.sql` before deploying this worker, followed by the matching admin update. Editing this checkout does not roll it out. See [inbox, context, and operator sends](docs/supabase-message-queue.md#inbox-context-and-operator-sends).
 
@@ -20,7 +20,7 @@ Open **http://127.0.0.1:3012**. The playground uses real OpenAI calls and the ac
 
 Switch between test identities and DM/group contexts to check isolation. Participants share their group's context; DMs and other groups remain separate. **New conversation** clears that context's short-term memory. This isolated playground uses bounded in-process memory: at most 12 messages per context, 16,000 characters, 200 contexts, and a 30-minute idle lifetime. It resets on restart. The Supabase-enabled worker instead reads recent history from its persistent inbox.
 
-The assistant currently chats and drafts text. CRM, supply, HRMS, reminder tools, employee roster authentication, and writes remain future work. Prompts explicitly prohibit claiming those capabilities. The formatter preserves the draft's facts and uncertainty, removes stock AI phrasing, and a final code guard removes em dashes. Identity/audience isolation here is conversation separation, not employee authorisation.
+The assistant currently chats and drafts text. CRM, supply, HRMS, reminder tools, and writes remain disconnected. Prompts explicitly prohibit claiming those capabilities. The formatter preserves the draft's facts and uncertainty, removes stock AI phrasing, and a final code guard removes em dashes. The playground's synthetic identities provide conversation separation; they do not enroll employees or authorize business reads.
 
 `OPENAI_MODEL` defaults to `gpt-5.6-terra`. The whole two-stage run has a 45-second deadline, each model response is capped at 800 output tokens, and the SDK permits one bounded retry. Configuration is in [.env.example](.env.example). No API key, request body, or conversation content is included in normal worker logs; stage timings and token counts are logged. Responses use `store: false`.
 
@@ -30,7 +30,9 @@ The repository now includes a reusable MCP client and thin CRM, supply, and know
 
 Each read uses a fresh MCP connection, discovers permitted read tools, and checks `get_context.employee_id` against the verified employee before calling a business tool. Credentials are employee OAuth access tokens, never the REST key or a shared admin token. Results retain source IDs, cursors, freshness, access scope, and uncertainty for later verification. Requests have a total deadline, response-size limits, cancellation, and redacted errors. Tests exercise the real SDK with synthetic HTTP responses.
 
-See [the MCP service contract and integration example](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). Employee enrollment, phone/LID resolution, encrypted OAuth storage and refresh remain to be wired through the resolver. Planner, worker, and verifier agents are deliberately deferred.
+`createEmployeeContextAccess` now supplies the concrete resolver: trusted phone or reciprocal Baileys LID mapping → one active `VerifiedNumber` employee → that employee's encrypted OAuth grant. It implements PKCE enrollment, employee-ID verification, serialized refresh rotation, expiry, revocation, and live roster rechecks. Unknown users can chat but receive no business credential; group business reads remain denied.
+
+See [employee identity, enrollment, and operations](docs/employee-identity-and-oauth.md) and [the MCP service contract](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). Operator commands are `npm run db:identity` and `npm run context:auth`. Live enrollment requires an owned, allowlisted callback and employee consent. The current chat graph and fake GUI do not invoke these adapters. Planner, worker, and verifier agents remain deferred.
 
 ## Agent evaluations
 
@@ -72,6 +74,7 @@ src/
   modules/greetings/       Eligibility, durable claim, generated reply handoff
   modules/assistant/       LangGraph, prompts, bounded memory and style guard
   modules/context-engine/  Read-tool contract, credential port and domain services
+  modules/identity/        Live employee roster resolution and canonical phone binding
   infrastructure/
     whatsapp/              SDK adapter, mapping, connection/retry management
     database/              SQLite auth/admin and PostgreSQL queue repositories
@@ -79,7 +82,7 @@ src/
     openai/                Responses adapter, deadlines and redacted errors
     context-engine/        Employee-scoped MCP transport and evidence validation
   lib/                     Logging, abortable pacing, bounded admission queue
-prisma/                    Local auth/admin SQLite schema and migrations
+prisma/                    Local auth/admin/OAuth SQLite schema and migrations
 supabase/migrations/       Prefixed PostgreSQL message-state/queue schema
 scripts/                   Local setup and capture-only chat playground
 playground/                Local chat interface assets
@@ -102,9 +105,11 @@ Each module has an entry comment describing its responsibility. Imports do not o
 - Model generation shares the session cancellation signal. The durable lease includes the graph deadline, pacing, send timeout and database margin. Eligibility is checked again after generation and before sending. Short-term memory is updated only after the transport accepts the reply. This first version retains serial processing per account; long model runs can delay other chats.
 - Persists Baileys credentials and Signal keys in Prisma using AES-256-GCM with authenticated row identities. Atomic key batches fail closed; a storage failure closes the socket.
 - Bounds the message/control queues and HTTP bodies, caps send time, attempts to finish active sends within the shutdown deadline, and clears obsolete QR codes.
-- Persists admin session hashes, logout revocation and login limits centrally, so Vercel instances share them. The admin password is an operational control; employee/CRM authorization remains a plan.
+- Persists admin session hashes, logout revocation and login limits centrally, so Vercel instances share them. The admin password is an operational control; employee CRM authority comes from the separate roster/OAuth adapter when future tools are connected.
 
 See [.env.example](.env.example) for settings. Back up `AUTH_ENCRYPTION_KEY` separately from both databases; losing it prevents reuse of the paired session and pending encrypted payloads. Keep one active worker per linked account. Apply the Prisma schema only to the bot's local SQLite database; the separate prefixed PostgreSQL migrations own the Supabase message tables without changing CRM business tables.
+
+SQLite also stores encrypted employee OAuth grants and enrollment/revocation state. After restoring old credentials, revoke/re-enroll affected grants instead of replaying potentially consumed refresh tokens. The roster provisioner adds SELECT for only four `VerifiedNumber` columns; it performs no business-row writes.
 
 Read [Supabase setup, state semantics, and queue recovery](docs/supabase-message-queue.md) before configuring `MESSAGE_DATABASE_URL`. Keep `DATABASE_URL` as SQLite. Fresh development databases without a message connection retain the original SQLite greeting mode; after Supabase is enabled, a persistent marker prevents silent fallback. Legacy greeting claims are imported without creating send jobs. The browser test fixture does not use the production Supabase connection.
 
@@ -139,6 +144,7 @@ Read the [detailed current implementation and architecture](docs/current-impleme
 | [Architecture and API](docs/architecture.md)                       | Compact topology and application boundaries                                              |
 | [Assistant architecture plan](docs/assistant-architecture-plan.md) | Consolidated system design, MCP service contract, deferred agents, reminders, and writes |
 | [Supabase queues](docs/supabase-message-queue.md)                  | Exact table names, atomic handoff, recovery, migrations, and local PostgreSQL tests      |
+| [Employee identity and OAuth](docs/employee-identity-and-oauth.md) | Trusted sender mapping, encrypted grants, enrollment commands, expiry, and revocation    |
 | [EC2 operations](docs/ec2-operations.md)                           | Current private deployment, SSM tunnel, runtime configuration, and backups               |
 | [Deployment guide](docs/deployment-vercel-ec2.md)                  | Independent release automation and the future public HTTPS/Vercel rollout                |
 | [Product context](CONTEXT.md)                                      | Confirmed decisions, organisational sources, and earlier options                         |
