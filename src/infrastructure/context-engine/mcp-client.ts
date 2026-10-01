@@ -17,6 +17,7 @@ import {
   type ContextSender,
   type ContextToolDefinition,
   type ContextToolGateway,
+  type EmployeeContextGrant,
 } from '../../modules/context-engine/context.types.js';
 
 const envelope = z
@@ -153,6 +154,7 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       { name: 'ramesh-context-reader', version: '0.1.0' },
       { listMaxPages: 4 },
     );
+    let activeGrant: EmployeeContextGrant | undefined;
     try {
       signal.throwIfAborted();
       const resolved = await abortable(
@@ -172,6 +174,7 @@ export class ContextEngineMcpClient implements ContextToolGateway {
         !/^wog_mcp_at_[A-Za-z0-9_-]{43}$/.test(grant.accessToken)
       )
         throw new ContextEngineError('AUTH_REQUIRED');
+      activeGrant = grant;
       const request = { signal, timeout: this.config.timeoutMs };
       const transport = new StreamableHTTPClientTransport(new URL(this.config.endpoint), {
         requestInit: { headers: { Authorization: `Bearer ${grant.accessToken}` } },
@@ -246,6 +249,17 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       );
       return await work(client, tools, context, request);
     } catch (error) {
+      if (
+        error instanceof ContextEngineError &&
+        error.code === 'AUTH_REQUIRED' &&
+        activeGrant &&
+        this.credentials.invalidate &&
+        !signal.aborted
+      ) {
+        await abortable(() => this.credentials.invalidate!(activeGrant!), signal).catch(
+          () => undefined,
+        );
+      }
       if (callerSignal?.aborted) throw new ContextEngineError('CANCELLED');
       if (deadline.signal.aborted) throw new ContextEngineError('TIMEOUT', true);
       if (error instanceof ContextEngineError) throw error;

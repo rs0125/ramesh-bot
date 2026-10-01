@@ -19,6 +19,8 @@
     "format:check": "prettier --check --ignore-unknown src tests scripts evals playground deploy .github *.json *.md docs",
     "setup:local": "tsx scripts/setup-local.ts",
     "db:messages": "tsx scripts/setup-message-database.ts",
+    "db:identity": "tsx scripts/setup-identity-roster.ts",
+    "context:auth": "tsx scripts/context-auth.ts",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "db:migrate": "prisma migrate deploy"

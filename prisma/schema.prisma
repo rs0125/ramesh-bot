@@ -51,3 +51,38 @@ model BotSetting {
   key   String @id
   value String
 }
+
+// Credential payloads are AES-GCM encrypted; one grant per account/resource/employee.
+// State and version fence refresh/revocation across processes without holding a network transaction.
+model ContextOAuthGrant {
+  id                 String   @id
+  namespace          String
+  employeeId         Int
+  state              String
+  version            Int      @default(0)
+  encrypted          String?
+  operation          String?
+  operationExpiresAt DateTime?
+  updatedAt          DateTime @updatedAt
+}
+
+// Server-owned PKCE verifier, state, and employee binding; a callback can be consumed only once.
+model ContextOAuthEnrollment {
+  id         String   @id
+  namespace  String
+  employeeId Int
+  state      String
+  encrypted  String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+// Known tokens from an interrupted/denied enrollment still need remote revocation.
+model ContextOAuthRevocation {
+  id         String   @id
+  namespace  String
+  encrypted  String
+  createdAt  DateTime @default(now())
+}

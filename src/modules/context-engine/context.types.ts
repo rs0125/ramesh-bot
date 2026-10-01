@@ -12,12 +12,13 @@ export interface EmployeeContextGrant {
   expiresAtMs: number;
 }
 
-/** Future roster/link + encrypted OAuth store adapter. Resolve current access on every call.
- * Refresh expiring OAuth tokens here with serialized rotation; never return a REST API key.
+/** Application-owned roster + encrypted OAuth adapter. Resolve current access on every call.
+ * EmployeeContextCredentials implements durable serialized rotation; never return a REST API key.
  * Phone input must come from the verified transport identity, never message text or an LLM.
  */
 export interface ContextCredentialResolver {
   resolve(sender: ContextSender, signal: AbortSignal): Promise<EmployeeContextGrant | null>;
+  invalidate?(grant: EmployeeContextGrant): Promise<void>;
 }
 
 export const CONTEXT_READ_TOOLS = {
@@ -86,7 +87,7 @@ export class ContextEngineError extends Error {
   }
 }
 
-/** Deliberately closed until employee enrollment and token storage are implemented. */
+/** Default remains closed unless the concrete employee credential adapter is supplied. */
 export const disconnectedContextCredentials: ContextCredentialResolver = {
   async resolve() {
     return null;

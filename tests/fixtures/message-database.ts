@@ -22,6 +22,8 @@ export async function temporaryMessageDatabase(migrate = applyMessageSchema) {
   const admin = new Pool({ connectionString: url.toString(), ssl: false, max: 2 });
   const password = 'ramesh_queue_tests_password_1234567890';
   const db = await admin.connect();
+  // PostgreSQL roles are cluster-wide even though each fixture has its own database.
+  await control.query('SELECT pg_advisory_lock(195332, 1001)');
   try {
     await db.query('BEGIN');
     for (const role of ['anon', 'authenticated', 'service_role']) {
@@ -34,6 +36,7 @@ export async function temporaryMessageDatabase(migrate = applyMessageSchema) {
     await db.query('COMMIT');
   } finally {
     db.release();
+    await control.query('SELECT pg_advisory_unlock(195332, 1001)');
   }
   url.username = 'ramesh_worker';
   url.password = password;
