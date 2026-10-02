@@ -1,5 +1,7 @@
 /** OpenAI Responses adapter: bounded tokens/retries, cancellation, and redacted errors. */
 import OpenAI from 'openai';
+import { replayModelResponse } from '../../modules/assistant/model-replay.js';
+import { CheckpointError } from '../../modules/assistant/checkpoint.types.js';
 import { effectiveReasoningEffort, type AssistantConfig } from '../../config/assistant.js';
 import { withUsageStage } from '../../modules/usage/usage-scope.js';
 import type {
@@ -51,31 +53,36 @@ export class OpenAITextModel implements TextModel {
         signal.throwIfAborted();
         if (pending.size) throw new Error('Tool outputs required before continuation');
         try {
-          const response = await withUsageStage('worker', () =>
-            this.client.responses.create(
-              {
-                model: this.config.model,
-                service_tier: 'default',
-                instructions: `${request.instructions}\nRemaining tool-call budget: ${remainingCalls}. If zero, give an honest answer from the evidence already retrieved and state any remaining limitation.`,
-                input,
-                tools,
-                tool_choice: remainingCalls > 0 ? 'auto' : 'none',
-                parallel_tool_calls: false,
-                store: false,
-                reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },
-                include: ['reasoning.encrypted_content'],
-                max_output_tokens: this.config.maxOutputTokens,
-              },
-              { signal },
-            ),
-          );
+          const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
+            model: this.config.model,
+            service_tier: 'default',
+            instructions: `${request.instructions}\nRemaining tool-call budget: ${remainingCalls}. If zero, give an honest answer from the evidence already retrieved and state any remaining limitation.`,
+            input,
+            tools,
+            tool_choice: remainingCalls > 0 ? 'auto' : 'none',
+            parallel_tool_calls: false,
+            store: false,
+            reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },
+            include: ['reasoning.encrypted_content'],
+            max_output_tokens: this.config.maxOutputTokens,
+          };
+          const { response, replayed } = await replayModelResponse(body, async () => {
+            const value = await withUsageStage('worker', () =>
+              this.client.responses.create(body, { signal }),
+            );
+            signal.throwIfAborted();
+            if (value.status !== 'completed') throw new Error('Incomplete model response');
+            validateToolResponse(value);
+            return value;
+          });
           signal.throwIfAborted();
           if (response.status !== 'completed') throw new Error('Incomplete model response');
+          validateToolResponse(response);
           const calls = response.output.filter((item) => item.type === 'function_call');
           if (calls.length > 1 || (!calls.length && !response.output_text?.trim()))
             throw new Error('Invalid tool response');
           // Keep all continuation items, including encrypted reasoning, with store:false.
-          // They remain in this run's closure and are not logged or persisted.
+          // Durable replay encrypts these items; they are never logged or shared across runs.
           for (const item of response.output) {
             if (
               item.type !== 'message' &&
@@ -93,12 +100,13 @@ export class OpenAITextModel implements TextModel {
               name: call.name,
               arguments: call.arguments,
             })),
-            inputTokens: response.usage?.input_tokens ?? 0,
-            outputTokens: response.usage?.output_tokens ?? 0,
-            ...usageDetails(response.usage),
+            inputTokens: replayed ? 0 : (response.usage?.input_tokens ?? 0),
+            outputTokens: replayed ? 0 : (response.usage?.output_tokens ?? 0),
+            ...usageDetails(replayed ? undefined : response.usage),
             responseId: response.id,
           };
         } catch (error) {
+          if (error instanceof CheckpointError) throw error;
           signal.throwIfAborted();
           const status = error instanceof OpenAI.APIError ? error.status : undefined;
           throw new Error(
@@ -126,54 +134,66 @@ export class OpenAITextModel implements TextModel {
   async complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResult> {
     signal?.throwIfAborted();
     try {
-      const response = await withUsageStage(request.stage, () =>
-        this.client.responses.create(
-          {
-            model: this.config.model,
-            service_tier: 'default',
-            instructions: request.instructions,
-            input: request.messages.map(({ role, content }) => ({ role, content })),
-            store: false,
-            reasoning: {
-              effort: effectiveReasoningEffort(
-                this.config.model,
-                request.reasoningEffort ?? 'none',
-              ),
-            },
-            max_output_tokens: this.config.maxOutputTokens,
-            ...(request.jsonSchema
-              ? {
-                  text: {
-                    format: {
-                      type: 'json_schema' as const,
-                      name: request.jsonSchema.name,
-                      schema: request.jsonSchema.schema,
-                      strict: true,
-                    },
-                  },
-                }
-              : {}),
-          },
-          { signal },
-        ),
-      );
+      const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
+        model: this.config.model,
+        service_tier: 'default',
+        instructions: request.instructions,
+        input: request.messages.map(({ role, content }) => ({ role, content })),
+        store: false,
+        reasoning: {
+          effort: effectiveReasoningEffort(this.config.model, request.reasoningEffort ?? 'none'),
+        },
+        max_output_tokens: this.config.maxOutputTokens,
+        ...(request.jsonSchema
+          ? {
+              text: {
+                format: {
+                  type: 'json_schema' as const,
+                  name: request.jsonSchema.name,
+                  schema: request.jsonSchema.schema,
+                  strict: true,
+                },
+              },
+            }
+          : {}),
+      };
+      const { response, replayed } = await replayModelResponse(body, async () => {
+        const value = await withUsageStage(request.stage, () =>
+          this.client.responses.create(body, { signal }),
+        );
+        signal?.throwIfAborted();
+        if (value.status !== 'completed' || !value.output_text?.trim())
+          throw new Error('Incomplete model response');
+        return value;
+      });
       signal?.throwIfAborted();
       if (response.status !== 'completed' || !response.output_text?.trim())
         throw new Error('OpenAI returned no complete text response');
       return {
         text: response.output_text.trim(),
-        inputTokens: response.usage?.input_tokens ?? 0,
-        outputTokens: response.usage?.output_tokens ?? 0,
-        ...usageDetails(response.usage),
+        inputTokens: replayed ? 0 : (response.usage?.input_tokens ?? 0),
+        outputTokens: replayed ? 0 : (response.usage?.output_tokens ?? 0),
+        ...usageDetails(replayed ? undefined : response.usage),
         responseId: response.id,
       };
     } catch (error) {
+      if (error instanceof CheckpointError) throw error;
       signal?.throwIfAborted();
       // Never bubble provider bodies, request headers or user prompts into worker logs.
       const status = error instanceof OpenAI.APIError ? error.status : undefined;
       throw new Error(status ? `OpenAI request failed (HTTP ${status})` : 'OpenAI request failed');
     }
   }
+}
+
+function validateToolResponse(response: OpenAI.Responses.Response) {
+  const calls = response.output.filter((item) => item.type === 'function_call');
+  if (
+    calls.length > 1 ||
+    (!calls.length && !response.output_text?.trim()) ||
+    response.output.some((item) => !['message', 'reasoning', 'function_call'].includes(item.type))
+  )
+    throw new Error('Invalid tool response');
 }
 
 function usageDetails(usage: OpenAI.Responses.ResponseUsage | undefined) {

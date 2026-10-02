@@ -16,6 +16,7 @@ import {
 import { SerialQueue } from '../../src/lib/serial-queue.js';
 import type { LocalChatInput } from './local-chat.js';
 import { withUsageScope } from '../../src/modules/usage/usage-scope.js';
+import type { AgentCheckpointStore } from '../../src/modules/assistant/checkpoint.types.js';
 
 export class LiveChat {
   private readonly queue = new SerialQueue(16);
@@ -29,6 +30,7 @@ export class LiveChat {
     },
     private readonly preflightMs: number,
     readonly media?: MediaService,
+    private readonly checkpoints?: AgentCheckpointStore,
   ) {}
 
   private validate(input: LocalChatInput) {
@@ -116,6 +118,7 @@ export class LiveChat {
           undefined,
           () => this.repo.history(job),
           this.access.reads,
+          { checkpoints: this.checkpoints },
         );
         const reply = await assistant.prepare(
           {
@@ -131,6 +134,7 @@ export class LiveChat {
           signal,
           {
             runId: id,
+            checkpointLease: { leaseToken: job.token },
             key,
             record: (kind, value) => this.repo.record(job, kind, value),
             mediaContext: this.media

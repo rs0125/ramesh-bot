@@ -20,6 +20,7 @@ async function simulate(
   let stored: MessageJob | undefined;
   let claimed = false;
   let sendStarted = false;
+  let outboundClaimed = false;
   let state: TerminalState | 'QUEUED' | undefined;
   const queue = new DurableMessages(
     {
@@ -37,7 +38,9 @@ async function simulate(
         return true;
       },
       async claimOutbound() {
-        return stored?.direction === 'outbound' ? stored : null;
+        if (stored?.direction !== 'outbound' || outboundClaimed) return null;
+        outboundClaimed = true;
+        return stored;
       },
       async beginSend() {
         sendStarted = true;

@@ -78,4 +78,6 @@ export interface AgentTrace {
   failureCode?: 'DEADLINE_EXCEEDED' | 'RUN_FAILED';
   usage?: import('../usage/usage.types.js').UsageSummary;
   usageUnavailable?: boolean;
+  /** Completed native model responses reused without another provider call. */
+  replayedSteps?: number;
 }

@@ -1,5 +1,8 @@
 /** Application-owned read execution: discovered schemas, current employee binding, budgets and durable evidence. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { runEvidenceId } from './evidence-presentation.js';
+import { currentCheckpoint } from './model-replay.js';
+import { CheckpointError } from './checkpoint.types.js';
 import { cyclicCursor, paginationCoverage } from './pagination.js';
 import { internalCrmReferences } from './record-identity.js';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
@@ -44,7 +47,30 @@ export interface BoundContextReader {
 }
 export type ResolveContextReader = (signal: AbortSignal) => Promise<BoundContextReader | null>;
 const queryKey = (name: string, args: Record<string, unknown>) =>
-  `${name}:${JSON.stringify(Object.entries(args).sort(([a], [b]) => a.localeCompare(b)))}`;
+  createHash('sha256')
+    .update(
+      `${name}:${JSON.stringify(Object.entries(args).sort(([a], [b]) => a.localeCompare(b)))}`,
+    )
+    .digest('hex');
+interface QueryAttempt {
+  count: number;
+  pending?: boolean;
+  failure?: Record<string, unknown>;
+  retryAt?: number;
+}
+interface RetryPolicy {
+  attempted: Array<[string, QueryAttempt]>;
+  unavailable: Array<[string, Record<string, unknown>]>;
+  cooldowns: Array<[string, { until: number; failure: Record<string, unknown> }]>;
+}
+/** Only retry decisions survive; old pagination, evidence IDs and source bodies do not. */
+function failurePolicy(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([key]) =>
+      ['ok', 'code', 'retryable', 'retry_after_seconds', 'recovery'].includes(key),
+    ),
+  );
+}
 const forbidden = new Set([
   'employee_id',
   'employeeId',
@@ -72,10 +98,7 @@ export class ContextToolRun {
     code: string;
     recovery?: ContextEngineError['recovery'];
   }> = [];
-  private readonly attempted = new Map<
-    string,
-    { count: number; failure?: Record<string, unknown>; retryAt?: number }
-  >();
+  private readonly attempted = new Map<string, QueryAttempt>();
   private readonly unavailableTools = new Map<string, Record<string, unknown>>();
   private readonly cooldowns = new Map<
     string,
@@ -84,6 +107,7 @@ export class ContextToolRun {
   private proposals = 0;
   private bytes = 0;
   private denied = false;
+  private policyRestored = false;
   private constructor(
     readonly employeeId: number,
     readonly tools: readonly ContextToolDefinition[],
@@ -92,12 +116,14 @@ export class ContextToolRun {
     private readonly now: () => number,
     readonly guidance = '',
     readonly context: Record<string, unknown> = {},
+    private readonly runId?: string,
   ) {}
   static async open(
     resolve: ResolveContextReader,
     record: TrustedReplyContext['record'],
     signal: AbortSignal,
     now = Date.now,
+    runId?: string,
   ) {
     const reader = await resolve(signal);
     if (!reader) return null;
@@ -128,6 +154,7 @@ export class ContextToolRun {
       now,
       catalogue.guidance,
       structuredClone(catalogue.context ?? {}),
+      runId,
     );
   }
   get remaining() {
@@ -135,6 +162,33 @@ export class ContextToolRun {
   }
   get blocked() {
     return this.denied;
+  }
+  private async restorePolicy() {
+    const checkpoint = currentCheckpoint();
+    if (!checkpoint || this.policyRestored) return;
+    const saved = await checkpoint.policy<RetryPolicy>(`context-retry:${this.employeeId}`);
+    for (const [key, attempt] of saved?.attempted ?? []) this.attempted.set(key, attempt);
+    for (const [key, failure] of saved?.unavailable ?? []) this.unavailableTools.set(key, failure);
+    for (const [key, cooldown] of saved?.cooldowns ?? []) this.cooldowns.set(key, cooldown);
+    this.policyRestored = true;
+  }
+  private async savePolicy() {
+    const checkpoint = currentCheckpoint();
+    if (!checkpoint) return;
+    await checkpoint.policy<RetryPolicy>(`context-retry:${this.employeeId}`, () => ({
+      attempted: [...this.attempted].map(([key, attempt]) => [
+        key,
+        { ...attempt, ...(attempt.failure ? { failure: failurePolicy(attempt.failure) } : {}) },
+      ]),
+      unavailable: [...this.unavailableTools].map(([key, failure]) => [
+        key,
+        failurePolicy(failure),
+      ]),
+      cooldowns: [...this.cooldowns].map(([key, cooldown]) => [
+        key,
+        { ...cooldown, failure: failurePolicy(cooldown.failure) },
+      ]),
+    }));
   }
   /** Harness utilities share the source proposal budget and live employee binding.
    * Their results are reviewed separately; they are never replayed as MCP reads.
@@ -158,6 +212,7 @@ export class ContextToolRun {
       // The utility invokes this recheck before accepting fresh or cached evidence.
       return await call(authorize);
     } catch (error) {
+      if (error instanceof CheckpointError) throw error;
       signal.throwIfAborted();
       const code = error instanceof ContextEngineError ? error.code : 'UNAVAILABLE';
       if (code === 'AUTH_REQUIRED' || code === 'ACCESS_DENIED') this.denied = true;
@@ -228,11 +283,12 @@ export class ContextToolRun {
     if (this.remaining <= 0)
       return { ok: false, code: this.denied ? 'ACCESS_DENIED' : 'TOOL_BUDGET_EXHAUSTED' };
     this.proposals++;
-    const operationId = randomUUID();
+    const operationId = this.runId ? runEvidenceId(this.runId, this.proposals) : randomUUID();
     let args: Record<string, unknown> = {};
     let fingerprint: string | undefined;
     let replaced: { id: string; index: number } | undefined;
     try {
+      await this.restorePolicy();
       const tool = this.tools.find((tool) => tool.name === name);
       if (!tool) throw new ContextEngineError('TOOL_UNAVAILABLE');
       if (Buffer.byteLength(argumentsJson) > 16384)
@@ -301,10 +357,16 @@ export class ContextToolRun {
             'Retry-After has not elapsed for this source. Changing the report or query cannot bypass it. Use another source or explain the temporary limit.',
         };
       const previous = this.attempted.get(fingerprint);
-      if (previous?.failure) {
-        if (previous.failure.retryable !== true || previous.count >= 2)
+      if (previous?.failure || previous?.pending) {
+        const earlierFailure = previous.failure ?? {
+          ok: false,
+          code: 'UNAVAILABLE',
+          retryable: true,
+        };
+        if (earlierFailure.retryable !== true || previous.count >= 2)
           return {
-            ...previous.failure,
+            ...earlierFailure,
+            pagination: this.pagination,
             retryable: false,
             suppressed_repeat: true,
             guidance:
@@ -312,14 +374,21 @@ export class ContextToolRun {
           };
         if ((previous.retryAt ?? 0) > this.now())
           return {
-            ...previous.failure,
+            ...earlierFailure,
+            pagination: this.pagination,
             retry_after_seconds: Math.ceil((previous.retryAt! - this.now()) / 1000),
             suppressed_repeat: true,
             guidance:
               'Retry-After has not elapsed. Do not bypass it by changing the query. Use another source or report that this source is temporarily busy.',
           };
       }
-      this.attempted.set(fingerprint, { count: (previous?.count ?? 0) + 1 });
+      const checkpoint = currentCheckpoint();
+      if (checkpoint && !(await checkpoint.consume('tool', 1)))
+        return { ok: false, code: 'TOOL_BUDGET_EXHAUSTED', retryable: false };
+      this.attempted.set(fingerprint, { count: (previous?.count ?? 0) + 1, pending: true });
+      // Reserve before dispatch: a crash leaves an ambiguous attempt, not a fresh retry episode.
+      await this.savePolicy();
+      signal.throwIfAborted();
       await this.record?.('tool_started', {
         version: 2,
         operationId,
@@ -334,6 +403,8 @@ export class ContextToolRun {
       const size = Buffer.byteLength(JSON.stringify(result));
       if (this.bytes + size > MAX_RUN_EVIDENCE_BYTES)
         throw new ContextEngineError('RESPONSE_TOO_LARGE');
+      if (checkpoint && !(await checkpoint.consume('bytes', size)))
+        throw new ContextEngineError('RESPONSE_TOO_LARGE');
       const current = await this.resolve(signal);
       if (!current || current.employeeId !== this.employeeId)
         throw new ContextEngineError('AUTH_REQUIRED');
@@ -343,6 +414,10 @@ export class ContextToolRun {
         employeeId: this.employeeId,
         ...evidence,
       });
+      // A verified successful replay must not spend the next failure's retry allowance.
+      this.attempted.delete(fingerprint);
+      this.cooldowns.delete(name);
+      await this.savePolicy();
       signal.throwIfAborted();
       this.bytes += size;
       for (const id of internalCrmReferences([evidence])) this.internalCrmIds.add(id);
@@ -359,6 +434,7 @@ export class ContextToolRun {
           : {}),
       };
     } catch (error) {
+      if (error instanceof CheckpointError) throw error;
       signal.throwIfAborted();
       const code = error instanceof ContextEngineError ? error.code : 'UNAVAILABLE';
       if (code === 'AUTH_REQUIRED' || code === 'ACCESS_DENIED') this.denied = true;
@@ -402,6 +478,7 @@ export class ContextToolRun {
       if (fingerprint) {
         const attempt = this.attempted.get(fingerprint);
         if (attempt) {
+          delete attempt.pending;
           attempt.failure = failure;
           const delay = error instanceof ContextEngineError ? error.retryAfterSeconds : undefined;
           if (delay !== undefined && Number.isFinite(delay) && delay >= 0)
@@ -416,6 +493,7 @@ export class ContextToolRun {
           recovery?.action === 'check_google_access')
       )
         this.unavailableTools.set(tool, failure);
+      await this.savePolicy();
       return failure;
     }
   }

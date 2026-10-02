@@ -13,6 +13,7 @@ import type { SessionFactory } from '../infrastructure/whatsapp/baileys-session.
 import { createReplyDelay } from '../lib/reply-delay.js';
 import { createMessagePool } from '../infrastructure/database/message-pool.js';
 import { MessageQueueRepository } from '../infrastructure/database/message-queue.repository.js';
+import { AgentCheckpointRepository } from '../infrastructure/database/agent-checkpoint.repository.js';
 import { DurableMessages } from '../infrastructure/whatsapp/durable-messages.js';
 import { AssistantService } from '../modules/assistant/assistant.service.js';
 import { OpenAITextModel } from '../infrastructure/openai/text-model.js';
@@ -51,11 +52,20 @@ export function createApplication(
           messagePool,
           config.messageDatabase.accountId,
           config.whatsapp.debounce,
+          config.messageDatabase.concurrency ?? 3,
         )
       : undefined;
   const inboxRepository =
     messagePool && config.messageDatabase
       ? new InboxRepository(messagePool, config.messageDatabase.accountId, config.encryptionKey)
+      : undefined;
+  const checkpoints =
+    messagePool && config.messageDatabase
+      ? new AgentCheckpointRepository(messagePool, {
+          namespace: 'production',
+          accountId: config.messageDatabase.accountId,
+          encryptionKey: config.encryptionKey,
+        })
       : undefined;
   const businessReads =
     config.businessReads && messagePool
@@ -106,7 +116,7 @@ export function createApplication(
         (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
         inboxRepository ? (message) => inboxRepository.context(message) : undefined,
         businessReads,
-        { usageMeter },
+        { usageMeter, checkpoints },
       )
     : undefined;
   const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
@@ -116,15 +126,9 @@ export function createApplication(
           encryptionKey: config.encryptionKey,
           maxAgeMs: config.whatsapp.maxMessageAgeMs,
           capacity: config.whatsapp.maxPendingMessages,
-          // Inbound generation and outbound rechecks own separate leases. Cover either budget.
-          leaseMs:
-            Math.max(
-              config.assistant?.timeoutMs ?? 0,
-              config.businessReads?.context.timeoutMs ?? 0,
-            ) +
-            config.whatsapp.replyDelay.maxMs +
-            config.whatsapp.sendTimeoutMs +
-            150000,
+          // Renew while working; a crashed owner can be replaced before message expiry.
+          leaseMs: 30000,
+          concurrency: config.messageDatabase.concurrency ?? 3,
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
           prepareReply,
@@ -238,6 +242,7 @@ export function createApplication(
           // Existing local claims suppress replies after the storage transition too.
           await messageRepository.importLegacy(await db.greeting.findMany());
           await messageRepository.clean();
+          await checkpoints?.clean();
           await media?.clean();
           await db.botSetting.upsert({
             where: { key: 'message-storage' },
@@ -254,6 +259,7 @@ export function createApplication(
           cleaning = cleaning
             .then(() => adminAccess.clean())
             .then(() => messageRepository?.clean())
+            .then(() => checkpoints?.clean())
             .then(() => media?.clean())
             .catch((error) => logger.error({ err: error }, 'State cleanup failed'));
         }, 60_000);

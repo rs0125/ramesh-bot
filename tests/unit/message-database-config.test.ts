@@ -26,6 +26,17 @@ test('message database config requires a scoped login and bounded polling', () =
   const config = loadConfig({ ...base, MESSAGE_DATABASE_URL });
   assert.equal(config.messageDatabase?.accountId, 'primary');
   assert.equal(config.messageDatabase?.pollMs, 5000);
+  assert.equal(config.messageDatabase?.concurrency, 3);
+  for (const value of ['1', '8'])
+    assert.equal(
+      loadConfig({ ...base, MESSAGE_DATABASE_URL, MESSAGE_QUEUE_CONCURRENCY: value })
+        .messageDatabase?.concurrency,
+      Number(value),
+    );
+  for (const value of ['0', '9', '-1', '2.5', 'NaN'])
+    assert.throws(() =>
+      loadConfig({ ...base, MESSAGE_DATABASE_URL, MESSAGE_QUEUE_CONCURRENCY: value }),
+    );
   assert.throws(() => loadConfig({ ...base, MESSAGE_DATABASE_URL, MESSAGE_QUEUE_POLL_MS: '0' }));
   assert.throws(() =>
     loadConfig({ ...base, MESSAGE_DATABASE_URL, MESSAGE_QUEUE_POLL_MS: '30001' }),

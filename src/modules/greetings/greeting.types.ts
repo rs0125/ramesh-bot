@@ -31,6 +31,8 @@ export type Reply = (text: string) => Promise<void>;
 /** Supplied only by the transport after decoding the saved original message, never by a model. */
 export interface TrustedReplyContext {
   readonly runId: string;
+  /** Transport-owned lease; never accepted from chat input or a model argument. */
+  readonly checkpointLease?: { readonly leaseToken: string };
   readonly mediaContext?: string;
   readonly key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null };
   readonly record?: (

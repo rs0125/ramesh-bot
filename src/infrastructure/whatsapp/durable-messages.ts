@@ -25,6 +25,7 @@ export interface DurableMessageOptions {
   capacity: number;
   leaseMs: number;
   pollMs: number;
+  concurrency?: number;
   waitBeforeReply: BeforeReply;
   prepareReply?: PrepareReply;
   agentRuns?: boolean;
@@ -64,6 +65,8 @@ type DurableRepository = Pick<
       | 'nextInboundDelay'
       | 'replaceWithDeliveryNotice'
       | 'usageRunId'
+      | 'claimNext'
+      | 'renewLease'
     >
   >;
 
@@ -82,6 +85,9 @@ export class DurableMessages {
     private readonly repository: DurableRepository,
     private readonly options: DurableMessageOptions,
   ) {
+    const concurrency = options.concurrency ?? 3;
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)
+      throw new Error('INVALID_QUEUE_CONCURRENCY');
     this.cipher = authCipher(options.encryptionKey);
     this.stoppingDownloads.signal.addEventListener(
       'abort',
@@ -325,32 +331,54 @@ export class DurableMessages {
     report: (outcome: 'sent' | 'error') => void,
   ): Promise<void> {
     let failures = 0;
-    while (!signal.aborted) {
-      const revision = this.revision;
-      try {
-        for (const [id, callback] of this.sentCallbacks)
-          if (callback.expiresAt <= Date.now()) this.sentCallbacks.delete(id);
-        // Deliver the previous reply before generating more work, preserving conversation order.
-        const job =
-          (await this.repository.claimOutbound(this.options.leaseMs)) ??
-          (await this.repository.claimInbound(this.options.leaseMs));
-        if (job) await this.process(job, session, signal, report);
-        else
+    const active = new Set<Promise<void>>();
+    const concurrency = this.options.concurrency ?? 3;
+    try {
+      while (!signal.aborted) {
+        const revision = this.revision;
+        try {
+          for (const [id, callback] of this.sentCallbacks)
+            if (callback.expiresAt <= Date.now()) this.sentCallbacks.delete(id);
+          if (active.size >= concurrency) {
+            await this.idle(signal, revision);
+            continue;
+          }
+          // Database arbitration owns per-chat order, including retries and handoff.
+          const job = this.repository.claimNext
+            ? await this.repository.claimNext(this.options.leaseMs)
+            : ((await this.repository.claimOutbound(this.options.leaseMs)) ??
+              (await this.repository.claimInbound(this.options.leaseMs)));
+          if (job) {
+            let work: Promise<void>;
+            work = this.process(job, session, signal, report)
+              .catch(() => report('error'))
+              .finally(() => {
+                active.delete(work);
+                this.revision++;
+                this.wake?.();
+              });
+            active.add(work);
+          } else {
+            await this.idle(
+              signal,
+              revision,
+              (await this.repository.nextInboundDelay?.(this.options.pollMs)) ??
+                this.options.pollMs,
+            );
+          }
+          failures = 0;
+        } catch {
+          report('error');
           await this.idle(
             signal,
-            revision,
-            (await this.repository.nextInboundDelay?.(this.options.pollMs)) ?? this.options.pollMs,
+            this.revision,
+            Math.min(30000, this.options.pollMs * 2 ** Math.min(++failures, 5)),
           );
-        failures = 0;
-      } catch {
-        report('error');
-        // Fixed, bounded database polling; this never polls WhatsApp.
-        await this.idle(
-          signal,
-          this.revision,
-          Math.min(30000, this.options.pollMs * 2 ** Math.min(++failures, 5)),
-        );
+        }
       }
+    } finally {
+      // Reconnect must not create a second local consumer while old tasks are unwinding.
+      await Promise.allSettled(active);
     }
   }
 
@@ -360,9 +388,37 @@ export class DurableMessages {
     signal: AbortSignal,
     report: (outcome: 'sent' | 'error') => void,
   ): Promise<void> {
-    return withUsageScope({ runId: job.id }, () =>
-      this.processScoped(job, session, signal, report),
-    );
+    const lease = new AbortController();
+    const ownedSignal = AbortSignal.any([signal, lease.signal]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pending: Promise<void> | undefined;
+    let finished = false;
+    const renew = () => {
+      timer = setTimeout(
+        () => {
+          pending = (async () => {
+            try {
+              if (!(await this.repository.renewLease!(job, this.options.leaseMs))) lease.abort();
+            } catch {
+              lease.abort(); // An unverifiable lease never permits more model/tool work.
+            }
+            if (!finished && !ownedSignal.aborted) renew();
+          })();
+        },
+        Math.max(10, Math.floor(this.options.leaseMs / 3)),
+      );
+      timer.unref();
+    };
+    if (this.repository.renewLease) renew();
+    try {
+      await withUsageScope({ runId: job.id }, () =>
+        this.processScoped(job, session, ownedSignal, report),
+      );
+    } finally {
+      finished = true;
+      clearTimeout(timer);
+      await pending;
+    }
   }
 
   private async processScoped(
@@ -481,6 +537,7 @@ export class DurableMessages {
         const prepared = this.options.prepareReply
           ? await this.options.prepareReply(candidate, signal, {
               runId: job.id,
+              checkpointLease: { leaseToken: job.token },
               mediaContext,
               key: {
                 remoteJid: message.key.remoteJid,
@@ -633,10 +690,10 @@ export class DurableMessages {
       sendInvoked = true;
       if (manual) await session.sendText!(job.chatId!, reply as string);
       else await session.reply(message!, reply as string);
-      this.sentCallbacks.get(job.id)?.run();
+      const completed = await this.repository.complete(job, 'SENT');
+      if (completed) this.sentCallbacks.get(job.id)?.run();
       this.sentCallbacks.delete(job.id);
-      if (await this.repository.complete(job, 'SENT')) report('sent');
-      else report('error');
+      report(completed ? 'sent' : 'error');
     } catch {
       // After the callback is invoked, a network/DB error cannot prove non-delivery.
       // If even this write fails, SENDING is recovered as UNCERTAIN when its lease expires.

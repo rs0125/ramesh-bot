@@ -73,7 +73,7 @@ export class PlaygroundRepository {
       !(
         await this.pool.query(
           'SELECT 1 FROM public."ramesh-test-schema-migrations" WHERE version=$1',
-          ['202610020002'],
+          ['202610030005'],
         )
       ).rowCount
     )

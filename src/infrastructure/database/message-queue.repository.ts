@@ -36,11 +36,15 @@ export class MessageQueueRepository {
     private readonly pool: Pool,
     readonly accountId: string,
     private readonly debounce?: DebouncePolicy,
-  ) {}
+    private readonly concurrency = 3,
+  ) {
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)
+      throw new Error('INVALID_QUEUE_CONCURRENCY');
+  }
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610020005'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610030005'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -147,6 +151,13 @@ export class MessageQueueRepository {
         AND j.batch_parent IS NULL AND NOT j.batch_closed AND j.state='READY' AND j.available_at>clock_timestamp()
         AND j.created_at+($3*interval '1 millisecond')>clock_timestamp() AND j.batch_count<16 AND j.batch_chars+$4<=24000
         AND j.media_count+$5<=8 AND m.expires_at>clock_timestamp()+interval '10 seconds'
+        AND NOT EXISTS (
+          SELECT 1 FROM public."ramesh-messages" newer
+          LEFT JOIN public."ramesh-inbound-queue" child ON child.message_id=newer.id
+          WHERE newer.account_id=m.account_id AND newer.chat_id=m.chat_id
+          AND newer.queue_order>m.queue_order AND newer.id<>$6
+          AND (child.batch_parent IS NULL OR child.batch_parent<>m.id)
+        )
         ORDER BY j.created_at DESC LIMIT 1 FOR UPDATE OF j`,
               [
                 this.accountId,
@@ -154,6 +165,7 @@ export class MessageQueueRepository {
                 this.debounce.maxMs,
                 message.text?.length ?? 0,
                 media ? 1 : 0,
+                id,
               ],
             )
           ).rows[0]
@@ -355,14 +367,30 @@ export class MessageQueueRepository {
       await this.finishMembers(db, parent.id, parent.state, parent.reason);
   }
 
+  /** A due job blocked by its chat must not turn the consumer into a busy poller. */
   async nextInboundDelay(maxMs: number) {
     const row = (
       await this.pool.query(
-        `SELECT extract(epoch FROM min(available_at)-clock_timestamp())*1000 AS wait FROM public."ramesh-inbound-queue" WHERE account_id=$1 AND state='READY' AND batch_parent IS NULL`,
+        `SELECT extract(epoch FROM min(j.available_at)-clock_timestamp())*1000 AS wait
+         FROM public."ramesh-inbound-queue" j JOIN public."ramesh-messages" m ON m.id=j.message_id
+         WHERE j.account_id=$1 AND j.state='READY' AND j.batch_parent IS NULL
+         AND ${this.conversationHead('m')}`,
         [this.accountId],
       )
     ).rows[0];
-    return row?.wait === null ? maxMs : Math.min(maxMs, Math.max(25, Number(row.wait)));
+    return row?.wait == null ? maxMs : Math.min(maxMs, Math.max(25, Number(row.wait)));
+  }
+
+  /** Batch members are part of their root's turn, not independent conversation heads. */
+  private conversationHead(alias: string): string {
+    return `NOT EXISTS (
+      SELECT 1 FROM public."ramesh-messages" earlier
+      LEFT JOIN public."ramesh-inbound-queue" child ON child.message_id=earlier.id
+      WHERE earlier.account_id=${alias}.account_id AND earlier.chat_id=${alias}.chat_id
+      AND earlier.queue_order<${alias}.queue_order
+      AND earlier.state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')
+      AND child.batch_parent IS NULL
+    )`;
   }
 
   claimInbound(leaseMs: number) {
@@ -371,37 +399,53 @@ export class MessageQueueRepository {
   claimOutbound(leaseMs: number) {
     return this.claim('outbound', leaseMs);
   }
+  /** Choose fairly across both directions, without starving inbound work behind outbound traffic. */
+  claimNext(leaseMs: number) {
+    return this.claim(undefined, leaseMs);
+  }
 
-  private async claim(direction: QueueDirection, leaseMs: number): Promise<MessageJob | null> {
+  private async claim(
+    requested: QueueDirection | undefined,
+    leaseMs: number,
+  ): Promise<MessageJob | null> {
     return this.transaction(async (db) => {
       await this.recover(db);
-      if (
-        (
-          await db.query(
-            `SELECT 1 FROM public."ramesh-inbound-queue" WHERE account_id=$1 AND state='LEASED'
-             UNION ALL SELECT 1 FROM public."ramesh-outbound-queue" WHERE account_id=$1 AND state='LEASED'`,
-            [this.accountId],
-          )
-        ).rowCount
-      )
-        return null;
-      const next = await db.query<{
-        id: string;
-        payload: string;
-        attempts: number;
-        replyPayload?: string;
-      }>(
-        `SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId",m.created_at AS "receivedAt",
-          m.reply_kind AS "replyKind",m.business_evidence_encrypted AS "businessEvidence"
-        ${direction === 'outbound' ? ',j.payload_encrypted AS "replyPayload"' : ''}
+      const active = await db.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM (
+          SELECT 1 FROM public."ramesh-inbound-queue" WHERE account_id=$1 AND state='LEASED'
+          UNION ALL SELECT 1 FROM public."ramesh-outbound-queue" WHERE account_id=$1 AND state='LEASED'
+        ) leases`,
+        [this.accountId],
+      );
+      if (active.rows[0]!.count >= this.concurrency) return null;
+      const directions = requested ? [requested] : (['inbound', 'outbound'] as const);
+      const choices = directions.map(
+        (direction) => `
+        SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId",m.created_at AS "receivedAt",
+          m.reply_kind AS "replyKind",m.business_evidence_encrypted AS "businessEvidence",
+          ${direction === 'outbound' ? 'j.payload_encrypted' : 'NULL::text'} AS "replyPayload",
+          '${direction}'::text AS direction,m.queue_order
         FROM ${queueTable(direction)} j JOIN public."ramesh-messages" m ON m.id=j.message_id
         WHERE j.account_id=$1 AND j.state='READY' AND j.available_at<=clock_timestamp()
-        ${direction === 'inbound' ? 'AND j.batch_parent IS NULL' : ''}
-        ORDER BY j.available_at,j.created_at,j.message_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`,
+        ${direction === 'inbound' ? 'AND j.batch_parent IS NULL' : `AND NOT EXISTS (SELECT 1 FROM public."ramesh-outbound-queue" sending WHERE sending.account_id=j.account_id AND sending.state='LEASED')`}
+        AND ${this.conversationHead('m')}
+        AND NOT EXISTS (
+          SELECT 1 FROM public."ramesh-messages" busy
+          WHERE busy.account_id=m.account_id AND busy.chat_id=m.chat_id
+          AND busy.state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING') AND (
+            EXISTS(SELECT 1 FROM public."ramesh-inbound-queue" iq WHERE iq.message_id=busy.id AND iq.state='LEASED') OR
+            EXISTS(SELECT 1 FROM public."ramesh-outbound-queue" oq WHERE oq.message_id=busy.id AND oq.state='LEASED')
+          )
+        )`,
+      );
+      // The account transaction lock serializes candidate selection + leasing across processes.
+      const next = await db.query<MessageJob & { queue_order: string }>(
+        `SELECT * FROM (${choices.join(' UNION ALL ')}) candidates ORDER BY queue_order LIMIT 1`,
         [this.accountId],
       );
       const row = next.rows[0];
       if (!row) return null;
+      const direction = row.direction;
       const token = randomUUID();
       await db.query(
         `UPDATE ${queueTable(direction)} SET state='LEASED',lease_token=$2,
@@ -418,7 +462,7 @@ export class MessageQueueRepository {
         direction === 'inbound'
           ? (
               await db.query(
-                `SELECT m.id,m.payload_encrypted AS payload,m.created_at AS "receivedAt" FROM public."ramesh-inbound-queue" j JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.batch_parent=$1 AND j.account_id=$2 AND m.payload_encrypted IS NOT NULL ORDER BY j.created_at,j.message_id`,
+                `SELECT m.id,m.payload_encrypted AS payload,m.created_at AS "receivedAt" FROM public."ramesh-inbound-queue" j JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.batch_parent=$1 AND j.account_id=$2 AND m.payload_encrypted IS NOT NULL ORDER BY m.queue_order`,
                 [row.id, this.accountId],
               )
             ).rows
@@ -430,6 +474,21 @@ export class MessageQueueRepository {
         attempts: row.attempts + 1,
         ...(members?.length ? { members } : {}),
       };
+    });
+  }
+
+  /** A renewal cannot resurrect an expired token or retain work beyond its lifetime. */
+  async renewLease(job: MessageJob, leaseMs: number): Promise<boolean> {
+    return this.transaction(async (db) => {
+      const renewed = await db.query(
+        `UPDATE ${queueTable(job.direction)} j
+         SET lease_until=least(m.expires_at,clock_timestamp()+$4*interval '1 millisecond'),updated_at=clock_timestamp()
+         FROM public."ramesh-messages" m WHERE m.id=j.message_id AND j.message_id=$1 AND j.account_id=$2
+         AND j.state='LEASED' AND j.lease_token=$3 AND j.lease_until>clock_timestamp()
+         AND m.expires_at>clock_timestamp() RETURNING j.message_id`,
+        [job.id, this.accountId, job.token, leaseMs],
+      );
+      return renewed.rowCount === 1;
     });
   }
 

@@ -6,6 +6,7 @@ import { Pool } from 'pg';
 import { loadLivePlaygroundConfig } from '../src/config/playground.js';
 import { messagePoolOptions } from '../src/infrastructure/database/message-pool.js';
 import { PlaygroundRepository } from '../src/infrastructure/database/playground.repository.js';
+import { AgentCheckpointRepository } from '../src/infrastructure/database/agent-checkpoint.repository.js';
 import { createPlaygroundAccess } from '../src/app/playground-access.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { MediaRepository } from '../src/infrastructure/database/media.repository.js';
@@ -35,6 +36,13 @@ async function main() {
     );
     await repo.health();
     await repo.clean();
+    const checkpoints = new AgentCheckpointRepository(pool, {
+      namespace: 'capture',
+      accountId: config.namespace,
+      employeeId: config.employeeId,
+      encryptionKey: config.encryptionKey,
+    });
+    await checkpoints.clean();
     const access = createPlaygroundAccess(config, pool);
     if (!(await access.employee(AbortSignal.timeout(config.context.timeoutMs))))
       throw new Error('CONFIGURED_EMPLOYEE_INACTIVE_OR_AMBIGUOUS');
@@ -59,7 +67,10 @@ async function main() {
     );
     await media.clean();
     const maintenance = setInterval(
-      () => void media.clean().catch(() => console.error('Media cleanup failed')),
+      () =>
+        void Promise.all([media.clean(), checkpoints.clean()]).catch(() =>
+          console.error('Playground cleanup failed'),
+        ),
       60000,
     );
     maintenance.unref();
@@ -70,6 +81,7 @@ async function main() {
       access,
       Math.max(config.context.timeoutMs, 60000),
       media,
+      checkpoints,
     );
     const server = await startPlaygroundServer({
       port: config.port,

@@ -1,5 +1,5 @@
 /** Request-local utilities. Business access and shared proposal budgets are enforced by the graph. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { calculate, calculateInput } from './calculator.js';
 import {
@@ -11,6 +11,10 @@ import {
 } from '../../infrastructure/tavily/client.js';
 import type { ToolSessionRequest } from './assistant.types.js';
 import { ContextEngineError } from '../context-engine/context.types.js';
+import { currentCheckpoint } from './model-replay.js';
+import { CheckpointError } from './checkpoint.types.js';
+import { currentUsageScope } from '../usage/usage-scope.js';
+import { runEvidenceId } from './evidence-presentation.js';
 
 const schemas = {
   calculate: calculateInput,
@@ -35,6 +39,10 @@ export interface UtilityEvidence {
   arguments: Record<string, unknown>;
   result: Record<string, unknown>;
 }
+interface WebRetryPolicy {
+  failure?: string;
+  queries: Array<[string, Record<string, unknown>]>;
+}
 
 export class UtilityToolRun {
   readonly evidence: UtilityEvidence[] = [];
@@ -45,6 +53,9 @@ export class UtilityToolRun {
   private webCalls = 0;
   private webFailure?: string;
   private bytes = 0;
+  private proposals = 0;
+  private policyRestored = false;
+  private readonly failedWeb = new Map<string, Record<string, unknown>>();
   constructor(
     apiKey?: string,
     fetcher?: typeof fetch,
@@ -63,6 +74,20 @@ export class UtilityToolRun {
   get usedWeb() {
     return this.evidence.some((entry) => entry.tool !== 'calculate');
   }
+  private async restorePolicy() {
+    const checkpoint = currentCheckpoint();
+    if (!checkpoint || this.policyRestored) return;
+    const saved = await checkpoint.policy<WebRetryPolicy>('utility-web-retry');
+    this.webFailure = saved?.failure;
+    for (const [key, failure] of saved?.queries ?? []) this.failedWeb.set(key, failure);
+    this.policyRestored = true;
+  }
+  private async savePolicy() {
+    await currentCheckpoint()?.policy<WebRetryPolicy>('utility-web-retry', () => ({
+      ...(this.webFailure ? { failure: this.webFailure } : {}),
+      queries: [...this.failedWeb],
+    }));
+  }
 
   async execute(
     name: UtilityToolName,
@@ -71,8 +96,11 @@ export class UtilityToolRun {
     authorizeResult: () => Promise<void> = async () => {},
   ): Promise<Record<string, unknown>> {
     signal.throwIfAborted();
+    this.proposals++;
     let key: string | undefined;
+    let webKey: string | undefined;
     try {
+      await this.restorePolicy();
       if (!this.tools.some((tool) => tool.name === name))
         throw new WebToolError('TOOL_UNAVAILABLE');
       let parsed: unknown;
@@ -87,7 +115,8 @@ export class UtilityToolRun {
       if (name === 'read_webpage')
         publicWebUrl((input.data as z.infer<typeof readWebpageInput>).url);
       key = `${name}:${JSON.stringify(input.data)}`;
-      const cached = this.cache.get(key);
+      if (name !== 'calculate') webKey = createHash('sha256').update(key).digest('hex');
+      const cached = this.cache.get(key) ?? (webKey ? this.failedWeb.get(webKey) : undefined);
       if (cached) {
         await authorizeResult();
         return { ...structuredClone(cached), reused_in_run: true };
@@ -95,8 +124,13 @@ export class UtilityToolRun {
       if (name !== 'calculate') {
         if (this.webFailure) throw new WebToolError(this.webFailure);
         if (this.webCalls >= 4) throw new WebToolError('WEB_CALL_LIMIT');
+        if (currentCheckpoint() && !(await currentCheckpoint()!.consume('web', 1)))
+          throw new WebToolError('WEB_CALL_LIMIT');
         this.webCalls++;
       }
+      if (currentCheckpoint() && !(await currentCheckpoint()!.consume('tool', 1)))
+        throw new WebToolError('TOOL_BUDGET_EXHAUSTED');
+      signal.throwIfAborted();
       const data =
         name === 'calculate'
           ? calculate(input.data as z.infer<typeof calculateInput>)
@@ -105,8 +139,9 @@ export class UtilityToolRun {
             : await this.web!.read(input.data as z.infer<typeof readWebpageInput>, signal);
       signal.throwIfAborted();
       await authorizeResult();
+      const runId = currentUsageScope()?.scope.runId;
       const entry: UtilityEvidence = {
-        id: randomUUID(),
+        id: runId ? runEvidenceId(`utility:${runId}`, this.proposals) : randomUUID(),
         tool: name,
         arguments: structuredClone(input.data),
         result: {
@@ -118,12 +153,15 @@ export class UtilityToolRun {
       const size = Buffer.byteLength(JSON.stringify(entry));
       if (size > 80000 || this.bytes + size > 100000)
         throw new WebToolError('UTILITY_RESULT_LIMIT');
+      if (currentCheckpoint() && !(await currentCheckpoint()!.consume('bytes', size)))
+        throw new WebToolError('UTILITY_RESULT_LIMIT');
       this.bytes += size;
       this.evidence.push(entry);
       const output = { ok: true, evidence_id: entry.id, ...entry.result };
       this.cache.set(key, structuredClone(output));
       return output;
     } catch (error) {
+      if (error instanceof CheckpointError) throw error;
       signal.throwIfAborted();
       if (error instanceof ContextEngineError) throw error;
       const calculationErrors = [
@@ -146,6 +184,8 @@ export class UtilityToolRun {
       this.failures.push({ tool: name, code });
       const failure = { ok: false, code, retryable: false };
       if (key) this.cache.set(key, failure);
+      if (webKey) this.failedWeb.set(webKey, failure);
+      if (webKey || this.webFailure) await this.savePolicy();
       return failure;
     }
   }

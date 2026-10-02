@@ -127,7 +127,9 @@ function messageDatabaseConfig(env: NodeJS.ProcessEnv): MessageDatabaseConfig | 
   const pollMs = positiveInteger(env, 'MESSAGE_QUEUE_POLL_MS', 5000);
   if (pollMs < 250 || pollMs > 30000)
     throw new Error('MESSAGE_QUEUE_POLL_MS must be between 250 and 30000');
-  return { url: url.toString(), ca: env.MESSAGE_DB_SSL_CA, accountId, pollMs };
+  const concurrency = positiveInteger(env, 'MESSAGE_QUEUE_CONCURRENCY', 3);
+  if (concurrency > 8) throw new Error('MESSAGE_QUEUE_CONCURRENCY must be between 1 and 8');
+  return { url: url.toString(), ca: env.MESSAGE_DB_SSL_CA, accountId, pollMs, concurrency };
 }
 
 function booleanValue(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {

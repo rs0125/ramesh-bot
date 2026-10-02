@@ -6,6 +6,7 @@ export interface MessageDatabaseConfig {
   readonly ca?: string;
   readonly accountId: string;
   readonly pollMs: number;
+  readonly concurrency?: number;
 }
 
 export function messagePoolOptions(urlString: string, ca?: string): PoolConfig {
