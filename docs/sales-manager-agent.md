@@ -4,11 +4,13 @@ Current local increment (2 October 2026): separate converser → planner → wor
 
 Updated **2 October 2026**. Ramesh is a personal chief of staff for the person messaging it. It helps with thinking, planning, prioritization, preparation, drafting and company research. Sales is one capability. Ordinary conversation needs no business lookup; a casual update is not an instruction to invent a work plan.
 
-This checkout implements the general tool loop and local real-data playground. Production activation remains a separate migration, configuration and deployment step. The older filename and exported `sales` symbols remain for compatibility. The deployed two-node chat flow and separate production queues are unchanged by editing this checkout.
+The general tool loop, media and batching are deployed. Production business reads were enabled on 2 October after fixing the worker roster RLS policy; a real LID, production signing key and captured answer passed delivery authorization. Production uses Sol/medium with a 240-second deadline and 6,000 output tokens per response. The older filename and exported `sales` symbols remain for compatibility. See the [production capability review](capability-review-2026-10-02.md).
 
 ## Capabilities and identity
 
 The graph receives every implemented read tool the Context Engine discovers for the current employee. An admin with all four registered read scopes sees **17 tools**:
+
+Production currently has the three CRM/supply/knowledge scopes and **14 tools**. Analytics works in the full-scope local capture profile; updating its server key registration and deploying the analytics auth changes remains necessary for production.
 
 | Domain       | Tools                                                                                                      |
 | ------------ | ---------------------------------------------------------------------------------------------------------- |
@@ -65,20 +67,22 @@ Prompts load from an explicit allowlist, independent of the working directory. M
 
 The formatter receives the current request, relevant history, clock, trusted access state, draft, successful evidence, bounded failure/recovery metadata and recalled selection. A repair also receives the actual previous answer, so it can fix the identified wording rather than regenerate from a different draft. Formatting-only feedback goes directly to it; missing evidence returns to the tool session. There is one repair and at most two reviews, within the original budgets. Code denies stale or unauthorized data independently of model review. A user-requested fallback can use a successful source when the original report failed; advertised capabilities alone do not prove that a report worked.
 
-| Limit                       | Current value                                   |
-| --------------------------- | ----------------------------------------------- |
-| Logical source reads        | 24; failed/duplicate proposals count            |
-| Tool/recall steps           | 28                                              |
-| Tool arguments              | 16 KiB                                          |
-| One result / total evidence | 80,000 / 200,000 bytes                          |
-| Catalogue / server guidance | 32 tools, 200,000 bytes / 32,000 bytes          |
-| Final reply                 | 12,000 characters for large multi-deal requests |
-| History                     | Last 32 messages within 48,000 characters       |
-| Protected recall            | 24 hours and 96 KiB of envelopes                |
-| Local live graph            | 240 seconds, 6,000 output tokens per response   |
-| Production defaults         | 45 seconds, 800 output tokens until configured  |
+| Limit                       | Current value                                             |
+| --------------------------- | --------------------------------------------------------- |
+| Logical source reads        | 24; failed/duplicate proposals count                      |
+| Tool/recall steps           | 28                                                        |
+| Tool arguments              | 16 KiB                                                    |
+| One result / total evidence | 80,000 / 200,000 bytes                                    |
+| Catalogue / server guidance | 32 tools, 200,000 bytes / 32,000 bytes                    |
+| Final reply                 | 12,000 characters for large multi-deal requests           |
+| History                     | Last 32 messages within 48,000 characters                 |
+| Protected recall            | 24 hours and 96 KiB of envelopes                          |
+| Local live graph            | 240 seconds, 6,000 output tokens per response             |
+| Production runtime          | Sol/medium; 240 seconds, 6,000 output tokens per response |
 
-OpenAI uses `store=false`, `parallel_tool_calls=false` and local schema validation with MCP optional arguments preserved. One SDK retry and up to 90 seconds per HTTP call remain within the overall deadline. Delivery preflight is bounded and checks at most three sources concurrently. Current production processing is serial per account; a long research turn can delay other chats.
+OpenAI uses `store=false`, `parallel_tool_calls=false` and local schema validation with MCP optional arguments preserved. One SDK retry and up to 90 seconds per HTTP call remain within the overall deadline. Delivery preflight is bounded and checks at most three sources concurrently. Current production processing is serial per account; a long research turn can delay other chats. Unconfigured repository chat defaults remain Terra/45 seconds/800 tokens.
+
+Broad CRM/supply searches prefer pages up to 25. The executor counts unique records, reports overlaps, tracks linked coverage and stops cyclic cursors. Worker, formatter and verifier share that coverage; original source evidence remains unchanged. See [paginated research](agent-modules/39-paginated-research.md). `node --import tsx evals/conversation-run.ts --suite pagination --model gpt-6.1-sol --trials 2` exercises six repeated fictional outcomes, also included in `eval:ci`.
 
 ## Context, display and source accuracy
 

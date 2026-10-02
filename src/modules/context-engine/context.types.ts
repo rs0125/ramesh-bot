@@ -92,6 +92,7 @@ export type ContextErrorCode =
   | 'INVALID_ARGUMENTS'
   | 'INVALID_RESPONSE'
   | 'RESPONSE_TOO_LARGE'
+  | 'PAGINATION_STALLED'
   | 'RATE_LIMITED'
   | 'UNAVAILABLE'
   | 'TIMEOUT'

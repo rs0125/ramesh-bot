@@ -109,6 +109,7 @@ export function createApplication(
                     signal,
                     AbortSignal.timeout(config.businessReads!.context.timeoutMs),
                   ]),
+                  (reason, tool) => logger.warn({ reason, tool }, 'Business delivery check failed'),
                 )
             : undefined,
         })

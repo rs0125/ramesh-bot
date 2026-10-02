@@ -67,6 +67,7 @@ export function salesEvidence(
   tool: ContextReadTool,
   args: Record<string, unknown>,
   now = Date.now(),
+  options: { warehouseCount?: number; warehousePageOverlap?: boolean } = {},
 ): ContextEvidence {
   if (CONTEXT_READ_TOOLS[tool] === 'analytics:read') return analyticsFixture(tool, args, now);
   const localDate = indiaDate(now);
@@ -150,16 +151,22 @@ export function salesEvidence(
       availability: { status: 'unknown', reason: 'Confirm current availability with the owner.' },
     },
   };
-  const warehouses = Array.from({ length: 9 }, (_, i) => ({
+  const warehouses = Array.from({ length: options.warehouseCount ?? 9 }, (_, i) => ({
     ...warehouse,
     id: 101 + i,
-    city: i < 5 ? 'Bengaluru' : 'Pune',
+    city: options.warehouseCount !== undefined || i < 5 ? 'Bengaluru' : 'Pune',
     micro_market: i < 5 ? 'Hoskote' : 'Chakan',
     micromarkets: [i < 5 ? 'Hoskote' : 'Chakan'],
     total_space_sqft: 26000 + i * 1000,
     area_sqft: 26000 + i * 1000,
     dock_count: i + 1,
     clear_height_ft: 24 + i,
+    ...(options.warehouseCount !== undefined
+      ? {
+          created_at: new Date(start - i * DAY).toISOString(),
+          updated_at: new Date(start).toISOString(),
+        }
+      : {}),
   }));
   const matchingWarehouses = () =>
     warehouses.filter(
@@ -311,7 +318,14 @@ export function salesEvidence(
       break;
     case 'search_warehouses': {
       path = '/api/v1/warehouses';
-      const { items, nextCursor } = pageRows(matchingWarehouses(), args);
+      const rows = matchingWarehouses();
+      if (args.sort === 'created_asc') rows.reverse();
+      const page = pageRows(rows, args);
+      if (options.warehousePageOverlap && page.nextCursor) {
+        const offset = Number(String(args.cursor ?? 'fixture:0').split(':')[1]);
+        page.nextCursor = `fixture:${offset + Math.max(1, page.items.length - 1)}`;
+      }
+      const { items, nextCursor } = page;
       data = {
         items,
         nextCursor,
@@ -402,6 +416,8 @@ export function createSalesFixture(now = Date.now) {
     }>,
     tools: structuredClone(SALES_CATALOGUE),
     guidance: CONTEXT_GUIDANCE,
+    warehouseCount: undefined as number | undefined,
+    warehousePageOverlap: false,
     failures: new Map<ContextReadTool, ContextEngineError>(),
     mutate: undefined as
       | ((result: ContextEvidence, tool: ContextReadTool, args: Record<string, unknown>) => void)
@@ -425,7 +441,7 @@ export function createSalesFixture(now = Date.now) {
         call: async (tool: ContextReadTool, args: Record<string, unknown>) => {
           state.calls.push({ tool, args: structuredClone(args) });
           if (state.failures.has(tool)) throw state.failures.get(tool)!;
-          const result = salesEvidence(tool, args, now());
+          const result = salesEvidence(tool, args, now(), state);
           if (tool === 'get_context')
             result.data.scopes = [
               ...new Set(

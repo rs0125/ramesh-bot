@@ -32,21 +32,29 @@ export class WhatsAppEmployeeResolver {
       if (!lid) return null;
       // Baileys stores both directions in one atomic Signal-key batch. Do not learn mappings
       // from quoted messages, mentions, display names, text, or user-supplied phone numbers.
-      digits = await this.db.$transaction(async (db) => {
-        const reverseId = `${lid}_reverse`;
-        const reverse = await db.whatsAppAuthEntry.findUnique({
-          where: { category_keyId: { category: 'lid-mapping', keyId: reverseId } },
-        });
-        if (!reverse) return undefined;
-        const pn = this.cipher.open('lid-mapping', reverseId, reverse.encrypted);
-        if (typeof pn !== 'string' || !/^[1-9]\d{7,14}$/.test(pn)) return undefined;
-        const forward = await db.whatsAppAuthEntry.findUnique({
-          where: { category_keyId: { category: 'lid-mapping', keyId: pn } },
-        });
-        return forward && this.cipher.open('lid-mapping', pn, forward.encrypted) === lid
+      const reverseId = `${lid}_reverse`;
+      const reverse = await this.db.whatsAppAuthEntry.findUnique({
+        where: { category_keyId: { category: 'lid-mapping', keyId: reverseId } },
+      });
+      if (!reverse) return null;
+      const pn = this.cipher.open('lid-mapping', reverseId, reverse.encrypted);
+      if (typeof pn !== 'string' || !/^[1-9]\d{7,14}$/.test(pn)) return null;
+      signal.throwIfAborted();
+      // Re-read BOTH directions in one SELECT snapshot. The first read only discovers
+      // the candidate key. Overlapping interactive SQLite transactions can time out
+      // during parallel delivery checks; a single statement needs no transaction lock.
+      const pair = await this.db.whatsAppAuthEntry.findMany({
+        where: { category: 'lid-mapping', keyId: { in: [reverseId, pn] } },
+      });
+      const currentReverse = pair.find((row) => row.keyId === reverseId);
+      const forward = pair.find((row) => row.keyId === pn);
+      digits =
+        currentReverse &&
+        forward &&
+        this.cipher.open('lid-mapping', reverseId, currentReverse.encrypted) === pn &&
+        this.cipher.open('lid-mapping', pn, forward.encrypted) === lid
           ? pn
           : undefined;
-      });
     }
     signal.throwIfAborted();
     return digits ? { phoneE164: `+${digits}`, audience: isGroup ? 'group' : 'dm' } : null;

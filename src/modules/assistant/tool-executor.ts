@@ -1,5 +1,6 @@
 /** Application-owned read execution: discovered schemas, current employee binding, budgets and durable evidence. */
 import { randomUUID } from 'node:crypto';
+import { cyclicCursor, paginationCoverage } from './pagination.js';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import {
@@ -114,6 +115,9 @@ export class ContextToolRun {
   get blocked() {
     return this.denied;
   }
+  get pagination() {
+    return paginationCoverage(this.evidence);
+  }
   /** A recalled query shares this run's evidence, budget and employee boundary. */
   async executeCached(name: string, args: Record<string, unknown>, signal: AbortSignal) {
     const stable = (value: Record<string, unknown>) =>
@@ -179,6 +183,8 @@ export class ContextToolRun {
       if (!reader || reader.employeeId !== this.employeeId)
         throw new ContextEngineError('AUTH_REQUIRED');
       fingerprint = queryKey(name, args);
+      if (cyclicCursor(this.evidence, name, args))
+        throw new ContextEngineError('PAGINATION_STALLED');
       const cached = this.evidence.find((e) => queryKey(e.tool, e.arguments) === fingerprint);
       if (cached) {
         verifyToolEvidence(name, args, cached.result, this.now());
@@ -187,6 +193,7 @@ export class ContextToolRun {
           evidence_id: cached.id,
           ...cached.result,
           reused_in_run: true,
+          pagination: this.pagination,
         };
       }
       const unavailable = this.unavailableTools.get(name);
@@ -245,7 +252,7 @@ export class ContextToolRun {
       signal.throwIfAborted();
       this.bytes += size;
       this.evidence.push(evidence);
-      return { ok: true, evidence_id: operationId, ...result };
+      return { ok: true, evidence_id: operationId, ...result, pagination: this.pagination };
     } catch (error) {
       signal.throwIfAborted();
       const code = error instanceof ContextEngineError ? error.code : 'UNAVAILABLE';
@@ -264,6 +271,7 @@ export class ContextToolRun {
       const failure: Record<string, unknown> = {
         ok: false,
         code,
+        pagination: this.pagination,
         ...(error instanceof ContextEngineError
           ? {
               retryable: error.retryable,
@@ -273,13 +281,15 @@ export class ContextToolRun {
           : {}),
         guidance: recovery
           ? 'Follow the recovery action. Do not repeat a non-retryable request unchanged. Other available sources may still work. Never treat failure as zero activity.'
-          : code === 'INVALID_ARGUMENTS'
-            ? 'Check the advertised schema and omit unset fields. CRM date_field requires a period or date_from/date_to; never combine these with follow_up_status. For all dates, omit date_field, period, date_from, date_to and follow_up_status.'
-            : error instanceof ContextEngineError && error.retryable
-              ? 'A transient read may be retried once with the same arguments, within the run deadline and after Retry-After if supplied. Do not change the query to bypass a delay. If recovery is unavailable, preserve useful results from other sources and explain the limitation.'
-              : code === 'RESPONSE_TOO_LARGE'
-                ? 'Narrow the query or use a smaller page.'
-                : 'Report the limitation. A failed read does not mean there are no matching records.',
+          : code === 'PAGINATION_STALLED'
+            ? 'The source repeated a cursor. Stop this traversal; preserve unique records already retrieved and state that coverage is partial. Do not bypass the cycle by changing page size.'
+            : code === 'INVALID_ARGUMENTS'
+              ? 'Check the advertised schema and omit unset fields. CRM date_field requires a period or date_from/date_to; never combine these with follow_up_status. For all dates, omit date_field, period, date_from, date_to and follow_up_status.'
+              : error instanceof ContextEngineError && error.retryable
+                ? 'A transient read may be retried once with the same arguments, within the run deadline and after Retry-After if supplied. Do not change the query to bypass a delay. If recovery is unavailable, preserve useful results from other sources and explain the limitation.'
+                : code === 'RESPONSE_TOO_LARGE'
+                  ? 'Narrow the query or use a smaller page.'
+                  : 'Report the limitation. A failed read does not mean there are no matching records.',
       };
       if (fingerprint) {
         const attempt = this.attempted.get(fingerprint);

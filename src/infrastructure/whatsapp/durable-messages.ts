@@ -48,7 +48,11 @@ type DurableRepository = Pick<
   Partial<
     Pick<
       MessageQueueRepository,
-      'enqueueAdmin' | 'beginAgentRun' | 'recordAgentEvent' | 'nextInboundDelay'
+      | 'enqueueAdmin'
+      | 'beginAgentRun'
+      | 'recordAgentEvent'
+      | 'nextInboundDelay'
+      | 'replaceWithDeliveryNotice'
     >
   >;
 
@@ -429,9 +433,29 @@ export class DurableMessages {
             signal,
           ));
         if (!allowed) {
-          await this.repository.complete(job, 'EXPIRED', 'business_delivery_not_authorized');
           this.sentCallbacks.delete(job.id);
-          return;
+          if (signal.aborted) {
+            await this.repository.releaseUnsent(job, true);
+            return;
+          }
+          const notice =
+            "I couldn't verify the business data before sending this reply. Please try again.";
+          const saved =
+            !manual &&
+            message &&
+            this.repository.replaceWithDeliveryNotice &&
+            (await this.repository.replaceWithDeliveryNotice(
+              job,
+              this.cipher.seal('outbound-reply', job.id, encodeReply(notice, false, voice)),
+            ));
+          if (!saved) {
+            await this.repository.complete(job, 'EXPIRED', 'business_delivery_check_failed');
+            report('error');
+            return;
+          }
+          reply = notice;
+          job.replyKind = 'conversation';
+          job.businessEvidence = undefined;
         }
       }
       // Persist the point of no safe automatic retry BEFORE invoking the SDK.

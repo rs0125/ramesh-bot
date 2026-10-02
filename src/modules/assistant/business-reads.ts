@@ -154,7 +154,12 @@ export class BusinessReadService {
     key: TrustedReplyContext['key'],
     stored: unknown,
     signal: AbortSignal,
+    onFailure?: (reason: string, tool?: string) => void,
   ): Promise<boolean> {
+    const deny = (reason: string, tool?: string) => {
+      onFailure?.(reason, tool);
+      return false;
+    };
     const general = toolDeliverySchema.safeParse(stored);
     if (general.success) {
       const receipt = general.data;
@@ -170,7 +175,7 @@ export class BusinessReadService {
         Date.parse(receipt.preparedAt) > now + 60000 ||
         now - Date.parse(receipt.preparedAt) > 300000
       )
-        return false;
+        return deny('INVALID_OR_EXPIRED_RECEIPT');
       try {
         const pending = [...receipt.checks];
         const verify = async (check: (typeof receipt.checks)[number]) => {
@@ -180,16 +185,15 @@ export class BusinessReadService {
             reader.employeeId !== receipt.employeeId ||
             reader.tools.employeeId !== receipt.employeeId
           )
-            return false;
+            return deny('IDENTITY_CHANGED', check.tool);
           const result = await reader.tools.call(check.tool, check.arguments, signal);
           signal.throwIfAborted();
           verifyToolEvidence(check.tool, check.arguments, result, this.now());
           const current = await this.resolve(key, signal);
-          if (
-            current?.employeeId !== receipt.employeeId ||
-            toolEvidenceFingerprint(result) !== check.fingerprint
-          )
-            return false;
+          if (current?.employeeId !== receipt.employeeId)
+            return deny('IDENTITY_CHANGED', check.tool);
+          if (toolEvidenceFingerprint(result) !== check.fingerprint)
+            return deny('SOURCE_CHANGED', check.tool);
           return true;
         };
         const workers = await Promise.all(
@@ -202,12 +206,18 @@ export class BusinessReadService {
           }),
         );
         return workers.every(Boolean) && !signal.aborted;
-      } catch {
-        return false;
+      } catch (error) {
+        return deny(
+          signal.aborted
+            ? 'CANCELLED'
+            : error instanceof ContextEngineError
+              ? error.code
+              : 'UNAVAILABLE',
+        );
       }
     }
     const parsed = followupsDeliverySchema.safeParse(stored);
-    if (!parsed.success) return false;
+    if (!parsed.success) return deny('INVALID_RECEIPT');
     const receipt = parsed.data;
     const now = this.now();
     if (

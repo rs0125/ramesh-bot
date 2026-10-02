@@ -10,6 +10,7 @@ import makeWASocket, {
 import { MAX_MEDIA_BYTES, type MediaUpload } from '../../modules/media/media.types.js';
 import type { Logger } from 'pino';
 import { createAuthStore } from '../database/auth-store.js';
+import { DeliveryReceipts } from './delivery-receipts.js';
 
 export interface WhatsAppSession {
   readonly botJids: readonly string[];
@@ -18,6 +19,7 @@ export interface WhatsAppSession {
     handler: (value: BaileysEventMap[K]) => void,
   ): () => void;
   saveCredentials(): Promise<void>;
+  acknowledgeDelivery?(message: WAMessage): void;
   reply(message: WAMessage, text: string): Promise<void>;
   sendText?(chatId: string, text: string): Promise<void>;
   downloadMedia?(message: WAMessage, signal: AbortSignal): Promise<MediaUpload>;
@@ -54,6 +56,10 @@ export function createSessionFactory(
       defaultQueryTimeoutMs: sendTimeoutMs,
       cachedGroupMetadata: groupMetadata,
     });
+    const deliveryReceipts = new DeliveryReceipts(
+      (jid, participant, ids, type) => socket.sendReceipt(jid, participant, ids, type),
+      () => logger.warn('WhatsApp delivery acknowledgement failed'),
+    );
     socket.ev.on('groups.update', (updates) => {
       for (const update of updates) if (update.id) groups.delete(update.id);
     });
@@ -89,6 +95,7 @@ export function createSessionFactory(
         return () => socket.ev.off(event, handler);
       },
       saveCredentials: () => auth.saveCredentials(),
+      acknowledgeDelivery: (message) => deliveryReceipts.acknowledge(message),
       reply: (message, text) => send(message.key.remoteJid!, text, message),
       sendText: (chatId, text) => send(chatId, text),
       async downloadMedia(message, signal) {
@@ -152,6 +159,7 @@ export function createSessionFactory(
         chatId.endsWith('@g.us') ? (await groupMetadata(chatId)).subject : undefined,
       async close() {
         try {
+          await deliveryReceipts.close();
           await socket.end(undefined);
         } finally {
           await auth.flush();

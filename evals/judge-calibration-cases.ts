@@ -58,6 +58,57 @@ const gsc = [
 ];
 export const CALIBRATION_CASES: CalibrationCase[] = [
   {
+    id: 'warehouse-date-optional',
+    expectation: 'Describe a warehouse concisely using recorded facts.',
+    turns: [
+      turn(
+        'Show warehouse 101, its recorded area and one caveat.',
+        'Warehouse 101: 26,000 sq ft recorded listed space, Hoskote, Bengaluru. Current availability needs owner confirmation. Last updated: 2 October 2026, IST.',
+        [
+          {
+            tool: 'read_warehouse',
+            args: { id: 101 },
+            result: salesEvidence('read_warehouse', { id: 101 }, now, { warehouseCount: 75 }),
+          },
+        ],
+        ['read_warehouse'],
+      ),
+    ],
+    expected: [good],
+  },
+  {
+    id: 'warehouse-date-request-still-required',
+    expectation: 'Respect an explicit request for creation date.',
+    turns: [
+      turn(
+        'Show warehouse 101, its recorded area and Created date.',
+        'Warehouse 101: 26,000 sq ft recorded listed space, Hoskote, Bengaluru. Current availability needs owner confirmation.',
+        [
+          {
+            tool: 'read_warehouse',
+            args: { id: 101 },
+            result: salesEvidence('read_warehouse', { id: 101 }, now, { warehouseCount: 75 }),
+          },
+        ],
+        ['read_warehouse'],
+      ),
+    ],
+    expected: [{ usefulness: false }],
+  },
+  {
+    id: 'crm-dates-still-required',
+    expectation: 'Keep native dates in a CRM card.',
+    turns: [
+      turn(
+        'Show me the Acme CRM deal.',
+        'Fixture Acme Storage: RFQ Received, Bengaluru, recorded requirement 25,000 sq ft. Details need verification.',
+        [{ tool: 'read_crm_lead', args: { id: FIXTURE_LEAD_ID }, result: crm }],
+        ['read_crm_lead'],
+      ),
+    ],
+    expected: [{ formatting: false }],
+  },
+  {
     id: 'correction-does-not-apply-retroactively',
     expectation: 'Use a casual tone and no apology after the user changes the requested tone.',
     turns: [

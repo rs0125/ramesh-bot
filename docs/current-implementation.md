@@ -2,9 +2,9 @@
 
 Current local increment (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
 
-Reviewed: **2026-10-02, Asia/Kolkata**, through the personal-assistant tool loop and real-data capture playground. Production business-read activation remains separate.
+Reviewed: **2026-10-02, Asia/Kolkata**. Production business reads are enabled for active employees, with the restricted worker roster SELECT/RLS policy verified. Production uses `gpt-6.1-sol`, medium tool reasoning, a 240-second graph budget and 6,000 output tokens per response. Fourteen CRM/supply/knowledge reads are live; the three analytics tools work in the local full-scope profile and await production signing-scope rollout. See the [capability and harness review](capability-review-2026-10-02.md).
 
-This reference describes ordinary two-node OpenAI Terra chat, the opt-in personal-assistant tool loop, separate Supabase queues, trusted identity and signed request adapters, optional legacy OAuth adapter, and independent pairing admin. The read loop handles the full employee-permitted CRM, supply, knowledge and analytics catalogue. The [architecture plan](assistant-architecture-plan.md) records future agents and workflows.
+This reference describes the ordinary two-node fallback, enabled personal-assistant tool loop, separate Supabase queues, trusted identity and signed request adapters, optional legacy OAuth adapter, and independent pairing admin. The read loop supports the employee-permitted CRM, supply, knowledge and analytics catalogue, subject to the deployment scopes above. The [architecture plan](assistant-architecture-plan.md) records future workflows.
 
 The linked WhatsApp session belongs to EC2; the earlier local pairing is retired. Supabase migrations `202610010001` and `202610010002` are provisioned. CI and EC2 deployment succeeded for the conversational, queue-split, and MCP scaffold changes. The EC2 API remains private; the Caddy/Vercel network rollout is not implied by those deployments. Local playground/evaluation replies use fake delivery and never go to WhatsApp.
 
@@ -31,7 +31,7 @@ The linked WhatsApp session belongs to EC2; the earlier local pairing is retired
 
 ## Purpose and scope
 
-The current product is a personal assistant for WareOnGo employees on WhatsApp. It responds conversationally to qualifying text DMs and actual group mentions of the linked account. OpenAI Responses with `gpt-5.6-terra` powers a LangGraph converser and formatter; `hello` remains the fallback when no API key is configured.
+The current product is a personal assistant for people messaging WareOnGo on WhatsApp, with business reads reserved for active employees in DMs. It responds to DMs and actual group mentions of the linked account. OpenAI Responses powers LangGraph; `hello` remains the fallback when no API key is configured. Terra/45 seconds/800 tokens remain repository defaults, overridden by the production settings above.
 
 The implementation already includes:
 
@@ -47,7 +47,7 @@ The implementation already includes:
 - A separate authenticated admin application for pairing, status, and session controls.
 - Local tests, independent CI/CD workflows, and EC2 provisioning, release, and backup assets.
 
-The default graph remains conversational. With BUSINESS_READS_ENABLED, active employee eligibility and signed Supabase/MCP configuration, it exposes the sender’s permitted Context Engine read catalogue in a DM, without a fixed question list or date restriction. Unknown, inactive and ambiguous users can chat but cannot read business data. BUSINESS_READ_EMPLOYEE_IDS defaults to all active employees; an optional explicit list can restrict a staged rollout. A separate planner, native-tool worker, verifier, media ingestion and durable inbound batching are implemented locally. Durable paused workflows, reminders and writes remain deferred. Operator sends remain restricted to existing inbox chats. See [first-read behavior and rollout](first-crm-read.md); this checkout has not been deployed.
+With BUSINESS_READS_ENABLED, active employee eligibility and signed Supabase/MCP configuration, the deployed graph exposes the sender’s permitted Context Engine reads in a DM, without a fixed question list or date restriction. Unknown, inactive and ambiguous users can chat but cannot read business data. Production BUSINESS_READ_EMPLOYEE_IDS is all; an optional list can restrict a staged rollout. Separate planner, native-tool worker, verifier, media ingestion and durable inbound batching are deployed. Durable paused workflows, reminders and writes remain deferred. Operator sends remain restricted to existing inbox chats. See the [personal-assistant runbook](sales-manager-agent.md).
 
 ## System topology
 
@@ -805,5 +805,17 @@ hard deadline.
 ### Voice display and STT configuration
 
 The transcript is rendered after answer verification and delivery authorization, directly from same-owner unexpired media. It appears in quotes and italics before the common response; a batch preserves receipt order. Version 2 encrypted outbound payloads store the answer and media references, not transcript copies. Inbox history decodes only the answer; business replies retain their protected recall receipts. The capture API exposes quoted display data with no owner key, and the GUI renders it with text nodes inside `em`. Failed/expired notes are explicit, and oversized extracts are labelled as excerpts.
+
+The 2 October voice incident occurred after successful transcription: concurrent
+delivery checks timed out in the local Baileys LID resolver. Reciprocal mappings
+now use one SELECT snapshot rather than overlapping interactive transactions.
+Failed business checks atomically replace the withheld answer with a neutral
+retry notice and retain unexpired same-owner voice references. The original
+business answer is not marked sent or remembered as delivered.
+
+After durable inbound archival, Baileys sends an explicit normal delivery receipt.
+Offline presence remains enabled; these are not read/played receipts. A bounded
+best-effort dispatcher prevents receipt writes from delaying forwarded bursts.
+See [module 40](agent-modules/40-delivery-acknowledgements.md).
 
 `OPENAI_STT_API_KEY` optionally separates audio credentials from `OPENAI_API_KEY`; `OPENAI_TRANSCRIBE_MODEL` defaults to `gpt-4o-transcribe`. Both the current model and newer `gpt-transcribe` were exercised through the real adapter with the authorized legacy key. See [module 35](agent-modules/35-voice-transcripts.md), [model evaluation](agent-modules/36-transcription-evaluation.md) and the [retained result](../evals/results/2026-10-02-stt-comparison.md).

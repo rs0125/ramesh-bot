@@ -527,6 +527,34 @@ export class MessageQueueRepository {
     });
   }
 
+  /** Replace withheld business output before any send; retries/history see only the notice. */
+  async replaceWithDeliveryNotice(job: MessageJob, replyPayload: string): Promise<boolean> {
+    if (job.direction !== 'outbound') return false;
+    return this.transaction(async (db) => {
+      const row = await this.owned(db, job);
+      if (!row || row.state !== 'READY_TO_SEND') return false;
+      const changed = await db.query(
+        `UPDATE public."ramesh-messages" SET reply_encrypted=$3,reply_kind='conversation',
+         business_evidence_encrypted=NULL,reason='business_delivery_check_failed',updated_at=clock_timestamp()
+         WHERE id=$1 AND account_id=$2 AND reply_kind='business' AND origin='whatsapp'
+         AND expires_at>clock_timestamp() RETURNING id`,
+        [job.id, this.accountId, replyPayload],
+      );
+      if (!changed.rowCount) return false;
+      await db.query(
+        `UPDATE public."ramesh-outbound-queue" SET payload_encrypted=$3,updated_at=clock_timestamp()
+         WHERE message_id=$1 AND account_id=$2`,
+        [job.id, this.accountId, replyPayload],
+      );
+      await db.query(
+        `UPDATE public."ramesh-agent-runs" SET state='failed',finalized_at=NULL,updated_at=clock_timestamp()
+         WHERE id=$1 AND account_id=$2`,
+        [job.id, this.accountId],
+      );
+      return true;
+    });
+  }
+
   private async owned(db: PoolClient, job: MessageJob): Promise<OwnedRow | undefined> {
     return (
       await db.query<OwnedRow>(

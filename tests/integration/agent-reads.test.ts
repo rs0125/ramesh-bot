@@ -168,10 +168,27 @@ test(
             await consuming;
           }
           const delivered = await row(account);
-          assert.equal(delivered.state, mode === 'send' ? 'SENT' : 'EXPIRED');
-          assert.equal(sent.length, mode === 'send' ? 1 : 0);
-          if (mode !== 'send') assert.equal(delivered.reason, 'business_delivery_not_authorized');
-          else assert.match(sent[0]!, /Fixture Acme/);
+          assert.equal(delivered.state, 'SENT');
+          assert.equal(sent.length, 1);
+          if (mode !== 'send') {
+            assert.match(sent[0]!, /couldn't verify the business data/);
+            assert.doesNotMatch(sent[0]!, /Fixture Acme/);
+            assert.equal(delivered.reply_kind, 'conversation');
+            assert.equal(delivered.business_evidence_encrypted, null);
+            assert.equal(
+              cipher.open('outbound-reply', delivered.id, delivered.reply_encrypted),
+              sent[0],
+            );
+            assert.equal(
+              (
+                await database.admin.query(
+                  'SELECT state FROM public."ramesh-agent-runs" WHERE id=$1',
+                  [saved.id],
+                )
+              ).rows[0].state,
+              'failed',
+            );
+          } else assert.match(sent[0]!, /Fixture Acme/);
           assert.equal(generations, 1);
           assert.equal(
             (
@@ -185,7 +202,10 @@ test(
 
           const inbox = new InboxRepository(database.runtime, account, key);
           assert.ok(!JSON.stringify(await inbox.messages(chatId)).includes('Fixture Acme'));
-          assert.match(JSON.stringify(await inbox.messages(chatId)), /Private CRM reply/);
+          assert.match(
+            JSON.stringify(await inbox.messages(chatId)),
+            mode === 'send' ? /Private CRM reply/ : /couldn't verify the business data/,
+          );
           const next = message();
           await first.enqueue(next, toInboxCandidate(next, botJids)!);
           const history = await inbox.context(toInboxCandidate(next, botJids)!);
@@ -197,7 +217,13 @@ test(
           assert.ok(
             history
               .filter((item) => item.role === 'assistant')
-              .every((item) => item.content.includes('Private content is omitted')),
+              .every((item) =>
+                item.content.includes(
+                  mode === 'send'
+                    ? 'Private content is omitted'
+                    : "couldn't verify the business data",
+                ),
+              ),
           );
           // Retention cascades to the append-only event log without granting event DELETE to the worker.
           await database.admin.query(
@@ -216,6 +242,51 @@ test(
           );
         });
       }
+
+      await t.test(
+        'a persisted failure notice survives restart and cannot be replaced by a stale lease',
+        async () => {
+          const account = 'notice-restart';
+          const repo = new MessageQueueRepository(database.runtime, account);
+          const incoming = message();
+          const id = randomUUID();
+          await repo.enqueue(
+            id,
+            toInboxCandidate(incoming, botJids)!,
+            cipher.seal('message', id, Buffer.from('synthetic')),
+            300000,
+            10,
+          );
+          const inbound = (await repo.claimInbound(45000))!;
+          await repo.beginAgentRun(inbound);
+          await repo.handoff(inbound, 'withheld-business', new Date(), 'withheld-evidence');
+          const outbound = (await repo.claimOutbound(45000))!;
+          assert.equal(
+            await repo.replaceWithDeliveryNotice({ ...outbound, token: randomUUID() }, 'stale'),
+            false,
+          );
+          assert.equal(
+            await new MessageQueueRepository(database.runtime, 'other').replaceWithDeliveryNotice(
+              outbound,
+              'wrong-account',
+            ),
+            false,
+          );
+          const notice = cipher.seal('outbound-reply', id, 'Please try again.');
+          assert.equal(await repo.replaceWithDeliveryNotice(outbound, notice), true);
+          await repo.releaseUnsent(outbound, true);
+          const restarted = new MessageQueueRepository(database.runtime, account);
+          const next = (await restarted.claimOutbound(45000))!;
+          assert.equal(next.replyKind, 'conversation');
+          assert.equal(next.businessEvidence, null);
+          assert.equal(cipher.open('outbound-reply', id, next.replyPayload!), 'Please try again.');
+          assert.equal(await repo.replaceWithDeliveryNotice(outbound, 'stale'), false);
+          assert.equal(await restarted.beginSend(next), true);
+          assert.equal(await restarted.replaceWithDeliveryNotice(next, 'too-late'), false);
+          await restarted.complete(next, 'SENT');
+          assert.equal((await row(account)).reply_encrypted, notice);
+        },
+      );
 
       await t.test(
         'journal writes and business handoff are fenced by the current inbound lease',

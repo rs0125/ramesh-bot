@@ -15,6 +15,7 @@ import { emptyUsage, addUsage } from './lib/usage.js';
 import { CONVERSATION_CASES } from './conversation-cases.js';
 import { JOURNEY_CASES } from './journey-cases.js';
 import { ADVERSARIAL_CASES } from './adversarial-cases.js';
+import { PAGINATION_CASES } from './pagination-cases.js';
 
 dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
@@ -41,11 +42,15 @@ for (const path of [
   'evals/conversation-cases.ts',
   'evals/journey-cases.ts',
   'evals/adversarial-cases.ts',
+  ...(source.inputManifest?.['evals/pagination-cases.ts'] ? ['evals/pagination-cases.ts'] : []),
 ])
   if (hash(await readFile(new URL(path, root))) !== source.inputManifest?.[path])
     throw new Error('ORIGINAL_SCENARIO_SNAPSHOT_REQUIRED');
 const cases = new Map(
-  [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES].map((c) => [c.id, c]),
+  [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES, ...PAGINATION_CASES].map((c) => [
+    c.id,
+    c,
+  ]),
 );
 for (const row of source.results)
   if (!cases.has(row.case)) throw new Error('UNKNOWN_SOURCE_SCENARIO');

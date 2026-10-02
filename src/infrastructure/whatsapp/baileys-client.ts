@@ -256,6 +256,15 @@ export class BaileysClient {
                 signal,
               )
             : 'ignored';
+        if (this.options.durableMessages && outcome !== 'ignored' && !signal.aborted) {
+          // Queued, observed, duplicate and full all mean the inbox archive exists.
+          // This does not send a reply or mark the message read/played.
+          try {
+            session.acknowledgeDelivery?.(message);
+          } catch {
+            this.options.logger.warn('WhatsApp delivery acknowledgement failed');
+          }
+        }
         if (!this.options.durableMessages && outcome === 'ignored')
           this.options.observeMessage?.(candidate);
         if (outcome === 'sent') {

@@ -208,121 +208,138 @@ test(
         ).rows;
         assert.ok(rows.every((r) => r.batch_parent === null));
       });
-      await t.test(
-        'out-of-order voice downloads preserve the original burst and attachment order',
-        async () => {
-          const account = 'ordered-voice-test';
-          const owner = mediaOwner(account, '101@s.whatsapp.net', '101@s.whatsapp.net');
-          const store = new MediaRepository(db.runtime, account, key, 'production');
-          const media = new MediaService(store, {
-            extract: async (upload) => upload.bytes.toString('utf8', 12),
-          });
-          const gates = Array.from({ length: 3 }, gate);
-          const allStarted = gate();
-          let downloads = 0;
-          let delivered: string | undefined;
-          const abort = new AbortController();
-          const session = {
-            botJids: [],
-            on: () => () => {},
-            saveCredentials: async () => {},
-            close: async () => {},
-            reply: async (_message: WAMessage, text: string) => {
-              delivered = text;
-              abort.abort();
-            },
-            downloadMedia: async (message: WAMessage) => {
-              const index = Number(message.key.id!.split('-')[1]);
-              if (++downloads === 3) allStarted.resolve();
-              await gates[index]!.promise;
-              return {
-                bytes: Buffer.from(`RIFF0000WAVEVoice note ${index + 1}`),
-                mime: 'audio/wav',
-                name: 'voice.wav',
-              };
-            },
-          };
-          let prepared = 0;
-          let captured: { text: string; mediaContext: string } | undefined;
-          const durable = new DurableMessages(
-            new MessageQueueRepository(db.runtime, account, policy),
-            {
-              encryptionKey: key,
-              accountId: account,
-              maxAgeMs: 300000,
-              capacity: 100,
-              leaseMs: 30000,
-              pollMs: 10,
-              waitBeforeReply: async () => true,
-              media,
-              prepareReply: async (candidate, _signal, trusted) => {
-                prepared++;
-                captured = { text: candidate.text!, mediaContext: trusted!.mediaContext! };
-                return { text: 'One ordered summary' };
+      for (const rejected of [false, true])
+        await t.test(
+          `out-of-order voice downloads preserve transcripts when business delivery is rejected: ${rejected}`,
+          async () => {
+            const account = `ordered-voice-test-${rejected}`;
+            const owner = mediaOwner(account, '101@s.whatsapp.net', '101@s.whatsapp.net');
+            const store = new MediaRepository(db.runtime, account, key, 'production');
+            const media = new MediaService(store, {
+              extract: async (upload) => upload.bytes.toString('utf8', 12),
+            });
+            const gates = Array.from({ length: 3 }, gate);
+            const allStarted = gate();
+            let downloads = 0;
+            let delivered: string | undefined;
+            const abort = new AbortController();
+            const session = {
+              botJids: [],
+              on: () => () => {},
+              saveCredentials: async () => {},
+              close: async () => {},
+              reply: async (_message: WAMessage, text: string) => {
+                delivered = text;
+                abort.abort();
               },
-            },
-          );
-          for (let i = 0; i < 4; i++) {
-            const message: WAMessage = {
-              key: { id: `voice-${i}`, remoteJid: '101@s.whatsapp.net' },
-              messageTimestamp: Math.floor(Date.now() / 1000),
-              message:
-                i < 3
-                  ? { audioMessage: { mimetype: 'audio/ogg', contextInfo: { isForwarded: true } } }
-                  : { conversation: 'Summarize these three notes' },
+              downloadMedia: async (message: WAMessage) => {
+                const index = Number(message.key.id!.split('-')[1]);
+                if (++downloads === 3) allStarted.resolve();
+                await gates[index]!.promise;
+                return {
+                  bytes: Buffer.from(`RIFF0000WAVEVoice note ${index + 1}`),
+                  mime: 'audio/wav',
+                  name: 'voice.wav',
+                };
+              },
             };
-            await durable.enqueue(message, toInboxCandidate(message, [])!, session);
-          }
-          await allStarted.promise;
-          // Persist in the opposite order before claiming; retrieval time is not send order.
-          for (let i = 2; i >= 0; i--) {
-            gates[i]!.resolve();
-            while ((await store.get(owner)).length < 3 - i) await delay(5);
-          }
-          await durable.consume(
-            session,
-            AbortSignal.any([abort.signal, AbortSignal.timeout(5000)]),
-            () => {},
-          );
-          assert.equal(prepared, 1);
-          assert.equal(
-            delivered,
-            'Voice note 1\n_"Voice note 1"_\n\nVoice note 2\n_"Voice note 2"_\n\nVoice note 3\n_"Voice note 3"_\n\nOne ordered summary',
-          );
-          const savedRow = (
-            await db.admin.query(
-              'SELECT id,reply_encrypted FROM public."ramesh-messages" WHERE account_id=$1 AND reply_encrypted IS NOT NULL',
-              [account],
-            )
-          ).rows[0];
-          const payload = authCipher(key).open(
-            'outbound-reply',
-            savedRow.id,
-            savedRow.reply_encrypted,
-          ) as { text: string; voice: { ids: string[] } };
-          assert.equal(payload.text, 'One ordered summary');
-          assert.equal(payload.voice.ids.length, 3);
-          assert.ok(!JSON.stringify(payload).includes('Voice note 1'));
+            let prepared = 0;
+            let remembered = 0;
+            let captured: { text: string; mediaContext: string } | undefined;
+            const durable = new DurableMessages(
+              new MessageQueueRepository(db.runtime, account, policy),
+              {
+                encryptionKey: key,
+                accountId: account,
+                maxAgeMs: 300000,
+                capacity: 100,
+                leaseMs: 30000,
+                pollMs: 10,
+                waitBeforeReply: async () => true,
+                media,
+                agentRuns: rejected,
+                businessPreflight: async () => !rejected,
+                prepareReply: async (candidate, _signal, trusted) => {
+                  prepared++;
+                  captured = { text: candidate.text!, mediaContext: trusted!.mediaContext! };
+                  return {
+                    text: 'One ordered summary',
+                    ...(rejected ? { businessEvidence: { private: 'synthetic' } } : {}),
+                    onSent: () => {
+                      remembered++;
+                    },
+                  };
+                },
+              },
+            );
+            for (let i = 0; i < 4; i++) {
+              const message: WAMessage = {
+                key: { id: `voice-${i}`, remoteJid: '101@s.whatsapp.net' },
+                messageTimestamp: Math.floor(Date.now() / 1000),
+                message:
+                  i < 3
+                    ? {
+                        audioMessage: { mimetype: 'audio/ogg', contextInfo: { isForwarded: true } },
+                      }
+                    : { conversation: 'Summarize these three notes' },
+              };
+              await durable.enqueue(message, toInboxCandidate(message, [])!, session);
+            }
+            await allStarted.promise;
+            // Persist in the opposite order before claiming; retrieval time is not send order.
+            for (let i = 2; i >= 0; i--) {
+              gates[i]!.resolve();
+              while ((await store.get(owner)).length < 3 - i) await delay(5);
+            }
+            await durable.consume(
+              session,
+              AbortSignal.any([abort.signal, AbortSignal.timeout(5000)]),
+              () => {},
+            );
+            assert.equal(prepared, 1);
+            assert.equal(remembered, rejected ? 0 : 1);
+            const answer = rejected
+              ? "I couldn't verify the business data before sending this reply. Please try again."
+              : 'One ordered summary';
+            assert.equal(
+              delivered,
+              'Voice note 1\n_"Voice note 1"_\n\nVoice note 2\n_"Voice note 2"_\n\nVoice note 3\n_"Voice note 3"_\n\n' +
+                answer,
+            );
+            const savedRow = (
+              await db.admin.query(
+                'SELECT id,reply_encrypted FROM public."ramesh-messages" WHERE account_id=$1 AND reply_encrypted IS NOT NULL',
+                [account],
+              )
+            ).rows[0];
+            const payload = authCipher(key).open(
+              'outbound-reply',
+              savedRow.id,
+              savedRow.reply_encrypted,
+            ) as { text: string; voice: { ids: string[] } };
+            assert.equal(payload.text, answer);
+            assert.equal(payload.voice.ids.length, 3);
+            assert.ok(!JSON.stringify(payload).includes('Voice note 1'));
 
-          const burst = JSON.parse(captured!.text);
-          const context = JSON.parse(captured!.mediaContext);
-          assert.deepEqual(
-            context.attachments.map((a: { text: string }) => a.text),
-            ['Voice note 1', 'Voice note 2', 'Voice note 3'],
-          );
-          for (let i = 0; i < 3; i++)
-            assert.equal(burst.messages[i].attachments[0], context.attachments[i].attachment);
-          assert.equal(burst.messages[3].text, 'Summarize these three notes');
-          const later = JSON.parse(
-            await media.context(owner, [], 'the second voice note', AbortSignal.timeout(1000)),
-          );
-          assert.deepEqual(
-            later.attachments.map((a: { text: string }) => a.text),
-            ['Voice note 1', 'Voice note 2', 'Voice note 3'],
-          );
-          await media.stop();
-        },
-      );
+            const burst = JSON.parse(captured!.text);
+            const context = JSON.parse(captured!.mediaContext);
+            assert.deepEqual(
+              context.attachments.map((a: { text: string }) => a.text),
+              ['Voice note 1', 'Voice note 2', 'Voice note 3'],
+            );
+            for (let i = 0; i < 3; i++)
+              assert.equal(burst.messages[i].attachments[0], context.attachments[i].attachment);
+            assert.equal(burst.messages[3].text, 'Summarize these three notes');
+            const later = JSON.parse(
+              await media.context(owner, [], 'the second voice note', AbortSignal.timeout(1000)),
+            );
+            assert.deepEqual(
+              later.attachments.map((a: { text: string }) => a.text),
+              ['Voice note 1', 'Voice note 2', 'Voice note 3'],
+            );
+            await media.stop();
+          },
+        );
     } finally {
       await db.close();
     }

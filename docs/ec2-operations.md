@@ -58,18 +58,19 @@ Readiness checks validate the process, release, and configured databases without
 
 `/etc/wareongo-sales-bot/worker.env` is root-owned mode `0600`. Parameter Store `/ramesh-bot/production/runtime` is a `SecureString` containing the encrypted JSON backup of runtime values. The process reads the host environment on startup; changing Parameter Store alone does not update or restart the worker. Bootstrap preserves an existing host environment, and ordinary releases do not replace it.
 
-| Setting                                       | Production role                                                                     |
-| --------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `DATABASE_URL`                                | Persistent SQLite auth/admin database                                               |
-| `AUTH_ENCRYPTION_KEY`, `WORKER_API_TOKEN`     | Existing encryption and private API credentials; preserve across updates            |
-| `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`   | Dedicated Supabase login and verified TLS                                           |
-| `MESSAGE_ACCOUNT_ID`                          | Stable message/deduplication namespace                                              |
-| `OPENAI_API_KEY`                              | Server-side model key; configured without copying it into Git or the admin          |
-| `OPENAI_MODEL`                                | `gpt-5.6-terra`                                                                     |
-| `AGENT_TIMEOUT_MS`, `AGENT_MAX_OUTPUT_TOKENS` | `45000` and `800`                                                                   |
-| `CONTEXT_MCP_*`                               | Not required by the inactive service scaffold; no shared employee token             |
-| `CONTEXT_RAMESH_SIGNING_KEY_JSON`             | Protected service private-key JSON, used by the future signed factory               |
-| `CONTEXT_OAUTH_REDIRECT_URI`                  | Optional legacy OAuth enrollment only; owned callback allowlisted by Context Engine |
+| Setting                                                | Production role                                                                     |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `DATABASE_URL`                                         | Persistent SQLite auth/admin database                                               |
+| `AUTH_ENCRYPTION_KEY`, `WORKER_API_TOKEN`              | Existing encryption and private API credentials; preserve across updates            |
+| `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`            | Dedicated Supabase login and verified TLS                                           |
+| `MESSAGE_ACCOUNT_ID`                                   | Stable message/deduplication namespace                                              |
+| `OPENAI_API_KEY`                                       | Server-side model key; configured without copying it into Git or the admin          |
+| `OPENAI_MODEL`, `AGENT_TOOL_REASONING_EFFORT`          | `gpt-6.1-sol`, `medium`                                                             |
+| `AGENT_TIMEOUT_MS`, `AGENT_MAX_OUTPUT_TOKENS`          | `240000` and `6000`                                                                 |
+| `BUSINESS_READS_ENABLED`, `BUSINESS_READ_EMPLOYEE_IDS` | `true`, `all`; current employee permissions still apply                             |
+| `CONTEXT_MCP_URL`                                      | Production Context Engine `/mcp/ramesh` endpoint                                    |
+| `CONTEXT_RAMESH_SIGNING_KEY_JSON`                      | Protected private signing key; three registered CRM/supply/knowledge scopes         |
+| `CONTEXT_OAUTH_REDIRECT_URI`                           | Optional legacy OAuth enrollment only; owned callback allowlisted by Context Engine |
 
 For an authorized AWS CLI environment update, read the current SecureString into protected memory/a private temporary file, merge only the intended fields, and preserve all other values. Write the complete merged JSON through `aws ssm put-parameter --cli-input-json file://...` as `SecureString`; avoid secret values in command arguments, logs, or terminal output. Check the expected parameter version before overwriting. Then install the matching host environment atomically with root ownership/mode `0600`, keeping a protected backup. Verify field presence and nonsecret settings, and restart through the normal release process or a controlled service restart. Do not print the decrypted parameter or `worker.env`.
 
@@ -89,7 +90,7 @@ For restoration, stop the original worker first, retrieve the database snapshot 
 
 Supabase backup/PITR settings were not changed or verified by the queue feature. Preserve pending message/final-reply encryption keys and the current message ledger across recovery. Never automatically resend `UNCERTAIN` rows. Rolling back to a pre-split worker preserves existing outbound rows but cannot deliver them; a split-aware release is needed to drain them.
 
-Signed identity services are ready for explicit composition through `createSignedEmployeeContextAccess`; the conversational graph does not invoke them. Configure the protected service signing key and `/mcp/ramesh` endpoint after the Context Engine rollout. Four-column roster SELECT is required; employee OAuth enrollment is not. See [signed operations](signed-context-auth.md). The optional old OAuth CLI and its recovery commands remain documented separately.
+Signed identity services are composed into the enabled production tool loop. Four-column roster SELECT and the `ramesh_worker_identity_read` SELECT policy are required; `npm run db:identity` now provisions and validates both. Test with the actual worker connection, since owner visibility does not prove worker RLS visibility. Employee OAuth enrollment is unnecessary. See [signed operations](signed-context-auth.md). The optional old OAuth CLI remains documented separately.
 
 Stack termination protection is enabled. The instance and backup bucket are retained on deletion/replacement. Removing the stack therefore does **not** stop billing for retained resources; inventory and explicitly retire them during decommissioning. Do not replace a paired instance without stopping its old worker.
 
@@ -101,4 +102,6 @@ Historical infrastructure estimate: the AWS Price List API on September 30, 2026
 
 ## Graph/media release prerequisites prepared on 2 October 2026
 
-Production message migrations through `202610020005` have been applied and verified through the restricted worker login. The separate capture schema remains isolated. Audio is now uploaded directly to STT; `ffmpeg` is not a runtime or bootstrap prerequisite. The package installed during initial preparation can remain unused on the existing host. Parameter Store runtime version 6 adds `OPENAI_STT_API_KEY` and `OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe`, with the matching host file installed atomically and existing fields preserved. The normal CD restart loads these settings. Inbound windows are `INBOUND_TEXT_QUIET_MS=1000`, `INBOUND_BURST_QUIET_MS=3000` and `INBOUND_MAX_WAIT_MS=8000`. These collect per-sender bursts; outbound pacing is separate. Sol medium is selected in the local test profile and paid CI, not in deployed AWS environment settings.
+Production message migrations through `202610020005` are applied and verified through the restricted worker login. The separate capture schema remains isolated. Audio uploads directly to STT; `ffmpeg` is not a runtime/bootstrap prerequisite. Runtime version 6 added independent STT credentials and `gpt-4o-transcribe`; version 7 enabled business reads for all active employees and selected Sol/medium with 240 seconds/6,000 tokens. Both Parameter Store and the root-only host environment were updated with other fields preserved, then the actual process environment was verified after restart. Inbound windows are 1 second for ordinary text, 3 seconds for forwarded/media bursts and an 8-second maximum; outbound pacing is separate.
+
+The production capture proof resolved the actual reciprocal WhatsApp LID mapping, discovered 14 permitted reads, retrieved CRM data through the full graph and passed fresh delivery authorization. It did not instantiate a sender or send a test message. `/healthz` still checks process/databases rather than employee visibility, model access or advertised tools; an automated post-deploy capability smoke remains a follow-up.

@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { promptManifest } from '../src/modules/assistant/prompt-files.js';
 import { JOURNEY_CASES } from './journey-cases.js';
 import { ADVERSARIAL_CASES } from './adversarial-cases.js';
+import { PAGINATION_CASES } from './pagination-cases.js';
 import { CRITERIA } from './lib/judge.js';
 import { judgeTurns } from './lib/turn-judge.js';
 import { satisfiesToolCheck } from './lib/tool-contracts.js';
@@ -50,7 +51,7 @@ if (!Number.isInteger(trials) || trials < 1 || trials > 5) throw new Error('Use 
 const concurrency = Number(values.concurrency);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
   throw new Error('Use concurrency 1–4');
-if (!['all', 'conversation', 'journeys', 'adversarial'].includes(values.suite!))
+if (!['all', 'conversation', 'journeys', 'adversarial', 'pagination'].includes(values.suite!))
   throw new Error('Unknown suite');
 const poolCases =
   values.suite === 'conversation'
@@ -59,7 +60,9 @@ const poolCases =
       ? JOURNEY_CASES
       : values.suite === 'adversarial'
         ? ADVERSARIAL_CASES
-        : [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES];
+        : values.suite === 'pagination'
+          ? PAGINATION_CASES
+          : [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES, ...PAGINATION_CASES];
 const filters = values.case?.split(',').map((value) => value.trim());
 const cases = poolCases.filter(
   (c) => !filters || filters.includes(c.id) || filters.includes(c.category ?? ''),

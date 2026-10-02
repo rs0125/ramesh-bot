@@ -1,6 +1,6 @@
 # Ramesh agent module specifications
 
-Updated: **2 October 2026**. Status: **Specifications prepared first; the personal-assistant tool loop and real-data capture playground are implemented. The production read pilot remains disabled by default.**
+Updated: **2 October 2026**. Status: **Specifications prepared first; the personal-assistant graph, media and batching are deployed. Production CRM/supply/knowledge reads are enabled for active employees; analytics is connected in the local full-scope capture profile.** Unconfigured installations remain closed to business tools by default. Reminder, SLA and write modules are specifications, not implemented capabilities.
 
 These files expand the [architecture plan](../assistant-architecture-plan.md#23-agent-architecture-draft-informed-by-the-factory-talk) into module contracts. They describe a target system, including changes to existing modules. A proposed interface, table, configuration option or test below does not exist merely because it is documented here.
 
@@ -132,3 +132,7 @@ Production schema migration `202610020005` is a prerequisite for this worker rev
 - [36. Transcription evaluation](36-transcription-evaluation.md): current model/pricing research and repeatable synthetic audio comparisons.
 - [37. Production evaluation](37-production-evaluation.md): primary-source research, current harness gaps, outcome contracts, private holdouts, judge calibration and proposed release/monitoring practices.
 - [38. Direct audio transcription](38-direct-audio-transcription.md): original-byte uploads, Ogg compatibility evidence and removal of the runtime transcoding dependency.
+- [39. Paginated research](39-paginated-research.md): unique coverage, cursor progress, broad-search outcomes and the production roster access correction.
+- [40. Delivery acknowledgements](40-delivery-acknowledgements.md): concurrent LID resolution, durable failure notices and normal WhatsApp delivery receipts.
+
+See the [2 October production capability review](../capability-review-2026-10-02.md) for deployed versus local-only capabilities, remaining work and AI Engineer research.

@@ -4,6 +4,14 @@ Status: **Durable sender and general tool-receipt preflight implemented; new pro
 
 **Implemented subset:** Protected replies require fresh identity/scope resolution and a matching re-read fingerprint after pacing. Revoked, changed, expired or disabled output is suppressed; the current read loop does not schedule automatic refresh. The encrypted versioned payload makes older string-only senders fail closed. See the [personal-assistant runbook](../sales-manager-agent.md) for the exact code contract and activation steps; production enablement remains separate.
 
+Failed business delivery checks replace the withheld output with a neutral retry
+notice under the same outbound lease. The transaction replaces both stored reply
+copies, clears protected evidence and marks the agent run failed. A restart can
+send only that notice; the original business memory callback is discarded.
+Same-owner unexpired voice references still render their italic quoted transcripts.
+Cancellation releases unsent work without creating a notice. See
+[module 40](40-delivery-acknowledgements.md) for the production incident and tests.
+
 ## Responsibility
 
 Deliver saved, authorized content through the one active Baileys account. The sender never calls a model to regenerate text and never accepts a model-chosen destination. Separate task completion from transport acceptance, delivery and reading.

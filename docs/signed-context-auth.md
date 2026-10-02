@@ -2,7 +2,7 @@
 
 Ramesh's preferred credential adapter uses service request signatures and live employee authorization. Each trusted WhatsApp phone/LID maps to exactly one active `VerifiedNumber` employee. Unknown users can still chat but cannot access business data. Business reads remain limited to DMs.
 
-The default production graph remains conversational. The disabled-by-default [personal-assistant integration](sales-manager-agent.md) composes these adapters for all permitted CRM, supply, knowledge, shortlist and analytics reads, with source verification, independent answer review and private delivery rechecks. The live capture playground enables that path as Raghav. Separate planner/worker/verifier roles are implemented in this checkout; reminders and writes remain deferred.
+The [personal-assistant integration](sales-manager-agent.md) is enabled in production as of 2 October 2026, with source verification, independent answer review and private delivery rechecks. Production's three registered scopes expose 14 CRM/supply/knowledge/shortlist reads; the local four-scope profile also exposes analytics. The restricted worker has four-column roster SELECT plus the `ramesh_worker_identity_read` policy, provisioned by `npm run db:identity`. A real production LID and captured full-graph answer passed current authorization. Planner/worker/verifier roles are deployed; reminders and writes remain deferred.
 
 ## Composition
 

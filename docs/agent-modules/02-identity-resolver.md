@@ -20,7 +20,7 @@ The proposed orchestration wrapper may attach safe internal reason codes: `unmap
 
 1. Reject own messages and malformed transport identifiers. Device suffixes may be normalized only by the existing parser.
 2. A phone JID must already carry its country code. The legacy India fallback applies to roster normalization only.
-3. An LID must resolve through the encrypted, reciprocal mappings persisted by Baileys. Both directions must agree in the same transactional read.
+3. An LID must resolve through the encrypted, reciprocal mappings persisted by Baileys. Discover the candidate phone key, then re-read both directions in one SELECT snapshot and require agreement. Avoid overlapping interactive SQLite transactions; concurrent delivery checks exposed a transaction timeout in the original implementation. A changed or missing mapping still fails closed.
 4. Canonicalize roster numbers and require one matching employee. Differently formatted duplicate numbers are ambiguous even if a raw database column is unique.
 5. Require active status for business operations. Rechecking an employee ID also verifies its current unique phone mapping and email binding.
 6. Bind the result to the run's account, sender and audience. Record an opaque actor reference; never take employee identity from the model.
@@ -30,6 +30,14 @@ Mentions, quoted-message senders, first names, display names, CRM notes and a us
 ## Lifecycle and storage
 
 The roster remains authoritative. Do not add a long-lived permission cache or a duplicate editable employee directory. Persist references for attribution, then resolve live identity again for tool calls, resumed runs and sensitive delivery. If a phone is reassigned, a pending task must not transfer to the new employee.
+
+Provisioning must grant the production `ramesh_worker` login SELECT on only `id`,
+`phone_number`, `email` and `is_active`, plus its own SELECT-only roster RLS policy.
+Column grants alone do not make rows visible when RLS is enabled. Preserve RLS and
+all other roles' policies, validate the named policy on repeat setup, and verify
+actual employee resolution through the restricted runtime login before enabling
+business tools. Integration tests must run with roster RLS enabled and continue
+to reject broader column reads and every roster write.
 
 LID data remains in the encrypted local Baileys store. Agent-run and evidence records belong in Supabase. No employee OAuth table is needed for identity. A roster outage is an unavailable authorization check, not proof the sender is unknown; allow ordinary chat while withholding business reads and previously cached business facts.
 

@@ -276,6 +276,7 @@ export function buildSalesGraph(
                 draft: value.draft,
                 recalled,
                 evidence: run?.evidence ?? [],
+                pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
                 deal_display: dealDisplayFacts(run?.evidence ?? []),
                 ...(value.feedback
@@ -336,6 +337,7 @@ export function buildSalesGraph(
                     run?.evidence.some((item) => item.tool === tool.name),
                 ),
                 evidence: run?.evidence ?? [],
+                pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
                 answer: value.reply,
                 presentation_issues: issues,

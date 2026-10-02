@@ -10,12 +10,14 @@ import { reconnectDelay } from '../../src/infrastructure/whatsapp/reconnect.poli
 import { createReplyDelay } from '../../src/lib/reply-delay.js';
 import { GreetingService } from '../../src/modules/greetings/greeting.service.js';
 import { MemoryGreetingRepository } from '../fixtures/greeting-repository.js';
+import type { DurableMessages } from '../../src/infrastructure/whatsapp/durable-messages.js';
 
 class FakeSession implements WhatsAppSession {
   readonly events = new EventEmitter();
   readonly botJids = ['10000000000@s.whatsapp.net'];
   closed = false;
   saved = 0;
+  acknowledgeDelivery?: (message: WAMessage) => void;
   on<K extends keyof BaileysEventMap>(event: K, handler: (value: BaileysEventMap[K]) => void) {
     this.events.on(event, handler);
     return () => {
@@ -36,6 +38,53 @@ const message = (id: string): WAMessage => ({
   key: { id, remoteJid: '20000000000@s.whatsapp.net' },
   message: { conversation: 'hi' },
   messageTimestamp: Date.now() / 1000,
+});
+
+test('delivery is acknowledged only after durable archival, including duplicates and full inboxes', async () => {
+  const session = new FakeSession();
+  const saved: string[] = [];
+  const acknowledged: string[] = [];
+  session.acknowledgeDelivery = (value) => {
+    assert.ok(saved.includes(value.key.id!));
+    acknowledged.push(value.key.id!);
+    if (value.key.id === 'observed') throw new Error('receipt failure');
+  };
+  const client = new BaileysClient({
+    createSession: async () => session,
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async () => assert.fail('durable path expected'),
+    durableMessages: {
+      async enqueue(value: WAMessage) {
+        const id = value.key.id!;
+        if (id === 'failed') throw new Error('persistence failed');
+        if (id !== 'ignored') saved.push(id);
+        return id;
+      },
+    } as unknown as DurableMessages,
+  });
+  await client.start();
+  session.events.emit('messages.upsert', { type: 'append', messages: [message('history')] });
+  session.events.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      message('queued'),
+      message('duplicate'),
+      message('observed'),
+      message('full'),
+      message('failed'),
+      message('ignored'),
+      { ...message('self'), key: { ...message('self').key, fromMe: true } },
+      {
+        ...message('queued-audio'),
+        message: { audioMessage: { mimetype: 'audio/ogg', ptt: true } },
+      },
+    ],
+  });
+  await tick();
+  await client.stop();
+  assert.deepEqual(acknowledged, ['queued', 'duplicate', 'observed', 'full', 'queued-audio']);
+  assert.equal(client.getStatus().metrics.errors, 1, 'a receipt failure is not a storage failure');
 });
 
 test('stop finishes active work, skips queued messages, and saves final credentials', async () => {

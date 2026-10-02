@@ -170,6 +170,71 @@ test('unknown, inactive, ambiguous and group senders cannot obtain a signed busi
   }
 });
 
+test('parallel delivery rechecks resolve reciprocal LIDs without SQLite transaction timeouts', async () => {
+  const f = await fixture();
+  try {
+    const cipher = authCipher(f.key);
+    await f.db.whatsAppAuthEntry.createMany({
+      data: [
+        {
+          category: 'lid-mapping',
+          keyId: '999_reverse',
+          encrypted: cipher.seal('lid-mapping', '999_reverse', '919876543210'),
+        },
+        {
+          category: 'lid-mapping',
+          keyId: '919876543210',
+          encrypted: cipher.seal('lid-mapping', '919876543210', '999'),
+        },
+      ],
+    });
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        f.app.whatsapp.resolve(message('999@lid'), AbortSignal.timeout(3000)),
+      ),
+    );
+    assert.ok(results.every((result) => result?.employee.employeeId === 23));
+    assert.equal(f.calls.length, 0);
+    f.rows[0]!.is_active = false;
+    assert.equal(await f.app.forMessage(message('999@lid')), null);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a LID changed between discovery and the pair snapshot cannot use its previous phone', async () => {
+  const f = await fixture();
+  try {
+    const cipher = authCipher(f.key);
+    await f.db.whatsAppAuthEntry.createMany({
+      data: [
+        {
+          category: 'lid-mapping',
+          keyId: '999_reverse',
+          encrypted: cipher.seal('lid-mapping', '999_reverse', '919876543210'),
+        },
+        {
+          category: 'lid-mapping',
+          keyId: '919876543210',
+          encrypted: cipher.seal('lid-mapping', '919876543210', '999'),
+        },
+      ],
+    });
+    const original = f.db.whatsAppAuthEntry.findMany.bind(f.db.whatsAppAuthEntry);
+    f.db.whatsAppAuthEntry.findMany = (async (...args: Parameters<typeof original>) => {
+      await f.db.whatsAppAuthEntry.update({
+        where: { category_keyId: { category: 'lid-mapping', keyId: '999_reverse' } },
+        data: { encrypted: cipher.seal('lid-mapping', '999_reverse', '919999999999') },
+      });
+      return original(...args);
+    }) as typeof original;
+    assert.equal(await f.app.forMessage(message('999@lid')), null);
+    assert.equal(f.calls.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
 test('rechecks employee status and binding after credential resolution and before each signed HTTP request', async () => {
   const f = await fixture();
   try {
