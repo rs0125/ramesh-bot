@@ -16,6 +16,7 @@ import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js'
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
 import { bindUsageEmployee, currentUsageScope, withUsageScope } from '../usage/usage-scope.js';
 import type { UsageMeter } from '../usage/usage-meter.js';
+import { UtilityToolRun } from './utility-tools.js';
 
 export interface AssistantReply extends PreparedReply {
   trace: AgentTrace;
@@ -26,7 +27,10 @@ export const UNAVAILABLE_REPLY = "I'm having trouble replying right now. Try aga
 export class AssistantService {
   private readonly graph;
   constructor(
-    private readonly modelConfig: Pick<AssistantConfig, 'model' | 'timeoutMs' | 'usageMeter'>,
+    private readonly modelConfig: Pick<
+      AssistantConfig,
+      'model' | 'timeoutMs' | 'usageMeter' | 'tavilyApiKey'
+    >,
     private readonly model: TextModel,
     private readonly memory = new ConversationMemory(),
     private readonly observe: (trace: AgentTrace) => void = () => {},
@@ -36,6 +40,7 @@ export class AssistantService {
       now?: () => number;
       observeContext?: (context: GraphContextObservation) => void;
       usageMeter?: UsageMeter;
+      utilityFetch?: typeof fetch;
     } = {},
   ) {
     this.graph = buildAssistantGraph(model);
@@ -172,6 +177,11 @@ export class AssistantService {
                 Math.min(60000, this.modelConfig.timeoutMs / 4),
               onStage: (stage) => trace.stages.push(stage),
               onContext: this.runtime.observeContext,
+              utilities: new UtilityToolRun(
+                this.modelConfig.tavilyApiKey,
+                this.runtime.utilityFetch,
+                this.runtime.now,
+              ),
             },
           ).invoke(inputState, { signal: combined, recursionLimit: 76 })
         : this.businessReads

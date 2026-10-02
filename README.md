@@ -51,6 +51,14 @@ The default synthetic playground chats and drafts text. Run `PLAYGROUND_CRM_FIXT
 
 ## Context Engine MCP services
 
+The employee DM tool loop also includes local `calculate` and optional Tavily-backed
+`web_search` / `read_webpage`. Set `TAVILY_API_KEY` in the worker's private `.env`,
+or in `.local/live-playground.env` for the real-data playground, and restart that
+process. A blank key hides both web tools; calculation needs no provider key.
+These are WhatsApp harness utilities, separate from the Context Engine platform
+selector. They use the existing active-employee DM boundary and share the tool
+budget. See [utility configuration and limits](docs/agent-modules/34-tool-extensibility.md#implemented-harness-utilities).
+
 The repository includes a reusable MCP client and thin CRM, supply, knowledge and analytics services. The personal-assistant loop uses `createBusinessReads` in `src/app/business-reads.ts`, enabled only with `BUSINESS_READS_ENABLED=true`, active employee eligibility (`BUSINESS_READ_EMPLOYEE_IDS=all` by default; a numeric list is optional), Supabase storage and signed credentials. It exposes the complete permitted read catalogue, currently seventeen tools for an authorized admin with all four registered read scopes. The generic `createContextEngineServices` factory still requires an employee credential resolver and otherwise grants no access.
 
 Each read uses a fresh MCP connection, discovers permitted read tools and checks `get_context.employee_id` against the verified employee before a business tool. The preferred adapter signs employee-scoped requests to `/mcp/ramesh` with a service key; Context Engine independently enforces current employee permissions. Results retain source IDs, cursors, freshness, access scope and uncertainty. Transport deadlines, response limits, cancellation and redacted errors apply.

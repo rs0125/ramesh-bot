@@ -5,6 +5,8 @@ export interface AssistantConfig {
   apiKey: string;
   sttApiKey?: string;
   transcriptionModel?: string;
+  /** Optional server-only credential for public web search and page reading. */
+  tavilyApiKey?: string;
   model: string;
   timeoutMs: number;
   maxOutputTokens: number;
@@ -31,6 +33,9 @@ export function loadAssistantConfig(
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(transcriptionModel))
     throw new Error('Invalid OPENAI_TRANSCRIBE_MODEL');
   const toolReasoningEffort = env.AGENT_TOOL_REASONING_EFFORT?.trim() || 'medium';
+  const tavilyApiKey = env.TAVILY_API_KEY?.trim() || undefined;
+  if (tavilyApiKey && (tavilyApiKey.length > 512 || /\s/.test(tavilyApiKey)))
+    throw new Error('Invalid TAVILY_API_KEY');
   if (!['low', 'medium', 'high'].includes(toolReasoningEffort))
     throw new Error('AGENT_TOOL_REASONING_EFFORT must be low, medium or high');
   const integer = (name: string, fallback: number, min: number, max: number) => {
@@ -44,6 +49,7 @@ export function loadAssistantConfig(
     apiKey,
     sttApiKey: env.OPENAI_STT_API_KEY?.trim() || apiKey,
     transcriptionModel,
+    tavilyApiKey,
     model,
     usagePolicy: loadUsagePolicy(env),
     toolReasoningEffort: toolReasoningEffort as 'low' | 'medium' | 'high',

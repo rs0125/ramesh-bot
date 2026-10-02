@@ -136,6 +136,34 @@ export class ContextToolRun {
   get blocked() {
     return this.denied;
   }
+  /** Harness utilities share the source proposal budget and live employee binding.
+   * Their results are reviewed separately; they are never replayed as MCP reads.
+   */
+  async executeUtility(
+    call: (authorizeResult: () => Promise<void>) => Promise<Record<string, unknown>>,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    if (this.remaining <= 0)
+      return { ok: false, code: this.denied ? 'ACCESS_DENIED' : 'TOOL_BUDGET_EXHAUSTED' };
+    this.proposals++;
+    const authorize = async () => {
+      const current = await this.resolve(signal);
+      signal.throwIfAborted();
+      if (!current || current.employeeId !== this.employeeId)
+        throw new ContextEngineError('AUTH_REQUIRED');
+    };
+    try {
+      await authorize();
+      // The utility invokes this recheck before accepting fresh or cached evidence.
+      return await call(authorize);
+    } catch (error) {
+      signal.throwIfAborted();
+      const code = error instanceof ContextEngineError ? error.code : 'UNAVAILABLE';
+      if (code === 'AUTH_REQUIRED' || code === 'ACCESS_DENIED') this.denied = true;
+      return { ok: false, code, retryable: false };
+    }
+  }
   get pagination() {
     return paginationCoverage(this.evidence);
   }

@@ -330,7 +330,8 @@ test('LangGraph supports dependent tools and all-date follow-ups, then formatter
     ],
   );
   assert.equal(toolDeliverySchema.parse(reply.businessEvidence).checks.length, 2);
-  assert.equal(fake.sessions[0]?.tools.length, 17);
+  assert.equal(fake.sessions[0]?.tools.length, 18);
+  assert.ok(fake.sessions[0]?.tools.some((tool) => tool.name === 'calculate'));
   const planner = fake.requests.find((request) => request.stage === 'planner')!;
   const plannedInput = JSON.parse(planner.messages[0]!.content);
   assert.deepEqual(plannedInput.tool_definitions, fake.sessions[0]!.tools);

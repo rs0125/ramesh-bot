@@ -24,6 +24,7 @@ import { businessRecall, recallDefinition, RECALL_TOOL } from './business-recall
 import { dealDisplayFacts, dealDisplayIssues, withDealDates } from './deal-display.js';
 import { planningContext } from './planning-context.js';
 import { routeSchema, taskPlanSchema, validateTaskPlan } from './task-plan.js';
+import { isUtilityTool, type UtilityToolName, type UtilityToolRun } from './utility-tools.js';
 
 const verdict = z
   .object({
@@ -62,6 +63,7 @@ export interface SalesGraphOptions {
   researchDeadlineMs?: number;
   onStage?: (stage: StageMetric) => void;
   onContext?: (context: GraphContextObservation) => void;
+  utilities?: UtilityToolRun;
 }
 
 export function buildSalesGraph(
@@ -80,6 +82,7 @@ export function buildSalesGraph(
   let modelHistory: ChatMessage[] = [];
   let toolSteps = 0;
   const recalled: unknown[] = [];
+  let utilities: UtilityToolRun | undefined;
   const currentRecalls = () => {
     const active = new Set(run?.evidence.map((entry) => entry.id) ?? []);
     return recalled.filter((value) => {
@@ -148,6 +151,10 @@ export function buildSalesGraph(
       const access = await open(config.signal ?? new AbortController().signal);
       run = access.run;
       accessStatus = access.status;
+      utilities =
+        value.audience === 'dm' && accessStatus === 'available' && run
+          ? options.utilities
+          : undefined;
       recall = businessRecall(value.history, run, requestTime);
       modelHistory = recall.messages;
       tools = [
@@ -157,9 +164,10 @@ export function buildSalesGraph(
           inputSchema,
         })) ?? []),
         ...(recall.available ? [recallDefinition] : []),
+        ...(utilities?.tools ?? []),
       ];
       options.onContext?.({ access: accessStatus, tools: structuredClone(tools) });
-      runtime = `Runtime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Tool access: ${accessStatus}. ${value.audience === 'group' ? 'No business tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private business data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The tool service is temporarily unavailable. Do not treat that as missing records.' : ''}`;
+      runtime = `Runtime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available, utilities?.tools))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Tool access: ${accessStatus}. ${value.audience === 'group' ? 'No business tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private business data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The tool service is temporarily unavailable. Do not treat that as missing records.' : ''}`;
       return {};
     })
     .addNode('converser', async (value, config) => {
@@ -256,7 +264,18 @@ export function buildSalesGraph(
         (signal) =>
           call.name === RECALL_TOOL
             ? recall.execute(call.arguments, signal)
-            : run!.execute(call.name, call.arguments, signal),
+            : isUtilityTool(call.name) && utilities
+              ? run!.executeUtility(
+                  (authorizeResult) =>
+                    utilities!.execute(
+                      call.name as UtilityToolName,
+                      call.arguments,
+                      signal,
+                      authorizeResult,
+                    ),
+                  signal,
+                )
+              : run!.execute(call.name, call.arguments, signal),
         config.signal,
       );
       if (attempt.limited) return { calls: [], researchExhausted: true };
@@ -282,7 +301,8 @@ export function buildSalesGraph(
       const result = await model.complete(
         {
           stage: 'formatter',
-          reasoningEffort: run?.evidence.length || value.feedback ? 'low' : 'none',
+          reasoningEffort:
+            run?.evidence.length || utilities?.evidence.length || value.feedback ? 'low' : 'none',
           instructions: `${BUSINESS_FORMATTER_PROMPT}\n${engineOrientation()}\n${value.feedback ? 'A source reviewer found a problem. Correct every identified issue without inventing replacements, and independently check every candidate against its actual fields; clearly state any unresolved limitation.' : ''}`,
           messages: [
             {
@@ -302,6 +322,8 @@ export function buildSalesGraph(
                   .map(({ name, description }) => ({ name, description })),
                 recalled: currentRecalls(),
                 evidence: run?.evidence ?? [],
+                utility_evidence: utilities?.evidence ?? [],
+                utility_failures: utilities?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
@@ -361,9 +383,12 @@ export function buildSalesGraph(
                 tool_definitions: tools.filter(
                   (tool) =>
                     tool.name === RECALL_TOOL ||
+                    utilities?.evidence.some((item) => item.tool === tool.name) ||
                     run?.evidence.some((item) => item.tool === tool.name),
                 ),
                 evidence: run?.evidence ?? [],
+                utility_evidence: utilities?.evidence ?? [],
+                utility_failures: utilities?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
@@ -415,6 +440,7 @@ export function buildSalesGraph(
           unavailable: true,
         };
       const delivery = run?.delivery();
+      if (delivery && utilities?.usedWeb) delivery.publicWebUsed = true;
       return {
         ...(delivery ? { business: { outcome: 'verified' as const, delivery } } : {}),
         unavailable:

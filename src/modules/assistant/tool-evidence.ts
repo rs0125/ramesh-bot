@@ -35,6 +35,8 @@ export const toolDeliverySchema = z
     localDate: z.iso.date(),
     preparedAt: instant,
     expiresAt: instant,
+    /** Recall refreshes private reads, not public web research used in the same answer. */
+    publicWebUsed: z.literal(true).optional(),
     checks: z
       .array(
         z

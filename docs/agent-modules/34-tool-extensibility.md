@@ -4,6 +4,69 @@ Status: dynamic first-party read discovery is implemented; writes and arbitrary
 third-party tools remain future work. Advertising a tool does not grant permission
 to run it. See the [live read contract](45-dynamic-tool-discovery.md).
 
+## Implemented harness utilities
+
+The employee DM tool loop now has a small application-owned utility adapter,
+separate from `CONTEXT_READ_TOOLS` and the Context Engine server. No database
+migration is needed. It is available only when the existing business-read loop
+opens for an eligible active employee in a DM. Groups, unknown users, and the
+ordinary two-node synthetic chat do not receive these tools.
+
+| Tool           | Inputs and behavior                                                                                                                                                                    | Configuration                               |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `calculate`    | Bounded decimal arithmetic, integer powers, parentheses and compatible area/length conversions. Returns a decimal string with explicit rounding. No executable code or network access. | Always present in the eligible DM loop.     |
+| `web_search`   | A public query, optional news/general topic, time range and up to five results. Snippets include their source URLs and optional publication dates.                                     | Non-empty `TAVILY_API_KEY`.                 |
+| `read_webpage` | One public HTTP(S) URL and an optional text limit. Extracted text includes its source URL and truncation state.                                                                        | Same `TAVILY_API_KEY`; Tavily Extract only. |
+
+Set `TAVILY_API_KEY` in the worker's private `.env`, the live playground's separate
+`.local/live-playground.env`, or the production worker environment. Restart the
+corresponding process after changing it. `.env.example` and the EC2 environment
+template include an empty placeholder. Blank leaves ordinary chat, Context Engine
+reads and calculation operational, and removes both web tools from discovery.
+No key is included in model instructions, tool arguments, trace summaries or
+provider error messages. This configuration does not enable an installation whose
+business-read feature or signed Context Engine access is unconfigured.
+
+Calls share the existing 24-proposal budget and 28-step graph limit. Every utility
+call checks the current employee binding, including before accepting a new or
+cached result. Tavily additionally has a four-request limit per run, a 15-second
+request deadline and a 1 MiB response cap. Search uses basic depth with automatic
+parameter upgrades disabled; extraction uses basic depth, one URL and a 10-second
+provider timeout. Identical calls reuse their result/failure within a run. There
+are no automatic provider retries or fallback providers. Quota, authentication or
+rate-limit failures stop further uncached web requests for that run.
+
+Search snippets are capped at 1,800 characters each. Page text defaults to 12,000
+characters and can be requested up to 20,000; truncation is explicit. Each utility
+result is limited to 80,000 bytes, with a 100,000-byte cumulative utility evidence budget.
+The worker only connects to the fixed Tavily API origin. URL validation rejects
+local/IP targets, non-web schemes, embedded credentials, nonstandard ports and
+recognized credential query parameters. This is a public-source adapter, not an
+authenticated browser. Returned source text cannot authorize tool calls or writes.
+
+Both formatter and verifier receive accepted utility evidence and failures.
+Private Context Engine evidence keeps its existing encrypted delivery receipts
+and current-access checks. Utility calls are never replayed as MCP reads during
+delivery. A private answer that also used public web data marks its receipt with
+`publicWebUsed`; later business recall refreshes the private reads but withholds
+the old combined answer and instructs the worker to refresh relevant web sources.
+Public-only tool results do not acquire private source permissions.
+
+Tavily's returned `credits_used` is recorded in the in-run result when present;
+missing usage stays unknown. The OpenAI USD ledger does not account for Tavily
+credits. Keep paid upgrades/automatic billing disabled in the Tavily account if
+the intended policy is free-tier-only. The per-run call bound is not a monthly
+provider quota or a guarantee of zero total inference cost.
+
+Implementation: `calculator.ts`, `utility-tools.ts`,
+`src/infrastructure/tavily/client.ts` and the existing graph/executor. Deterministic
+checks in `utility-tools.test.ts` and `utility-agent.test.ts` use synthetic models
+and mocked HTTP, including quota errors, cancellation, denied identities, source
+projection, shared budgets and mixed-answer recall. No live Tavily or model call
+is required to run them. Provider integration follows the official
+[Search](https://docs.tavily.com/documentation/api-reference/endpoint/search) and
+[Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract) APIs.
+
 ## Current compatibility
 
 | Layer                    | Current behavior                                                                                          | New tool impact                                                                               |
