@@ -8,11 +8,14 @@ import { config as dotenv } from 'dotenv';
 import { STT_CASES } from './stt-cases.js';
 import { loadAssistantConfig } from '../src/config/assistant.js';
 import { OpenAIMediaProcessor } from '../src/infrastructure/openai/media-processor.js';
+import { assertEvalRun, evalPolicyOptions } from './lib/run-policy.js';
 dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
+    ...evalPolicyOptions,
+    case: { type: 'string' },
     models: { type: 'string', default: 'gpt-4o-transcribe,gpt-4o-mini-transcribe,gpt-transcribe' },
-    trials: { type: 'string', default: '2' },
+    trials: { type: 'string', default: '1' },
   },
 });
 const models = values.models!.split(',');
@@ -26,6 +29,8 @@ if (
   trials > 5
 )
   throw new Error('INVALID_STT_EVAL_OPTIONS');
+const cases = STT_CASES.filter((c) => !values.case || values.case.split(',').includes(c.id));
+assertEvalRun(models, cases.length * trials * models.length, values);
 const config = loadAssistantConfig();
 if (!config) throw new Error('OPENAI_API_KEY_REQUIRED');
 const runId = new Date().toISOString().replaceAll(':', '-') + '-' + randomUUID().slice(0, 8);
@@ -33,7 +38,7 @@ const directory = new URL(`../.local/stt-evals/${runId}/`, import.meta.url);
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const run = promisify(execFile);
 const recordings: Array<{ id: string; bytes: Buffer; duration: number; hash: string }> = [];
-for (const c of STT_CASES) {
+for (const c of cases) {
   const files: string[] = [];
   for (const [i, segment] of c.segments.entries()) {
     const file = new URL(`${c.id}-${i}.wav`, directory).pathname;
@@ -86,10 +91,10 @@ for (const c of STT_CASES) {
 const results: any[] = [];
 // Run in rotation, with bounded concurrency. Keep failures and do not reroll transcripts.
 const jobs = Array.from({ length: trials }, (_, trial) =>
-  STT_CASES.flatMap((c) => models.map((model) => ({ c, model, trial: trial + 1 }))),
+  cases.flatMap((c) => models.map((model) => ({ c, model, trial: trial + 1 }))),
 ).flat();
 await Promise.all(
-  Array.from({ length: 2 }, async () => {
+  Array.from({ length: 1 }, async () => {
     for (;;) {
       const item = jobs.shift();
       if (!item) return;

@@ -11,6 +11,7 @@ import { loadLivePlaygroundConfig } from '../src/config/playground.js';
 import { messagePoolOptions } from '../src/infrastructure/database/message-pool.js';
 import { authCipher } from '../src/infrastructure/database/auth-store.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
+import { assertEvalRun, DEFAULT_EVAL_MODEL, evalPolicyOptions } from './lib/run-policy.js';
 const scenarioSchema = z
   .object({
     id: z.string().regex(/^private-[a-z0-9-]+$/),
@@ -37,6 +38,8 @@ async function main() {
     throw new Error('PRIVATE_EVALS_FORBIDDEN_IN_CI');
   const { values } = parseArgs({
     options: {
+      ...evalPolicyOptions,
+      'judge-model': { type: 'string', default: DEFAULT_EVAL_MODEL },
       'case-file': { type: 'string', default: '.local/private-evals/cases.json' },
       'env-file': { type: 'string', default: '.local/live-playground-sol-eval.env' },
       'base-url': { type: 'string', default: 'http://127.0.0.1:3012' },
@@ -80,6 +83,12 @@ async function main() {
   const status = await request('/api/status', {});
   if (status.delivery !== 'capture' || status.whatsapp !== false)
     throw new Error('CAPTURE_PREFLIGHT_FAILED');
+  if (typeof status.model !== 'string') throw new Error('CAPTURE_MODEL_REQUIRED');
+  const spendingPolicy = assertEvalRun(
+    [status.model, values['judge-model']!],
+    cases.length * trials,
+    values,
+  );
   const output = join(root, 'runs', new Date().toISOString().replaceAll(':', '-'));
   await mkdir(output, { recursive: true, mode: 0o700 });
   const pool = new Pool(messagePoolOptions(config.databaseUrl, config.ca));
@@ -87,7 +96,7 @@ async function main() {
   const cipher = authCipher(config.encryptionKey);
   const judge = new OpenAITextModel({
     ...config.model,
-    model: 'gpt-5.6-terra',
+    model: values['judge-model']!,
     timeoutMs: 90000,
     maxOutputTokens: 4000,
   });
@@ -97,6 +106,7 @@ async function main() {
     for (const scenario of cases)
       for (let trial = 1; trial <= trials; trial++) {
         const record: any = {
+          spendingPolicy,
           id: scenario.id,
           trial,
           asOf: scenario.asOf,

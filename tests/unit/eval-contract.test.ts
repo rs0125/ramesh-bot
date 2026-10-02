@@ -4,12 +4,20 @@ import { junit } from '../../evals/lib/report.js';
 import { CONVERSATION_CASES } from '../../evals/conversation-cases.js';
 import { JOURNEY_CASES } from '../../evals/journey-cases.js';
 import { ADVERSARIAL_CASES } from '../../evals/adversarial-cases.js';
+import { PAGINATION_CASES } from '../../evals/pagination-cases.js';
+import { RECOVERY_CASES } from '../../evals/recovery-cases.js';
 import { traceViolations } from '../../evals/lib/trace-checks.js';
 import { loadPrompt, promptManifest } from '../../src/modules/assistant/prompt-files.js';
 import { createSalesFixture, salesEvidence } from '../../scripts/lib/sales-fixture.js';
 
 test('CI dataset has unique scenarios covering every assistant domain', () => {
-  const cases = [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES];
+  const cases = [
+    ...CONVERSATION_CASES,
+    ...JOURNEY_CASES,
+    ...ADVERSARIAL_CASES,
+    ...PAGINATION_CASES,
+    ...RECOVERY_CASES,
+  ];
   assert.equal(new Set(cases.map((c) => c.id)).size, cases.length);
   assert.ok(cases.length >= 50);
   for (const category of ['assistant', 'crm', 'supply', 'knowledge', 'analytics', 'boundaries'])
@@ -134,6 +142,56 @@ test('fictional warehouse scope, totals and detail fields remain consistent', ()
     assert.deepEqual(salesEvidence('read_warehouse', { id: row.id }).data, row);
   assert.deepEqual(salesEvidence('search_warehouses', { city: 'NoSuchCity' }).data.items, []);
   assert.throws(() => salesEvidence('read_warehouse', { id: 999999 }));
+});
+
+test('changed CRM visibility is consistent across pages, summaries, briefing and detail tools', () => {
+  const visible = '00000000-0000-4000-8000-000000000102';
+  const removed = '00000000-0000-4000-8000-000000000101';
+  const now = Date.parse('2026-10-02T04:30:00Z');
+  const options = { visibleLeadIds: [visible] };
+  const search = salesEvidence(
+    'search_crm_leads',
+    { limit: 2, sort: 'created_desc' },
+    now,
+    options,
+  ).data;
+  assert.deepEqual(
+    (search.items as any[]).map((row) => row.id),
+    [visible],
+  );
+  assert.equal(search.nextCursor, null);
+  assert.equal((search.query_context as any).has_more, false);
+  assert.equal(salesEvidence('crm_summary', {}, now, options).data.total, 1);
+  const briefing = salesEvidence('crm_briefing', {}, now, options).data;
+  assert.equal(briefing.total_active, 1);
+  assert.equal(briefing.follow_up_overdue, 0);
+  assert.ok(!JSON.stringify(briefing).includes(removed));
+  for (const tool of ['read_crm_lead', 'read_crm_lead_context', 'assess_shortlist'] as const) {
+    const args =
+      tool === 'assess_shortlist' ? { lead_id: removed, warehouse_ids: [101] } : { id: removed };
+    assert.throws(() => salesEvidence(tool, args, now, options));
+  }
+});
+
+test('continuation regression has real recoverable second-page data', () => {
+  const fixture = createSalesFixture();
+  const scenario = RECOVERY_CASES.find((c) => c.id === 'recovery-changed-continuation')!;
+  scenario.setup!(fixture.state);
+  scenario.beforeTurn!(1, fixture.state);
+  const args = { sort: 'created_desc', limit: 2 };
+  const first = salesEvidence('search_crm_leads', args, Date.now(), fixture.state);
+  fixture.state.mutate!(first, 'search_crm_leads', args);
+  assert.equal((first.data.items as any[]).length, 1);
+  const next = { ...args, cursor: first.data.nextCursor };
+  const second = salesEvidence('search_crm_leads', next, Date.now(), fixture.state);
+  fixture.state.mutate!(second, 'search_crm_leads', next);
+  assert.equal((second.data.items as any[]).length, 1);
+  assert.equal(second.data.nextCursor, null);
+  assert.equal(
+    new Set([...(first.data.items as any[]), ...(second.data.items as any[])].map((r) => r.id))
+      .size,
+    2,
+  );
 });
 
 test('unavailable analytics scenario agrees across discovery and report failure', () => {

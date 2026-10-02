@@ -8,6 +8,7 @@ import {
   type ContextEvidence,
 } from '../context-engine/context.types.js';
 import { indiaDate } from './followups.js';
+import { recordIdentity, recordIdentitySchema } from './record-identity.js';
 import {
   ANALYTICS_CITATION_FIELDS,
   verifyAnalyticsEvidence,
@@ -35,6 +36,7 @@ export const toolDeliverySchema = z
             ),
             arguments: z.record(z.string(), z.unknown()),
             fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+            records: recordIdentitySchema.optional(),
           })
           .strict(),
       )
@@ -258,10 +260,14 @@ export function toolDelivery(
     localDate,
     preparedAt: new Date(now).toISOString(),
     expiresAt: new Date(Math.min(now + 300_000, midnight)).toISOString(),
-    checks: evidence.map((item) => ({
-      tool: item.tool,
-      arguments: item.arguments,
-      fingerprint: toolEvidenceFingerprint(item.result),
-    })),
+    checks: evidence.map((item) => {
+      const records = recordIdentity(item.tool, item.result);
+      return {
+        tool: item.tool,
+        arguments: item.arguments,
+        fingerprint: toolEvidenceFingerprint(item.result),
+        ...(records ? { records } : {}),
+      };
+    }),
   });
 }

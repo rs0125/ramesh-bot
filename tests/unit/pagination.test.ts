@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { paginationCoverage, cyclicCursor } from '../../src/modules/assistant/pagination.js';
+import {
+  paginationCoverage,
+  paginationContinuations,
+  cyclicCursor,
+} from '../../src/modules/assistant/pagination.js';
 import type { ToolEvidence } from '../../src/modules/assistant/tool-evidence.js';
 import { createSalesFixture, FIXTURE_JID, salesEvidence } from '../../scripts/lib/sales-fixture.js';
 
@@ -54,6 +58,7 @@ test('filters, sort and tool isolate traversals; cycles remain partial', () => {
     page([3], 'fixture:2', 'fixture:1'),
   ];
   assert.equal(paginationCoverage(pages)[0]!.status, 'cursor_cycle');
+  assert.deepEqual(paginationContinuations(pages), []);
   assert.equal(
     cyclicCursor(pages, 'search_warehouses', { city: 'Bengaluru', cursor: 'fixture:1', limit: 1 }),
     true,
@@ -75,6 +80,28 @@ test('filters, sort and tool isolate traversals; cycles remain partial', () => {
   const other = page([1]);
   other.arguments.city = 'Pune';
   assert.equal(paginationCoverage([...pages, crm, other]).length, 3);
+});
+
+test('recall continuations preserve each current query and omit exhausted traversals without mutating evidence', () => {
+  const ongoing = page([], undefined, 'fixture:0');
+  ongoing.arguments.sort = 'created_desc';
+  const exhausted = page([1]);
+  exhausted.arguments.city = 'Pune';
+  const disconnected = page([4], 'fixture:4', 'fixture:5');
+  disconnected.arguments.city = 'Mumbai';
+  const pages = [ongoing, exhausted, disconnected];
+  const original = structuredClone(pages);
+  const next = paginationContinuations(pages);
+  assert.equal(next.length, 2);
+  assert.deepEqual(next[0]!.arguments, {
+    city: 'Bengaluru',
+    limit: 25,
+    sort: 'created_desc',
+    cursor: 'fixture:0',
+  });
+  assert.equal(next[1]!.coverage.status, 'unlinked');
+  assert.equal(next[1]!.arguments.cursor, 'fixture:5');
+  assert.deepEqual(pages, original);
 });
 
 test('executor blocks a cyclic continuation without another source call or loss of accepted pages', async () => {

@@ -3,14 +3,31 @@ name: Agent conversation evals
 on:
   workflow_dispatch:
     inputs:
+      cases:
+        description: Comma-separated case IDs for this run
+        default: 'changed-history,source-label-crm-name,source-label-knowledge-title'
+        required: true
+        type: string
       trials:
         description: Independent trials per scenario (1 to 5)
-        default: '2'
+        default: '1'
         required: true
         type: choice
         options: ['1', '2', '3', '4', '5']
-  schedule:
-    - cron: '30 1 * * 1'
+      max_trials:
+        description: Maximum total scenario executions approved for this run
+        default: '3'
+        required: true
+        type: string
+      model:
+        description: Agent and grader model
+        default: 'gpt-6-luna'
+        type: choice
+        options: ['gpt-6-luna', 'gpt-6.1-sol']
+      sol_approval:
+        description: User approval reference for this Sol run; leave empty for Luna
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -21,7 +38,7 @@ concurrency:
 
 jobs:
   conversations:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.AGENT_EVALS_ENABLED == 'true')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # Configure this environment's secret and optional required reviewers in GitHub.
@@ -37,17 +54,16 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run prisma:generate
       - run: npm run typecheck && npm run build
-      - name: Calibrate the independent grader on known positive and negative outcomes
+      - name: Run the explicitly selected conversations with fictional tools
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: npm run eval:judge
-      - name: Run every conversation with the real model and fictional tools
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-6.1-sol
+          EVAL_MODEL: ${{ inputs.model }}
           AGENT_TOOL_REASONING_EFFORT: medium
-          EVAL_TRIALS: ${{ inputs.trials || '2' }}
-        run: npm run eval:ci -- --trials "$EVAL_TRIALS"
+          EVAL_CASES: ${{ inputs.cases }}
+          EVAL_TRIALS: ${{ inputs.trials }}
+          EVAL_MAX_TRIALS: ${{ inputs.max_trials }}
+          SOL_APPROVAL_REFERENCE: ${{ inputs.sol_approval }}
+        run: npm run eval:ci -- --case "$EVAL_CASES" --trials "$EVAL_TRIALS" --max-trials "$EVAL_MAX_TRIALS" --model "$EVAL_MODEL" --judge-model "$EVAL_MODEL" --sol-approval "$SOL_APPROVAL_REFERENCE"
       - name: Publish quality summary
         if: always()
         run: |

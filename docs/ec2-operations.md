@@ -1,10 +1,15 @@
 # Private EC2 operations
 
-Current local increment (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
+Current implementation (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
 
 The optional business-read flag in this checkout now enables the full employee-permitted CRM, supply, knowledge and shortlist catalogue through the [sales loop](sales-manager-agent.md). Validate production migration `202610010004`, roster RLS, signed scopes and model limits before enabling it. Local Supabase capture tests do not change that production configuration.
 
-Reviewed **1 October 2026** through release `5eb14d0`. The Terra conversational flow and split Supabase queues are deployed. The first-read route in the current checkout is disabled by default and not rolled out here. It requires migration `202610010004`, the signed Context Engine setup and an explicit feature enablement; employee eligibility defaults to all active trusted employees, with optional numeric rollout lists; see [first-read rollout](first-crm-read.md).
+Reviewed **2 October 2026** through release `cdd9881`. Production runs Sol with the
+LangGraph agent, separate Supabase queues, media and debouncing, active employee
+business reads, and 14 signed CRM/supply/knowledge tools. Roster RLS is provisioned.
+Concurrent LID resolution and delivery acknowledgements are corrected; see
+[the delivery incident](agent-modules/40-delivery-acknowledgements.md). Analytics
+signing scopes, reminders and writes remain separate rollout work.
 
 The `ramesh-bot-production` CloudFormation stack in Mumbai (`ap-south-1`) owns a dedicated Ubuntu 24.04 `t3.micro`, a security group with **no inbound rules**, its instance profile, a fixed SSM deployment document, the GitHub deployment role, and a private backup bucket. The instance uses an automatically assigned public IPv4 address for outbound traffic. The application listens only on `127.0.0.1:3011`.
 

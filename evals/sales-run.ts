@@ -15,17 +15,25 @@ import { SALES_CASES } from './sales-cases.js';
 import type { AgentTrace } from '../src/modules/assistant/assistant.types.js';
 import { promptManifest } from '../src/modules/assistant/prompt-files.js';
 import { captureEvalProvenance } from './lib/provenance.js';
+import { assertEvalRun, evalModel, evalPolicyOptions } from './lib/run-policy.js';
 
 loadEnvironment({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
-  options: { trials: { type: 'string', default: '3' }, case: { type: 'string' } },
+  options: {
+    ...evalPolicyOptions,
+    model: { type: 'string' },
+    trials: { type: 'string', default: '1' },
+    case: { type: 'string' },
+  },
 });
 const trials = Number(values.trials);
 if (!Number.isInteger(trials) || trials < 1 || trials > 5)
   throw new Error('--trials must be between 1 and 5');
 const cases = SALES_CASES.filter((c) => !values.case || c.id === values.case);
 if (!cases.length) throw new Error('No matching cases');
-const loaded = loadAssistantConfig();
+const selectedModel = evalModel(values.model);
+assertEvalRun([selectedModel], cases.length * trials, values);
+const loaded = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!loaded) throw new Error('OPENAI_API_KEY is required');
 const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000 };
 const model = new OpenAITextModel(config);
@@ -53,7 +61,7 @@ console.log(
   `Sales eval: ${work.length} real-model trials, ${config.model}, synthetic evidence, no transport.`,
 );
 await Promise.all(
-  Array.from({ length: Math.min(2, work.length) }, async () => {
+  Array.from({ length: 1 }, async () => {
     for (;;) {
       const item = work.shift();
       if (!item) return;

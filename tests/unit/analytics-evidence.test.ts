@@ -8,6 +8,24 @@ import {
 import { createSalesFixture, FIXTURE_JID } from '../../scripts/lib/sales-fixture.js';
 
 const now = Date.parse('2026-10-02T01:00:00Z');
+test('fictional Search Console comparison CTR agrees with clicks and impressions in each period', () => {
+  const data = analyticsFixture(
+    'search_console_report',
+    { group: 'summary', period: 'last_7_days', compare_to: 'previous_period' },
+    now,
+  ).data as any;
+  const metrics = new Map<string, any>(
+    data.comparison.metrics.map((metric: any) => [metric.name, metric]),
+  );
+  for (const period of ['current', 'previous'])
+    assert.ok(
+      Math.abs(
+        metrics.get('ctr')[period] -
+          metrics.get('clicks')[period] / metrics.get('impressions')[period],
+      ) < 1e-12,
+    );
+  assert.equal(metrics.get('ctr').percentage_point_change, 0);
+});
 test('analytics uses each source calendar and citation-safe filters', () => {
   for (const [tool, args] of [
     ['ga4_report', { report: 'overview', period: 'last_7_days', compare_to: 'previous_period' }],

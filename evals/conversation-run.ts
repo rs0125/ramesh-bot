@@ -8,10 +8,10 @@ import { promptManifest } from '../src/modules/assistant/prompt-files.js';
 import { JOURNEY_CASES } from './journey-cases.js';
 import { ADVERSARIAL_CASES } from './adversarial-cases.js';
 import { PAGINATION_CASES } from './pagination-cases.js';
+import { RECOVERY_CASES } from './recovery-cases.js';
 import { CRITERIA } from './lib/judge.js';
 import { judgeTurns } from './lib/turn-judge.js';
 import { satisfiesToolCheck } from './lib/tool-contracts.js';
-import { ContextEngineError } from '../src/modules/context-engine/context.types.js';
 import { traceViolations } from './lib/trace-checks.js';
 import { emptyUsage, addUsage } from './lib/usage.js';
 import { writeEvalReports } from './lib/report.js';
@@ -31,18 +31,25 @@ import { SALES_PROMPT_VERSION } from '../src/modules/assistant/sales-prompts.js'
 import { styleViolations } from '../src/modules/assistant/style.js';
 import { indiaDate } from '../src/modules/assistant/followups.js';
 import { CONVERSATION_CASES } from './conversation-cases.js';
+import {
+  assertEvalRun,
+  evalModel,
+  DEFAULT_EVAL_MODEL,
+  evalPolicyOptions,
+} from './lib/run-policy.js';
 
 dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
-    trials: { type: 'string', default: '2' },
+    ...evalPolicyOptions,
+    trials: { type: 'string', default: '1' },
     case: { type: 'string' },
     suite: { type: 'string', default: 'all' },
-    concurrency: { type: 'string', default: '3' },
+    concurrency: { type: 'string', default: '1' },
     output: { type: 'string' },
     model: { type: 'string' },
     'tool-effort': { type: 'string' },
-    'judge-model': { type: 'string', default: 'gpt-6.1-sol' },
+    'judge-model': { type: 'string', default: DEFAULT_EVAL_MODEL },
     list: { type: 'boolean', default: false },
   },
 });
@@ -51,7 +58,11 @@ if (!Number.isInteger(trials) || trials < 1 || trials > 5) throw new Error('Use 
 const concurrency = Number(values.concurrency);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
   throw new Error('Use concurrency 1–4');
-if (!['all', 'conversation', 'journeys', 'adversarial', 'pagination'].includes(values.suite!))
+if (
+  !['all', 'conversation', 'journeys', 'adversarial', 'pagination', 'recovery'].includes(
+    values.suite!,
+  )
+)
   throw new Error('Unknown suite');
 const poolCases =
   values.suite === 'conversation'
@@ -62,7 +73,15 @@ const poolCases =
         ? ADVERSARIAL_CASES
         : values.suite === 'pagination'
           ? PAGINATION_CASES
-          : [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES, ...PAGINATION_CASES];
+          : values.suite === 'recovery'
+            ? RECOVERY_CASES
+            : [
+                ...CONVERSATION_CASES,
+                ...JOURNEY_CASES,
+                ...ADVERSARIAL_CASES,
+                ...PAGINATION_CASES,
+                ...RECOVERY_CASES,
+              ];
 const filters = values.case?.split(',').map((value) => value.trim());
 const cases = poolCases.filter(
   (c) => !filters || filters.includes(c.id) || filters.includes(c.category ?? ''),
@@ -72,9 +91,15 @@ if (values.list) {
   process.exit(0);
 }
 if (!cases.length) throw new Error('Unknown case');
+const selectedModel = evalModel(values.model);
+const spendingPolicy = assertEvalRun(
+  [selectedModel, values['judge-model']!],
+  cases.length * trials,
+  values,
+);
 const loaded = loadAssistantConfig({
   ...process.env,
-  ...(values.model ? { OPENAI_MODEL: values.model } : {}),
+  OPENAI_MODEL: selectedModel,
   ...(values['tool-effort'] ? { AGENT_TOOL_REASONING_EFFORT: values['tool-effort'] } : {}),
 });
 if (!loaded) throw new Error('OPENAI_API_KEY is required; do not pass it as a command argument');
@@ -95,6 +120,7 @@ const startedAt = Date.now();
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const manifest = promptManifest();
 const metadata = {
+  spendingPolicy,
   runId,
   startedAt: new Date(startedAt).toISOString(),
   syntheticClock: '2026-10-02T09:00:00Z; +1 minute per user turn',
@@ -216,20 +242,7 @@ await Promise.all(
               );
           if (index === 1 && scenario.revoke) fixture.state.active = false;
           if (index === 1 && scenario.change)
-            fixture.state.mutate = (e, tool, args) => {
-              if (
-                (tool === 'read_crm_lead' || tool === 'read_crm_lead_context') &&
-                args.id === '00000000-0000-4000-8000-000000000101'
-              )
-                throw new ContextEngineError('UNAVAILABLE', false, undefined, {
-                  sourceCode: 'RECORD_NOT_FOUND',
-                  action: 'correct_query',
-                });
-              if (tool === 'search_crm_leads') {
-                e.data.items = (e.data.items as any[]).filter((row) => row.name.includes('Beacon'));
-                (e.data.query_context as any).returned_count = (e.data.items as any[]).length;
-              }
-            };
+            fixture.state.visibleLeadIds = ['00000000-0000-4000-8000-000000000102'];
           const before = fixture.state.calls.length;
           const evidenceBefore = fixture.state.evidence.length;
           const localToolsBefore = record.localTools.length;

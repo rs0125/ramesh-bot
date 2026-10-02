@@ -17,17 +17,25 @@ import { FORMATTER_PROMPT } from '../src/modules/assistant/prompts.js';
 import { styleViolations } from '../src/modules/assistant/style.js';
 import type { AgentTrace } from '../src/modules/assistant/assistant.types.js';
 import { BUSINESS_CASES } from './business-cases.js';
+import { assertEvalRun, evalModel, evalPolicyOptions } from './lib/run-policy.js';
 
 loadEnvironment({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
-  options: { trials: { type: 'string', default: '3' }, case: { type: 'string' } },
+  options: {
+    ...evalPolicyOptions,
+    model: { type: 'string' },
+    trials: { type: 'string', default: '1' },
+    case: { type: 'string' },
+  },
 });
 const trials = Number(values.trials);
 if (!Number.isInteger(trials) || trials < 1 || trials > 5)
   throw new Error('--trials must be between 1 and 5');
 const cases = BUSINESS_CASES.filter((scenario) => !values.case || scenario.id === values.case);
 if (!cases.length) throw new Error('No matching evaluation cases');
-const config = loadAssistantConfig();
+const selectedModel = evalModel(values.model);
+assertEvalRun([selectedModel], cases.length * trials, values);
+const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!config) throw new Error('OPENAI_API_KEY is required for live evaluations');
 const runId = `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`;
 const directory = fileURLToPath(new URL(`../.local/business-evals/${runId}/`, import.meta.url));
@@ -54,7 +62,7 @@ console.log(
 );
 try {
   await Promise.all(
-    Array.from({ length: Math.min(2, work.length) }, async () => {
+    Array.from({ length: 1 }, async () => {
       for (;;) {
         const item = work.shift();
         if (!item) return;

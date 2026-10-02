@@ -11,17 +11,25 @@ import { loadAssistantConfig } from '../src/config/assistant.js';
 import { writeEvalReports, type EvalTrial } from './lib/report.js';
 import { addUsage, emptyUsage } from './lib/usage.js';
 import { captureEvalProvenance } from './lib/provenance.js';
+import { assertEvalRun, evalModel, evalPolicyOptions } from './lib/run-policy.js';
 dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
-    trials: { type: 'string', default: '2' },
+    ...evalPolicyOptions,
+    trials: { type: 'string', default: '1' },
     case: { type: 'string' },
-    model: { type: 'string', default: 'gpt-6.1-sol' },
+    model: { type: 'string' },
   },
 });
 const trials = Number(values.trials);
 if (!Number.isInteger(trials) || trials < 1 || trials > 5) throw new Error('Use 1–5 trials');
-const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: values.model });
+const cases = CALIBRATION_CASES.filter(
+  (c) => !values.case || values.case.split(',').includes(c.id),
+);
+if (!cases.length) throw new Error('Unknown case');
+const selectedModel = evalModel(values.model);
+const spendingPolicy = assertEvalRun([selectedModel], cases.length * trials, values);
+const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!config) throw new Error('OPENAI_API_KEY is required through the environment');
 const model = new OpenAITextModel({ ...config, timeoutMs: 90000, maxOutputTokens: 5000 });
 const prompt = await readFile(new URL('./prompts/journey-judge.md', import.meta.url), 'utf8');
@@ -31,6 +39,7 @@ await mkdir(directory, { recursive: true, mode: 0o700 });
 const started = Date.now(),
   usage = emptyUsage();
 const metadata = {
+  spendingPolicy,
   runId,
   model: config.model,
   promptHash: createHash('sha256').update(prompt).digest('hex'),
@@ -39,16 +48,12 @@ const metadata = {
 await writeFile(new URL('run-metadata.json', directory), JSON.stringify(metadata, null, 2), {
   mode: 0o600,
 });
-const cases = CALIBRATION_CASES.filter(
-  (c) => !values.case || values.case.split(',').includes(c.id),
-);
-if (!cases.length) throw new Error('Unknown case');
 const jobs = cases.flatMap((c) =>
   Array.from({ length: trials }, (_, i) => ({ scenario: c, trial: i + 1 })),
 );
 const results: EvalTrial[] = [];
 await Promise.all(
-  Array.from({ length: 3 }, async () => {
+  Array.from({ length: 1 }, async () => {
     for (;;) {
       const job = jobs.shift();
       if (!job) return;

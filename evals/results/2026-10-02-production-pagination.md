@@ -13,6 +13,13 @@ The pagination increment adds accepted-evidence coverage accounting and cycle
 detection. Evidence rules allow a clearly labelled provisional warehouse comparison
 when listed total space is present but usable area is not recorded.
 
+Release `cdd98815d04092beff635bf8436fff8ee066f68e` was pushed to main.
+[CI](https://github.com/rs0125/ramesh-bot/actions/runs/37023166129) and
+[EC2 deployment](https://github.com/rs0125/ramesh-bot/actions/runs/37023329168)
+succeeded. The active EC2 release was checked directly. Its Sol/v20 full CRM graph
+completed and passed delivery authorization with no sender; the voice incident's
+five-query concurrent preflight passed again in 3.78 seconds on deployed code.
+
 ## Paid outcome checks
 
 - Real Supabase plus production Context Engine: two fresh private trials passed
@@ -25,8 +32,16 @@ when listed total space is present but usable area is not recorded.
   retained answers passed 12/12. This is a judge-only regrade, not 12 new agent runs.
 - Updated judge calibration: 31 labelled examples, twice each, passed 62/62.
 - A 160-trial broad run was interrupted after repeated immediate model failures.
-  Partial artifacts are retained and excluded from complete-suite claims. A fresh
-  run at concurrency two is in progress; its final result will be recorded here.
+  Partial artifacts are retained and excluded from complete-suite claims.
+- The fresh frozen **v20 broad run completed at 155/160**, all 80 scenarios twice,
+  with `inputIntegrity=true` and no changed inputs. Run:
+  `2026-10-02T14-14-45.448Z-5eec1a24`. It took about 107.6 minutes at concurrency two.
+  Failures were changed-history usefulness (one), withheld analytics source labels
+  (two), and a contradictory synthetic Search Console CTR comparison (two).
+  Provider overload responses recovered through the bounded SDK retry; no trial
+  ended in a provider exception. These results are retained, not regraded away.
+- The follow-up [recall and label correction](2026-10-02-recall-source-labels.md)
+  distinguishes runtime changes from fixture corrections and records new trials.
 
 The complete preceding baseline and prior targeted regrades remain in the
 [historical report](2026-10-02-eval-refinement.md). Two private outcomes or a

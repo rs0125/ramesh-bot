@@ -60,27 +60,21 @@ See [signed identity and operations](docs/signed-context-auth.md), [the MCP serv
 ## Agent evaluations
 
 ```sh
-# Current chief-of-staff graph: all 74 multi-turn scenarios, two trials each.
-npm run eval:ci
-# List scenarios without a paid request, or repeat a focused regression.
+# No paid request: inspect the registry.
 npm run eval:conversations -- --suite all --list
-npm run eval:conversations -- --case reported-shortlist,ordinal-reference --trials 3
-
-# Older ordinary-chat and fixed-read regressions remain available.
-npm run eval:agent -- --trials 3
-npm run eval:agent -- --case greeting --trials 2
-npm run eval:agent -- --split holdout --trials 3
-npm run eval:sales -- --trials 3
-npm run eval:business -- --trials 3
+# Small Luna agent + grader screen, one trial per case.
+npm run eval:ci -- --case changed-history,source-label-crm-name,source-label-knowledge-title
+# One focused repeated check.
+npm run eval:conversations -- --case ordinal-reference --trials 2
 ```
 
-The [current conversation harness](evals/README.md) runs the real OpenAI model through the employee tool graph with fictional CRM, supply, knowledge and analytics evidence. It covers personal assistance, 32-message context, corrected requirements, revoked access, source failures and multi-step research. It records every tool proposal, answer, review, failure, prompt/code hash, duration and returned token usage. JSON, JUnit and Markdown reports go into `.local/ci-evals`. Any failed trial exits nonzero; a model judge cannot override hard tool/privacy/format checks. The paid workflow is restricted to protected main via manual dispatch or an opt-in schedule. Deterministic PR checks need no API key. No eval creates a WhatsApp session.
+The [current conversation harness](evals/README.md) runs the real OpenAI model through the employee tool graph with fictional CRM, supply, knowledge and analytics evidence. It covers personal assistance, 32-message context, corrected requirements, revoked access, source failures and multi-step research. It records every tool proposal, answer, review, failure, prompt/code hash, duration and returned token usage. JSON, JUnit and Markdown reports go into `.local/ci-evals`. Any failed trial exits nonzero; a model judge cannot override hard tool/privacy/format checks. Paid CI is manual only. Agent and grader default to Luna, one trial and a three-trial allowance. Every Sol run requires explicit user approval and `--sol-approval <reference>`; larger runs require an explicit `--max-trials`. Production model settings do not select the test model. Deterministic PR checks need no API key. No eval creates a WhatsApp session.
 
 The historical `eval:agent` harness runs 13 ordinary-chat scenarios through isolated SQLite, with a fresh conversation per trial. It checks both graph stages completed, SQLite recorded the captured reply, output length, em dashes, and a defined stock-phrase list. Ambiguous-reference scenarios must include a clarification question. A schema-validated Terra judge scores relevance, naturalness, fidelity and capability honesty. Passing requires no mechanical failures, at least 4/5 for the first three scores, and 5/5 for honesty. Exact wording and output variation are not pass conditions.
 
 Its reports under `.local/evals/<run>/` include drafts, final replies, judge reasons, per-case pass rates, distinct-output counts, token usage, latency, and prompt/dataset hashes. Review the transcripts: synthetic cases and a same-model judge provide evidence, not a guarantee.
 
-The general sales harness runs 17 cases with three real-model trials by default, uses a snapshot of the real tool schemas with synthetic facts, has no transport, and saves all outputs/tool arguments/checks under `.local/sales-evals/`. The [legacy context/media review](docs/agent-modules/23-context-and-media-reference.md) records the old logistics bot patterns; [the implemented media contract](docs/agent-modules/30-media-lifecycle.md) defines the new 24-hour lifecycle.
+The general sales harness runs 17 cases with one trial per selected case by default and the same spending controls, uses a snapshot of the real tool schemas with synthetic facts, has no transport, and saves all outputs/tool arguments/checks under `.local/sales-evals/`. The [legacy context/media review](docs/agent-modules/23-context-and-media-reference.md) records the old logistics bot patterns; [the implemented media contract](docs/agent-modules/30-media-lifecycle.md) defines the new 24-hour lifecycle.
 
 The historical business harness runs 15 cases with three real-model trials each by default and writes `.local/business-evals/<run>/report.json` and `report.md`. It checks routing, exact tool scope, read/delivery call counts, evidence presence, refusal boundaries and factual caveats against synthetic CRM fixtures. It keeps all failures; PostgreSQL tests separately validate persistence and authorization fencing. The separate `smoke:chat:live` command uses current Supabase/Context Engine data and reports metadata only.
 
@@ -193,7 +187,7 @@ Dependency note: the Prisma config dependency overrides `deepmerge-ts` to patche
 
 ## Personal-assistant prompts and CI evals
 
-Role prompts are separate editable files under [`src/prompts/`](src/prompts/), loaded once and included in the build. Restart after editing. `npm run eval:ci` runs 74 multi-turn scenarios twice with real OpenAI calls and fictional tool data, retaining every result with JSON, JUnit and Markdown reports. The [evaluation guide](evals/README.md) covers protected CI setup, real-source capture checks, measured results and limitations.
+Role prompts are separate editable files under [`src/prompts/`](src/prompts/), loaded once and included in the build. Restart after editing. `npm run eval:ci` selects explicit cases from 85 scenarios using Luna by default and a bounded trial allowance, retaining every result with JSON, JUnit and Markdown reports. The [evaluation guide](evals/README.md) covers protected CI setup, real-source capture checks, measured results and limitations.
 
 Latest local validation: [evaluation, graph and voice refinements](evals/results/2026-10-02-eval-refinement.md). The complete v18 model run scored 138/148; later targeted v19 repairs and explicitly separate regrading are recorded with their exact scope. The full stochastic gate is not claimed green.
 

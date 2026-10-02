@@ -67,7 +67,11 @@ export function salesEvidence(
   tool: ContextReadTool,
   args: Record<string, unknown>,
   now = Date.now(),
-  options: { warehouseCount?: number; warehousePageOverlap?: boolean } = {},
+  options: {
+    warehouseCount?: number;
+    warehousePageOverlap?: boolean;
+    visibleLeadIds?: readonly string[];
+  } = {},
 ): ContextEvidence {
   if (CONTEXT_READ_TOOLS[tool] === 'analytics:read') return analyticsFixture(tool, args, now);
   const localDate = indiaDate(now);
@@ -109,7 +113,7 @@ export function salesEvidence(
         start + (i < 2 ? (-2 + i) * DAY : (i + 2) * DAY) + 36_000_000,
       ).toISOString(),
     })),
-  ];
+  ].filter((row) => !options.visibleLeadIds || options.visibleLeadIds.includes(row.id));
   const matchingLeads = () => {
     const [from, to] = dateBounds(args, localDate);
     return leads.filter((row) => {
@@ -294,17 +298,24 @@ export function salesEvidence(
         source_fetched_at: new Date(now).toISOString(),
       };
       break;
-    case 'crm_briefing':
+    case 'crm_briefing': {
       path = '/api/v1/crm/my-briefing';
+      const overdue = leads.filter((row) => indiaDate(Date.parse(row.next_follow_up)) < localDate);
       data = {
         ...clock,
-        total_active: 17,
-        counts_by_stage: { RFQ_RECEIVED: 12, FOLLOW_UP: 5 },
-        counts_by_sla: { breached: 2 },
-        follow_up_overdue: 2,
-        priorities: [leads[2], leads[3], lead],
+        total_active: leads.length,
+        counts_by_stage: Object.fromEntries(
+          ['RFQ_RECEIVED', 'FOLLOW_UP'].map((stage) => [
+            stage,
+            leads.filter((row) => row.stage === stage).length,
+          ]),
+        ),
+        counts_by_sla: { breached: overdue.length },
+        follow_up_overdue: overdue.length,
+        priorities: [...overdue, ...leads.filter((row) => row.id === lead.id)],
       };
       break;
+    }
     case 'warehouse_filters':
       path = '/api/v1/warehouses/filters';
       data = {
@@ -372,6 +383,8 @@ export function salesEvidence(
       data = page;
       break;
     case 'assess_shortlist':
+      if (!leads.some((row) => row.id === args.lead_id))
+        throw new ContextEngineError('TOOL_UNAVAILABLE');
       path = `/api/v1/crm/opportunities/${args.lead_id}/assessment`;
       data = {
         lead_id: args.lead_id,
@@ -418,6 +431,7 @@ export function createSalesFixture(now = Date.now) {
     guidance: CONTEXT_GUIDANCE,
     warehouseCount: undefined as number | undefined,
     warehousePageOverlap: false,
+    visibleLeadIds: undefined as string[] | undefined,
     failures: new Map<ContextReadTool, ContextEngineError>(),
     mutate: undefined as
       | ((result: ContextEvidence, tool: ContextReadTool, args: Record<string, unknown>) => void)
@@ -427,7 +441,7 @@ export function createSalesFixture(now = Date.now) {
     if (!state.active || key.remoteJid !== FIXTURE_JID) return null;
     return {
       employeeId: state.employeeId,
-      search: async () => salesEvidence('search_crm_leads', {}, now()),
+      search: async () => salesEvidence('search_crm_leads', {}, now(), state),
       tools: {
         employeeId: state.employeeId,
         discover: async () => {

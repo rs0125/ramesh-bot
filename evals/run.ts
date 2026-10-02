@@ -17,11 +17,14 @@ import {
 import type { AgentTrace } from '../src/modules/assistant/assistant.types.js';
 import { CASES } from './cases.js';
 import { judge, type GradeResult } from './judge.js';
+import { assertEvalRun, evalModel, evalPolicyOptions } from './lib/run-policy.js';
 
 loadEnvironment({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
-    trials: { type: 'string', default: '3' },
+    ...evalPolicyOptions,
+    model: { type: 'string' },
+    trials: { type: 'string', default: '1' },
     case: { type: 'string' },
     split: { type: 'string', default: 'all' },
   },
@@ -36,7 +39,9 @@ const cases = CASES.filter(
     (values.split === 'all' || item.split === values.split),
 );
 if (!cases.length) throw new Error('No matching evaluation cases');
-const config = loadAssistantConfig();
+const selectedModel = evalModel(values.model);
+assertEvalRun([selectedModel], cases.length * trials, values);
+const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!config) throw new Error('OPENAI_API_KEY is required for live evaluations');
 const runId = `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`;
 const directory = fileURLToPath(new URL(`../.local/evals/${runId}/`, import.meta.url));
@@ -64,7 +69,7 @@ console.log(
 );
 try {
   await Promise.all(
-    Array.from({ length: Math.min(2, work.length) }, async () => {
+    Array.from({ length: 1 }, async () => {
       for (;;) {
         const item = work.shift();
         if (!item) return;

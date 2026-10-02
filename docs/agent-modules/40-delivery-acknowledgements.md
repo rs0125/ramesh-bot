@@ -7,8 +7,9 @@ transcribed successfully. The agent completed five permitted CRM/supply reads an
 saved a business response. The outbound verifier rejected it, leaving the message
 EXPIRED with `business_delivery_not_authorized`, so the user received nothing.
 The original data fingerprints still matched when replayed, and the full fresh
-preflight reproduced the rejection. The source of that rejection must be diagnosed
-before weakening any check. Transcription and final delivery are different stages.
+preflight reproduced the rejection. Diagnosis identified the identity lookup
+conflict without weakening source or authority checks. Transcription and final
+delivery are different stages.
 
 The failure was reproduced as concurrent Prisma P1008/P2028 errors in reciprocal
 LID resolution. Replace the interactive SQLite transaction with discovery of the
@@ -19,7 +20,7 @@ this problem. Supabase remains the message, queue and business-data store; this
 SQLite lookup is only for Baileys session state.
 
 Baileys 7.0.0-rc14 uses an inactive receipt while `markOnlineOnConnect=false`.
-Ramesh currently adds no normal delivery acknowledgement. The old logistics bot
+Before this fix, Ramesh added no normal delivery acknowledgement. The old logistics bot
 used Twilio webhooks/media delivery, so its transport acknowledgements were handled
 by Twilio rather than this Baileys adapter.
 
@@ -45,8 +46,8 @@ transient reads within the original deadline; revoked authority and changed
 business facts remain denied. A correction must retain the same protection in
 both WhatsApp and capture sinks.
 
-A failed check should not silently disappear. If a neutral failure notice is
-implemented, persist replacement output atomically under the current outbound
+A failed check now produces a neutral failure notice. Persist replacement output
+atomically under the current outbound
 lease before sending it. Do not put the withheld business reply into SENT history,
 call its original memory callback, or mark a business task complete. Preserve
 same-owner voice transcript references only while unexpired. No replay or automatic
@@ -60,3 +61,10 @@ Exercise the reproduced delivery failure, concurrent reads, source changes,
 revocation, cancellation and restart. Keep the normal provider evaluation frozen
 while transport changes are implemented in an isolated checkout. Re-run the
 relevant deterministic and real-data capture checks before rollout.
+
+The combined release passed 237 tests without skips and shipped as `cdd9881`.
+CI run `37023166129` and EC2 deployment `37023329168` passed. After deployment,
+the full CRM graph completed with delivery authorization, and the original five
+queries passed a fresh concurrent preflight in 3.78 seconds. Both were read-only
+diagnostics with no sender. Sender-side ticks still need observation on a new real
+message; no historical receipts or old business replies were replayed.

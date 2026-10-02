@@ -6,6 +6,7 @@ import { businessRecall, RECALL_TOOL } from '../../src/modules/assistant/busines
 import { PRIVATE_HISTORY_REPLY } from '../../src/modules/assistant/conversation-memory.js';
 import { dealDisplayFacts, dealDisplayIssues } from '../../src/modules/assistant/deal-display.js';
 import { AssistantService } from '../../src/modules/assistant/assistant.service.js';
+import { ContextEngineError } from '../../src/modules/context-engine/context.types.js';
 import type {
   ChatMessage,
   TextModel,
@@ -42,6 +43,9 @@ test('recall restores selection/order only after fresh registered reads; metadat
   assert.match(recall.messages[1]!.content, /business turn 1/);
   const output = await recall.execute('{}', signal());
   assert.equal(output.previous_reply_verified, true);
+  assert.equal(output.refresh_status, 'unchanged');
+  assert.equal(output.refreshed_checks, 1);
+  assert.deepEqual(output.unavailable_checks, []);
   assert.equal(output.previous_reply, history[1]!.protectedReply!.text);
   assert.equal(fixture.state.calls.length, 2);
   assert.equal(run.evidence.length, 1);
@@ -55,12 +59,105 @@ test('changed results and revoked access cannot reveal the old answer', async ()
   };
   const output = await businessRecall(history, run).execute('{}', signal());
   assert.equal(output.previous_reply_verified, false);
+  assert.equal(output.refresh_status, 'changed');
+  assert.deepEqual(output.source_record_checks, [
+    { evidence_id: run.evidence[0]!.id, same_records: true, same_order: true },
+  ]);
   assert.equal(output.previous_reply, undefined);
   assert.ok(!JSON.stringify(output).includes('Fixture Acme'));
+  // Equal record IDs never authorize delivery of an answer whose facts changed.
+  assert.equal(
+    await fixture.service.canDeliver(trusted.key, history[1]!.protectedReply!.receipt, signal()),
+    false,
+  );
   fixture.state.active = false;
   const denied = await businessRecall(history, run).execute('{}', signal());
   assert.equal(denied.code, 'ACCESS_DENIED');
   assert.ok(!JSON.stringify(denied).includes('Fixture Acme'));
+});
+
+test('legacy receipts refresh without inventing membership or order verification', async () => {
+  const { fixture, history, run } = await setup();
+  const receipt = history[1]!.protectedReply!.receipt as any;
+  for (const check of receipt.checks) delete check.records;
+  fixture.state.mutate = (result, tool) => {
+    if (tool === 'search_crm_leads')
+      (result.data.items as any[])[0].source_updated_at = '2026-10-01T08:30:00Z';
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.refresh_status, 'changed');
+  assert.equal(output.previous_reply, undefined);
+  assert.deepEqual(output.source_record_checks, [
+    { evidence_id: run.evidence[0]!.id, same_records: null, same_order: null },
+  ]);
+});
+
+test('reordered current results do not imply changed membership or permit historical text replay', async () => {
+  const { fixture, history, run } = await setup();
+  fixture.state.mutate = (result, tool) => {
+    if (tool === 'search_crm_leads') (result.data.items as any[]).reverse();
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.previous_reply, undefined);
+  assert.deepEqual(output.source_record_checks, [
+    { evidence_id: run.evidence[0]!.id, same_records: true, same_order: false },
+  ]);
+});
+
+test('changed recall exposes genuine continuation without leaking stale prose or changing query scope', async () => {
+  const { fixture, history, run } = await setup();
+  const privateText = 'HISTORICAL_TEXT_ONLY';
+  history[1]!.protectedReply!.text = privateText;
+  fixture.state.mutate = (result, tool, args) => {
+    if (tool === 'search_crm_leads' && args.cursor === undefined) {
+      result.data.items = (result.data.items as unknown[]).slice(0, 1);
+      result.data.nextCursor = 'fixture:1';
+      Object.assign(result.data.query_context as object, { returned_count: 1, has_more: true });
+    }
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.refresh_status, 'changed');
+  assert.equal(output.previous_reply_verified, false);
+  assert.ok(!JSON.stringify(output).includes(privateText));
+  assert.deepEqual(output.unavailable_checks, []);
+  const next = (output.continuations as any[])[0];
+  assert.deepEqual(next.arguments, { view: 'accessible', limit: 10, cursor: 'fixture:1' });
+  assert.equal(next.coverage.status, 'more_available');
+  assert.equal(next.coverage.unique_records, 1);
+  const page = await run.execute(next.tool, JSON.stringify(next.arguments), signal());
+  assert.equal(page.ok, true);
+  assert.equal(run.pagination[0]!.unique_records, 11);
+});
+
+test('exhausted changed recall exposes the complete smaller result without a fabricated continuation', async () => {
+  const { fixture, history, run } = await setup();
+  fixture.state.visibleLeadIds = ['00000000-0000-4000-8000-000000000102'];
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.refresh_status, 'changed');
+  assert.deepEqual(output.continuations, []);
+  assert.equal((output.source_record_checks as any[])[0].same_records, false);
+  assert.equal((output.pagination as any[])[0].status, 'exhausted');
+  assert.equal((output.pagination as any[])[0].unique_records, 1);
+  assert.ok(!JSON.stringify(output).includes('Fixture Acme'));
+  assert.ok(JSON.stringify(output.fresh_evidence).includes('Fixture Beacon'));
+});
+
+test('partial recall retains successful current evidence and reports failed checks without old query arguments', async () => {
+  const { fixture, history, run, original } = await setup();
+  await original.execute('warehouse_summary', '{"city":"Bengaluru"}', signal());
+  history[1]!.protectedReply!.receipt = original.delivery();
+  fixture.state.failures.set('search_crm_leads', new ContextEngineError('TOOL_UNAVAILABLE'));
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.refresh_status, 'partial');
+  assert.equal(output.refreshed_checks, 1);
+  assert.equal(output.requested_checks, 2);
+  assert.deepEqual(output.unavailable_checks, [
+    { tool: 'search_crm_leads', code: 'TOOL_UNAVAILABLE' },
+  ]);
+  assert.equal((output.fresh_evidence as any[])[0].data.total, 5);
+  assert.equal(output.previous_reply, undefined);
+  assert.ok(!JSON.stringify(output).includes('Fixture Acme'));
+  assert.ok(!JSON.stringify(output).includes('accessible'));
 });
 
 test('cross-employee, expired-window and legacy receipts never become recallable', async () => {

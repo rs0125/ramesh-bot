@@ -33,7 +33,7 @@
     "eval:journeys": "tsx evals/conversation-run.ts --suite journeys",
     "eval:adversarial": "tsx evals/conversation-run.ts --suite adversarial",
     "eval:compare-models": "tsx evals/compare-models.ts",
-    "eval:ci": "tsx evals/conversation-run.ts --suite all --trials 2 --concurrency 3 --output .local/ci-evals",
+    "eval:ci": "tsx evals/conversation-run.ts --suite all --output .local/ci-evals",
     "eval:private": "tsx evals/private-run.ts",
     "eval:judge": "tsx evals/judge-calibration-run.ts",
     "eval:regrade": "tsx evals/regrade-run.ts",

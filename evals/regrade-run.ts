@@ -16,13 +16,16 @@ import { CONVERSATION_CASES } from './conversation-cases.js';
 import { JOURNEY_CASES } from './journey-cases.js';
 import { ADVERSARIAL_CASES } from './adversarial-cases.js';
 import { PAGINATION_CASES } from './pagination-cases.js';
+import { RECOVERY_CASES } from './recovery-cases.js';
+import { assertEvalRun, evalModel, evalPolicyOptions } from './lib/run-policy.js';
 
 dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
+    ...evalPolicyOptions,
     source: { type: 'string' },
-    model: { type: 'string', default: 'gpt-6.1-sol' },
-    concurrency: { type: 'string', default: '4' },
+    model: { type: 'string' },
+    concurrency: { type: 'string', default: '1' },
   },
 });
 if (!values.source) throw new Error('--source must name a completed public CI run directory');
@@ -43,18 +46,24 @@ for (const path of [
   'evals/journey-cases.ts',
   'evals/adversarial-cases.ts',
   ...(source.inputManifest?.['evals/pagination-cases.ts'] ? ['evals/pagination-cases.ts'] : []),
+  ...(source.inputManifest?.['evals/recovery-cases.ts'] ? ['evals/recovery-cases.ts'] : []),
 ])
   if (hash(await readFile(new URL(path, root))) !== source.inputManifest?.[path])
     throw new Error('ORIGINAL_SCENARIO_SNAPSHOT_REQUIRED');
 const cases = new Map(
-  [...CONVERSATION_CASES, ...JOURNEY_CASES, ...ADVERSARIAL_CASES, ...PAGINATION_CASES].map((c) => [
-    c.id,
-    c,
-  ]),
+  [
+    ...CONVERSATION_CASES,
+    ...JOURNEY_CASES,
+    ...ADVERSARIAL_CASES,
+    ...PAGINATION_CASES,
+    ...RECOVERY_CASES,
+  ].map((c) => [c.id, c]),
 );
 for (const row of source.results)
   if (!cases.has(row.case)) throw new Error('UNKNOWN_SOURCE_SCENARIO');
-const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: values.model });
+const selectedModel = evalModel(values.model);
+const spendingPolicy = assertEvalRun([selectedModel], source.results.length, values);
+const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!config) throw new Error('OPENAI_API_KEY is required through the environment');
 const model = new OpenAITextModel({ ...config, timeoutMs: 90000, maxOutputTokens: 5000 });
 const prompt = await readFile(new URL('prompts/journey-judge.md', import.meta.url), 'utf8');
@@ -63,6 +72,7 @@ const directory = new URL(`../.local/regrades/${runId}/`, import.meta.url);
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const began = Date.now();
 const metadata = {
+  spendingPolicy,
   runId,
   kind: 'regrade',
   agentRerun: false,

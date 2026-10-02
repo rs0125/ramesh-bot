@@ -29,7 +29,7 @@ The deployed baseline contains the converser, formatter and separate queues. Thi
 | [16. SLA escalation](16-sla-escalation.md)                             | CRM-owned breach episodes and recipient progression                    | Existing CRM-Automations context; bot delivery proposed              |
 | [17. Business actions](17-business-actions.md)                         | Future typed writes, confirmations and reconciliation                  | Deferred                                                             |
 | [18. Model runtime](18-model-runtime.md)                               | Provider adapter, structured outputs, prompts and usage limits         | Existing OpenAI Responses adapter                                    |
-| [19. Evaluation harness](19-evaluation-harness.md)                     | Deterministic checks and repeated model evaluations                    | 74 multi-turn scenarios, protected CI and real-data capture smoke    |
+| [19. Evaluation harness](19-evaluation-harness.md)                     | Deterministic checks and repeated model evaluations                    | 85 multi-turn scenarios, protected CI and real-data capture smoke    |
 | [20. Observability and playground](20-observability-and-playground.md) | Operator traces, fake-chat inspection and recovery visibility          | Synthetic CRM GUI and run-correlated traces                          |
 | [21. Live-data playground](21-live-data-playground.md)                 | Real authorized reads with isolated Supabase capture queues            | Verified live as Raghav; no WhatsApp delivery                        |
 
@@ -134,5 +134,8 @@ Production schema migration `202610020005` is a prerequisite for this worker rev
 - [38. Direct audio transcription](38-direct-audio-transcription.md): original-byte uploads, Ogg compatibility evidence and removal of the runtime transcoding dependency.
 - [39. Paginated research](39-paginated-research.md): unique coverage, cursor progress, broad-search outcomes and the production roster access correction.
 - [40. Delivery acknowledgements](40-delivery-acknowledgements.md): concurrent LID resolution, durable failure notices and normal WhatsApp delivery receipts.
+
+- [41. Recall and source labels](41-recall-and-source-labels.md): changed-result recovery, current-source continuations and inert labels across CRM, knowledge and analytics.
+- [42. Evaluation spending](42-evaluation-spend-controls.md): Luna defaults, bounded case selection, explicit Sol approval and manual-only paid CI.
 
 See the [2 October production capability review](../capability-review-2026-10-02.md) for deployed versus local-only capabilities, remaining work and AI Engineer research.

@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { parseArgs } from 'node:util';
 import { parse } from 'dotenv';
 import { Pool } from 'pg';
 import { loadLivePlaygroundConfig } from '../src/config/playground.js';
@@ -12,11 +13,14 @@ import { createPlaygroundAccess } from '../src/app/playground-access.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { toolDeliverySchema } from '../src/modules/assistant/tool-evidence.js';
 import { LiveChat } from './lib/live-chat.js';
+import { assertEvalRun, evalPolicyOptions } from '../evals/lib/run-policy.js';
 
 async function main() {
+  const { values } = parseArgs({ options: evalPolicyOptions });
   const config = loadLivePlaygroundConfig(
     parse(await readFile(resolve(process.env.PLAYGROUND_ENV_FILE ?? '.local/live-playground.env'))),
   );
+  assertEvalRun([config.model.model], 5, values);
   const pool = new Pool(messagePoolOptions(config.databaseUrl, config.ca));
   pool.on('error', () => {});
   const repo = new PlaygroundRepository(

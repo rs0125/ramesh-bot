@@ -3,11 +3,13 @@ import { spawn } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { assertEvalRun, evalPolicyOptions } from './lib/run-policy.js';
 
 const { values } = parseArgs({
   options: {
-    trials: { type: 'string', default: '2' },
-    concurrency: { type: 'string', default: '4' },
+    ...evalPolicyOptions,
+    trials: { type: 'string', default: '1' },
+    concurrency: { type: 'string', default: '1' },
   },
 });
 if (!/^[1-5]$/.test(values.trials!)) throw new Error('Use 1–5 trials');
@@ -31,6 +33,11 @@ const profiles = [
   { name: 'sol-medium', model: 'gpt-6.1-sol', effort: 'medium' },
   { name: 'sol-high', model: 'gpt-6.1-sol', effort: 'high' },
 ];
+assertEvalRun(
+  profiles.map((profile) => profile.model),
+  cases.length * profiles.length * Number(values.trials),
+  values,
+);
 const root = new URL('../', import.meta.url);
 const directory = new URL(
   `.local/model-comparisons/${new Date().toISOString().replaceAll(':', '-')}/`,
@@ -79,6 +86,9 @@ for (const profile of profiles) {
         profile.effort,
         '--judge-model',
         'gpt-5.6-terra',
+        '--max-trials',
+        values['max-trials']!,
+        ...(values['sol-approval'] ? ['--sol-approval', values['sol-approval']] : []),
         '--output',
         fileURLToPath(output),
       ],

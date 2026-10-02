@@ -4,25 +4,26 @@ The current harness exercises Ramesh as a personal chief of staff with all emplo
 
 ## Run it
 
-Place the existing OpenAI key in the gitignored worker `.env`, or supply `OPENAI_API_KEY` through the CI secret. Do not paste it into a command or commit it. The default model is `gpt-5.6-terra`.
+Routine text-agent and grader checks default to `gpt-6-luna`, one trial, one concurrent case and a three-trial allowance. Production `OPENAI_MODEL` cannot select the evaluation model; use `EVAL_MODEL` or `--model` explicitly. Supply the existing key through the ignored `.env` or CI secret, never in a command.
 
 ```sh
-# All 74 scenarios, two independent trials each, three at a time.
-npm run eval:ci
-
-# List cases without making paid calls.
+# List cases without an API key or paid request.
 npm run eval:conversations -- --suite all --list
 
-# A domain or comma-separated scenario IDs; each trial uses fresh state.
-npm run eval:journeys -- --case analytics --trials 3
-npm run eval:conversations -- --case reported-shortlist,ordinal-reference --trials 3
-npm run eval:adversarial -- --trials 2
+# A small Luna agent + Luna grader screen: three cases, one trial each.
+npm run eval:ci -- --case changed-history,source-label-crm-name,source-label-knowledge-title
 
-# Fixed-judge Terra/Sol and medium/high tool-effort comparison.
-npm run eval:compare-models
+# One focused conversation, two independent trials.
+npm run eval:conversations -- --case ordinal-reference --trials 2
 ```
 
-`--suite all|conversation|journeys|adversarial`, `--case`, `--trials 1..5`, `--concurrency 1..4` and `--output <directory>` are supported. Every trial is retained; failed outputs are not silently rerolled. A new post-fix run is separate evidence. Any failed trial makes the command exit nonzero. Limits are 240 seconds per graph and 6000 output tokens per response. Token reports count usage returned by successful API responses; a failed request may have unknown billed usage.
+All paid runners reject plans exceeding `--max-trials` (default 3). This counts scenario executions, not HTTP calls or dollars. An intentional larger run needs an explicit allowance. Never launch the full 85-case suite by habit. Scope cases to the change and reuse retained traces for offline inspection.
+
+**Get the user's approval before any Sol agent or grader call**, including private live-source tests and comparison runs. State the models, cases, repetitions and expected spend/limits first. After approval, `--sol-approval <reference>` records it; the flag itself is not permission. Production and the interactive playground keep their configured models. STT uses its dedicated audio models, also with a bounded trial allowance.
+
+`--suite all|conversation|journeys|adversarial|pagination|recovery`, `--case`, `--trials 1..5`, `--concurrency 1..4`, `--model`, `--judge-model`, `--max-trials`, `--sol-approval` and `--output` are supported by the conversation runner. Every completed trial is retained. An interrupted run is incomplete, even if every completed row passed; do not rerun it merely to obtain a green summary. Limits remain 240 seconds per graph and 6000 output tokens per response. Failed/in-flight requests can have unreported billed usage.
+
+Luna checks are low-cost screening, not evidence of identical Sol behavior. No Luna quality calibration has been performed for this change. The previous Sol calibration scores remain historical. [Spending policy](../docs/agent-modules/42-evaluation-spend-controls.md).
 
 ## Coverage
 
@@ -36,6 +37,8 @@ npm run eval:compare-models
 | Knowledge and combined work |         4 | Read-to-agenda, property preparation, source injection and cross-domain work briefs                                                                                                                                                                     |
 | Access/action boundaries    |         4 | Unknown users, groups, absent analytics permission, unsupported writes and sends                                                                                                                                                                        |
 | Adversarial journeys        |        20 | Source injection and role spoofing, requested versus reported facts, retry recovery, configuration failures, old dates, native-date substitution, cohort/causal pressure, policy laundering, personal planning, unknown warehouse fields and shortening |
+| Paginated research          |         6 | Bounded pool membership, late-page candidates, overlapping rows, empty continuation pages, interrupted sources and cursor cycles                                                                                                                        |
+| Recall recovery and labels  |         5 | Changed dates, genuine continuation, partial-source refresh, instruction-like CRM names and knowledge titles                                                                                                                                            |
 
 The personal-assistance row contains nine scenarios; reminder and media limitations are separate cases within that total. The scenario registry is the source of truth; `--list` prints all IDs. Tests assert unique IDs, domain coverage and valid turn references.
 
@@ -59,13 +62,13 @@ The start-time snapshot prevents a long-running experiment from being mislabeled
 
 ## CI
 
-`.github/workflows/ci.yml` runs deterministic tests on PRs with disposable PostgreSQL, no model secret and fake delivery. `.github/workflows/agent-evals.yml` runs paid repeated conversations on protected main via manual dispatch or the opt-in weekly schedule. The paid workflow selects Sol medium with a fixed Terra judge. Configure an `agent-evals` GitHub environment with `OPENAI_API_KEY`; set repository variable `AGENT_EVALS_ENABLED=true` for the schedule. Optional environment reviewers can control spend. No paid workflow runs on untrusted PR code.
+`.github/workflows/ci.yml` runs deterministic checks with disposable PostgreSQL and no model secret. Paid `.github/workflows/agent-evals.yml` is **manual only on main**. The dispatcher selects case IDs, repetitions, total trial allowance and model; both agent and grader default to Luna. Sol requires the explicit approval reference. Automatic weekly execution and automatic grader calibration were removed. No paid workflow runs on untrusted PR code. Configure the `agent-evals` environment's key only for intentional approved use.
 
 The paid job publishes the Markdown summary and uploads only `.local/ci-evals` for 14 days. These artifacts contain fictional transcripts, not real-data smoke results. The workflow is authored locally; configuring the remote environment/secret and executing it on GitHub remain deployment tasks. `npm run eval:ci` has been executed locally with the real API key.
 
 ## Real-source smoke
 
-Use `PLAYGROUND_ENV_FILE=.local/live-playground-analytics.env npm run dev:chat:live` for the currently provisioned local full-catalogue profile. The actual local Context Engine must also be running. Use `npm run smoke:chat:live` with the same profile for source checks. This connects actual Supabase and Context Engine, pins the authorized employee in server configuration and uses `ramesh-test-inbound-queue` / `ramesh-test-outbound-queue`. It never creates Baileys. Keep raw source/transcript artifacts private under `.local`, and report only outcomes, timings and relevant limitations outside that directory. See the [live setup](../docs/live-data-playground.md) for the older deployed-endpoint profile and provisioning steps.
+Use `PLAYGROUND_ENV_FILE=.local/live-playground-analytics.env npm run dev:chat:live` for the currently provisioned local full-catalogue profile. The actual local Context Engine must also be running. The real-source smoke command requires explicit model/run approval when that profile uses Sol and an allowance for its five test turns; do not run it automatically. This connects actual Supabase and Context Engine, pins the authorized employee in server configuration and uses `ramesh-test-inbound-queue` / `ramesh-test-outbound-queue`. It never creates Baileys. Keep raw source/transcript artifacts private under `.local`, and report only outcomes, timings and relevant limitations outside that directory. See the [live setup](../docs/live-data-playground.md) for the older deployed-endpoint profile and provisioning steps.
 
 The current local analytics profile uses the actual Context Engine running locally against real Supabase and Google sources, because the production public key registration still needs its analytics scope rollout. Live reads proved that the signed route can expose all seventeen tools to the authorized admin. That is not a claim that every employee has admin access or that production was updated.
 
@@ -77,7 +80,7 @@ The first complete chief-of-staff run passed **91/108 trials**, retaining all fa
 
 A focused v2 run passed **20/24 trials** before the remaining fixture/judge corrections. The v3 full rerun passed **92/108**, the v4 focused run passed **21/24**, v5 passed **87/108**, and v6 passed **48/54** with one trial per scenario. Subsequent corrections addressed clock/access context in the judge, ongoing-task updates, chat layout and successful fallback handling. The [dated results record](results/2026-10-02.md) contains run identifiers, final outcomes, deterministic/source checks and remaining failures. Original artifacts remain in `.local`; successful reruns do not erase failed trials. Because fixtures and rubrics changed too, these scores are not a controlled model-comparison trend.
 
-The prior sales-manager-v2 baseline passed 51/51 single-request trials. It is historical and does not measure the newer chief-of-staff role. The older `eval:agent`, `eval:business` and `eval:sales` commands remain available as legacy regression suites; the current CI contract is the 74-scenario multi-turn harness.
+The prior sales-manager-v2 baseline passed 51/51 single-request trials. It is historical and does not measure the newer chief-of-staff role. The older `eval:agent`, `eval:business` and `eval:sales` commands remain available as legacy regression suites; the current CI contract is the 85-scenario multi-turn harness.
 
 Prompt design and repeated task-specific evals follow [OpenAI evaluation guidance](https://developers.openai.com/api/docs/guides/evaluation-best-practices). The local [coworker-loop review](../docs/agent-modules/26-coworker-loop-and-context.md) explains the comparison with claudeconvo.md and the logistics bot's context/media design.
 
@@ -93,11 +96,11 @@ The older 17-case suite was also run on v4: **16/17** under its original checks.
 
 ## Model and effort comparisons
 
-The conversation runner also accepts `--model`, `--tool-effort low|medium|high` and `--judge-model`. The public evaluator defaults to fixed `gpt-6.1-sol`, even when the agent model changes. This was selected after blind calibration (Sol 56/56 versus Terra 54/56); it remains a separate call, not an independent provider, so human review is still required. Historical comparison/private runners retain their explicitly recorded judge setting. Metadata records effective stage efforts and the judge model. Reports distinguish `agentUsage`, `judgeUsage` and their combined `usage`; reasoning tokens are a subset of output tokens and cached input tokens a subset of input tokens, not additional tokens to add again.
+The conversation runner also accepts `--model`, `--tool-effort low|medium|high` and `--judge-model`. The public evaluator now defaults to `gpt-6-luna`. Earlier runs used fixed `gpt-6.1-sol` after blind calibration (Sol 56/56 versus Terra 54/56). That historical calibration does not validate the new Luna grader; it remains a separate call within the same provider, so human review is still required. Historical comparison/private runners retain their explicitly recorded judge setting. Metadata records effective stage efforts and the judge model. Reports distinguish `agentUsage`, `judgeUsage` and their combined `usage`; reasoning tokens are a subset of output tokens and cached input tokens a subset of input tokens, not additional tokens to add again.
 
 `eval:compare-models` runs a predeclared 12-scenario subset twice for Terra-medium, GPT-6.1-Sol-medium and GPT-6.1-Sol-high. It retains every profile's reports and writes a comparison under `.local/model-comparisons`. Code/prompt/dataset/judge hashes must agree for a matched comparison. The Sol-medium versus Sol-high comparison changes only tool-loop effort; the Terra versus Sol comparison changes the agent model throughout the graph, with its external judge held fixed. Sol ordinary formatting uses low because none is unsupported. Current request clocks keep advancing; this is a repeated screening experiment, not statistical proof or a model leaderboard.
 
-Compare hard tool-contract failures, invalid arguments, completed turns, source/proposal counts, semantic quality, turn latency and agent-only token use. Read failures before selecting a setting. Do not count a polished answer as successful tool use, or a source configuration failure as zero activity. Run the entire 74-scenario suite on the chosen candidate after screening. Prompt/fixture fixes during screening require a new comparison, not mixing incompatible runs. Runtime reasoning continuity stays within one model session and is never included in reports.
+Compare hard tool-contract failures, invalid arguments, completed turns, source/proposal counts, semantic quality, turn latency and agent-only token use. Read failures before selecting a setting. Do not count a polished answer as successful tool use, or a source configuration failure as zero activity. A full 85-scenario production-model release evaluation requires separate explicit approval; it is not the default after every edit. Prompt/fixture fixes during screening require a new comparison, not mixing incompatible runs. Runtime reasoning continuity stays within one model session and is never included in reports.
 
 See [adversarial review](../docs/agent-modules/27-adversarial-review-and-response-contracts.md) and [model/effort specification](../docs/agent-modules/28-model-and-effort-comparison.md) for implementation boundaries and measured follow-up.
 

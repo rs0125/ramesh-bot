@@ -335,7 +335,9 @@ export function analyticsFixture(
         const current = items[0].metrics[c.name];
         const previous =
           c.unit === 'fraction'
-            ? current - (c.name === 'ctr' ? 0.01 : 0.1)
+            ? c.name === 'ctr'
+              ? current
+              : current - 0.1
             : c.unit === 'position'
               ? current + 1.2
               : current / 1.2;

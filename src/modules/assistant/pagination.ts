@@ -31,6 +31,7 @@ function traversals(evidence: readonly ToolEvidence[]) {
       expected: string | null;
       unlinked: boolean;
       cycle: boolean;
+      last: ToolEvidence;
     }
   >();
   for (const page of evidence) {
@@ -53,10 +54,12 @@ function traversals(evidence: readonly ToolEvidence[]) {
         expected: null,
         unlinked: false,
         cycle: false,
+        last: page,
       };
       groups.set(fingerprint, group);
     }
     const cursor = typeof page.arguments.cursor === 'string' ? page.arguments.cursor : null;
+    group.last = page;
     if (
       (group.summary.pages === 0 && cursor !== null) ||
       (group.summary.pages > 0 && (cursor === null || cursor !== group.expected))
@@ -86,6 +89,18 @@ function traversals(evidence: readonly ToolEvidence[]) {
 
 export function paginationCoverage(evidence: readonly ToolEvidence[]): PaginationCoverage[] {
   return [...traversals(evidence).values()].map((group) => group.summary);
+}
+
+/** Available next reads, not an instruction to expand every recalled bounded selection. */
+export function paginationContinuations(evidence: readonly ToolEvidence[]) {
+  return [...traversals(evidence).values()]
+    .filter((group) => group.expected !== null && !group.cycle)
+    .map((group) => ({
+      evidence_id: group.last.id,
+      tool: group.last.tool,
+      arguments: { ...group.last.arguments, cursor: group.expected! },
+      coverage: { ...group.summary },
+    }));
 }
 
 export function cyclicCursor(
