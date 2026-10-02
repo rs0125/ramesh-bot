@@ -183,6 +183,31 @@ test('unknown, expired, inactive, REST-key, mismatched-phone and group identitie
   assert.equal(fixture.calls.length, 0);
 });
 
+test('protocol argument errors remain distinct from a tool removed from the current catalog', async () => {
+  const fixture = fakeServer({
+    http: (rpc) =>
+      rpc.method === 'tools/call' && rpc.params?.name === 'search_crm_leads'
+        ? Response.json({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            error: { code: -32602, message: 'Invalid arguments: private details' },
+          })
+        : undefined,
+  });
+  const client = new ContextEngineMcpClient(config, resolver, fixture.fetch);
+  await assert.rejects(client.call(sender, 'search_crm_leads', {}), (error) => {
+    assert.ok(error instanceof ContextEngineError);
+    assert.equal(error.code, 'INVALID_ARGUMENTS');
+    assert.equal(error.retryable, false);
+    assert.doesNotMatch(error.message, /private details/);
+    return true;
+  });
+  assert.equal(
+    fixture.calls.filter(({ rpc }) => rpc.params?.name === 'search_crm_leads').length,
+    1,
+  );
+});
+
 test('a token belonging to another employee never reaches a business tool', async () => {
   const fixture = fakeServer({ employeeId: () => 99 });
   const client = new ContextEngineMcpClient(config, resolver, fixture.fetch);

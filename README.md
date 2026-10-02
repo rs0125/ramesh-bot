@@ -55,6 +55,8 @@ Each read uses a fresh MCP connection, discovers permitted read tools and checks
 
 `createSignedEmployeeContextAccess` supplies the preferred resolver: trusted phone or reciprocal Baileys LID mapping → one active `VerifiedNumber` employee → a fresh signed request. No employee OAuth enrollment or refresh storage is needed. Unknown users can chat without business access; group business reads are denied. The earlier OAuth adapter remains available for compatibility.
 
+Context Engine admins choose each tool's platforms in **Prompts → Available on**. The signed `/mcp/ramesh` endpoint serves the **WhatsApp** catalog; the OAuth `/mcp` endpoint serves **Claude**. Ramesh discovers the current catalog before every read, including evidence replay, and intersects it with employee scopes and its registered read adapters. A deselected tool becomes unavailable even during an existing conversation. If it disappears between discovery and execution, Ramesh refreshes discovery once and returns a non-retryable tool-unavailable result without retrying the read or switching endpoints. New Context Engine tools still need an approved Ramesh adapter and evidence contract before the worker can execute them.
+
 See [signed identity and operations](docs/signed-context-auth.md), [the MCP service contract](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold) and [first-read behavior](docs/first-crm-read.md). `npm run db:identity` provisions the worker's roster column grant; verify any live roster RLS policies also permit that worker. Claude keeps its separate OAuth connector. The live playground reuses signed MCP through its own runtime and separately provisioned roster SELECT policy.
 
 ## Agent evaluations

@@ -36,6 +36,15 @@ Registry entries must be installed by application code/configuration. Neither an
 MCP annotation, source document nor a model-generated label may authorize a write.
 Unknown capabilities remain unavailable until their adapter is registered.
 
+Context Engine also requires an explicit platform list for every tool. Its admin
+**Prompts → Available on** selector controls `claude` and `whatsapp` independently;
+the authenticated `/mcp/ramesh` endpoint selects WhatsApp on the server. Keep this
+selection separate from `CONTEXT_READ_TOOLS`: platform selection decides which
+tools the server offers, while the local registry decides which offers have a
+supported adapter. The worker refreshes discovery before every call and receipt
+replay. A tool removed during an in-flight read produces a non-retryable
+`TOOL_UNAVAILABLE`; there is no fallback to the Claude endpoint.
+
 Do not run a write through current read receipt replay: that would execute the
 mutation again during recall or delivery. A committed action has a persistent
 operation receipt; verification reads its postcondition or operation status. The

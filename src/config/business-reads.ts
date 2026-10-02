@@ -30,6 +30,6 @@ export function loadBusinessReadConfig(env: NodeJS.ProcessEnv): BusinessReadConf
   const context = loadContextEngineConfig(env);
   const signing = loadContextSigningConfig(env);
   if (!context || !signing || !context.endpoint.endsWith('/mcp/ramesh'))
-    throw new Error('Business reads require the configured signed Context Engine integration');
+    throw new Error('WhatsApp business reads require signed Context Engine access at /mcp/ramesh');
   return { employeeIds, context, signing };
 }

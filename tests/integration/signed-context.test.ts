@@ -26,6 +26,9 @@ async function fixture() {
   };
   const nonces = new Set<string>();
   const calls: string[] = [];
+  const toolCalls: string[] = [];
+  let tools = ['get_context', 'search_crm_leads'];
+  let unavailableOnCall: string | undefined;
   let afterInitialize: (() => void) | undefined;
   const fetcher: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
@@ -61,6 +64,18 @@ async function fixture() {
       params?: Record<string, unknown>;
     };
     calls.push(rpc.method);
+    if (rpc.method === 'tools/call') {
+      const name = String(rpc.params?.name);
+      toolCalls.push(name);
+      if (name === unavailableOnCall) {
+        tools = tools.filter((tool) => tool !== name);
+        return Response.json({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          error: { code: -32602, message: `Tool ${name} not found` },
+        });
+      }
+    }
     if (rpc.id === undefined) return new Response(null, { status: 202 });
     let result: unknown;
     if (rpc.method === 'initialize') {
@@ -72,7 +87,7 @@ async function fixture() {
       afterInitialize?.();
     } else if (rpc.method === 'tools/list') {
       result = {
-        tools: ['get_context', 'search_crm_leads'].map((name) => ({
+        tools: tools.map((name) => ({
           name,
           inputSchema: { type: 'object' },
           annotations: { readOnlyHint: true },
@@ -102,9 +117,16 @@ async function fixture() {
     ...local,
     app,
     calls,
+    toolCalls,
     nonces,
     config,
     signing,
+    setTools(names: string[]) {
+      tools = names;
+    },
+    removeOnCall(name: string) {
+      unavailableOnCall = name;
+    },
     setAfterInitialize(fn: () => void) {
       afterInitialize = fn;
     },
@@ -112,6 +134,57 @@ async function fixture() {
 }
 const message = (remoteJid = '919876543210@s.whatsapp.net') => ({
   key: { remoteJid, fromMe: false },
+});
+
+test('uses only the WhatsApp catalog and rechecks platform changes before each signed read', async () => {
+  const f = await fixture();
+  try {
+    const service = (await f.app.forMessage(message()))!;
+    assert.deepEqual(
+      (await service.describe()).tools.map((tool) => tool.name),
+      ['get_context', 'search_crm_leads'],
+    );
+    // A Claude-only tool is absent even though the employee has its CRM scope.
+    await assert.rejects(service.crm.summary(), { code: 'TOOL_UNAVAILABLE', retryable: false });
+    assert.ok(!f.toolCalls.includes('crm_summary'));
+    f.setTools(['get_context']);
+    await assert.rejects(service.crm.search(), { code: 'TOOL_UNAVAILABLE', retryable: false });
+    assert.ok(!f.toolCalls.includes('search_crm_leads'));
+    assert.deepEqual(
+      (await service.discover()).map((tool) => tool.name),
+      ['get_context'],
+    );
+    f.setTools(['get_context', 'search_crm_leads']);
+    await service.crm.search();
+    assert.equal(f.toolCalls.filter((name) => name === 'search_crm_leads').length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a tool disabled between discovery and execution fails without retrying or changing endpoints', async () => {
+  const f = await fixture();
+  try {
+    const service = (await f.app.forMessage(message()))!;
+    f.removeOnCall('search_crm_leads');
+    await assert.rejects(service.crm.search(), { code: 'TOOL_UNAVAILABLE', retryable: false });
+    assert.equal(f.toolCalls.filter((name) => name === 'search_crm_leads').length, 1);
+    assert.equal(f.calls.filter((method) => method === 'tools/list').length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test('disabling the identity tool during connection also fails without a retry', async () => {
+  const f = await fixture();
+  try {
+    const service = (await f.app.forMessage(message()))!;
+    f.removeOnCall('get_context');
+    await assert.rejects(service.crm.search(), { code: 'TOOL_UNAVAILABLE', retryable: false });
+    assert.deepEqual(f.toolCalls, ['get_context']);
+  } finally {
+    await f.close();
+  }
 });
 
 test('signs every MCP request with the live employee without creating any OAuth enrollment or credential', async () => {

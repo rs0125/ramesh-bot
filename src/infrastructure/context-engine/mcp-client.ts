@@ -1,6 +1,8 @@
 /** Request-scoped MCP connections. No shared employee session, token cache or automatic consent flow. */
 import {
   Client,
+  ProtocolError,
+  ProtocolErrorCode,
   StreamableHTTPClientTransport,
   type CallToolResult,
   type Tool,
@@ -107,6 +109,33 @@ function evidence(result: CallToolResult): ContextEvidence {
   return checked.data;
 }
 
+async function callDiscoveredTool(
+  client: Client,
+  name: ContextReadTool,
+  args: Record<string, unknown>,
+  request: { signal: AbortSignal; timeout: number },
+): Promise<CallToolResult> {
+  try {
+    return await client.callTool({ name, arguments: args }, request);
+  } catch (error) {
+    if (error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams) {
+      // A platform selection or employee permission can change after discovery.
+      // Refresh once to distinguish a removed tool from invalid arguments. Never
+      // retry the tool call or fall back to the Claude connector.
+      const catalogue = await client.listTools({}, request);
+      if (catalogue.nextCursor) throw new ContextEngineError('INVALID_RESPONSE');
+      if (
+        !catalogue.tools.some(
+          (tool) => tool.name === name && tool.annotations?.readOnlyHint === true,
+        )
+      )
+        throw new ContextEngineError('TOOL_UNAVAILABLE');
+      throw new ContextEngineError('INVALID_ARGUMENTS');
+    }
+    throw error;
+  }
+}
+
 export class ContextEngineMcpClient implements ContextToolGateway {
   private readonly config: ContextEngineConfig;
   constructor(
@@ -158,7 +187,7 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       if (name === 'get_context') return context;
       if (!tools.some((tool) => tool.name === name))
         throw new ContextEngineError('TOOL_UNAVAILABLE');
-      return evidence(await client.callTool({ name, arguments: frozen }, request));
+      return evidence(await callDiscoveredTool(client, name, frozen, request));
     });
   }
 
@@ -268,6 +297,8 @@ export class ContextEngineMcpClient implements ContextToolGateway {
         },
       });
       await client.connect(transport, request);
+      // The authenticated endpoint owns platform selection. Ramesh's signed
+      // /mcp/ramesh catalog is refreshed for every read, including receipt replay.
       const catalogue = await client.listTools({}, request);
       if (catalogue.nextCursor) throw new ContextEngineError('INVALID_RESPONSE');
       if (
@@ -276,9 +307,7 @@ export class ContextEngineMcpClient implements ContextToolGateway {
         )
       )
         throw new ContextEngineError('TOOL_UNAVAILABLE');
-      const context = evidence(
-        await client.callTool({ name: 'get_context', arguments: {} }, request),
-      );
+      const context = evidence(await callDiscoveredTool(client, 'get_context', {}, request));
       const current = identity.safeParse(context.data);
       if (!current.success) throw new ContextEngineError('INVALID_RESPONSE');
       if (current.data.employee_id !== grant.employeeId)

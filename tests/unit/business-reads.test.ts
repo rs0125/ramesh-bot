@@ -249,6 +249,10 @@ test('enabled signed configuration defaults to active employees and accepts the 
     [23, 77],
   );
   assert.equal(loadBusinessReadConfig(env)?.signing.scopes.length, 4);
+  assert.throws(
+    () => loadBusinessReadConfig({ ...env, CONTEXT_MCP_URL: 'https://context.example/mcp' }),
+    /WhatsApp business reads require signed Context Engine access at \/mcp\/ramesh/,
+  );
 });
 
 test('all-active mode removes the pilot list while keeping trusted resolution and group boundaries', async () => {
