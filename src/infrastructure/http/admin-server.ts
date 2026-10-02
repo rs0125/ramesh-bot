@@ -11,6 +11,7 @@ import {
   type InboxRepository,
 } from '../database/inbox.repository.js';
 import type { DurableMessages } from '../whatsapp/durable-messages.js';
+import { createOutboundApi, type OutboundApiOptions } from './outbound-api.js';
 
 export interface BotControl {
   getStatus(): BotStatus;
@@ -19,6 +20,7 @@ export interface BotControl {
 }
 
 interface ServerOptions {
+  automation?: OutboundApiOptions;
   adminAccess?: AdminAccess;
   health?: () => Promise<{ release: string }>;
   inbox?: Pick<InboxRepository, 'conversations' | 'messages'>;
@@ -28,6 +30,7 @@ interface ServerOptions {
 export function createAdminServer(bot: BotControl, token: string, options: ServerOptions = {}) {
   let controls = Promise.resolve();
   let pendingControls = 0;
+  const outbound = createOutboundApi(options.automation);
   const expected = createHash('sha256').update(`Bearer ${token}`).digest();
   const server = createServer({ maxHeaderSize: 8192 }, (request, response) => {
     void handle(request, response).catch((error) =>
@@ -47,6 +50,7 @@ export function createAdminServer(bot: BotControl, token: string, options: Serve
       send(response, 200, { status: 'ok', release: health.release });
       return;
     }
+    if (await outbound(request, response)) return;
     const actual = createHash('sha256')
       .update(request.headers.authorization ?? '')
       .digest();

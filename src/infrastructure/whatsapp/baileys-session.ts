@@ -5,7 +5,9 @@ import makeWASocket, {
   type BaileysEventMap,
   type GroupMetadata,
   type WAMessage,
+  type AnyMessageContent,
 } from '@whiskeysockets/baileys';
+import type { OutboundAutomationMedia } from '../../contracts/outbound-automation.js';
 import { MAX_MEDIA_BYTES, type MediaUpload } from '../../modules/media/media.types.js';
 import type { Logger } from 'pino';
 import { createAuthStore } from '../database/auth-store.js';
@@ -23,9 +25,42 @@ export interface WhatsAppSession {
   acknowledgeDelivery?(message: WAMessage): void;
   reply(message: WAMessage, text: string): Promise<void>;
   sendText?(chatId: string, text: string): Promise<void>;
+  sendMedia?(chatId: string, media: OutboundMediaSend): Promise<void>;
   downloadMedia?(message: WAMessage, signal: AbortSignal): Promise<MediaUpload>;
   chatName?(chatId: string): Promise<string | undefined>;
   close(): Promise<void>;
+}
+
+export interface OutboundMediaSend {
+  bytes: Buffer;
+  mimeType: OutboundAutomationMedia['mimeType'];
+  fileName: string;
+  caption: string;
+}
+
+/** Bytes only: callers cannot make the SDK download an arbitrary URL or local path. */
+export function outboundMediaMessage(media: OutboundMediaSend): AnyMessageContent {
+  if (
+    !Buffer.isBuffer(media.bytes) ||
+    media.bytes.length < 1 ||
+    media.bytes.length > 8 * 1024 * 1024 ||
+    !['image/jpeg', 'image/png', 'application/pdf'].includes(media.mimeType) ||
+    typeof media.fileName !== 'string' ||
+    !media.fileName ||
+    /[\\/\x00-\x1f\x7f]/.test(media.fileName) ||
+    typeof media.caption !== 'string' ||
+    media.caption.length > (media.mimeType === 'application/pdf' ? 4000 : 1024)
+  )
+    throw new Error('INVALID_OUTBOUND_MEDIA');
+  return media.mimeType === 'application/pdf'
+    ? {
+        document: media.bytes,
+        mimetype: media.mimeType,
+        fileName: media.fileName,
+        caption: media.caption,
+      }
+    : // Avoid optional image decoding/thumbnail generation for untrusted uploaded images.
+      { image: media.bytes, mimetype: media.mimeType, caption: media.caption, jpegThumbnail: '' };
 }
 
 export type SessionFactory = (onFatal?: (error: Error) => void) => Promise<WhatsAppSession>;
@@ -76,11 +111,14 @@ export function createSessionFactory(
       groups.delete(id);
     });
 
-    const send = async (chatId: string, text: string, quoted?: WAMessage) => {
+    const send = async (chatId: string, content: AnyMessageContent, quoted?: WAMessage) => {
       let timer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
-          socket.sendMessage(chatId, plainTextMessage(text), quoted ? { quoted } : {}),
+          socket.sendMessage(chatId, content, {
+            ...(quoted ? { quoted } : {}),
+            mediaUploadTimeoutMs: sendTimeoutMs,
+          }),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               const error = new Error('WhatsApp send timed out; delivery is uncertain');
@@ -105,8 +143,9 @@ export function createSessionFactory(
       },
       saveCredentials: () => auth.saveCredentials(),
       acknowledgeDelivery: (message) => deliveryReceipts.acknowledge(message),
-      reply: (message, text) => send(message.key.remoteJid!, text, message),
-      sendText: (chatId, text) => send(chatId, text),
+      reply: (message, text) => send(message.key.remoteJid!, plainTextMessage(text), message),
+      sendText: (chatId, text) => send(chatId, plainTextMessage(text)),
+      sendMedia: (chatId, media) => send(chatId, outboundMediaMessage(media)),
       async downloadMedia(message, signal) {
         const content = persistableMessageContent(message.message);
         const attachment =

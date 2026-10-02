@@ -11,7 +11,12 @@ export interface AppConfig {
   readonly shutdownTimeoutMs: number;
   readonly encryptionKey: string;
   readonly release: string;
-  readonly api: { readonly host: string; readonly port: number; readonly token: string };
+  readonly api: {
+    readonly host: string;
+    readonly port: number;
+    readonly token: string;
+    readonly automationKey?: string;
+  };
   readonly autoConnect: boolean;
   readonly messageDatabase?: MessageDatabaseConfig;
   readonly assistant?: AssistantConfig;
@@ -83,6 +88,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (shutdownTimeoutMs > 300_000) throw new Error('SHUTDOWN_TIMEOUT_MS must be at most 300000');
 
   const messageDatabase = messageDatabaseConfig(env);
+  const api = apiConfig(env);
+  if (api.automationKey && !messageDatabase)
+    throw new Error('RAMESH_AUTOMATION_API_KEY requires Supabase message storage');
   const assistant = loadAssistantConfig(env);
   const businessReads = loadBusinessReadConfig(env);
   if (businessReads && (!messageDatabase || !assistant))
@@ -104,7 +112,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       replyDelay,
       printQr: booleanValue(env, 'PRINT_QR', false),
     },
-    api: apiConfig(env),
+    api,
     autoConnect: booleanValue(env, 'WHATSAPP_AUTO_CONNECT', false),
   };
 }
@@ -146,5 +154,20 @@ function apiConfig(env: NodeJS.ProcessEnv): AppConfig['api'] {
     );
   const port = positiveInteger(env, 'WORKER_PORT', 3011);
   if (port > 65535) throw new Error('WORKER_PORT must be at most 65535');
-  return { host: env.WORKER_HOST ?? '127.0.0.1', port, token };
+  const automationKey = env.RAMESH_AUTOMATION_API_KEY || undefined;
+  if (
+    automationKey &&
+    (!/^[A-Za-z0-9_-]{43}$/.test(automationKey) ||
+      Buffer.from(automationKey, 'base64url').toString('base64url') !== automationKey ||
+      automationKey === token)
+  )
+    throw new Error(
+      'RAMESH_AUTOMATION_API_KEY must encode 32 random bytes as base64url and differ from WORKER_API_TOKEN',
+    );
+  return {
+    host: env.WORKER_HOST ?? '127.0.0.1',
+    port,
+    token,
+    ...(automationKey ? { automationKey } : {}),
+  };
 }

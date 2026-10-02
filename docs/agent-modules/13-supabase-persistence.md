@@ -1,20 +1,20 @@
 # Supabase persistence and recovery
 
-Status: **Message tables and the minimal run/event journal are established. Per-chat concurrency and encrypted model-response replay are implemented locally, not deployed. Native LangGraph snapshots and paused-task state remain proposed.**
+Status: **Message tables and the minimal run/event journal are established. Per-chat concurrency and encrypted model-response replay are deployed in `e0b7232`. Native LangGraph snapshots and paused-task state remain proposed.**
 
 The run ID equals its inbound message UUID. Current run state is running/finalized/failed, fenced by the inbound lease and retry attempt. Encrypted tool receipts are append-only; run finalization shares the outbound handoff transaction. Finalized means saved, not sent. Message cleanup cascades to run/event history after 30 days.
 
-The local increment requires production migrations [202610030004_per_chat_queue.sql](../../supabase/migrations/202610030004_per_chat_queue.sql) and [202610030005_agent_checkpoints.sql](../../supabase/migrations/202610030005_agent_checkpoints.sql), following the earlier inbox/media/ledger migrations. The real-data playground independently requires [capture 202610030005](../../supabase/playground/202610030005_agent_checkpoints.sql). Runtime health checks reject an older schema. These migrations have not been applied to production as part of this increment.
+The deployed release requires production migrations [202610030004_per_chat_queue.sql](../../supabase/migrations/202610030004_per_chat_queue.sql) and [202610030005_agent_checkpoints.sql](../../supabase/migrations/202610030005_agent_checkpoints.sql), following the earlier inbox/media/ledger migrations. The real-data playground independently requires [capture 202610030005](../../supabase/playground/202610030005_agent_checkpoints.sql). Runtime health checks reject an older schema. These production and capture migrations are applied, including the previously pending production `202610020006` and capture `202610020003` usage ledgers. The separate [outbound automation implementation](48-outbound-automation-api.md) additionally requires production migration `202610030006`, which is applied and verified with the restricted runtime role. Automation code deployment remains pending; see the [integration guide](../outbound-automation.md).
 
 ## Implemented stores and ownership
 
-| Store                                                                                       | Owner and content                                                                                                                   |
-| ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `ramesh-messages`, `ramesh-inbound-queue`, `ramesh-outbound-queue`, `ramesh-message-events` | Message repository; admission order, inbox content, fenced work, delivery and transition history                                    |
-| `ramesh-agent-runs`                                                                         | One run per inbound job, current retry attempt/lease and running/finalized/failed status                                            |
-| `ramesh-agent-events`                                                                       | Append-only encrypted tool receipts and finalization events                                                                         |
-| `ramesh-agent-checkpoints`                                                                  | Local increment: encrypted completed model responses, original request/start/deadline clocks, consumption counters and retry policy |
-| `ramesh-test-agent-checkpoints`                                                             | Same recovery contract in the physically separate capture namespace and role                                                        |
+| Store                                                                                       | Owner and content                                                                                                  |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `ramesh-messages`, `ramesh-inbound-queue`, `ramesh-outbound-queue`, `ramesh-message-events` | Message repository; admission order, inbox content, fenced work, delivery and transition history                   |
+| `ramesh-agent-runs`                                                                         | One run per inbound job, current retry attempt/lease and running/finalized/failed status                           |
+| `ramesh-agent-events`                                                                       | Append-only encrypted tool receipts and finalization events                                                        |
+| `ramesh-agent-checkpoints`                                                                  | Encrypted completed model responses, original request/start/deadline clocks, consumption counters and retry policy |
+| `ramesh-test-agent-checkpoints`                                                             | Same recovery contract in the physically separate capture namespace and role                                       |
 
 All these tables use quoted hyphenated identifiers in `public`. Production and capture migrations/grants remain independent. SQLite retains device/admin state and synthetic fixtures; it has no production checkpoint authority. Use additive SQL migrations beside existing Supabase migrations, never Prisma against shared Supabase business data. Runtime roles do not own DDL.
 

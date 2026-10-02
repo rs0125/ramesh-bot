@@ -2,6 +2,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { batchDeadline, type DebouncePolicy } from '../../modules/messaging/debounce.js';
+import type {
+  AutomationEnqueueResult,
+  OutboundAutomationStatus,
+} from '../../contracts/outbound-automation.js';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
 
 export type TerminalState = 'SENT' | 'EXPIRED' | 'FAILED' | 'UNCERTAIN';
@@ -18,7 +22,8 @@ export interface MessageJob {
   receivedAt?: Date;
   direction: QueueDirection;
   replyPayload?: string;
-  origin?: 'whatsapp' | 'admin';
+  origin?: 'whatsapp' | 'admin' | 'automation';
+  mediaPayload?: string;
   chatId?: string;
   replyKind?: 'conversation' | 'business';
   businessEvidence?: string;
@@ -44,7 +49,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610030005'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610030006'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -257,6 +262,123 @@ export class MessageQueueRepository {
     });
   }
 
+  /** Server-authorized outbound admission. Does not weaken operator inbox destination checks. */
+  async enqueueAutomation(
+    id: string,
+    chatId: string,
+    content: string,
+    replyPayload: string,
+    capacity: number,
+    fingerprint: string,
+    expiresInSeconds: number,
+    media?: { payload: string; byteLength: number },
+  ): Promise<AutomationEnqueueResult> {
+    if (
+      !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(id) ||
+      !/^[1-9]\d{7,14}@s\.whatsapp\.net$/.test(chatId) ||
+      !/^[a-f0-9]{64}$/.test(fingerprint) ||
+      !Number.isSafeInteger(expiresInSeconds) ||
+      expiresInSeconds < 30 ||
+      expiresInSeconds > 86400 ||
+      !Number.isSafeInteger(capacity) ||
+      capacity < 1 ||
+      capacity > 1000 ||
+      (media &&
+        (!Number.isSafeInteger(media.byteLength) ||
+          media.byteLength < 1 ||
+          media.byteLength > 8388608 ||
+          !media.payload ||
+          Buffer.byteLength(media.payload) > 16777216))
+    )
+      throw new Error('INVALID_AUTOMATION_ENQUEUE');
+    return this.transaction(async (db) => {
+      const existing = (
+        await db.query(
+          `SELECT origin,chat_id,request_fingerprint FROM public."ramesh-messages" WHERE account_id=$1 AND id=$2`,
+          [this.accountId, id],
+        )
+      ).rows[0];
+      if (existing)
+        return existing.origin === 'automation' &&
+          existing.chat_id === chatId &&
+          existing.request_fingerprint === fingerprint
+          ? 'duplicate'
+          : 'conflict';
+      const count = await db.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM public."ramesh-messages"
+         WHERE account_id=$1 AND state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')`,
+        [this.accountId],
+      );
+      if (count.rows[0]!.count >= capacity) return 'full';
+      await db.query(
+        `INSERT INTO public."ramesh-messages"
+         (id,account_id,chat_id,whatsapp_message_id,sent_at,expires_at,state,payload_encrypted,
+          origin,content_encrypted,reply_encrypted,reply_created_at,request_fingerprint)
+         VALUES ($1,$2,$3,$4,clock_timestamp(),clock_timestamp()+$8*interval '1 second',
+          'READY_TO_SEND',$5,'automation',$6,$5,clock_timestamp(),$7)`,
+        [
+          id,
+          this.accountId,
+          chatId,
+          `automation:${id}`,
+          replyPayload,
+          content,
+          fingerprint,
+          expiresInSeconds,
+        ],
+      );
+      await db.query(
+        `INSERT INTO public."ramesh-outbound-queue"
+         (message_id,account_id,payload_encrypted,media_payload_encrypted,media_byte_length,media_expires_at)
+         SELECT id,account_id,$3,$4,$5,CASE WHEN $4::text IS NULL THEN NULL ELSE expires_at END
+         FROM public."ramesh-messages" WHERE id=$1 AND account_id=$2`,
+        [id, this.accountId, replyPayload, media?.payload ?? null, media?.byteLength ?? null],
+      );
+      return 'queued';
+    });
+  }
+
+  /** Automation credentials must not disclose inbox/operator/inbound job metadata. */
+  async automationStatus(id: string): Promise<OutboundAutomationStatus | null> {
+    const row = (
+      await this.pool.query<{
+        id: string;
+        state: string;
+        created_at: Date;
+        expires_at: Date;
+        finished_at: Date | null;
+        reason: string | null;
+      }>(
+        `SELECT id,state,created_at,expires_at,finished_at,reason FROM public."ramesh-messages"
+       WHERE id=$1 AND account_id=$2 AND origin='automation'`,
+        [id, this.accountId],
+      )
+    ).rows[0];
+    if (!row) return null;
+    // Never let an arbitrary database reason become an external error/message disclosure.
+    const reasons = new Set([
+      'message_too_old',
+      'attempts_exhausted',
+      'send_interrupted',
+      'send_or_status_failed',
+      'invalid_encrypted_reply',
+      'invalid_automation_media',
+      'manual_send_unavailable',
+      'automation_send_unavailable',
+      'connection_paused',
+      'processing_retry',
+      'lease_expired',
+    ]);
+    return {
+      messageId: row.id,
+      state: row.state,
+      createdAt: row.created_at.toISOString(),
+      expiresAt: row.expires_at.toISOString(),
+      finishedAt: row.finished_at?.toISOString() ?? null,
+      reason: row.reason && reasons.has(row.reason) ? row.reason : null,
+    };
+  }
+
   private async finish(
     db: PoolClient,
     job: Pick<MessageJob, 'id' | 'direction'>,
@@ -317,6 +439,13 @@ export class MessageQueueRepository {
   }
 
   private async recover(db: PoolClient): Promise<void> {
+    // Also purge media whose message is still leased while cancellation/recovery catches up.
+    await db.query(
+      `UPDATE public."ramesh-outbound-queue" SET media_payload_encrypted=NULL,
+      media_byte_length=NULL,media_expires_at=NULL
+      WHERE account_id=$1 AND media_expires_at<=clock_timestamp()`,
+      [this.accountId],
+    );
     for (const direction of ['inbound', 'outbound'] as const) {
       const table = queueTable(direction);
       const ready = readyState(direction);
@@ -424,6 +553,7 @@ export class MessageQueueRepository {
         SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId",m.created_at AS "receivedAt",
           m.reply_kind AS "replyKind",m.business_evidence_encrypted AS "businessEvidence",
           ${direction === 'outbound' ? 'j.payload_encrypted' : 'NULL::text'} AS "replyPayload",
+          ${direction === 'outbound' ? 'j.media_payload_encrypted' : 'NULL::text'} AS "mediaPayload",
           '${direction}'::text AS direction,m.queue_order
         FROM ${queueTable(direction)} j JOIN public."ramesh-messages" m ON m.id=j.message_id
         WHERE j.account_id=$1 AND j.state='READY' AND j.available_at<=clock_timestamp()

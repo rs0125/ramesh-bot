@@ -66,6 +66,8 @@ Readiness checks validate the process, release, and configured databases without
 
 ## Runtime configuration
 
+The separate [outbound automation API](outbound-automation.md) uses `RAMESH_AUTOMATION_API_KEY` and `/v1/outbound-messages` plus its per-message status route. Supabase migration `202610030006` is applied; its dedicated key is installed in the protected host environment and SSM runtime version 11. The extended Caddy allowlist has been validated and reloaded. Code rollout is pending CI/CD. Normal app deployments do not replace the Caddyfile or these credentials.
+
 `/etc/wareongo-sales-bot/worker.env` is root-owned mode `0600`. Parameter Store `/ramesh-bot/production/runtime` is a `SecureString` containing the encrypted JSON backup of runtime values. The process reads the host environment on startup; changing Parameter Store alone does not update or restart the worker. Bootstrap preserves an existing host environment, and ordinary releases do not replace it.
 
 | Setting                                                | Production role                                                                     |

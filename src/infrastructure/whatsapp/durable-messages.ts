@@ -9,7 +9,8 @@ import type {
   GreetingCandidate,
   PrepareReply,
 } from '../../modules/greetings/greeting.types.js';
-import type { WhatsAppSession } from './baileys-session.js';
+import type { WhatsAppSession, OutboundMediaSend } from './baileys-session.js';
+import { decodeAutomationMedia } from '../../modules/messaging/outbound-automation.js';
 import { toGreetingCandidate } from './message.mapper.js';
 import { combinedTurn } from '../../modules/messaging/debounce.js';
 import { MediaService, mediaOwner } from '../../modules/media/media.service.js';
@@ -100,6 +101,12 @@ export class DurableMessages {
 
   private get usageEnabled() {
     return this.options.usageMode === 'observe' || this.options.usageMode === 'enforce';
+  }
+
+  /** A committed API enqueue wakes the existing connected consumer without creating a sender. */
+  notifyOutbound(): void {
+    this.revision++;
+    this.wake?.();
   }
 
   /** Stop queue admission synchronously before waiting for the WhatsApp consumer to drain. */
@@ -434,7 +441,8 @@ export class DurableMessages {
         return;
       }
       let message: WAMessage | undefined;
-      const manual = job.origin === 'admin';
+      const automation = job.origin === 'automation';
+      const manual = job.origin === 'admin' || automation;
       try {
         if (!manual) {
           const wire = this.cipher.open('message', job.id, job.payload);
@@ -599,13 +607,14 @@ export class DurableMessages {
         } else await this.repository.releaseUnsent(job);
         return;
       }
-      if (manual && (!job.chatId || !session.sendText)) {
+      if (manual && (!job.chatId || (!automation && !session.sendText))) {
         await this.repository.complete(job, 'FAILED', 'manual_send_unavailable');
         report('error');
         return;
       }
       let reply: unknown;
       let voice: VoiceReplyReference | undefined;
+      let outgoingMedia: Omit<OutboundMediaSend, 'caption'> | undefined;
       try {
         const decoded = decodeReply(
           this.cipher.open('outbound-reply', job.id, job.replyPayload ?? ''),
@@ -613,11 +622,34 @@ export class DurableMessages {
         );
         reply = decoded.text;
         voice = decoded.voice;
-        if (typeof reply !== 'string' || !reply.trim() || reply.length > 16000)
+        if (automation !== !!decoded.automation || (!automation && job.mediaPayload))
+          throw new Error('INVALID_REPLY_ORIGIN');
+        if (automation) {
+          if (!/^[1-9][0-9]{7,14}@s\.whatsapp\.net$/.test(job.chatId ?? ''))
+            throw new Error('INVALID_AUTOMATION_DESTINATION');
+          const metadata = decoded.automation?.media;
+          if (metadata) {
+            if (!job.mediaPayload) throw new Error('MISSING_AUTOMATION_MEDIA');
+            outgoingMedia = decodeAutomationMedia(
+              this.cipher.open('outbound-media', job.id, job.mediaPayload),
+              metadata,
+            );
+          } else if (job.mediaPayload) throw new Error('UNEXPECTED_AUTOMATION_MEDIA');
+        }
+        if (typeof reply !== 'string' || (!reply.trim() && !outgoingMedia) || reply.length > 16000)
           throw new Error('Invalid saved reply');
       } catch {
-        await this.repository.complete(job, 'FAILED', 'invalid_encrypted_reply');
+        await this.repository.complete(
+          job,
+          'FAILED',
+          automation ? 'invalid_automation_media' : 'invalid_encrypted_reply',
+        );
         this.sentCallbacks.delete(job.id);
+        report('error');
+        return;
+      }
+      if (automation && (outgoingMedia ? !session.sendMedia : !session.sendText)) {
+        await this.repository.complete(job, 'FAILED', 'automation_send_unavailable');
         report('error');
         return;
       }
@@ -688,7 +720,9 @@ export class DurableMessages {
         return;
       }
       sendInvoked = true;
-      if (manual) await session.sendText!(job.chatId!, reply as string);
+      if (automation && outgoingMedia)
+        await session.sendMedia!(job.chatId!, { ...outgoingMedia, caption: reply as string });
+      else if (manual) await session.sendText!(job.chatId!, reply as string);
       else await session.reply(message!, reply as string);
       const completed = await this.repository.complete(job, 'SENT');
       if (completed) this.sentCallbacks.get(job.id)?.run();

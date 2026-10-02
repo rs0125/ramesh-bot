@@ -1,6 +1,6 @@
 # Durable model checkpoints
 
-Status: implemented, 3 October 2026. Production and capture migrations through `202610030005` are applied; this release enables the worker integration.
+Status: **deployed on 3 October 2026 in [e0b7232](https://github.com/rs0125/ramesh-bot/commit/e0b723290478da646809af1542a343d49b913b07).** Production and capture migrations through `202610030005` are applied, and the running worker integration passed schema health checks.
 
 ## Purpose
 
@@ -61,4 +61,4 @@ Recovery does not guarantee reuse of every step. Unknown source fields, analytic
 
 ## Migration verification, 3 October 2026
 
-The production schema advanced from `202610020005`, applying the pending usage-ledger migration before concurrency and checkpoints. Capture advanced from `202610020002`, applying its separate ledger and checkpoint migrations. Historical checksums passed; both changes committed in one operator transaction after a successful rollback dry run. Existing runtime passwords were preserved. Restricted worker and capture health checks passed; checkpoint RLS and cross-role denial were verified. Spending mode remains off. No model calls, test messages or business-record mutations were used for rollout verification.
+The production schema advanced from `202610020005`, applying the pending usage-ledger migration before concurrency and checkpoints. Capture advanced from `202610020002`, applying its separate ledger and checkpoint migrations. Historical checksums passed; both changes committed in one operator transaction after a successful rollback dry run. Existing runtime passwords were preserved. Restricted worker and capture health checks passed; checkpoint RLS and cross-role denial were verified. [CI 37067044403](https://github.com/rs0125/ramesh-bot/actions/runs/37067044403) and [CD 37067181558](https://github.com/rs0125/ramesh-bot/actions/runs/37067181558) passed for the deployed commit. WhatsApp is connected and the effective concurrency is three. Spending mode remains off. No paid evaluations, model calls, test messages or business-record mutations were used for rollout verification. Production restart faults were not injected; replay correctness is covered by the isolated deterministic tests.

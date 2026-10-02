@@ -22,7 +22,7 @@ export interface InboxContent {
 interface InboxRow {
   id: string;
   chat_id: string;
-  origin: 'whatsapp' | 'admin';
+  origin: 'whatsapp' | 'admin' | 'automation';
   mentions_bot: boolean;
   content_encrypted: string;
   reply_encrypted: string | null;
@@ -89,7 +89,7 @@ export class InboxRepository {
   private messagesFor(row: InboxRow): InboxMessage[] {
     const content = this.content(row);
     const messages: InboxMessage[] =
-      row.origin === 'admin'
+      row.origin !== 'whatsapp'
         ? []
         : [
             {
@@ -108,7 +108,7 @@ export class InboxRepository {
           ];
     if (row.reply_encrypted) {
       // The operational admin session grants no employee CRM authority.
-      const text =
+      let text =
         row.reply_kind === 'business'
           ? '[Private CRM reply]'
           : decodeReply(
@@ -116,6 +116,14 @@ export class InboxRepository {
               'conversation',
             ).text;
       if (typeof text !== 'string') throw new Error('Invalid inbox reply');
+      if (row.origin === 'automation' && !text.trim())
+        text =
+          content.text ||
+          (content.kind === 'document'
+            ? '[Document]'
+            : content.kind === 'image'
+              ? '[Image]'
+              : '[Attachment]');
       messages.push({
         id: `${row.id}:reply`,
         chatId: row.chat_id,
@@ -123,7 +131,7 @@ export class InboxRepository {
         senderId: null,
         senderName: 'Ramesh',
         direction: 'outbound',
-        source: row.origin === 'admin' ? 'admin' : 'assistant',
+        source: row.origin === 'whatsapp' ? 'assistant' : row.origin,
         mentionsBot: false,
         at: (
           (row.state === 'SENT' ? row.finished_at : null) ??
@@ -131,7 +139,7 @@ export class InboxRepository {
           row.created_at
         ).toISOString(),
         status: row.state,
-        kind: 'text',
+        kind: row.origin === 'automation' ? content.kind : 'text',
       });
     }
     return messages;
@@ -140,13 +148,13 @@ export class InboxRepository {
   async conversations(cursor?: string | null): Promise<ConversationPage> {
     const before = decodeInboxCursor(cursor);
     const rows = (
-      await this.pool.query<InboxRow & { name_id: string; name_content: string }>(
+      await this.pool.query<InboxRow & { name_id: string | null; name_content: string | null }>(
         `WITH latest AS (
         SELECT DISTINCT ON (chat_id) * FROM public."ramesh-messages"
         WHERE account_id=$1 AND content_encrypted IS NOT NULL
         ORDER BY chat_id,updated_at DESC,id DESC
       ) SELECT l.*,l.updated_at::text AS updated_cursor,n.id AS name_id,n.content_encrypted AS name_content FROM latest l
-      JOIN LATERAL (
+      LEFT JOIN LATERAL (
         SELECT id,content_encrypted FROM public."ramesh-messages"
         WHERE account_id=$1 AND chat_id=l.chat_id AND origin='whatsapp' AND content_encrypted IS NOT NULL
         ORDER BY created_at DESC,id DESC LIMIT 1
@@ -158,7 +166,10 @@ export class InboxRepository {
     ).rows;
     return {
       conversations: rows.slice(0, 50).map((row) => {
-        const content = this.content({ id: row.name_id, content_encrypted: row.name_content });
+        const content =
+          row.name_id && row.name_content
+            ? this.content({ id: row.name_id, content_encrypted: row.name_content })
+            : this.content(row);
         const latest = this.messagesFor(row).at(-1)!;
         const isGroup = row.chat_id.endsWith('@g.us');
         return {
@@ -166,7 +177,11 @@ export class InboxRepository {
           isGroup,
           name:
             content.chatName ||
-            (isGroup ? `Group ${row.chat_id.split('@')[0]}` : content.senderName),
+            (isGroup
+              ? `Group ${row.chat_id.split('@')[0]}`
+              : row.name_id
+                ? content.senderName
+                : `+${row.chat_id.split('@')[0]}`),
           lastMessage: latest.text.slice(0, 200),
           lastMessageAt: latest.at,
         };

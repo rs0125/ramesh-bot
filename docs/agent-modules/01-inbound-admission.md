@@ -1,8 +1,8 @@
 # Inbound admission
 
-Status: **Trusted queue admission is integrated. Per-chat concurrency and restart replay are implemented locally, not deployed.** Depends on [shared contracts](00-shared-contracts.md), [identity](02-identity-resolver.md) and [persistence](13-supabase-persistence.md).
+Status: **Trusted queue admission is integrated. Per-chat concurrency and restart replay are deployed in `e0b7232`.** Depends on [shared contracts](00-shared-contracts.md), [identity](02-identity-resolver.md) and [persistence](13-supabase-persistence.md).
 
-**Implemented subset:** DurableMessages passes the original decrypted transport key and persisted message UUID to the graph. Its journal callback and checkpoint handle are tied to the current inbound lease. The local increment admits up to three active chats by default, with one active turn per chat and one outbound lease for the account. Leases last 30 seconds, renew about every 10 seconds and cannot extend message expiry. Production migrations `202610030004`/`202610030005` are required before rollout. See the [first-read runbook](../first-crm-read.md) for the exact code contract and activation steps; production enablement remains separate.
+**Implemented subset:** DurableMessages passes the original decrypted transport key and persisted message UUID to the graph. Its journal callback and checkpoint handle are tied to the current inbound lease. The deployed worker admits up to three active chats by default, with one active turn per chat and one outbound lease for the account. Leases last 30 seconds, renew about every 10 seconds and cannot extend message expiry. Production migrations `202610030004`/`202610030005` are applied, with runtime schema health checks passing. Fresh installations still need the complete migration history. See the [first-read runbook](../first-crm-read.md) for the exact code contract and activation steps.
 
 ## Responsibility and current code
 
@@ -25,7 +25,7 @@ Admission returns the existing distinctions `queued`, `duplicate`, `full`, `igno
 5. Bind the run and encrypted replay store to that inbound job, trusted sender and current lease. On retry, reconstruct the graph, revalidate identity/tools and reread source data; reuse only exact matching completed model responses within the original deadline. Attaching a later clarification to a paused task remains proposed.
 6. Dispatch to the orchestrator. Finalization atomically hands off to outbound and deletes the checkpoint. A storage/lease failure propagates to queue recovery; the transport does not manufacture a successful response.
 
-The local concurrency increment preserves server-assigned admission order within each chat through generation, retry, handoff and sending. Pending work blocks its own chat while unrelated chats may advance. Debounce never crosses another participant or operator turn. Client message timestamps still inform age checks and do not choose processing order. See [module 46](46-per-chat-concurrency.md); captured GUI dispatch remains serial.
+Per-chat concurrency preserves server-assigned admission order within each chat through generation, retry, handoff and sending. Pending work blocks its own chat while unrelated chats may advance. Debounce never crosses another participant or operator turn. Client message timestamps still inform age checks and do not choose processing order. See [module 46](46-per-chat-concurrency.md); captured GUI dispatch remains serial.
 
 ## Failures and recovery
 

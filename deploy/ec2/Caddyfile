@@ -1,7 +1,7 @@
 # Replace this hostname with the DNS name pointing to the EC2 public IP.
 # Caddy manages HTTPS; the worker keeps its bearer-token check behind this proxy.
 bot-worker.example.com {
-	@api path /v1/status /v1/control /v1/admin/attempt /v1/admin/session /v1/inbox/conversations /v1/inbox/messages /v1/inbox/send
+	@api path /v1/status /v1/control /v1/admin/attempt /v1/admin/session /v1/inbox/conversations /v1/inbox/messages /v1/inbox/send /v1/outbound-messages /v1/outbound-messages/*
 	handle @api {
 		reverse_proxy 127.0.0.1:3011
 	}

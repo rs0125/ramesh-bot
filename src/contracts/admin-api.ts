@@ -42,7 +42,7 @@ export interface InboxMessage {
   senderId: string | null;
   senderName: string;
   direction: 'inbound' | 'outbound';
-  source: 'whatsapp' | 'assistant' | 'admin';
+  source: 'whatsapp' | 'assistant' | 'admin' | 'automation';
   mentionsBot: boolean;
   at: string;
   status: string;

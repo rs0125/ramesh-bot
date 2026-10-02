@@ -28,6 +28,7 @@ import { EmployeeIdentityResolver } from '../modules/identity/employee-identity.
 import { PostgresEmployeeRoster } from '../infrastructure/database/employee-roster.js';
 import { UsageMeter } from '../modules/usage/usage-meter.js';
 import { UsageLedgerRepository } from '../infrastructure/database/usage-ledger.repository.js';
+import { AutomationOutboundService } from '../modules/messaging/outbound-automation.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -209,6 +210,18 @@ export function createApplication(
     config.api.token,
     {
       adminAccess,
+      automation:
+        config.api.automationKey && messageRepository && durableMessages
+          ? {
+              key: config.api.automationKey,
+              service: new AutomationOutboundService(
+                messageRepository,
+                config.encryptionKey,
+                config.whatsapp.maxPendingMessages,
+                () => durableMessages.notifyOutbound(),
+              ),
+            }
+          : undefined,
       inbox: inboxRepository,
       sendMessage: durableMessages
         ? (id, chatId, text) => durableMessages.sendAsAdmin(id, chatId, text)
