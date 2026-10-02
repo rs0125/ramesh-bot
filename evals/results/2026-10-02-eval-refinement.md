@@ -157,6 +157,11 @@ The first live smoke exposed an API serializer dropping transcript metadata; tha
 boundary was fixed and has an integration regression test. The original failed
 smoke log was retained before the successful rerun.
 
+The first pushed CI run passed 222/223 tests and failed the real audio-normalization
+test with `AUDIO_DECODE_FAILED`. CI now explicitly installs the native `ffmpeg`
+dependency, matching the prepared EC2 host. The failed run remains visible and
+did not trigger deployment.
+
 The [STT comparison](2026-10-02-stt-comparison.md) retains all 24 API trials across
 three models. Every model passed English checks and failed the poor synthetic
 Hindi/mixed cases. This does not rank accuracy on real Hindi/Hinglish audio.
