@@ -10,9 +10,7 @@ import {
 import { z } from 'zod';
 import { loadContextEngineConfig, type ContextEngineConfig } from '../../config/context-engine.js';
 import {
-  CONTEXT_READ_TOOLS,
   ContextEngineError,
-  isContextReadTool,
   type ContextCredentialResolver,
   type ContextEvidence,
   type ContextReadTool,
@@ -21,6 +19,15 @@ import {
   type ContextToolGateway,
   type EmployeeContextGrant,
 } from '../../modules/context-engine/context.types.js';
+import {
+  admittedReadTool,
+  MAX_CATALOGUE_BYTES,
+  MAX_CATALOGUE_TOOLS,
+  MAX_GUIDANCE_BYTES,
+  modelContext,
+  schemaAccepts,
+  TOOL_NAME,
+} from '../../modules/context-engine/read-contract.js';
 
 const envelope = z
   .object({
@@ -111,22 +118,30 @@ function evidence(result: CallToolResult): ContextEvidence {
 
 async function callDiscoveredTool(
   client: Client,
-  name: ContextReadTool,
+  tool: Tool,
   args: Record<string, unknown>,
   request: { signal: AbortSignal; timeout: number },
 ): Promise<CallToolResult> {
   try {
-    return await client.callTool({ name, arguments: args }, request);
+    // Do not allow schema extensions to mirror model arguments into HTTP headers.
+    // Both schemas are validated here against the authenticated current descriptor.
+    if (!schemaAccepts(tool.inputSchema, args)) throw new ContextEngineError('INVALID_ARGUMENTS');
+    const result = await client.request(
+      { method: 'tools/call', params: { name: tool.name, arguments: args } },
+      request,
+    );
+    if (!result.isError && tool.outputSchema && !schemaAccepts(tool.outputSchema, evidence(result)))
+      throw new ContextEngineError('INVALID_RESPONSE');
+    return result;
   } catch (error) {
     if (error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams) {
       // A platform selection or employee permission can change after discovery.
       // Refresh once to distinguish a removed tool from invalid arguments. Never
       // retry the tool call or fall back to the Claude connector.
-      const catalogue = await client.listTools({}, request);
-      if (catalogue.nextCursor) throw new ContextEngineError('INVALID_RESPONSE');
+      const catalogue = await listCurrentTools(client, request);
       if (
-        !catalogue.tools.some(
-          (tool) => tool.name === name && tool.annotations?.readOnlyHint === true,
+        !catalogue.some(
+          (current) => current.name === tool.name && current.annotations?.readOnlyHint === true,
         )
       )
         throw new ContextEngineError('TOOL_UNAVAILABLE');
@@ -134,6 +149,39 @@ async function callDiscoveredTool(
     }
     throw error;
   }
+}
+
+/** Explicit pages avoid SDK auto-aggregation silently ending a repeated cursor. No shared cache. */
+async function listCurrentTools(
+  client: Client,
+  request: { signal: AbortSignal; timeout: number },
+): Promise<Tool[]> {
+  const tools: Tool[] = [];
+  const cursors = new Set<string>();
+  const names = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 4; page++) {
+    const result = await client.request(
+      { method: 'tools/list', params: cursor === undefined ? {} : { cursor } },
+      request,
+    );
+    for (const tool of result.tools) {
+      if (names.has(tool.name)) throw new ContextEngineError('INVALID_RESPONSE');
+      names.add(tool.name);
+      tools.push(tool);
+    }
+    if (
+      tools.length > MAX_CATALOGUE_TOOLS ||
+      Buffer.byteLength(JSON.stringify(tools)) > MAX_CATALOGUE_BYTES
+    )
+      throw new ContextEngineError('RESPONSE_TOO_LARGE');
+    if (result.nextCursor === undefined) return tools;
+    if (!result.nextCursor || result.nextCursor.length > 2048 || cursors.has(result.nextCursor))
+      throw new ContextEngineError('INVALID_RESPONSE');
+    cursors.add(result.nextCursor);
+    cursor = result.nextCursor;
+  }
+  throw new ContextEngineError('RESPONSE_TOO_LARGE');
 }
 
 export class ContextEngineMcpClient implements ContextToolGateway {
@@ -156,12 +204,16 @@ export class ContextEngineMcpClient implements ContextToolGateway {
     return (await this.describe(sender, signal)).tools;
   }
   describe(sender: ContextSender, signal?: AbortSignal) {
-    return this.withConnection(sender, signal, async (client, tools) => ({
+    return this.withConnection(sender, signal, async (client, tools, context) => ({
       guidance: client.getInstructions(),
+      context: modelContext(context.data),
       tools: tools.map((tool) => ({
         name: tool.name as ContextReadTool,
         description: tool.description,
         inputSchema: tool.inputSchema,
+        ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+        ...(tool.annotations ? { annotations: tool.annotations } : {}),
+        ...(tool._meta ? { _meta: tool._meta } : {}),
       })),
     }));
   }
@@ -172,7 +224,7 @@ export class ContextEngineMcpClient implements ContextToolGateway {
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<ContextEvidence> {
-    if (!isContextReadTool(name)) throw new ContextEngineError('TOOL_UNAVAILABLE');
+    if (!TOOL_NAME.test(name)) throw new ContextEngineError('TOOL_UNAVAILABLE');
     // Serialize once so callers cannot mutate arguments while authorization is in flight.
     let frozen: Record<string, unknown>;
     try {
@@ -184,10 +236,13 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       throw new ContextEngineError('INVALID_ARGUMENTS');
     }
     return this.withConnection(sender, signal, async (client, tools, context, request) => {
-      if (name === 'get_context') return context;
-      if (!tools.some((tool) => tool.name === name))
-        throw new ContextEngineError('TOOL_UNAVAILABLE');
-      return evidence(await callDiscoveredTool(client, name, frozen, request));
+      const tool = tools.find((tool) => tool.name === name);
+      if (!tool) throw new ContextEngineError('TOOL_UNAVAILABLE');
+      if (name === 'get_context') {
+        if (Object.keys(frozen).length) throw new ContextEngineError('INVALID_ARGUMENTS');
+        return context;
+      }
+      return evidence(await callDiscoveredTool(client, tool, frozen, request));
     });
   }
 
@@ -299,26 +354,23 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       await client.connect(transport, request);
       // The authenticated endpoint owns platform selection. Ramesh's signed
       // /mcp/ramesh catalog is refreshed for every read, including receipt replay.
-      const catalogue = await client.listTools({}, request);
-      if (catalogue.nextCursor) throw new ContextEngineError('INVALID_RESPONSE');
-      if (
-        !catalogue.tools.some(
-          (tool) => tool.name === 'get_context' && tool.annotations?.readOnlyHint === true,
-        )
-      )
-        throw new ContextEngineError('TOOL_UNAVAILABLE');
-      const context = evidence(await callDiscoveredTool(client, 'get_context', {}, request));
+      const catalogue = await listCurrentTools(client, request);
+      const contextTool = catalogue.find(
+        (tool) =>
+          tool.name === 'get_context' &&
+          tool.annotations?.readOnlyHint === true &&
+          tool.annotations.destructiveHint !== true,
+      );
+      if (!contextTool) throw new ContextEngineError('TOOL_UNAVAILABLE');
+      const context = evidence(await callDiscoveredTool(client, contextTool, {}, request));
       const current = identity.safeParse(context.data);
       if (!current.success) throw new ContextEngineError('INVALID_RESPONSE');
       if (current.data.employee_id !== grant.employeeId)
         throw new ContextEngineError('ACCESS_DENIED');
-      const tools = catalogue.tools.filter(
-        (tool) =>
-          isContextReadTool(tool.name) &&
-          tool.annotations?.readOnlyHint === true &&
-          (CONTEXT_READ_TOOLS[tool.name] === null ||
-            current.data.scopes.includes(CONTEXT_READ_TOOLS[tool.name]!)),
-      );
+      const instructions = client.getInstructions();
+      if (instructions && Buffer.byteLength(instructions) > MAX_GUIDANCE_BYTES)
+        throw new ContextEngineError('RESPONSE_TOO_LARGE');
+      const tools = catalogue.filter((tool) => admittedReadTool(tool, current.data.scopes));
       return await work(client, tools, context, request);
     } catch (error) {
       if (

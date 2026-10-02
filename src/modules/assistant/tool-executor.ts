@@ -2,7 +2,6 @@
 import { randomUUID } from 'node:crypto';
 import { cyclicCursor, paginationCoverage } from './pagination.js';
 import { internalCrmReferences } from './record-identity.js';
-import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import {
   ContextEngineError,
@@ -10,7 +9,16 @@ import {
   type ContextToolDefinition,
   type ContextReadTool,
   type ContextEvidence,
+  type ContextCatalogue,
 } from '../context-engine/context.types.js';
+import {
+  contextReadDescriptor,
+  sameToolContract,
+  schemaAccepts,
+  MAX_CATALOGUE_BYTES,
+  MAX_CATALOGUE_TOOLS,
+  MAX_GUIDANCE_BYTES,
+} from '../context-engine/read-contract.js';
 import {
   MAX_TOOL_CALLS,
   MAX_RUN_EVIDENCE_BYTES,
@@ -20,9 +28,14 @@ import {
 } from './tool-evidence.js';
 
 export interface BoundContextReader {
+  /** Trusted port: discovery already filters the current employee's permitted reads.
+   * call must enforce current employee, tool and argument/row permissions independently.
+   * The production MCP adapter owns that boundary; graph schemas never grant permission. */
   employeeId: number;
   discover(signal: AbortSignal): Promise<ContextToolDefinition[]>;
-  describe?(signal: AbortSignal): Promise<{ tools: ContextToolDefinition[]; guidance?: string }>;
+  describe?(signal: AbortSignal): Promise<ContextCatalogue>;
+  /** Only immutable/synthetic sources may opt in. Production replays reads to reauthorize rows. */
+  allowEvidenceReuse?: boolean;
   call(
     name: ContextReadTool,
     args: Record<string, unknown>,
@@ -45,8 +58,6 @@ const forbidden = new Set([
   'api_key',
   'access_token',
   'credential',
-  'destination',
-  'recipient',
   'scopes',
 ]);
 
@@ -61,7 +72,6 @@ export class ContextToolRun {
     code: string;
     recovery?: ContextEngineError['recovery'];
   }> = [];
-  private readonly validator = new AjvJsonSchemaValidator();
   private readonly attempted = new Map<
     string,
     { count: number; failure?: Record<string, unknown>; retryAt?: number }
@@ -81,6 +91,7 @@ export class ContextToolRun {
     private readonly record: TrustedReplyContext['record'],
     private readonly now: () => number,
     readonly guidance = '',
+    readonly context: Record<string, unknown> = {},
   ) {}
   static async open(
     resolve: ResolveContextReader,
@@ -93,13 +104,17 @@ export class ContextToolRun {
     const catalogue = reader.describe
       ? await reader.describe(signal)
       : { tools: await reader.discover(signal), guidance: '' };
-    const tools = catalogue.tools.filter((tool) => isContextReadTool(tool.name));
+    const tools = catalogue.tools.filter(
+      (tool) => isContextReadTool(tool.name) || contextReadDescriptor(tool),
+    );
     if (
-      tools.length > 32 ||
+      tools.length > MAX_CATALOGUE_TOOLS ||
       new Set(tools.map((tool) => tool.name)).size !== tools.length ||
-      Buffer.byteLength(JSON.stringify(tools)) > 200_000 ||
+      Buffer.byteLength(JSON.stringify(tools)) > MAX_CATALOGUE_BYTES ||
       (catalogue.guidance !== undefined &&
-        (typeof catalogue.guidance !== 'string' || Buffer.byteLength(catalogue.guidance) > 32_000))
+        (typeof catalogue.guidance !== 'string' ||
+          Buffer.byteLength(catalogue.guidance) > MAX_GUIDANCE_BYTES)) ||
+      Buffer.byteLength(JSON.stringify(catalogue.context ?? {})) > 32_000
     )
       throw new ContextEngineError('INVALID_RESPONSE');
     const current = await resolve(signal);
@@ -112,6 +127,7 @@ export class ContextToolRun {
       record,
       now,
       catalogue.guidance,
+      structuredClone(catalogue.context ?? {}),
     );
   }
   get remaining() {
@@ -123,9 +139,16 @@ export class ContextToolRun {
   get pagination() {
     return paginationCoverage(this.evidence);
   }
-  private reusable(evidence: ToolEvidence) {
+  private reusable(evidence: ToolEvidence, reader: BoundContextReader) {
+    if (reader.allowEvidenceReuse !== true) return false;
     try {
-      verifyToolEvidence(evidence.tool, evidence.arguments, evidence.result, this.now());
+      verifyToolEvidence(
+        evidence.tool,
+        evidence.arguments,
+        evidence.result,
+        this.now(),
+        this.tools.find((tool) => tool.name === evidence.tool),
+      );
       return true;
     } catch {
       return false;
@@ -152,7 +175,14 @@ export class ContextToolRun {
         this.denied = true;
         return undefined;
       }
-      if (this.reusable(existing)) return existing;
+      if (this.reusable(existing, current)) {
+        const catalogue = current.describe
+          ? await current.describe(signal)
+          : { tools: await current.discover(signal) };
+        const before = this.tools.find((tool) => tool.name === name);
+        const after = catalogue.tools.find((tool) => tool.name === name);
+        if (before && after && sameToolContract(before, after)) return existing;
+      }
       if (this.remaining <= 0) {
         this.retire(existing);
         return undefined;
@@ -176,7 +206,7 @@ export class ContextToolRun {
     let replaced: { id: string; index: number } | undefined;
     try {
       const tool = this.tools.find((tool) => tool.name === name);
-      if (!tool || !isContextReadTool(name)) throw new ContextEngineError('TOOL_UNAVAILABLE');
+      if (!tool) throw new ContextEngineError('TOOL_UNAVAILABLE');
       if (Buffer.byteLength(argumentsJson) > 16384)
         throw new ContextEngineError('INVALID_ARGUMENTS');
       try {
@@ -191,8 +221,7 @@ export class ContextToolRun {
         Object.keys(args).some((key) => forbidden.has(key))
       )
         throw new ContextEngineError('INVALID_ARGUMENTS');
-      const checked = this.validator.getValidator(tool.inputSchema)(args);
-      if (!checked.valid) throw new ContextEngineError('INVALID_ARGUMENTS');
+      if (!schemaAccepts(tool.inputSchema, args)) throw new ContextEngineError('INVALID_ARGUMENTS');
       if (name === 'search_crm_leads' || name === 'crm_summary') {
         const window = ['period', 'date_from', 'date_to'].some((key) => args[key] !== undefined);
         // MCP's JSON Schema does not express every backend filter dependency.
@@ -211,7 +240,14 @@ export class ContextToolRun {
         throw new ContextEngineError('PAGINATION_STALLED');
       const cached = this.evidence.find((e) => queryKey(e.tool, e.arguments) === fingerprint);
       if (cached) {
-        if (this.reusable(cached)) {
+        const currentCatalogue =
+          reader.allowEvidenceReuse === true
+            ? reader.describe
+              ? await reader.describe(signal)
+              : { tools: await reader.discover(signal) }
+            : undefined;
+        const currentTool = currentCatalogue?.tools.find((item) => item.name === name);
+        if (this.reusable(cached, reader) && currentTool && sameToolContract(tool, currentTool)) {
           return {
             ok: true,
             evidence_id: cached.id,
@@ -266,7 +302,7 @@ export class ContextToolRun {
       });
       const result = await reader.call(name, args, signal);
       signal.throwIfAborted();
-      verifyToolEvidence(name, args, result, this.now());
+      verifyToolEvidence(name, args, result, this.now(), tool);
       const size = Buffer.byteLength(JSON.stringify(result));
       if (this.bytes + size > MAX_RUN_EVIDENCE_BYTES)
         throw new ContextEngineError('RESPONSE_TOO_LARGE');
@@ -299,7 +335,7 @@ export class ContextToolRun {
       const code = error instanceof ContextEngineError ? error.code : 'UNAVAILABLE';
       if (code === 'AUTH_REQUIRED' || code === 'ACCESS_DENIED') this.denied = true;
       // No upstream exception bodies or failed tool data enter the model or logs.
-      const tool = isContextReadTool(name) ? name : 'unknown';
+      const tool = this.tools.some((item) => item.name === name) ? name : 'unknown';
       await this.record?.('tool_failed', {
         version: 2,
         operationId,
@@ -328,7 +364,7 @@ export class ContextToolRun {
           : code === 'PAGINATION_STALLED'
             ? 'The source repeated a cursor. Stop this traversal; preserve unique records already retrieved and state that coverage is partial. Do not bypass the cycle by changing page size.'
             : code === 'INVALID_ARGUMENTS'
-              ? 'Check the advertised schema and omit unset fields. CRM date_field requires a period or date_from/date_to; never combine these with follow_up_status. For all dates, omit date_field, period, date_from, date_to and follow_up_status.'
+              ? 'Check the current advertised schema and source guidance. Omit unset fields, and correct the invalid argument or filter combination.'
               : error instanceof ContextEngineError && error.retryable
                 ? 'A transient read may be retried once with the same arguments, within the run deadline and after Retry-After if supplied. Do not change the query to bypass a delay. If recovery is unavailable, preserve useful results from other sources and explain the limitation.'
                 : code === 'RESPONSE_TOO_LARGE'

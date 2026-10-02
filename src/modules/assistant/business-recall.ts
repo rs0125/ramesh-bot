@@ -98,7 +98,8 @@ export function businessRecall(
           same_order:
             check.records && currentRecords ? check.records.order === currentRecords.order : null,
         });
-        if (toolEvidenceFingerprint(result.result) !== check.fingerprint) unchanged = false;
+        if (toolEvidenceFingerprint(result.result, result.tool) !== check.fingerprint)
+          unchanged = false;
       }
       const reads = run.evidence.filter((e) => ids.includes(e.id));
       // Keep the provider's tool-output limit; the formatter/reviewer still receive the full ledger.

@@ -6,10 +6,9 @@ The optional business-read flag in this checkout now enables the full employee-p
 
 Reviewed **2 October 2026** through release `cdd9881`. Production runs Sol with the
 LangGraph agent, separate Supabase queues, media and debouncing, active employee
-business reads, and 14 signed CRM/supply/knowledge tools. Roster RLS is provisioned.
+business reads, and the employee-permitted signed Context Engine catalogue. Roster RLS is provisioned.
 Concurrent LID resolution and delivery acknowledgements are corrected; see
-[the delivery incident](agent-modules/40-delivery-acknowledgements.md). Analytics
-signing scopes, reminders and writes remain separate rollout work.
+[the delivery incident](agent-modules/40-delivery-acknowledgements.md). Analytics signing scopes were enabled on 3 October; the actual production probe passed GA4 and Search Console. Reminders and writes remain separate work.
 
 The `ramesh-bot-production` CloudFormation stack in Mumbai (`ap-south-1`) owns a dedicated Ubuntu 24.04 `t3.micro`, a security group with **no inbound rules**, its instance profile, a fixed SSM deployment document, the GitHub deployment role, and a private backup bucket. The instance uses an automatically assigned public IPv4 address for outbound traffic. The application listens only on `127.0.0.1:3011`.
 
@@ -74,7 +73,7 @@ Readiness checks validate the process, release, and configured databases without
 | `AGENT_TIMEOUT_MS`, `AGENT_MAX_OUTPUT_TOKENS`          | `240000` and `6000`                                                                 |
 | `BUSINESS_READS_ENABLED`, `BUSINESS_READ_EMPLOYEE_IDS` | `true`, `all`; current employee permissions still apply                             |
 | `CONTEXT_MCP_URL`                                      | Production Context Engine `/mcp/ramesh` endpoint                                    |
-| `CONTEXT_RAMESH_SIGNING_KEY_JSON`                      | Protected private signing key; three registered CRM/supply/knowledge scopes         |
+| `CONTEXT_RAMESH_SIGNING_KEY_JSON`                      | Protected private signing key; four registered read scopes, including analytics     |
 | `CONTEXT_OAUTH_REDIRECT_URI`                           | Optional legacy OAuth enrollment only; owned callback allowlisted by Context Engine |
 
 For an authorized AWS CLI environment update, read the current SecureString into protected memory/a private temporary file, merge only the intended fields, and preserve all other values. Write the complete merged JSON through `aws ssm put-parameter --cli-input-json file://...` as `SecureString`; avoid secret values in command arguments, logs, or terminal output. Check the expected parameter version before overwriting. Then install the matching host environment atomically with root ownership/mode `0600`, keeping a protected backup. Verify field presence and nonsecret settings, and restart through the normal release process or a controlled service restart. Do not print the decrypted parameter or `worker.env`.
@@ -110,3 +109,22 @@ Historical infrastructure estimate: the AWS Price List API on September 30, 2026
 Production message migrations through `202610020005` are applied and verified through the restricted worker login. The separate capture schema remains isolated. Audio uploads directly to STT; `ffmpeg` is not a runtime/bootstrap prerequisite. Runtime version 6 added independent STT credentials and `gpt-4o-transcribe`; version 7 enabled business reads for all active employees and selected Sol/medium with 240 seconds/6,000 tokens. Both Parameter Store and the root-only host environment were updated with other fields preserved, then the actual process environment was verified after restart. Inbound windows are 1 second for ordinary text, 3 seconds for forwarded/media bursts and an 8-second maximum; outbound pacing is separate.
 
 The production capture proof resolved the actual reciprocal WhatsApp LID mapping, discovered 14 permitted reads, retrieved CRM data through the full graph and passed fresh delivery authorization. It did not instantiate a sender or send a test message. `/healthz` still checks process/databases rather than employee visibility, model access or advertised tools; an automated post-deploy capability smoke remains a follow-up.
+
+## Analytics and dynamic discovery rollout, 3 October 2026
+
+Context Engine release `5b6f41a` accepts the same four read scopes for signed
+WhatsApp requests as for its other clients. The existing public registration and
+worker signer now include `analytics:read`; key material and expiry were preserved.
+The encrypted runtime backup advanced from version 7 to 8, with the matching host
+field updated and a controlled restart. Other runtime settings were preserved.
+The model-free production probe passed identity, catalogue, CRM, warehouses,
+knowledge, GA4 and Search Console, including source receipt checks.
+
+`USAGE_MODE` remains `off`. Dollar caps and reviewed prices are optional operational
+controls, not prerequisites for using this internal bot. Existing model-call,
+tool-loop, timeout and media bounds remain active; paid evaluation approval rules
+are separate. No paid model checks or WhatsApp test sends were used for this rollout.
+
+The [dynamic discovery contract](agent-modules/45-dynamic-tool-discovery.md) lets
+Context Engine supply permitted read tools and their guidance without a matching
+Ramesh name-list edit. Discovery metadata does not replace live authorization.

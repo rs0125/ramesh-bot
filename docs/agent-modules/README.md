@@ -137,7 +137,8 @@ Production media/message schema migration `202610020005` remains a prerequisite.
 
 - [41. Recall and source labels](41-recall-and-source-labels.md): changed-result recovery, current-source continuations and inert labels across CRM, knowledge and analytics.
 - [42. Evaluation spending](42-evaluation-spend-controls.md): Luna defaults, bounded case selection, explicit Sol approval and manual-only paid CI.
-- [43. Usage ledger and budgets](43-usage-ledger-and-budgets.md): HTTP-attempt reservations, operator-reviewed pricing, atomic currency caps, isolated capture accounting and retained unknown usage. Implemented locally; runtime metering defaults off.
-- [44. Capability readiness](44-capability-readiness.md): bounded checks of a configured employee's actual source and receipt path, without model calls or WhatsApp delivery. Implemented locally; not automatically added to deployment.
+- [43. Usage ledger and budgets](43-usage-ledger-and-budgets.md): HTTP-attempt reservations, operator-reviewed pricing, atomic currency caps, isolated capture accounting and retained unknown usage. Deployed; optional runtime metering remains off.
+- [44. Capability readiness](44-capability-readiness.md): bounded checks of a configured employee's actual source and receipt path, without model calls or WhatsApp delivery. Deployed and used for production verification; not automatically added to deployment.
+- [45. Dynamic tool discovery](45-dynamic-tool-discovery.md): live employee-scoped catalogues, schemas and guidance; generic read evidence and request binding; independent Context Engine tool development.
 
 See the [2 October production capability review](../capability-review-2026-10-02.md) for deployed versus local-only capabilities, remaining work and AI Engineer research.

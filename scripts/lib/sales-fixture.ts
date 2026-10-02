@@ -444,6 +444,7 @@ export function createSalesFixture(now = Date.now) {
       search: async () => salesEvidence('search_crm_leads', {}, now(), state),
       tools: {
         employeeId: state.employeeId,
+        allowEvidenceReuse: true,
         discover: async () => {
           state.discoveries++;
           return state.tools;

@@ -4,9 +4,17 @@ import { z } from 'zod';
 import {
   ContextEngineError,
   CONTEXT_READ_TOOLS,
+  isContextReadTool,
   type ContextReadTool,
   type ContextEvidence,
+  type ContextToolDefinition,
 } from '../context-engine/context.types.js';
+import {
+  argumentsSha256,
+  canonicalJson,
+  schemaAccepts,
+  TOOL_NAME,
+} from '../context-engine/read-contract.js';
 import { indiaDate } from './followups.js';
 import { recordIdentity, recordIdentitySchema } from './record-identity.js';
 import {
@@ -31,9 +39,7 @@ export const toolDeliverySchema = z
       .array(
         z
           .object({
-            tool: z.enum(
-              Object.keys(CONTEXT_READ_TOOLS) as [ContextReadTool, ...ContextReadTool[]],
-            ),
+            tool: z.string().regex(TOOL_NAME),
             arguments: z.record(z.string(), z.unknown()),
             fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
             records: recordIdentitySchema.optional(),
@@ -103,14 +109,43 @@ export function verifyToolEvidence(
   args: Record<string, unknown>,
   evidence: ContextEvidence,
   now = Date.now(),
+  definition?: ContextToolDefinition,
 ): void {
+  if (
+    !TOOL_NAME.test(tool) ||
+    !evidence.source_path.startsWith('/api/v1/') ||
+    evidence.source_path.includes('\\')
+  )
+    invalid();
   const citation = new URL(evidence.source_path, 'https://context.invalid');
   if (
     citation.origin !== 'https://context.invalid' ||
-    citation.pathname !== sourcePath(tool, args) ||
+    citation.pathname !== evidence.source_path.split(/[?#]/)[0] ||
+    /%(?:2e|2f|5c)/i.test(citation.pathname) ||
     citation.hash
   )
     invalid();
+  const bound = evidence.meta.toolName !== undefined || evidence.meta.argumentsSha256 !== undefined;
+  if (
+    (bound || !isContextReadTool(tool)) &&
+    (evidence.meta.toolName !== tool || evidence.meta.argumentsSha256 !== argumentsSha256(args))
+  )
+    invalid();
+  if (definition?.outputSchema && !schemaAccepts(definition.outputSchema, evidence)) invalid();
+  const generated = Date.parse(evidence.meta.generatedAt);
+  if (
+    evidence.status !== 200 ||
+    !evidence.meta.requestId ||
+    !Number.isFinite(generated) ||
+    Math.abs(now - generated) > 120_000
+  )
+    invalid();
+  if (Buffer.byteLength(JSON.stringify(evidence)) > MAX_TOOL_RESULT_BYTES)
+    throw new ContextEngineError('RESPONSE_TOO_LARGE');
+  // New CE tools use their live output schema and request binding. Existing source-specific
+  // checks remain compatibility semantics, not an admission list for future tools.
+  if (!isContextReadTool(tool)) return;
+  if (citation.pathname !== sourcePath(tool, args)) invalid();
   const expected = Object.entries(args).filter(
     ([name]) =>
       (CONTEXT_READ_TOOLS[tool] !== 'analytics:read' || ANALYTICS_CITATION_FIELDS.has(name)) &&
@@ -123,16 +158,6 @@ export function verifyToolEvidence(
     expected.some(([name, value]) => citation.searchParams.get(name) !== String(value))
   )
     invalid();
-  const generated = Date.parse(evidence.meta.generatedAt);
-  if (
-    evidence.status !== 200 ||
-    !evidence.meta.requestId ||
-    !Number.isFinite(generated) ||
-    Math.abs(now - generated) > 120_000
-  )
-    invalid();
-  if (Buffer.byteLength(JSON.stringify(evidence)) > MAX_TOOL_RESULT_BYTES)
-    throw new ContextEngineError('RESPONSE_TOO_LARGE');
   const data = evidence.data;
   if (CONTEXT_READ_TOOLS[tool] === 'analytics:read') {
     verifyAnalyticsEvidence(tool, args, data, now);
@@ -217,7 +242,18 @@ export function verifyToolEvidence(
 }
 
 /** Ignore retrieval clocks, not record timestamps or business values. */
-export function toolEvidenceFingerprint(evidence: ContextEvidence): string {
+export function toolEvidenceFingerprint(evidence: ContextEvidence, tool?: ContextReadTool): string {
+  const name =
+    tool ?? (typeof evidence.meta.toolName === 'string' ? evidence.meta.toolName : undefined);
+  if (name !== undefined && !isContextReadTool(name)) {
+    const value = structuredClone(evidence);
+    const metadata: Record<string, unknown> = { ...value.meta };
+    delete metadata.requestId;
+    delete metadata.generatedAt;
+    return createHash('sha256')
+      .update(canonicalJson({ ...value, meta: metadata }))
+      .digest('hex');
+  }
   const data = structuredClone(evidence.data);
   if (evidence.source_path.startsWith('/api/v1/analytics/')) removeAnalyticsRetrievalClocks(data);
   delete data.source_status;
@@ -265,7 +301,7 @@ export function toolDelivery(
       return {
         tool: item.tool,
         arguments: item.arguments,
-        fingerprint: toolEvidenceFingerprint(item.result),
+        fingerprint: toolEvidenceFingerprint(item.result, item.tool),
         ...(records ? { records } : {}),
       };
     }),

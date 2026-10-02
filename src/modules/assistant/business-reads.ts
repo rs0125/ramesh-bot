@@ -201,7 +201,7 @@ export class BusinessReadService {
           const current = await this.resolve(key, signal);
           if (current?.employeeId !== receipt.employeeId)
             return deny('IDENTITY_CHANGED', check.tool);
-          if (toolEvidenceFingerprint(result) !== check.fingerprint)
+          if (toolEvidenceFingerprint(result, check.tool) !== check.fingerprint)
             return deny('SOURCE_CHANGED', check.tool);
           return true;
         };

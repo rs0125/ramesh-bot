@@ -1,7 +1,8 @@
 # Tool extensibility without changing the agent graph
 
-Status: current extension boundaries audited; writes and an arbitrary tool plugin
-registry remain future work. Adding an advertised tool is not permission to run it.
+Status: dynamic first-party read discovery is implemented; writes and arbitrary
+third-party tools remain future work. Advertising a tool does not grant permission
+to run it. See the [live read contract](45-dynamic-tool-discovery.md).
 
 ## Current compatibility
 
@@ -9,8 +10,8 @@ registry remain future work. Adding an advertised tool is not permission to run 
 | ------------------------ | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | Converser/planner/worker | Plan from the permitted live catalogue and JSON Schemas; graph stages do not enumerate business workflows | Same graph can plan a different capability                                                    |
 | Model adapter            | Native Responses function calls with generic names, schemas and outputs                                   | No new agent or provider implementation required                                              |
-| Context executor         | Filters to `CONTEXT_READ_TOOLS`, validates schemas and read-result envelopes                              | New approved read needs registration and result validation                                    |
-| Evidence/delivery        | Domain-aware source paths, freshness checks and encrypted read receipts; replays reads before delivery    | New read needs a stable evidence fingerprint and revalidation contract                        |
+| Context executor         | Admits current employee-permitted read contracts, validates schemas and evidence                          | New conforming reads need server registration; no bot name-list edit                          |
+| Evidence/delivery        | Domain-aware source paths, freshness checks and encrypted read receipts; replays reads before delivery    | Generic reads use request binding and full evidence replay; domain checks remain specialized  |
 | Media                    | Same-owner image/PDF extraction and audio transcription; 24-hour private retention                        | Useful input today; extraction is bounded and potentially lossy, not a general document index |
 | Writes                   | No write transport, confirmation state, idempotent command lifecycle or write receipt                     | Requires an effect adapter and the action lifecycle in module 17                              |
 
@@ -21,8 +22,9 @@ Implementation references: `src/modules/assistant/task-plan.ts`, `sales.graph.ts
 ## Extension contract
 
 Keep the shared graph concerned with intent, outcomes, execution, evidence and
-response quality. A tool adapter owns domain validation and authority. A future
-application-owned registry should describe each capability with:
+response quality. Context Engine owns read registrations and domain authority.
+Its live read contract carries schemas and minimum scopes; future effect adapters
+should also describe each capability with:
 
 - Stable name/version and discovered input schema.
 - Effect class: read, private artifact analysis, proposal, or write.
@@ -32,16 +34,18 @@ application-owned registry should describe each capability with:
 - Read freshness/revalidation, or write idempotency/reconciliation and authoritative
   postcondition checks. These are different contracts.
 
-Registry entries must be installed by application code/configuration. Neither an
-MCP annotation, source document nor a model-generated label may authorize a write.
-Unknown capabilities remain unavailable until their adapter is registered.
+First-party read tools are discovered from the authenticated Context Engine at
+runtime. They need the versioned read contract and current employee permission,
+not a matching bot-side registration. New effects remain unavailable until their
+adapter is implemented. Neither an MCP annotation, source document nor a
+model-generated label may authorize a write.
 
 Context Engine also requires an explicit platform list for every tool. Its admin
 **Prompts → Available on** selector controls `claude` and `whatsapp` independently;
 the authenticated `/mcp/ramesh` endpoint selects WhatsApp on the server. Keep this
-selection separate from `CONTEXT_READ_TOOLS`: platform selection decides which
-tools the server offers, while the local registry decides which offers have a
-supported adapter. The worker refreshes discovery before every call and receipt
+selection separate from employee permissions: platform selection decides which
+tools the server offers, while current permissions and the read contract decide
+which offers Ramesh can use. The worker refreshes discovery before every call and receipt
 replay. A tool removed during an in-flight read produces a non-retryable
 `TOOL_UNAVAILABLE`; there is no fallback to the Claude endpoint.
 

@@ -135,19 +135,18 @@ test('MCP performs discovery, verifies employee identity, and preserves evidence
   assert.ok(!JSON.stringify(toolCalls.map(({ rpc }) => rpc)).includes(token()));
 });
 
-test('discovery exposes only approved, granted read tools; future writes are refused before auth', async () => {
+test('discovery exposes granted read tools; unsupported operations are refused before execution', async () => {
   const fixture = fakeServer({ scopes: ['crm:read'] });
   const client = new ContextEngineMcpClient(config, resolver, fixture.fetch);
   assert.deepEqual(
     (await client.discover(sender)).map((tool) => tool.name),
     ['get_context', 'search_crm_leads'],
   );
-  const before = fixture.calls.length;
   await assert.rejects(
     client.call(sender, 'delete_crm_lead' as ContextReadTool, {}),
     failsWith('TOOL_UNAVAILABLE'),
   );
-  assert.equal(fixture.calls.length, before);
+  assert.ok(!fixture.calls.some(({ rpc }) => rpc.params?.name === 'delete_crm_lead'));
   await assert.rejects(
     client.call(sender, 'read_warehouse', { id: 1 }),
     failsWith('TOOL_UNAVAILABLE'),

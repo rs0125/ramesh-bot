@@ -1,6 +1,6 @@
 import { loadPrompt } from './prompt-files.js';
 /** Personal-assistant instructions; exported names retained for graph compatibility. */
-export const SALES_PROMPT_VERSION = 'ramesh-chief-of-staff-v23';
+export const SALES_PROMPT_VERSION = 'ramesh-chief-of-staff-v25';
 const evidencePolicy = loadPrompt('evidence-policy');
 export const SALES_MANAGER_PROMPT = `${loadPrompt('chief-of-staff')}\n\n${loadPrompt('planning-reference')}\n\n${evidencePolicy}`;
 export const BUSINESS_FORMATTER_PROMPT = `${loadPrompt('business-formatter')}\n\n${evidencePolicy}`;

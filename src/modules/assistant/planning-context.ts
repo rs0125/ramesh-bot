@@ -1,4 +1,5 @@
 import type { ContextToolRun } from './tool-executor.js';
+import { readContract } from '../context-engine/read-contract.js';
 
 /** Application-owned orientation, with no credentials, private history or model-selected identity. */
 export function planningContext(
@@ -14,15 +15,7 @@ export function planningContext(
     access,
     available_tools: names,
     available_source_families: [
-      ...(names.includes('get_context') ? ['employee_context'] : []),
-      ...(names.some((n) => n.includes('knowledge')) ? ['company_knowledge'] : []),
-      ...(names.some((n) => n.includes('crm')) ? ['crm'] : []),
-      ...(names.some((n) => n.includes('warehouse') || n === 'assess_shortlist') ? ['supply'] : []),
-      ...(names.some(
-        (n) => n.includes('analytics') || n === 'ga4_report' || n === 'search_console_report',
-      )
-        ? ['website_analytics']
-        : []),
+      ...new Set(tools.map((tool) => readContract(tool)?.sourceFamily).filter(Boolean)),
     ],
     private_selection_recall_available: tools.length > 0 && recallAvailable,
     function_schema_reference:

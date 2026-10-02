@@ -18,7 +18,7 @@ test('planning reference is derived from live permitted tools and trusted audien
   );
   const run = (await fixture.service.openTools(trusted, signal())).run!;
   const brief = planningContext(run, 'dm', 'available', true);
-  assert.deepEqual(brief.available_source_families, ['employee_context', 'company_knowledge']);
+  assert.deepEqual(brief.available_source_families, ['context', 'knowledge']);
   assert.deepEqual(brief.available_tools, ['get_context', 'search_knowledge']);
   assert.equal(brief.private_selection_recall_available, true);
   assert.equal(brief.remaining_source_proposals, 24);

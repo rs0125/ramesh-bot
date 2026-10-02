@@ -34,7 +34,8 @@ export interface EmployeeRequestGrant {
   authorize(request: Request, signal: AbortSignal): Promise<Request>;
 }
 
-export const CONTEXT_READ_TOOLS = {
+/** Legacy semantic validators, not the universe of admissible tools. Live MCP owns admission. */
+export const CONTEXT_READ_TOOLS: Readonly<Record<string, string | null | undefined>> = {
   get_context: null,
   search_knowledge: 'knowledge:read',
   read_knowledge: 'knowledge:read',
@@ -53,9 +54,8 @@ export const CONTEXT_READ_TOOLS = {
   ga4_report: 'analytics:read',
   search_console_report: 'analytics:read',
 } as const;
-export type ContextReadTool = keyof typeof CONTEXT_READ_TOOLS;
-export const isContextReadTool = (name: string): name is ContextReadTool =>
-  Object.hasOwn(CONTEXT_READ_TOOLS, name);
+export type ContextReadTool = string;
+export const isContextReadTool = (name: string): boolean => Object.hasOwn(CONTEXT_READ_TOOLS, name);
 
 /** Preserve source metadata, cursors, uncertainty and access/freshness evidence for the verifier. */
 export interface ContextEvidence {
@@ -69,12 +69,24 @@ export interface ContextToolDefinition {
   name: ContextReadTool;
   description?: string;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+    [field: string]: unknown;
+  };
+  _meta?: Record<string, unknown>;
+}
+export interface ContextCatalogue {
+  tools: ContextToolDefinition[];
+  guidance?: string;
+  /** Bounded orientation metadata from authenticated get_context, never caller identity input. */
+  context?: Record<string, unknown>;
 }
 export interface ContextToolGateway {
-  describe?(
-    sender: ContextSender,
-    signal?: AbortSignal,
-  ): Promise<{ tools: ContextToolDefinition[]; guidance?: string }>;
+  describe?(sender: ContextSender, signal?: AbortSignal): Promise<ContextCatalogue>;
   discover(sender: ContextSender, signal?: AbortSignal): Promise<ContextToolDefinition[]>;
   call(
     sender: ContextSender,
