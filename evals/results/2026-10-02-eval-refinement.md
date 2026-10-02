@@ -158,9 +158,22 @@ boundary was fixed and has an integration regression test. The original failed
 smoke log was retained before the successful rerun.
 
 The first pushed CI run passed 222/223 tests and failed the real audio-normalization
-test with `AUDIO_DECODE_FAILED`. CI now explicitly installs the native `ffmpeg`
-dependency, matching the prepared EC2 host. The failed run remains visible and
-did not trigger deployment.
+test with `AUDIO_DECODE_FAILED`. An explicit CI `ffmpeg` install fixed that run in
+commit `4822924`, which passed CI. Subsequent review of the old bot and direct Ogg
+API checks showed that mandatory conversion was unnecessary. The
+[direct-upload follow-up](../../docs/agent-modules/38-direct-audio-transcription.md)
+removes that runtime dependency and its CI/bootstrap install. The failed run
+remains visible and did not trigger deployment.
+
+The direct-upload follow-up passed **224/224 deterministic tests**, schema
+validation, type checking, build and formatting against a disposable local
+PostgreSQL instance. A fresh real API/Supabase capture voice smoke passed **10/10
+checks** with the same three-note batch and follow-up contract. Its first attempt
+reported 9/10 because the order matcher expected `floor plan` and STT returned
+`floorplan`; the actual transcript order was correct. The matcher now accepts
+both spellings. The original result and successful rerun are retained separately
+as `.local/media-smoke/direct-stt-quotes.json` and `direct-stt-quotes-2.json`.
+These are direct-upload checks, separate from the earlier converted-audio run.
 
 The [STT comparison](2026-10-02-stt-comparison.md) retains all 24 API trials across
 three models. Every model passed English checks and failed the poor synthetic

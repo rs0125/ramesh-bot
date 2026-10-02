@@ -82,4 +82,4 @@ Semantic review can still over-reject useful answers or miss a subtle unsupporte
 
 Account-wide work processing remains serial; per-sender burst collection does not yet mean concurrent research workers. Media extraction is bounded and potentially lossy, and later references select at most eight recent unexpired same-owner files. Unmentioned group media is not automatically downloaded. Paused-task checkpoints, reminders, business writes and calendar/HRMS integration remain separate increments.
 
-Deployment requires the production migration and ffmpeg installation before releasing this checkout. The local test GUI is capture-only, and private cases must stay ignored.
+At the time of this run, deployment required the production migration and ffmpeg installation. The subsequent [direct-audio change](../../docs/agent-modules/38-direct-audio-transcription.md) removes the runtime ffmpeg requirement; the measurements above remain historical. The local test GUI is capture-only, and private cases must stay ignored.

@@ -141,7 +141,7 @@ await writeFile(
       references: STT_CASES.map((c) => ({ id: c.id, segments: c.segments })),
       results,
       limitation:
-        'Synthetic speech semantic smoke tests, not real-voice WER or proof of multilingual production accuracy. Latency includes normalization and network. Every trial retained.',
+        'Synthetic speech semantic smoke tests, not real-voice WER or proof of multilingual production accuracy. Latency includes upload and provider processing; synthetic encoding occurs before timing. Every trial retained.',
     },
     null,
     2,

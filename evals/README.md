@@ -167,12 +167,17 @@ CI results are refused. A regrade is not a fresh validation of newer agent code.
 
 `npm run eval:stt` compares `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` and
 `gpt-transcribe` on four fictional generated English/Hindi audio cases, twice per
-model. It requires ffmpeg, espeak-ng and an authorized OpenAI key, and saves every
+model. Generating these synthetic fixtures requires ffmpeg and espeak-ng; the bot
+and ordinary CI do not require either program. The runner uses an authorized
+OpenAI key and saves every
 transcript under ignored `.local/stt-evals`. `OPENAI_STT_API_KEY` takes precedence
 for audio; `OPENAI_TRANSCRIBE_MODEL` controls runtime transcription independently
 of the assistant model. This paid opt-in smoke is not a human-audio accuracy
 benchmark. Unit/integration checks cover exact quoted delivery, ordering,
 expiration, key routing and the forwarded-audio debounce without WhatsApp.
+The current adapter uploads original accepted audio bytes directly. The first
+published comparison used the earlier conversion path; its recorded timings
+remain historical rather than being relabelled as direct-upload measurements.
 
 The public judge now evaluates one delivered turn per API request. It receives only
 preceding conversation and that turn's evidence/permissions, so it cannot read

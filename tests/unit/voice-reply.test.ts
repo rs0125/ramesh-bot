@@ -143,6 +143,30 @@ function wav() {
 }
 test('real SDK routes audio to the STT key/model and PDF to the Responses key without provider storage', async () => {
   const calls: string[] = [];
+  const uploads = [
+    { bytes: wav(), mime: 'audio/wav', extension: 'wav' },
+    {
+      bytes: Buffer.from('OggS synthetic SDK transport fixture'),
+      mime: 'audio/ogg',
+      extension: 'ogg',
+    },
+    {
+      bytes: Buffer.from('ID3 synthetic SDK transport fixture'),
+      mime: 'audio/mpeg',
+      extension: 'mp3',
+    },
+    {
+      bytes: Buffer.from('synthetic MP4 SDK transport fixture'),
+      mime: 'audio/mp4',
+      extension: 'mp4',
+    },
+    {
+      bytes: Buffer.from('synthetic WebM SDK transport fixture'),
+      mime: 'audio/webm',
+      extension: 'webm',
+    },
+  ];
+  let audioIndex = 0;
   const config = loadAssistantConfig({
     OPENAI_API_KEY: 'responses-test',
     OPENAI_STT_API_KEY: 'stt-test',
@@ -157,7 +181,11 @@ test('real SDK routes audio to the STT key/model and PDF to the Responses key wi
       const form = init!.body as FormData;
       assert.equal(form.get('model'), 'gpt-4o-transcribe');
       assert.equal(form.get('response_format'), 'json');
-      assert.ok((form.get('file') as Blob).size > 44);
+      const file = form.get('file') as File;
+      const original = uploads[audioIndex++]!;
+      assert.equal(file.name, `voice.${original.extension}`);
+      assert.equal(file.type, original.mime);
+      assert.deepEqual(Buffer.from(await file.arrayBuffer()), original.bytes);
       return Response.json({ text: 'Verbatim transcript.' });
     }
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer responses-test');
@@ -176,13 +204,14 @@ test('real SDK routes audio to the STT key/model and PDF to the Responses key wi
       ],
     });
   });
-  assert.equal(
-    await processor.extract(
-      { bytes: wav(), mime: 'audio/wav', name: 'a.wav' },
-      AbortSignal.timeout(5000),
-    ),
-    'Verbatim transcript.',
-  );
+  for (const upload of uploads)
+    assert.equal(
+      await processor.extract(
+        { ...upload, name: '../../untrusted-file-name' },
+        AbortSignal.timeout(5000),
+      ),
+      'Verbatim transcript.',
+    );
   assert.equal(
     await processor.extract(
       { bytes: Buffer.from('%PDF-1.7'), mime: 'application/pdf', name: 'a.pdf' },
@@ -190,5 +219,46 @@ test('real SDK routes audio to the STT key/model and PDF to the Responses key wi
     ),
     'PDF content.',
   );
-  assert.equal(calls.length, 2);
+  assert.equal(audioIndex, uploads.length);
+  assert.equal(calls.length, uploads.length + 1);
+});
+
+test('direct STT rejects unsafe inputs before network access and preserves provider failures', async () => {
+  const config = loadAssistantConfig({
+    OPENAI_API_KEY: 'responses-test',
+    OPENAI_STT_API_KEY: 'stt-test',
+  })!;
+  let calls = 0;
+  const processor = new OpenAIMediaProcessor(config, undefined, async (url) => {
+    if (String(url) === 'data:,') return new Response('');
+    calls++;
+    return Response.json(
+      { error: { message: 'Unsupported audio fixture', type: 'invalid_request_error' } },
+      { status: 400 },
+    );
+  });
+  const signal = AbortSignal.timeout(5000);
+  await assert.rejects(
+    processor.extract({ bytes: Buffer.from('x'), mime: 'audio/unknown', name: 'a' }, signal),
+    /UNSUPPORTED_AUDIO/,
+  );
+  await assert.rejects(
+    processor.extract({ bytes: Buffer.alloc(0), mime: 'audio/ogg', name: 'a' }, signal),
+    /INVALID_AUDIO_SIZE/,
+  );
+  await assert.rejects(
+    processor.extract(
+      { bytes: Buffer.alloc(8 * 1024 * 1024 + 1), mime: 'audio/ogg', name: 'a' },
+      signal,
+    ),
+    /INVALID_AUDIO_SIZE/,
+  );
+  await assert.rejects(
+    processor.extract({ bytes: wav(), mime: 'audio/wav', name: 'a' }, AbortSignal.abort()),
+  );
+  assert.equal(calls, 0);
+  await assert.rejects(processor.extract({ bytes: wav(), mime: 'audio/wav', name: 'a' }, signal), {
+    status: 400,
+  });
+  assert.equal(calls, 1);
 });

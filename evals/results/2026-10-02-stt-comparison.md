@@ -27,8 +27,10 @@ Sources: [OpenAI pricing](https://developers.openai.com/api/docs/pricing),
 
 Command: `npm run eval:stt`. Four fictional scripts, two trials, three models:
 **24 API trials, all retained**. Local espeak-ng speech was compressed to 16 kbps
-mono Ogg/Opus and passed through the same bounded ffmpeg normalization and OpenAI
-adapter used by the application. No real voices, CRM data or WhatsApp transport.
+mono Ogg/Opus and passed through the bounded ffmpeg normalization and OpenAI
+adapter used by the application at the time of this run. The current adapter
+uploads audio directly; the figures below describe the earlier conversion path.
+No real voices, CRM data or WhatsApp transport.
 
 | Model                  | English semantic checks | Hindi/mixed-script checks | Median elapsed |
 | ---------------------- | ----------------------- | ------------------------- | -------------- |
@@ -50,3 +52,17 @@ including background noise, numbers, names, negation and code-switching. Compare
 optional language/term hints separately rather than quietly changing one model's
 input. The repeatable runner is opt-in and does not make the ordinary CI suite
 fail because synthetic multilingual speech is not representative.
+
+## Direct-upload compatibility follow-up
+
+The old logistics bot sent original audio bytes directly to STT. A subsequent API
+check sent one fictional Ogg/Opus note unchanged to both `gpt-4o-transcribe` and
+`gpt-transcribe`. Both requests succeeded and preserved the visit day and gate
+identifier (1.64 s and 1.69 s respectively). This is format-compatibility evidence,
+not a new accuracy or latency ranking. Results remain in ignored
+`.local/media-smoke/direct-ogg-check.json`.
+
+[Module 38](../../docs/agent-modules/38-direct-audio-transcription.md) removes
+mandatory runtime conversion and CI/bootstrap ffmpeg installation. Fixture
+generation in `eval:stt` still uses ffmpeg as a developer tool. Recheck original
+Ogg compatibility whenever changing the transcription provider or model.

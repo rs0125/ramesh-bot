@@ -119,7 +119,7 @@ Use the parent plan for product intent and this directory for detailed contracts
 - [31. Private outcome evals](31-private-outcome-evals.md): real-data operator tests, excluded from git and CI artifacts.
 - [32. Inbound debounce](32-inbound-debounce.md): forwarded text/media use a sliding 3-second window; ordinary text uses 1 second; total collection capped at 8 seconds.
 
-Production schema migration `202610020005` and host `ffmpeg` are prerequisites for this worker revision. The separate Supabase capture schema is upgraded through `202610020002`. The local real-data playground uses Sol at medium tool effort. No WhatsApp connection or production queue migration is performed by its setup.
+Production schema migration `202610020005` is a prerequisite for this worker revision. Audio is uploaded directly to STT, so the worker does not require `ffmpeg`. The separate Supabase capture schema is upgraded through `202610020002`. The local real-data playground uses Sol at medium tool effort. No WhatsApp connection or production queue migration is performed by its setup.
 
 - [33. Evaluation refinement](33-eval-refinement.md): calibrated per-turn judgments,
   consistent fixtures and clocks, semantic query checks, and bounded research with
@@ -131,3 +131,4 @@ Production schema migration `202610020005` and host `ffmpeg` are prerequisites f
 - [35. Voice transcripts](35-voice-transcripts.md): exact quoted/italic audio text before one batch answer, expiring references, independent STT credentials.
 - [36. Transcription evaluation](36-transcription-evaluation.md): current model/pricing research and repeatable synthetic audio comparisons.
 - [37. Production evaluation](37-production-evaluation.md): primary-source research, current harness gaps, outcome contracts, private holdouts, judge calibration and proposed release/monitoring practices.
+- [38. Direct audio transcription](38-direct-audio-transcription.md): original-byte uploads, Ogg compatibility evidence and removal of the runtime transcoding dependency.
