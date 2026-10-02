@@ -1,4 +1,4 @@
-/** Final punctuation guard plus shared, transparent style checks for live evaluations. */
+/** Final WhatsApp formatting/punctuation guards and shared style checks. */
 export const STOCK_PHRASES = [
   /\bgreat question\b/i,
   /\bcertainly\b/i,
@@ -11,9 +11,27 @@ export const STOCK_PHRASES = [
   /\blet me know if you (?:need|have)\b/i,
 ];
 
+/** WhatsApp bold uses one asterisk per side. Leave literal code/URLs alone and
+ * do not guess at unmatched markers, escaped text or arithmetic expressions.
+ * Apply only to generated answer text, before exact voice transcripts are added.
+ */
+export function whatsappBold(text: string): string {
+  return text
+    .split(/(```[\s\S]*?(?:```|$)|``[^\n]*?``|`[^`\n]*`|(?:https?:\/\/|www\.)[^\s]+)/gi)
+    .map((part, index) =>
+      index % 2
+        ? part
+        : part.replace(
+            /(?<![\p{L}\p{N}_*\\])\*\*([^\s*](?:[^*\n]*[^\s*])?)(?<!\\)\*\*(?![\p{L}\p{N}_*])/gu,
+            '*$1*',
+          ),
+    )
+    .join('');
+}
+
 export function finishReply(text: string): string {
   return (
-    text
+    whatsappBold(text)
       // En/figure dashes normally denote ranges, including 25 Sep–1 Oct and 9 am–5 pm.
       .replace(/[\u2012\u2013]/g, '-')
       .replace(/(?<=\d)\s*[\u2014\u2015]\s*(?=\d)/g, '-')
