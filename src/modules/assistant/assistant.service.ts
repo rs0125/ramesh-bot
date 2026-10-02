@@ -14,6 +14,8 @@ import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
 import type { BusinessReadService } from './business-reads.js';
 import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js';
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
+import { bindUsageEmployee, currentUsageScope, withUsageScope } from '../usage/usage-scope.js';
+import type { UsageMeter } from '../usage/usage-meter.js';
 
 export interface AssistantReply extends PreparedReply {
   trace: AgentTrace;
@@ -24,7 +26,7 @@ export const UNAVAILABLE_REPLY = "I'm having trouble replying right now. Try aga
 export class AssistantService {
   private readonly graph;
   constructor(
-    private readonly modelConfig: Pick<AssistantConfig, 'model' | 'timeoutMs'>,
+    private readonly modelConfig: Pick<AssistantConfig, 'model' | 'timeoutMs' | 'usageMeter'>,
     private readonly model: TextModel,
     private readonly memory = new ConversationMemory(),
     private readonly observe: (trace: AgentTrace) => void = () => {},
@@ -33,6 +35,7 @@ export class AssistantService {
     private readonly runtime: {
       now?: () => number;
       observeContext?: (context: GraphContextObservation) => void;
+      usageMeter?: UsageMeter;
     } = {},
   ) {
     this.graph = buildAssistantGraph(model);
@@ -69,10 +72,33 @@ export class AssistantService {
     signal?: AbortSignal,
     trusted?: TrustedReplyContext,
   ): Promise<AssistantReply> {
+    const runId = trusted?.runId ?? randomUUID();
+    const upstream = currentUsageScope()?.scope;
+    return withUsageScope(
+      {
+        runId,
+        // Only an application-owned enclosing scope for this same turn may carry billing identity.
+        // It does not grant business access; the graph still performs live tool authorization.
+        subjectId:
+          (upstream?.runId === runId ? upstream.subjectId : undefined) ??
+          `sender:${createHash('sha256')
+            .update(message.senderId ?? message.chatId)
+            .digest('hex')}`,
+      },
+      () => this.prepareScoped(message, signal, trusted, runId),
+    );
+  }
+
+  private async prepareScoped(
+    message: GreetingCandidate,
+    signal: AbortSignal | undefined,
+    trusted: TrustedReplyContext | undefined,
+    runId: string,
+  ): Promise<AssistantReply> {
     signal?.throwIfAborted();
     const started = Date.now();
     const trace: AgentTrace = {
-      runId: trusted?.runId ?? randomUUID(),
+      runId,
       model: this.modelConfig.model,
       promptVersion: this.businessReads?.toolLoop
         ? SALES_PROMPT_VERSION
@@ -83,8 +109,16 @@ export class AssistantService {
       stages: [],
       outcome: 'completed',
     };
-    const finish = (reply: Omit<AssistantReply, 'trace'>): AssistantReply => {
+    const finish = async (reply: Omit<AssistantReply, 'trace'>): Promise<AssistantReply> => {
       trace.durationMs = Date.now() - started;
+      const meter = this.runtime.usageMeter ?? this.modelConfig.usageMeter;
+      if (meter) {
+        try {
+          trace.usage = await meter.summarize(runId);
+        } catch {
+          trace.usageUnavailable = true;
+        }
+      }
       this.observe(trace);
       return { ...reply, trace };
     };
@@ -122,11 +156,14 @@ export class AssistantService {
       const result = this.businessReads?.toolLoop
         ? await buildSalesGraph(
             this.model,
-            (readSignal) =>
-              this.businessReads!.openTools(
+            async (readSignal) => {
+              const tools = await this.businessReads!.openTools(
                 trusted?.key.remoteJid === message.chatId ? trusted : undefined,
                 readSignal,
-              ),
+              );
+              if (tools.run) bindUsageEmployee(tools.run.employeeId);
+              return tools;
+            },
             {
               now: this.runtime.now,
               researchDeadlineMs:

@@ -1,4 +1,5 @@
 /** Opt-in, nondeterministic OpenAI evaluations through isolated SQLite and capture-only delivery. */
+import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
@@ -23,6 +24,7 @@ loadEnvironment({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     model: { type: 'string' },
     trials: { type: 'string', default: '1' },
     case: { type: 'string' },
@@ -41,11 +43,17 @@ const cases = CASES.filter(
 if (!cases.length) throw new Error('No matching evaluation cases');
 const selectedModel = evalModel(values.model);
 assertEvalRun([selectedModel], cases.length * trials, values);
-const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
-if (!config) throw new Error('OPENAI_API_KEY is required for live evaluations');
+const loaded = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
+if (!loaded) throw new Error('OPENAI_API_KEY is required for live evaluations');
 const runId = `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`;
 const directory = fileURLToPath(new URL(`../.local/evals/${runId}/`, import.meta.url));
 await mkdir(directory, { recursive: true, mode: 0o700 });
+const usageMeter = await createEvalUsageMeter(
+  { ...values, campaignId: runId, directory },
+  process.env,
+  [selectedModel],
+);
+const config = { ...loaded, usageMeter };
 const db = await openLocalChatDatabase(join(directory, 'evaluation.db'));
 const model = new OpenAITextModel(config);
 type Trial = {
@@ -67,8 +75,10 @@ const started = Date.now();
 console.log(
   `Live eval: ${work.length} trials on ${config.model}. SQLite + fake transport; no WhatsApp or Supabase connections.`,
 );
+let usageBudget: Awaited<ReturnType<typeof usageMeter.report>>;
 try {
-  await Promise.all(
+  usageBudget = await settleEvalWorkers(
+    usageMeter,
     Array.from({ length: 1 }, async () => {
       for (;;) {
         const item = work.shift();
@@ -146,6 +156,7 @@ const summary = cases.map((scenario) => {
   };
 });
 const report = {
+  usageBudget,
   runId,
   model: config.model,
   promptVersion: PROMPT_VERSION,

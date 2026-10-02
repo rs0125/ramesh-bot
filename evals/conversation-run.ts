@@ -1,4 +1,5 @@
 /** Paid real-model conversational evals. Synthetic CRM/supply, no transport, retained failed trials. */
+import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdir, appendFile, writeFile, readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
@@ -42,6 +43,7 @@ dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     trials: { type: 'string', default: '1' },
     case: { type: 'string' },
     suite: { type: 'string', default: 'all' },
@@ -103,14 +105,6 @@ const loaded = loadAssistantConfig({
   ...(values['tool-effort'] ? { AGENT_TOOL_REASONING_EFFORT: values['tool-effort'] } : {}),
 });
 if (!loaded) throw new Error('OPENAI_API_KEY is required; do not pass it as a command argument');
-const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000 };
-const provider = new OpenAITextModel(config);
-const judgeLoaded = loadAssistantConfig({ ...process.env, OPENAI_MODEL: values['judge-model'] })!;
-const judgeProvider = new OpenAITextModel({
-  ...judgeLoaded,
-  timeoutMs: 90000,
-  maxOutputTokens: 5000,
-});
 const runId = `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`;
 const directory = values.output
   ? pathToFileURL(join(resolve(values.output), runId) + '/')
@@ -118,8 +112,24 @@ const directory = values.output
 const judgePrompt = await readFile(new URL('./prompts/journey-judge.md', import.meta.url), 'utf8');
 const startedAt = Date.now();
 await mkdir(directory, { recursive: true, mode: 0o700 });
+const usageMeter = await createEvalUsageMeter(
+  { ...values, campaignId: runId, directory },
+  process.env,
+  [selectedModel, values['judge-model']!],
+);
+const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000, usageMeter };
+const provider = new OpenAITextModel(config);
+const judgeLoaded = loadAssistantConfig({ ...process.env, OPENAI_MODEL: values['judge-model'] })!;
+const judgeProvider = new OpenAITextModel({
+  ...judgeLoaded,
+  usageMeter,
+  timeoutMs: 90000,
+  maxOutputTokens: 5000,
+});
+
 const manifest = promptManifest();
 const metadata = {
+  usageBudget: usageMeter.manifest,
   spendingPolicy,
   runId,
   startedAt: new Date(startedAt).toISOString(),
@@ -154,7 +164,8 @@ const jobs = cases.flatMap((scenario) =>
 console.log(
   `Conversation evals: ${jobs.length} trials using ${config.model}; synthetic data, no WhatsApp.`,
 );
-await Promise.all(
+const usageBudget = await settleEvalWorkers(
+  usageMeter,
   Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
     for (;;) {
       const item = jobs.shift();
@@ -411,6 +422,7 @@ const changedInputs = [
 ].filter((path) => metadata.inputManifest[path] !== finalInputs.inputManifest[path]);
 const report = {
   ...metadata,
+  usageBudget,
   inputIntegrity: changedInputs.length === 0,
   changedInputs,
   durationMs: Date.now() - startedAt,

@@ -49,6 +49,9 @@ test(
           assert.equal(await service.ingest(owner, source, upload), id);
           await service.drain();
           assert.equal(calls, 1);
+          assert.equal(await store.findSource(owner, source), id);
+          assert.equal(await store.findSource(owner, randomUUID()), undefined);
+          assert.equal(await store.findSource(mediaOwner('a', 'chat', 'other'), source), undefined);
           assert.equal((await store.get(mediaOwner('a', 'chat', 'other'), [id])).length, 0);
           const atRest = (
             await db.admin.query(
@@ -76,6 +79,7 @@ test(
             [id],
           );
           assert.equal((await store.get(owner, [id])).length, 0);
+          assert.equal(await store.findSource(owner, source), undefined);
           assert.match(
             await restored.context(owner, [id], 'summarize', AbortSignal.timeout(1000)),
             /unavailable_or_expired/,

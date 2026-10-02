@@ -14,6 +14,8 @@ import { OpenAIMediaProcessor } from '../src/infrastructure/openai/media-process
 import { loadDebounce } from '../src/modules/messaging/debounce.js';
 import { LiveChat } from './lib/live-chat.js';
 import { startPlaygroundServer } from './lib/playground-server.js';
+import { UsageMeter } from '../src/modules/usage/usage-meter.js';
+import { UsageLedgerRepository } from '../src/infrastructure/database/usage-ledger.repository.js';
 
 async function main() {
   const env = parse(
@@ -36,6 +38,16 @@ async function main() {
     const access = createPlaygroundAccess(config, pool);
     if (!(await access.employee(AbortSignal.timeout(config.context.timeoutMs))))
       throw new Error('CONFIGURED_EMPLOYEE_INACTIVE_OR_AMBIGUOUS');
+    const policy = config.model.usagePolicy;
+    const usageMeter =
+      policy && policy.mode !== 'off'
+        ? new UsageMeter(
+            new UsageLedgerRepository(pool, config.namespace, 'playground', 'capture'),
+            { accountId: config.namespace, purpose: 'playground', policy },
+          )
+        : undefined;
+    await usageMeter?.summarize('startup-readiness');
+    const modelConfig = { ...config.model, usageMeter };
     const media = new MediaService(
       new MediaRepository(
         pool,
@@ -43,7 +55,7 @@ async function main() {
         config.encryptionKey,
         'capture',
       ),
-      new OpenAIMediaProcessor(config.model),
+      new OpenAIMediaProcessor(modelConfig),
     );
     await media.clean();
     const maintenance = setInterval(
@@ -52,8 +64,8 @@ async function main() {
     );
     maintenance.unref();
     const chat = new LiveChat(
-      config.model,
-      new OpenAITextModel(config.model),
+      modelConfig,
+      new OpenAITextModel(modelConfig),
       repo,
       access,
       Math.max(config.context.timeoutMs, 60000),

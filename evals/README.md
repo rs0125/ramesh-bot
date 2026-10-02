@@ -4,26 +4,40 @@ The current harness exercises Ramesh as a personal chief of staff with all emplo
 
 ## Run it
 
-Routine text-agent and grader checks default to `gpt-6-luna`, one trial, one concurrent case and a three-trial allowance. Production `OPENAI_MODEL` cannot select the evaluation model; use `EVAL_MODEL` or `--model` explicitly. Supply the existing key through the ignored `.env` or CI secret, never in a command.
+Routine text-agent and grader checks default to `gpt-6-luna`, one trial, one concurrent case and a three-trial allowance. Production `OPENAI_MODEL` cannot select the evaluation model; use `EVAL_MODEL` or `--model` explicitly. Supply the existing key through the ignored `.env` or CI secret, never in a command. Every paid runner also requires an approved `--max-usd` allowance (or `EVAL_MAX_USD`) and a reviewed, versioned `EVAL_USAGE_PRICES_JSON` rate profile (`USAGE_PRICES_JSON` is the fallback). No allowance or model price is guessed. Duration-billed transcription profiles are refused in enforced campaigns until a safe duration reservation is implemented.
 
 ```sh
 # List cases without an API key or paid request.
 npm run eval:conversations -- --suite all --list
 
 # A small Luna agent + Luna grader screen: three cases, one trial each.
-npm run eval:ci -- --case changed-history,source-label-crm-name,source-label-knowledge-title
+npm run eval:ci -- --case changed-history,source-label-crm-name,source-label-knowledge-title --max-usd "$EVAL_MAX_USD"
 
 # One focused conversation, two independent trials.
-npm run eval:conversations -- --case ordinal-reference --trials 2
+npm run eval:conversations -- --case ordinal-reference --trials 2 --max-usd "$EVAL_MAX_USD"
 ```
+
+Set `EVAL_MAX_USD` to the allowance actually approved for that run before using these examples. Case listing needs neither pricing nor an API key.
 
 All paid runners reject plans exceeding `--max-trials` (default 3). This counts scenario executions, not HTTP calls or dollars. An intentional larger run needs an explicit allowance. Never launch the full 85-case suite by habit. Scope cases to the change and reuse retained traces for offline inspection.
 
 **Get the user's approval before any Sol agent or grader call**, including private live-source tests and comparison runs. State the models, cases, repetitions and expected spend/limits first. After approval, `--sol-approval <reference>` records it; the flag itself is not permission. Production and the interactive playground keep their configured models. STT uses its dedicated audio models, also with a bounded trial allowance.
 
-`--suite all|conversation|journeys|adversarial|pagination|recovery`, `--case`, `--trials 1..5`, `--concurrency 1..4`, `--model`, `--judge-model`, `--max-trials`, `--sol-approval` and `--output` are supported by the conversation runner. Every completed trial is retained. An interrupted run is incomplete, even if every completed row passed; do not rerun it merely to obtain a green summary. Limits remain 240 seconds per graph and 6000 output tokens per response. Failed/in-flight requests can have unreported billed usage.
+`--suite all|conversation|journeys|adversarial|pagination|recovery`, `--case`, `--trials 1..5`, `--concurrency 1..4`, `--model`, `--judge-model`, `--max-trials`, `--max-usd`, `--sol-approval` and `--output` are supported by the conversation runner. Every completed trial is retained. An interrupted run is incomplete, even if every completed row passed; do not rerun it merely to obtain a green summary. Limits remain 240 seconds per graph and 6000 output tokens per response. Failed/in-flight requests can have unreported billed usage.
 
 Luna checks are low-cost screening, not evidence of identical Sol behavior. No Luna quality calibration has been performed for this change. The previous Sol calibration scores remain historical. [Spending policy](../docs/agent-modules/42-evaluation-spend-controls.md).
+
+## Currency accounting
+
+A single campaign meter is shared by every agent stage, grader, repair and audio request in a runner. It wraps the provider HTTP boundary, so SDK retries consume the same allowance. Admission reserves a conservative amount before each request; completed provider usage replaces the reservation. Missing usage, network ambiguity and process interruption retain the reservation instead of becoming zero-cost calls. Concurrent cases cannot each spend the full allowance independently. A budget or pricing denial stops subsequent requests for that campaign, including requests that would individually fit the remaining allowance; already admitted work can settle.
+
+The rate profile has `{ "version": "reviewed-version", "models": { "exact-model-id": { ... } } }`. Each model needs integer `inputMicrosPerMillion` and `outputMicrosPerMillion` rates, with any applicable `cachedInputMicrosPerMillion`, `audioInputMicrosPerMillion` or `durationMicrosPerSecond`. Amounts are millionths of USD; the token rates apply to one million tokens. Include a reviewed `maxInputTokens` provider ceiling and `maxOutputTokens` where the request has no explicit output limit, as with transcription. Do not estimate these ceilings from characters or compressed audio size. Unpriced models or requests without a safe reservation are rejected. Pricing is operator-maintained and the meter is only as accurate as that reviewed profile; it is not a provider billing reconciliation service.
+
+Each run retains private `usage-policy.json`, an append-only `usage-ledger.ndjson` and a final `usage-summary.json`, also included as `usageBudget` in its report. The usage ledger contains request IDs, stages, models, policy version, reservation amounts and reported usage, never prompts, source records, media or credentials. `knownActualMicros` is incomplete whenever `costComplete` is false; inspect `heldMicros`, `unknownRequests` and `pendingRequests` too. These files remain under the run's ignored `.local` directory (or the explicit output directory). The policy snapshot is created exclusively: reusing a directory with retained campaign artifacts is rejected rather than resetting its allowance. Workers settle before the final accounting is written, including when a worker or trial artifact fails; abrupt process termination can still leave only the append-only ledger.
+
+The comparison runner splits the approved total into equal, disjoint profile allowances rounded down to one millionth of a dollar. Unused allowance is not transferred to another child. Each independent invocation is a new explicitly approved campaign, not a resumable allowance across process restarts. Preserve interrupted logs and account for them before authorizing another run.
+
+Private HTTP evaluations are disabled until the server can enforce an authenticated shared campaign allowance. A local grader cap cannot control the agent in an already-running playground, so the private runner fails before sending HTTP requests. The separate `smoke:chat:live` script owns its agent in-process and shares the campaign meter across those model requests; it requires the explicit allowance, approved rate profile and any applicable Sol approval. Intentional interactive playground chats retain their separate runtime policy. This does not affect free fixture evaluation or offline grading inspections.
 
 ## Coverage
 
@@ -54,6 +68,7 @@ The judge is probabilistic and uses the same provider/model family. It is not pr
 
 Each run writes:
 
+- `usage-policy.json` before paid requests, `usage-ledger.ndjson` on reservations/settlements and `usage-summary.json` at completion.
 - `run-metadata.json` before the first paid trial: model, limits, scenario IDs, prompt manifest, judge hash, dataset hash and a file-by-file code/input manifest.
 - `trials.ndjson` after each trial, including failures and drafts/reviews, so an interrupted run retains finished work.
 - `report.json`, `junit.xml` and `summary.md` when complete, with per-case pass rates and failure reasons.
@@ -62,13 +77,13 @@ The start-time snapshot prevents a long-running experiment from being mislabeled
 
 ## CI
 
-`.github/workflows/ci.yml` runs deterministic checks with disposable PostgreSQL and no model secret. Paid `.github/workflows/agent-evals.yml` is **manual only on main**. The dispatcher selects case IDs, repetitions, total trial allowance and model; both agent and grader default to Luna. Sol requires the explicit approval reference. Automatic weekly execution and automatic grader calibration were removed. No paid workflow runs on untrusted PR code. Configure the `agent-evals` environment's key only for intentional approved use.
+`.github/workflows/ci.yml` runs deterministic checks with disposable PostgreSQL and no model secret. Paid `.github/workflows/agent-evals.yml` is **manual only on main**. The dispatcher selects case IDs, repetitions, total trial allowance, an explicit USD allowance and model; both agent and grader default to Luna. Sol requires the explicit approval reference. Automatic weekly execution and automatic grader calibration were removed. No paid workflow runs on untrusted PR code. Configure the `agent-evals` environment's key only for intentional approved use, plus its `EVAL_USAGE_PRICES_JSON` variable with reviewed rates and ceilings for each approved model. Missing pricing or allowance fails closed.
 
 The paid job publishes the Markdown summary and uploads only `.local/ci-evals` for 14 days. These artifacts contain fictional transcripts, not real-data smoke results. The workflow is authored locally; configuring the remote environment/secret and executing it on GitHub remain deployment tasks. `npm run eval:ci` has been executed locally with the real API key.
 
 ## Real-source smoke
 
-Use `PLAYGROUND_ENV_FILE=.local/live-playground-analytics.env npm run dev:chat:live` for the currently provisioned local full-catalogue profile. The actual local Context Engine must also be running. The real-source smoke command requires explicit model/run approval when that profile uses Sol and an allowance for its five test turns; do not run it automatically. This connects actual Supabase and Context Engine, pins the authorized employee in server configuration and uses `ramesh-test-inbound-queue` / `ramesh-test-outbound-queue`. It never creates Baileys. Keep raw source/transcript artifacts private under `.local`, and report only outcomes, timings and relevant limitations outside that directory. See the [live setup](../docs/live-data-playground.md) for the older deployed-endpoint profile and provisioning steps.
+Use `PLAYGROUND_ENV_FILE=.local/live-playground-analytics.env npm run dev:chat:live` for the currently provisioned local full-catalogue profile. The actual local Context Engine must also be running. The in-process real-source smoke requires its approved `--max-usd` allowance, reviewed model pricing and explicit model/run approval when that profile uses Sol. It writes accounting in `finally` and closes its pool even if draining or summary writing fails. The HTTP private runner remains blocked because it cannot cap a separately running server. This connects actual Supabase and Context Engine, pins the authorized employee in server configuration and uses `ramesh-test-inbound-queue` / `ramesh-test-outbound-queue`. It never creates Baileys. Keep raw source/transcript artifacts private under `.local`, and report only outcomes, timings and relevant limitations outside that directory. See the [live setup](../docs/live-data-playground.md) for the older deployed-endpoint profile and provisioning steps.
 
 The current local analytics profile uses the actual Context Engine running locally against real Supabase and Google sources, because the production public key registration still needs its analytics scope rollout. Live reads proved that the signed route can expose all seventeen tools to the authorized admin. That is not a claim that every employee has admin access or that production was updated.
 
@@ -106,7 +121,7 @@ See [adversarial review](../docs/agent-modules/27-adversarial-review-and-respons
 
 ## Private real-data outcomes
 
-Run `npm run eval:private -- --base-url http://127.0.0.1:3012 --env-file .local/live-playground-sol-eval.env --case-file .local/private-evals/cases.json`. The localhost server must report capture delivery and no WhatsApp transport. The runner uses the server-configured employee, actual Context Engine/Supabase and an independent Terra judge. It checks employee outcomes against private reference facts and fresh source evidence, without prescribing tool selection or order. Private cases/results cannot run in CI and are never in the CI artifact path.
+`npm run eval:private` currently stops with `REMOTE_EVAL_BUDGET_UNSUPPORTED` before reading private cases or contacting the server. Re-enable it only after the capture server accepts a trusted, enforceable campaign allowance covering its agent requests and the runner's grader. A command-line amount alone cannot cap another process. The retained real-source architecture uses the server-configured employee, actual Context Engine/Supabase, capture-only delivery and independent outcome grading; private cases/results remain forbidden in CI.
 
 Each private case has an opaque `private-*` ID, `turns`, `outcomes`, `reference` and `asOf`. Keep questions and facts only under the ignored `.local/private-evals/` directory. Files use mode 0600 and directories 0700. The runner checks the real path and git ignore status. Terminal output contains opaque case IDs and aggregate pass counts only.
 

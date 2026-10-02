@@ -22,6 +22,11 @@ import { MediaRepository } from '../infrastructure/database/media.repository.js'
 import { MediaService } from '../modules/media/media.service.js';
 import { OpenAIMediaProcessor } from '../infrastructure/openai/media-processor.js';
 import { createBusinessReads } from './business-reads.js';
+import { WhatsAppEmployeeResolver } from '../infrastructure/whatsapp/employee-sender.js';
+import { EmployeeIdentityResolver } from '../modules/identity/employee-identity.js';
+import { PostgresEmployeeRoster } from '../infrastructure/database/employee-roster.js';
+import { UsageMeter } from '../modules/usage/usage-meter.js';
+import { UsageLedgerRepository } from '../infrastructure/database/usage-ledger.repository.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -56,8 +61,33 @@ export function createApplication(
     config.businessReads && messagePool
       ? createBusinessReads(config.businessReads, db, messagePool, config.encryptionKey)
       : undefined;
+  const usagePolicy = config.assistant?.usagePolicy;
+  if (usagePolicy && usagePolicy.mode !== 'off' && !messagePool)
+    throw new Error('USAGE_DURABLE_DATABASE_REQUIRED');
+  const usageMeter =
+    usagePolicy && usagePolicy.mode !== 'off' && messagePool
+      ? new UsageMeter(
+          new UsageLedgerRepository(messagePool, config.messageDatabase!.accountId, 'production'),
+          {
+            accountId: config.messageDatabase!.accountId,
+            purpose: 'production',
+            policy: usagePolicy,
+            observe: (usage) => logger.info({ usage }, 'Provider usage recorded'),
+          },
+        )
+      : undefined;
+  const assistantConfig = config.assistant ? { ...config.assistant, usageMeter } : undefined;
+  // Billing identity is independent of access to business tools and also applies in groups.
+  const usageIdentity =
+    usageMeter && messagePool
+      ? new WhatsAppEmployeeResolver(
+          db,
+          config.encryptionKey,
+          new EmployeeIdentityResolver(new PostgresEmployeeRoster(messagePool)),
+        )
+      : undefined;
   const media =
-    config.assistant && messagePool && config.messageDatabase
+    assistantConfig && messagePool && config.messageDatabase
       ? new MediaService(
           new MediaRepository(
             messagePool,
@@ -65,17 +95,18 @@ export function createApplication(
             config.encryptionKey,
             'production',
           ),
-          new OpenAIMediaProcessor(config.assistant),
+          new OpenAIMediaProcessor(assistantConfig),
         )
       : undefined;
-  const assistant = config.assistant
+  const assistant = assistantConfig
     ? new AssistantService(
-        config.assistant,
-        overrides.model ?? new OpenAITextModel(config.assistant),
+        assistantConfig,
+        overrides.model ?? new OpenAITextModel(assistantConfig),
         undefined,
         (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
         inboxRepository ? (message) => inboxRepository.context(message) : undefined,
         businessReads,
+        { usageMeter },
       )
     : undefined;
   const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
@@ -100,6 +131,13 @@ export function createApplication(
           agentRuns: !!businessReads,
           media,
           accountId: config.messageDatabase.accountId,
+          usageMode: usagePolicy?.mode ?? 'off',
+          usageEmployee: usageIdentity
+            ? async (key, signal) =>
+                (await usageIdentity.resolve({ key }, signal))?.employee.employeeId
+            : undefined,
+          onUsageAttributionFailure: (reason) =>
+            logger.warn({ reason }, 'Usage attribution unavailable'),
           businessPreflight: businessReads
             ? (message, evidence, signal) =>
                 businessReads.canDeliver(
@@ -196,6 +234,7 @@ export function createApplication(
           );
         if (messageRepository) {
           await messageRepository.health();
+          await usageMeter?.summarize('startup-readiness');
           // Existing local claims suppress replies after the storage transition too.
           await messageRepository.importLegacy(await db.greeting.findMany());
           await messageRepository.clean();
@@ -235,11 +274,15 @@ export function createApplication(
         try {
           await api.stop();
         } finally {
+          durableMessages?.stopMediaIngress();
+          // Abort extractors before WhatsApp waits for a consumer that may be awaiting media.
+          const mediaStopped = media?.stop();
           try {
             await whatsapp.stop();
           } finally {
             await cleaning;
-            await media?.stop();
+            await mediaStopped;
+            await durableMessages?.drainMediaIngress();
             await db.$disconnect();
             await messagePool?.end();
           }

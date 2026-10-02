@@ -31,6 +31,18 @@ export type BusinessReadResult =
   | { outcome: 'verified'; facts: FollowupsFacts; delivery: FollowupsDelivery }
   | { outcome: 'denied' | 'unavailable' };
 
+function receiptIsFresh(
+  receipt: Pick<FollowupsDelivery, 'localDate' | 'expiresAt' | 'preparedAt'>,
+  now: number,
+) {
+  return (
+    receipt.localDate === indiaDate(now) &&
+    Date.parse(receipt.expiresAt) > now &&
+    Date.parse(receipt.preparedAt) <= now + 60_000 &&
+    now - Date.parse(receipt.preparedAt) <= 300_000
+  );
+}
+
 export class BusinessReadService {
   private readonly employees: ReadonlySet<number> | null;
   constructor(
@@ -170,10 +182,7 @@ export class BusinessReadService {
         key.fromMe ||
         !/@(s\.whatsapp\.net|lid)$/.test(key.remoteJid) ||
         !this.permits(receipt.employeeId) ||
-        receipt.localDate !== indiaDate(now) ||
-        Date.parse(receipt.expiresAt) <= now ||
-        Date.parse(receipt.preparedAt) > now + 60000 ||
-        now - Date.parse(receipt.preparedAt) > 300000
+        !receiptIsFresh(receipt, now)
       )
         return deny('INVALID_OR_EXPIRED_RECEIPT');
       try {
@@ -205,6 +214,9 @@ export class BusinessReadService {
             }
           }),
         );
+        // Source and identity checks can cross the original receipt's deadline or midnight.
+        // Fresh evidence does not renew permission to send an already prepared answer.
+        if (!receiptIsFresh(receipt, this.now())) return deny('INVALID_OR_EXPIRED_RECEIPT');
         return workers.every(Boolean) && !signal.aborted;
       } catch (error) {
         return deny(
@@ -220,16 +232,11 @@ export class BusinessReadService {
     if (!parsed.success) return deny('INVALID_RECEIPT');
     const receipt = parsed.data;
     const now = this.now();
-    if (
-      Date.parse(receipt.expiresAt) <= now ||
-      Date.parse(receipt.preparedAt) > now + 60_000 ||
-      now - Date.parse(receipt.preparedAt) > 300_000 ||
-      receipt.localDate !== indiaDate(now) ||
-      !this.permits(receipt.employeeId)
-    )
-      return false;
+    if (!receiptIsFresh(receipt, now) || !this.permits(receipt.employeeId)) return false;
     const result = await this.read({ key, runId: 'delivery-preflight' }, signal);
+    if (!receiptIsFresh(receipt, this.now())) return deny('INVALID_OR_EXPIRED_RECEIPT');
     return (
+      !signal.aborted &&
       result.outcome === 'verified' &&
       result.delivery.employeeId === receipt.employeeId &&
       followupsFingerprint(result.facts) === receipt.fingerprint

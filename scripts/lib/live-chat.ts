@@ -15,11 +15,12 @@ import {
 } from '../../src/infrastructure/database/playground.repository.js';
 import { SerialQueue } from '../../src/lib/serial-queue.js';
 import type { LocalChatInput } from './local-chat.js';
+import { withUsageScope } from '../../src/modules/usage/usage-scope.js';
 
 export class LiveChat {
   private readonly queue = new SerialQueue(16);
   constructor(
-    private readonly config: Pick<AssistantConfig, 'model' | 'timeoutMs'>,
+    private readonly config: Pick<AssistantConfig, 'model' | 'timeoutMs' | 'usageMeter'>,
     private readonly model: TextModel,
     private readonly repo: PlaygroundRepository,
     private readonly access: {
@@ -52,7 +53,12 @@ export class LiveChat {
     this.validate({ ...input, text: 'attachment' });
     if (!this.media || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(sourceId))
       throw new Error('MEDIA_UPLOAD_UNAVAILABLE');
-    return this.media.ingest(this.owner(input), sourceId, file);
+    // Uploads precede chat admission in this GUI; they have separate stable runs but
+    // share the employee/account/campaign budget with the eventual conversation.
+    return withUsageScope(
+      { runId: `upload:${sourceId}`, subjectId: `employee:${this.repo.employeeId}` },
+      () => this.media!.ingest(this.owner(input), sourceId, file),
+    );
   }
   async send(input: LocalChatInput, caller?: AbortSignal) {
     this.validate(input);
@@ -86,6 +92,11 @@ export class LiveChat {
       batch = await this.repo.batch(item.id);
     }
     const id = batch.id;
+    return withUsageScope({ runId: id, subjectId: `employee:${this.repo.employeeId}` }, () =>
+      this.processScoped(item, id, signal),
+    );
+  }
+  private async processScoped(item: CaptureInput, id: string, signal: AbortSignal) {
     const actor = await this.access.employee(signal);
     const chatId = item.group
       ? 'test-group@g.us'

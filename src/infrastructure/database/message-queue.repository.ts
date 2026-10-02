@@ -45,6 +45,18 @@ export class MessageQueueRepository {
       throw new Error('Message queue schema or runtime role is not ready');
   }
 
+  /** Early media and the later combined turn share the already committed batch root. */
+  async usageRunId(chatId: string, messageId: string): Promise<string> {
+    const result = await this.pool.query<{ id: string }>(
+      `SELECT coalesce(j.batch_parent,m.id)::text AS id FROM public."ramesh-messages" m
+       JOIN public."ramesh-inbound-queue" j ON j.message_id=m.id
+       WHERE m.account_id=$1 AND m.chat_id=$2 AND m.whatsapp_message_id=$3`,
+      [this.accountId, chatId, messageId],
+    );
+    if (!result.rows[0]) throw new Error('USAGE_MESSAGE_NOT_ADMITTED');
+    return result.rows[0].id;
+  }
+
   private async transaction<T>(work: (db: PoolClient) => Promise<T>): Promise<T> {
     const db = await this.pool.connect();
     let destroy = false;

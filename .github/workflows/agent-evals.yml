@@ -19,6 +19,10 @@ on:
         default: '3'
         required: true
         type: string
+      max_usd:
+        description: Approved total USD allowance for agent, grader and retries; required
+        required: true
+        type: string
       model:
         description: Agent and grader model
         default: 'gpt-6-luna'
@@ -62,8 +66,10 @@ jobs:
           EVAL_CASES: ${{ inputs.cases }}
           EVAL_TRIALS: ${{ inputs.trials }}
           EVAL_MAX_TRIALS: ${{ inputs.max_trials }}
+          EVAL_MAX_USD: ${{ inputs.max_usd }}
+          EVAL_USAGE_PRICES_JSON: ${{ vars.EVAL_USAGE_PRICES_JSON }}
           SOL_APPROVAL_REFERENCE: ${{ inputs.sol_approval }}
-        run: npm run eval:ci -- --case "$EVAL_CASES" --trials "$EVAL_TRIALS" --max-trials "$EVAL_MAX_TRIALS" --model "$EVAL_MODEL" --judge-model "$EVAL_MODEL" --sol-approval "$SOL_APPROVAL_REFERENCE"
+        run: npm run eval:ci -- --case "$EVAL_CASES" --trials "$EVAL_TRIALS" --max-trials "$EVAL_MAX_TRIALS" --max-usd "$EVAL_MAX_USD" --model "$EVAL_MODEL" --judge-model "$EVAL_MODEL" --sol-approval "$SOL_APPROVAL_REFERENCE"
       - name: Publish quality summary
         if: always()
         run: |

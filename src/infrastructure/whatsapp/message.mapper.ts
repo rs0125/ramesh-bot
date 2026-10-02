@@ -1,10 +1,7 @@
 /** Translates SDK messages into the small, transport-independent greeting contract. */
-import {
-  jidNormalizedUser,
-  normalizeMessageContent,
-  type WAMessage,
-} from '@whiskeysockets/baileys';
+import { jidNormalizedUser, type WAMessage } from '@whiskeysockets/baileys';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
+import { persistableMessageContent } from './media-privacy.js';
 
 export function toGreetingCandidate(
   message: WAMessage,
@@ -30,7 +27,13 @@ function mapMessage(
   if (!chatId || !messageId || !message.message) return null;
   const isGroup = chatId.endsWith('@g.us');
   if (!isGroup && !chatId.endsWith('@s.whatsapp.net') && !chatId.endsWith('@lid')) return null;
-  const content = normalizeMessageContent(message.message);
+  let content: ReturnType<typeof persistableMessageContent>;
+  try {
+    content = persistableMessageContent(message.message);
+  } catch {
+    // Do not persist captions, queue work, or download bytes from view-once messages.
+    return null;
+  }
   if (!content || content.protocolMessage || content.reactionMessage) return null;
   const kind = content.imageMessage
     ? 'image'

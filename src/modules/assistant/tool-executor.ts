@@ -1,6 +1,7 @@
 /** Application-owned read execution: discovered schemas, current employee binding, budgets and durable evidence. */
 import { randomUUID } from 'node:crypto';
 import { cyclicCursor, paginationCoverage } from './pagination.js';
+import { internalCrmReferences } from './record-identity.js';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import {
@@ -51,6 +52,10 @@ const forbidden = new Set([
 
 export class ContextToolRun {
   readonly evidence: ToolEvidence[] = [];
+  /** Removed source snapshots are no longer grounding or delivery evidence, even in old tool prose. */
+  readonly retiredEvidenceIds: string[] = [];
+  /** Source facts can expire; their known internal identifiers still must not be printed. */
+  readonly internalCrmIds = new Set<string>();
   readonly failures: Array<{
     tool: string;
     code: string;
@@ -118,6 +123,21 @@ export class ContextToolRun {
   get pagination() {
     return paginationCoverage(this.evidence);
   }
+  private reusable(evidence: ToolEvidence) {
+    try {
+      verifyToolEvidence(evidence.tool, evidence.arguments, evidence.result, this.now());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  private retire(evidence: ToolEvidence) {
+    const index = this.evidence.indexOf(evidence);
+    if (index >= 0) this.evidence.splice(index, 1);
+    this.retiredEvidenceIds.push(evidence.id);
+    // bytes is cumulative work, not live array size: refreshing cannot reset the run's byte budget.
+    return index;
+  }
   /** A recalled query shares this run's evidence, budget and employee boundary. */
   async executeCached(name: string, args: Record<string, unknown>, signal: AbortSignal) {
     const stable = (value: Record<string, unknown>) =>
@@ -132,8 +152,11 @@ export class ContextToolRun {
         this.denied = true;
         return undefined;
       }
-      verifyToolEvidence(existing.tool, existing.arguments, existing.result, this.now());
-      return existing;
+      if (this.reusable(existing)) return existing;
+      if (this.remaining <= 0) {
+        this.retire(existing);
+        return undefined;
+      }
     }
     const result = await this.execute(name, JSON.stringify(args), signal);
     return result.ok ? this.evidence.find((e) => e.id === result.evidence_id) : undefined;
@@ -150,6 +173,7 @@ export class ContextToolRun {
     const operationId = randomUUID();
     let args: Record<string, unknown> = {};
     let fingerprint: string | undefined;
+    let replaced: { id: string; index: number } | undefined;
     try {
       const tool = this.tools.find((tool) => tool.name === name);
       if (!tool || !isContextReadTool(name)) throw new ContextEngineError('TOOL_UNAVAILABLE');
@@ -187,14 +211,19 @@ export class ContextToolRun {
         throw new ContextEngineError('PAGINATION_STALLED');
       const cached = this.evidence.find((e) => queryKey(e.tool, e.arguments) === fingerprint);
       if (cached) {
-        verifyToolEvidence(name, args, cached.result, this.now());
-        return {
-          ok: true,
-          evidence_id: cached.id,
-          ...cached.result,
-          reused_in_run: true,
-          pagination: this.pagination,
-        };
+        if (this.reusable(cached)) {
+          return {
+            ok: true,
+            evidence_id: cached.id,
+            ...cached.result,
+            reused_in_run: true,
+            pagination: this.pagination,
+          };
+        }
+        // Retire before the fresh attempt. A failed/cancelled refresh must not resurrect old facts.
+        replaced = { id: cached.id, index: this.retire(cached) };
+        // A successfully cached read starts a new bounded retry episode when it expires.
+        this.attempted.delete(fingerprint);
       }
       const unavailable = this.unavailableTools.get(name);
       if (unavailable) return { ...unavailable, suppressed_repeat: true };
@@ -233,6 +262,7 @@ export class ContextToolRun {
         tool: name,
         employeeId: this.employeeId,
         arguments: args,
+        ...(replaced ? { replacesEvidenceId: replaced.id } : {}),
       });
       const result = await reader.call(name, args, signal);
       signal.throwIfAborted();
@@ -251,8 +281,19 @@ export class ContextToolRun {
       });
       signal.throwIfAborted();
       this.bytes += size;
-      this.evidence.push(evidence);
-      return { ok: true, evidence_id: operationId, ...result, pagination: this.pagination };
+      for (const id of internalCrmReferences([evidence])) this.internalCrmIds.add(id);
+      if (replaced) this.evidence.splice(replaced.index, 0, evidence);
+      else this.evidence.push(evidence);
+      return {
+        ok: true,
+        evidence_id: operationId,
+        ...result,
+        pagination: this.pagination,
+        ...(replaced ? { replaces_evidence_id: replaced.id } : {}),
+        ...(this.retiredEvidenceIds.length
+          ? { retired_evidence_ids: [...this.retiredEvidenceIds] }
+          : {}),
+      };
     } catch (error) {
       signal.throwIfAborted();
       const code = error instanceof ContextEngineError ? error.code : 'UNAVAILABLE';
@@ -272,6 +313,9 @@ export class ContextToolRun {
         ok: false,
         code,
         pagination: this.pagination,
+        ...(this.retiredEvidenceIds.length
+          ? { retired_evidence_ids: [...this.retiredEvidenceIds] }
+          : {}),
         ...(error instanceof ContextEngineError
           ? {
               retryable: error.retryable,

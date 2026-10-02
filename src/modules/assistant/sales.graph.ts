@@ -78,6 +78,20 @@ export function buildSalesGraph(
   let modelHistory: ChatMessage[] = [];
   let toolSteps = 0;
   const recalled: unknown[] = [];
+  const currentRecalls = () => {
+    const active = new Set(run?.evidence.map((entry) => entry.id) ?? []);
+    return recalled.filter((value) => {
+      if (!value || typeof value !== 'object') return false;
+      const recalled = value as {
+        ok?: boolean;
+        source_record_checks?: Array<{ evidence_id: string }>;
+      };
+      // A recalled answer is supported jointly by all of its checks. Never preserve its
+      // old prose by removing only a stale check or treating an unknown ID as still valid.
+      if (recalled.ok !== true) return true;
+      return recalled.source_record_checks?.every((check) => active.has(check.evidence_id));
+    });
+  };
   const requestTime = (options.now ?? Date.now)();
   const recordMetric = (stage: StageMetric) => {
     options.onStage?.(stage);
@@ -274,8 +288,9 @@ export function buildSalesGraph(
                 audience: value.audience,
                 access: accessStatus,
                 draft: value.draft,
-                recalled,
+                recalled: currentRecalls(),
                 evidence: run?.evidence ?? [],
+                retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
                 deal_display: dealDisplayFacts(run?.evidence ?? []),
@@ -308,7 +323,7 @@ export function buildSalesGraph(
     .addNode('verifier', async (value, config) => {
       const started = Date.now();
       const issues = [
-        ...dealDisplayIssues(value.reply, run?.evidence ?? []),
+        ...dealDisplayIssues(value.reply, run?.evidence ?? [], run?.internalCrmIds),
         ...chatLayoutIssues(value.reply),
       ];
       const result = await model.complete(
@@ -324,7 +339,7 @@ export function buildSalesGraph(
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
                 history: modelHistory,
-                recalled,
+                recalled: currentRecalls(),
                 deal_display: dealDisplayFacts(run?.evidence ?? []),
                 request_clock: requestClock,
                 application_context: applicationContext(),
@@ -337,6 +352,7 @@ export function buildSalesGraph(
                     run?.evidence.some((item) => item.tool === tool.name),
                 ),
                 evidence: run?.evidence ?? [],
+                retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
                 answer: value.reply,

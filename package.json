@@ -27,6 +27,7 @@
     "db:messages": "tsx scripts/setup-message-database.ts",
     "db:identity": "tsx scripts/setup-identity-roster.ts",
     "context:auth": "tsx scripts/context-auth.ts",
+    "capability:preflight": "tsx scripts/capability-preflight.ts",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "db:migrate": "prisma migrate deploy",

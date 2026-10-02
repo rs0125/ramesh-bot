@@ -15,7 +15,9 @@ quotes, including when business output must be withheld.
 
 Detailed [agent module specifications](docs/agent-modules/README.md) define the proposed role interfaces, identity and tool boundaries, Supabase run state, delivery, reminders, writes and evaluation requirements before implementation.
 
-Apply migrations through `202610020005_media_and_batches.sql` before deploying this worker, even with business reads disabled. No production migration, environment update or deployment is implied by editing this checkout. See the [first-read runbook](docs/first-crm-read.md) for activation and rollback, and [inbox operations](docs/supabase-message-queue.md#inbox-context-and-operator-sends).
+Apply production migrations through `202610020006_usage_ledger.sql` and independently upgrade the capture schema through `202610020003_usage_ledger.sql` before using this checkout's metered runtime. The earlier media/message migrations remain required for normal operation. No production migration, environment update or deployment is implied by editing this checkout. See the [first-read runbook](docs/first-crm-read.md) for activation and rollback, and [inbox operations](docs/supabase-message-queue.md#inbox-context-and-operator-sends).
+
+This checkout adds [currency accounting and admission caps](docs/agent-modules/43-usage-ledger-and-budgets.md), disabled by default, and a [model-free capability readiness probe](docs/agent-modules/44-capability-readiness.md). Runtime monetary caps and automatic capability gating need explicit configuration; deploying the code alone does not enable them. The probe verifies a configured employee's current source access; ordinary `/healthz` remains process liveness. See the [3 October adversarial audit](docs/adversarial-audit-2026-10-03.md) for confirmed fixes, remaining gaps and architecture recommendations.
 
 ## Safe local chat playground
 
@@ -29,7 +31,7 @@ PLAYGROUND_ENV_FILE=.local/live-playground-sol-eval.env PLAYGROUND_PORT=3012 npm
 
 Open **http://127.0.0.1:3012**, refresh an existing tab, and try **All my follow-ups**, a pipeline summary, warehouse search or company knowledge request. This profile uses real Sol calls, the live employee roster and signed Context Engine MCP reads. Requests and replies go through `ramesh-test-inbound-queue` and `ramesh-test-outbound-queue` in Supabase. A dedicated login separates them from production queues; the outbound transport is constrained to `capture` and the process never creates a Baileys session. Employee identity is pinned server-side. Unknown users and groups cannot read CRM data.
 
-`npm run smoke:chat:live` checks the real read, saved-output replay and access boundaries without sending WhatsApp messages. See the [live playground runbook](docs/live-data-playground.md) for provisioning, private configuration, retention, supported requests and test evidence. The agent discovers all permitted CRM, supply, knowledge and analytics reads. HRMS, reminders and writes remain unconnected. This harness does not deploy or enable the production pilot.
+The in-process `npm run smoke:chat:live` requires its explicitly approved currency allowance and model/run approval; it shares the evaluation meter across agent requests. Remote `eval:private` stays blocked until its capture server can enforce the same campaign allowance. Intentional interactive chats use separate runtime controls. See the [live playground runbook](docs/live-data-playground.md) for provisioning, private configuration, retention, supported requests and historical test evidence. The agent discovers all permitted CRM, supply, knowledge and analytics reads. HRMS, reminders and writes remain unconnected. This harness does not deploy or enable the production pilot.
 
 ### Synthetic chat and CRM fixtures
 
@@ -64,13 +66,15 @@ See [signed identity and operations](docs/signed-context-auth.md), [the MCP serv
 ```sh
 # No paid request: inspect the registry.
 npm run eval:conversations -- --suite all --list
-# Small Luna agent + grader screen, one trial per case.
-npm run eval:ci -- --case changed-history,source-label-crm-name,source-label-knowledge-title
-# One focused repeated check.
-npm run eval:conversations -- --case ordinal-reference --trials 2
+# Small Luna screen only after an allowance and reviewed price profile are configured.
+npm run eval:ci -- --case changed-history,source-label-crm-name,source-label-knowledge-title --max-usd "$EVAL_MAX_USD"
+# One focused repeated check, within its approved allowance.
+npm run eval:conversations -- --case ordinal-reference --trials 2 --max-usd "$EVAL_MAX_USD"
 ```
 
-The [current conversation harness](evals/README.md) runs the real OpenAI model through the employee tool graph with fictional CRM, supply, knowledge and analytics evidence. It covers personal assistance, 32-message context, corrected requirements, revoked access, source failures and multi-step research. It records every tool proposal, answer, review, failure, prompt/code hash, duration and returned token usage. JSON, JUnit and Markdown reports go into `.local/ci-evals`. Any failed trial exits nonzero; a model judge cannot override hard tool/privacy/format checks. Paid CI is manual only. Agent and grader default to Luna, one trial and a three-trial allowance. Every Sol run requires explicit user approval and `--sol-approval <reference>`; larger runs require an explicit `--max-trials`. Production model settings do not select the test model. Deterministic PR checks need no API key. No eval creates a WhatsApp session.
+The [current conversation harness](evals/README.md) runs the real OpenAI model through the employee tool graph with fictional CRM, supply, knowledge and analytics evidence. It covers personal assistance, 32-message context, corrected requirements, revoked access, source failures and multi-step research. It records every tool proposal, answer, review, failure, prompt/code hash, duration and returned token usage. JSON, JUnit and Markdown reports go into `.local/ci-evals`. Any failed trial exits nonzero; a model judge cannot override hard tool/privacy/format checks. Paid CI is manual only. Agent and grader default to Luna, one trial and a three-trial allowance. Every Sol run requires explicit user approval and an approval reference recorded with `--sol-approval`; larger runs require an explicit `--max-trials`. Production model settings do not select the test model. Deterministic PR checks need no API key. No eval creates a WhatsApp session.
+
+Every paid runner additionally requires an explicitly approved `--max-usd` or `EVAL_MAX_USD`, plus a reviewed `EVAL_USAGE_PRICES_JSON` profile (`USAGE_PRICES_JSON` is the fallback). Agent, grader, media and HTTP retries share the campaign allowance. No rate or spend allowance is supplied by default. Failed or interrupted usage stays recorded, with unknown charges retained rather than treated as zero. `eval:private` refuses remote requests until server-side campaign enforcement exists; the in-process real-source smoke uses the shared meter. See [the ledger contract](docs/agent-modules/43-usage-ledger-and-budgets.md).
 
 The historical `eval:agent` harness runs 13 ordinary-chat scenarios through isolated SQLite, with a fresh conversation per trial. It checks both graph stages completed, SQLite recorded the captured reply, output length, em dashes, and a defined stock-phrase list. Ambiguous-reference scenarios must include a clarification question. A schema-validated Terra judge scores relevance, naturalness, fidelity and capability honesty. Passing requires no mechanical failures, at least 4/5 for the first three scores, and 5/5 for honesty. Exact wording and output variation are not pass conditions.
 
@@ -78,7 +82,7 @@ Its reports under `.local/evals/<run>/` include drafts, final replies, judge rea
 
 The general sales harness runs 17 cases with one trial per selected case by default and the same spending controls, uses a snapshot of the real tool schemas with synthetic facts, has no transport, and saves all outputs/tool arguments/checks under `.local/sales-evals/`. The [legacy context/media review](docs/agent-modules/23-context-and-media-reference.md) records the old logistics bot patterns; [the implemented media contract](docs/agent-modules/30-media-lifecycle.md) defines the new 24-hour lifecycle.
 
-The historical business harness runs 15 cases with three real-model trials each by default and writes `.local/business-evals/<run>/report.json` and `report.md`. It checks routing, exact tool scope, read/delivery call counts, evidence presence, refusal boundaries and factual caveats against synthetic CRM fixtures. It keeps all failures; PostgreSQL tests separately validate persistence and authorization fencing. The separate `smoke:chat:live` command uses current Supabase/Context Engine data and reports metadata only.
+The historical business harness covered 15 cases with three real-model trials each and wrote `.local/business-evals/<run>/report.json` and `report.md`. It checked routing, exact tool scope, read/delivery call counts, evidence presence, refusal boundaries and factual caveats against synthetic CRM fixtures. Current paid runs use the explicit trial and currency controls above. They keep all failures; PostgreSQL tests separately validate persistence and authorization fencing. Real-source in-process smoke requires the explicit currency/model approvals; remote private evaluations remain blocked pending shared campaign enforcement.
 
 ## Local setup
 
@@ -170,18 +174,20 @@ Read the [detailed current implementation and architecture](docs/current-impleme
 
 ## Documentation map
 
-| Document                                                           | Use it for                                                                               |
-| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| [Current implementation](docs/current-implementation.md)           | Running behavior, source map, limits, API contracts, and test evidence                   |
-| [Architecture and API](docs/architecture.md)                       | Compact topology and application boundaries                                              |
-| [Assistant architecture plan](docs/assistant-architecture-plan.md) | Consolidated system design, MCP service contract, deferred agents, reminders, and writes |
-| [Supabase queues](docs/supabase-message-queue.md)                  | Exact table names, atomic handoff, recovery, migrations, and local PostgreSQL tests      |
-| [Live-data playground](docs/live-data-playground.md)               | Real CRM as Raghav, isolated Supabase capture queues, setup and live smoke checks        |
-| [Signed Context Engine access](docs/signed-context-auth.md)        | Preferred first-party identity, signing, keys and replay protection                      |
-| [Employee identity and OAuth](docs/employee-identity-and-oauth.md) | Trusted sender mapping, encrypted grants, enrollment commands, expiry, and revocation    |
-| [EC2 operations](docs/ec2-operations.md)                           | Current private deployment, SSM tunnel, runtime configuration, and backups               |
-| [Deployment guide](docs/deployment-vercel-ec2.md)                  | Independent release automation and the future public HTTPS/Vercel rollout                |
-| [Product context](CONTEXT.md)                                      | Confirmed decisions, organisational sources, and earlier options                         |
+| Document                                                                      | Use it for                                                                                  |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| [Current implementation](docs/current-implementation.md)                      | Running behavior, source map, limits, API contracts, and test evidence                      |
+| [Architecture and API](docs/architecture.md)                                  | Compact topology and application boundaries                                                 |
+| [Assistant architecture plan](docs/assistant-architecture-plan.md)            | Consolidated system design, MCP service contract, deferred agents, reminders, and writes    |
+| [Supabase queues](docs/supabase-message-queue.md)                             | Exact table names, atomic handoff, recovery, migrations, and local PostgreSQL tests         |
+| [Live-data playground](docs/live-data-playground.md)                          | Real CRM as Raghav, isolated Supabase capture queues, setup and live smoke checks           |
+| [Signed Context Engine access](docs/signed-context-auth.md)                   | Preferred first-party identity, signing, keys and replay protection                         |
+| [Employee identity and OAuth](docs/employee-identity-and-oauth.md)            | Trusted sender mapping, encrypted grants, enrollment commands, expiry, and revocation       |
+| [EC2 operations](docs/ec2-operations.md)                                      | Current private deployment, SSM tunnel, runtime configuration, and backups                  |
+| [Deployment guide](docs/deployment-vercel-ec2.md)                             | Independent release automation and the future public HTTPS/Vercel rollout                   |
+| [Usage ledger and budgets](docs/agent-modules/43-usage-ledger-and-budgets.md) | Runtime modes, reviewed pricing, atomic reservations, capture isolation and eval allowances |
+| [Capability readiness](docs/agent-modules/44-capability-readiness.md)         | Bounded employee-scoped source verification without a model or WhatsApp session             |
+| [Product context](CONTEXT.md)                                                 | Confirmed decisions, organisational sources, and earlier options                            |
 
 The fake chat GUI uses local port **3012**; the documented SSM tunnel uses **3013**. The pairing admin at **3010** is an operations surface and is separate from the fake chat GUI.
 
@@ -195,4 +201,4 @@ Latest local validation: [evaluation, graph and voice refinements](evals/results
 
 Voice transcripts are quoted in italics before one common answer for a batch. The delivery layer reads the exact STT text from expiring media, while durable history stores only references and the answer. Configure `OPENAI_STT_API_KEY` independently of the assistant key and `OPENAI_TRANSCRIBE_MODEL` independently of the assistant model. See [voice delivery](docs/agent-modules/35-voice-transcripts.md) and [current model comparison](evals/results/2026-10-02-stt-comparison.md).
 
-The [production evaluation review](docs/agent-modules/37-production-evaluation.md) maps current primary-source guidance to this harness. Human-labelled holdouts, a required release gate and sampled production quality monitoring remain proposed; the current manual/weekly evaluation workflow does not block every deployment.
+The [production evaluation review](docs/agent-modules/37-production-evaluation.md) maps current primary-source guidance to this harness. Human-labelled holdouts, a required release gate and sampled production quality monitoring remain proposed; the current manual-only paid evaluation workflow does not block every deployment.

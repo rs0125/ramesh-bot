@@ -1,4 +1,5 @@
 /** Operator-only outcome evals against real data. Confidential cases/results never leave .local. */
+import { assertRemoteEvaluationBudget, evalBudgetOptions } from './lib/usage-budget.js';
 import { readFile, mkdir, writeFile, realpath } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify, parseArgs } from 'node:util';
@@ -39,6 +40,7 @@ async function main() {
   const { values } = parseArgs({
     options: {
       ...evalPolicyOptions,
+      ...evalBudgetOptions,
       'judge-model': { type: 'string', default: DEFAULT_EVAL_MODEL },
       'case-file': { type: 'string', default: '.local/private-evals/cases.json' },
       'env-file': { type: 'string', default: '.local/live-playground-sol-eval.env' },
@@ -46,6 +48,7 @@ async function main() {
       trials: { type: 'string', default: '1' },
     },
   });
+  assertRemoteEvaluationBudget();
   const base = new URL(values['base-url']!);
   if (
     !['127.0.0.1', 'localhost'].includes(base.hostname) ||

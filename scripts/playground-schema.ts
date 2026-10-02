@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { PoolClient } from 'pg';
 
-export const PLAYGROUND_SCHEMA_VERSION = '202610020002';
+export const PLAYGROUND_SCHEMA_VERSION = '202610020003';
 export async function applyPlaygroundSchema(db: PoolClient, password: string) {
   if (!/^[A-Za-z0-9_-]{32,128}$/.test(password)) throw new Error('INVALID_PLAYGROUND_PASSWORD');
   const existing = (
@@ -59,7 +59,11 @@ export async function applyPlaygroundSchema(db: PoolClient, password: string) {
     await db.query(
       'CREATE POLICY "ramesh_test_schema_read" ON public."ramesh-test-schema-migrations" FOR SELECT TO ramesh_playground USING (true)',
     );
-  for (const name of ['202610020001_capture.sql', '202610020002_media_and_batches.sql']) {
+  for (const name of [
+    '202610020001_capture.sql',
+    '202610020002_media_and_batches.sql',
+    '202610020003_usage_ledger.sql',
+  ]) {
     const version = name.split('_')[0]!;
     const sql = await readFile(new URL(`../supabase/playground/${name}`, import.meta.url), 'utf8');
     const checksum = createHash('sha256').update(sql).digest('hex');

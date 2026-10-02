@@ -1,6 +1,6 @@
 /** Presentation metadata comes from native CRM fields, never mirror ingestion clocks. */
 import type { ToolEvidence } from './tool-evidence.js';
-const uuid = /\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/i;
+import { internalCrmReferences, nativeCrmRecords } from './record-identity.js';
 const dateFormat = new Intl.DateTimeFormat('en-GB', {
   day: 'numeric',
   month: 'short',
@@ -13,22 +13,7 @@ function date(value: unknown) {
     : 'Not recorded';
 }
 export function dealDisplayFacts(evidence: readonly ToolEvidence[]) {
-  const records = new Map<string, Record<string, unknown>>();
-  for (const entry of evidence) {
-    const data = entry.result.data;
-    const items =
-      entry.tool === 'search_crm_leads'
-        ? data.items
-        : entry.tool === 'crm_briefing'
-          ? data.priorities
-          : entry.tool === 'read_crm_lead'
-            ? [data]
-            : [];
-    if (!Array.isArray(items)) continue;
-    for (const row of items)
-      if (row && typeof row === 'object' && typeof row.id === 'string') records.set(row.id, row);
-  }
-  return [...records.values()].map((row) => ({
+  return nativeCrmRecords(evidence).map((row) => ({
     internal_id: row.id,
     label: row.company_name || row.name || 'Unnamed enquiry',
     created: date(row.source_created_at),
@@ -112,9 +97,15 @@ export function withDealDates(reply: string, evidence: readonly ToolEvidence[]) 
   }
   return lines.join('\n');
 }
-export function dealDisplayIssues(reply: string, evidence: readonly ToolEvidence[]) {
+export function dealDisplayIssues(
+  reply: string,
+  evidence: readonly ToolEvidence[],
+  knownInternalIds: Iterable<string> = [],
+) {
   const issues: string[] = [];
-  if (uuid.test(reply))
+  const internalIds = new Set([...knownInternalIds, ...internalCrmReferences(evidence)]);
+  const shown = reply.toLowerCase();
+  if ([...internalIds].some((id) => id.length > 0 && shown.includes(id.toLowerCase())))
     issues.push(
       'Remove internal deal UUIDs and API paths; use company/requirement labels. Keep warehouse IDs.',
     );

@@ -1,4 +1,5 @@
 /** Opt-in repeated model evals with the real catalogue and synthetic adversarial evidence. No delivery adapter. */
+import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, writeFile, appendFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
@@ -21,6 +22,7 @@ loadEnvironment({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     model: { type: 'string' },
     trials: { type: 'string', default: '1' },
     case: { type: 'string' },
@@ -35,11 +37,16 @@ const selectedModel = evalModel(values.model);
 assertEvalRun([selectedModel], cases.length * trials, values);
 const loaded = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!loaded) throw new Error('OPENAI_API_KEY is required');
-const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000 };
-const model = new OpenAITextModel(config);
 const runId = `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`;
 const directory = fileURLToPath(new URL(`../.local/sales-evals/${runId}/`, import.meta.url));
 await mkdir(directory, { recursive: true, mode: 0o700 });
+const usageMeter = await createEvalUsageMeter(
+  { ...values, campaignId: runId, directory },
+  process.env,
+  [selectedModel],
+);
+const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000, usageMeter };
+const model = new OpenAITextModel(config);
 const inputProvenance = await captureEvalProvenance(new URL('../', import.meta.url));
 const prompts = promptManifest();
 type Trial = {
@@ -60,7 +67,8 @@ const started = Date.now();
 console.log(
   `Sales eval: ${work.length} real-model trials, ${config.model}, synthetic evidence, no transport.`,
 );
-await Promise.all(
+const usageBudget = await settleEvalWorkers(
+  usageMeter,
   Array.from({ length: 1 }, async () => {
     for (;;) {
       const item = work.shift();
@@ -241,6 +249,7 @@ results.sort((a, b) => a.case.localeCompare(b.case) || a.trial - b.trial);
 const passed = results.filter((r) => r.passed).length;
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const report = {
+  usageBudget,
   runId,
   model: config.model,
   promptVersion: SALES_PROMPT_VERSION,

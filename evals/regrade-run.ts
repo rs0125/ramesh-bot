@@ -1,4 +1,5 @@
 /** Fresh judge calls over ALL answers in a completed public run. No agent rerun or score replacement. */
+import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, realpath, mkdir, appendFile, writeFile } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
@@ -23,6 +24,7 @@ dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     source: { type: 'string' },
     model: { type: 'string' },
     concurrency: { type: 'string', default: '1' },
@@ -65,13 +67,24 @@ const selectedModel = evalModel(values.model);
 const spendingPolicy = assertEvalRun([selectedModel], source.results.length, values);
 const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!config) throw new Error('OPENAI_API_KEY is required through the environment');
-const model = new OpenAITextModel({ ...config, timeoutMs: 90000, maxOutputTokens: 5000 });
 const prompt = await readFile(new URL('prompts/journey-judge.md', import.meta.url), 'utf8');
 const runId = new Date().toISOString().replaceAll(':', '-') + '-' + randomUUID().slice(0, 8);
 const directory = new URL(`../.local/regrades/${runId}/`, import.meta.url);
 await mkdir(directory, { recursive: true, mode: 0o700 });
+const usageMeter = await createEvalUsageMeter(
+  { ...values, campaignId: runId, directory },
+  process.env,
+  [selectedModel],
+);
+const model = new OpenAITextModel({
+  ...config,
+  timeoutMs: 90000,
+  maxOutputTokens: 5000,
+  usageMeter,
+});
 const began = Date.now();
 const metadata = {
+  usageBudget: usageMeter.manifest,
   spendingPolicy,
   runId,
   kind: 'regrade',
@@ -93,7 +106,8 @@ await writeFile(new URL('run-metadata.json', directory), JSON.stringify(metadata
 const work = [...source.results];
 const results: any[] = [];
 const usage = emptyUsage();
-await Promise.all(
+const usageBudget = await settleEvalWorkers(
+  usageMeter,
   Array.from({ length: concurrency }, async () => {
     for (;;) {
       const original = work.shift();
@@ -147,6 +161,7 @@ const sourceUnchanged =
   hash(await readFile(resolve(sourceDir, 'report.json'))) === metadata.sourceReportHash;
 const report = {
   ...metadata,
+  usageBudget,
   inputIntegrity: finalInputs.inputHash === metadata.inputHash && sourceUnchanged,
   usage,
   durationMs: Date.now() - began,

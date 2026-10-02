@@ -2,7 +2,6 @@
 import type { PrismaClient } from '@prisma/client';
 import makeWASocket, {
   downloadMediaMessage,
-  normalizeMessageContent,
   type BaileysEventMap,
   type GroupMetadata,
   type WAMessage,
@@ -11,6 +10,8 @@ import { MAX_MEDIA_BYTES, type MediaUpload } from '../../modules/media/media.typ
 import type { Logger } from 'pino';
 import { createAuthStore } from '../database/auth-store.js';
 import { DeliveryReceipts } from './delivery-receipts.js';
+import { privateTransportLogger } from './sdk-logger.js';
+import { persistableMessageContent } from './media-privacy.js';
 
 export interface WhatsAppSession {
   readonly botJids: readonly string[];
@@ -29,12 +30,20 @@ export interface WhatsAppSession {
 
 export type SessionFactory = (onFatal?: (error: Error) => void) => Promise<WhatsAppSession>;
 
+/** Replies may contain URLs as text; they never authorize server-side preview fetches. */
+export function plainTextMessage(text: string) {
+  return { text, linkPreview: null } as const;
+}
+
 export function createSessionFactory(
   db: PrismaClient,
   encryptionKey: string,
   logger: Logger,
   sendTimeoutMs: number,
 ): SessionFactory {
+  // The SDK's warn/error paths can contain raw nodes, identifiers and provider errors.
+  // Keep application-authored logs separate from this strict third-party boundary.
+  const transportLogger = privateTransportLogger(logger);
   return async (onFatal) => {
     const auth = await createAuthStore(db, encryptionKey, (error) => onFatal?.(error));
     const groups = new Map<string, { value: GroupMetadata; expiresAt: number }>();
@@ -48,7 +57,7 @@ export function createSessionFactory(
     };
     const socket = makeWASocket({
       auth: auth.state,
-      logger,
+      logger: transportLogger,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       // Keep the SDK's initial sync: it supplies LID mappings required for group mentions.
@@ -71,7 +80,7 @@ export function createSessionFactory(
       let timer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
-          socket.sendMessage(chatId, { text }, quoted ? { quoted } : {}),
+          socket.sendMessage(chatId, plainTextMessage(text), quoted ? { quoted } : {}),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               const error = new Error('WhatsApp send timed out; delivery is uncertain');
@@ -99,13 +108,7 @@ export function createSessionFactory(
       reply: (message, text) => send(message.key.remoteJid!, text, message),
       sendText: (chatId, text) => send(chatId, text),
       async downloadMedia(message, signal) {
-        if (
-          message.message?.viewOnceMessage ||
-          message.message?.viewOnceMessageV2 ||
-          message.message?.viewOnceMessageV2Extension
-        )
-          throw new Error('VIEW_ONCE_MEDIA_UNSUPPORTED');
-        const content = normalizeMessageContent(message.message);
+        const content = persistableMessageContent(message.message);
         const attachment =
           content?.imageMessage ?? content?.audioMessage ?? content?.documentMessage;
         if (!attachment || Number(attachment.fileLength ?? 0) > MAX_MEDIA_BYTES)
@@ -133,7 +136,7 @@ export function createSessionFactory(
           message,
           'stream',
           { options: { signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]) } },
-          { logger, reuploadRequest: socket.updateMediaMessage },
+          { logger: transportLogger, reuploadRequest: socket.updateMediaMessage },
         );
         const chunks: Buffer[] = [];
         let size = 0;

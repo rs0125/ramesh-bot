@@ -1,4 +1,5 @@
 /** Paid grader calibration with synthetic known-good/known-bad outcomes; no agent or transport. */
+import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
 import { config as dotenv } from 'dotenv';
 import { parseArgs } from 'node:util';
 import { mkdir, readFile, appendFile, writeFile } from 'node:fs/promises';
@@ -16,6 +17,7 @@ dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     trials: { type: 'string', default: '1' },
     case: { type: 'string' },
     model: { type: 'string' },
@@ -31,14 +33,25 @@ const selectedModel = evalModel(values.model);
 const spendingPolicy = assertEvalRun([selectedModel], cases.length * trials, values);
 const config = loadAssistantConfig({ ...process.env, OPENAI_MODEL: selectedModel });
 if (!config) throw new Error('OPENAI_API_KEY is required through the environment');
-const model = new OpenAITextModel({ ...config, timeoutMs: 90000, maxOutputTokens: 5000 });
 const prompt = await readFile(new URL('./prompts/journey-judge.md', import.meta.url), 'utf8');
 const runId = new Date().toISOString().replaceAll(':', '-') + '-' + randomUUID().slice(0, 8);
 const directory = new URL(`../.local/judge-calibration/${runId}/`, import.meta.url);
 await mkdir(directory, { recursive: true, mode: 0o700 });
+const usageMeter = await createEvalUsageMeter(
+  { ...values, campaignId: runId, directory },
+  process.env,
+  [selectedModel],
+);
+const model = new OpenAITextModel({
+  ...config,
+  timeoutMs: 90000,
+  maxOutputTokens: 5000,
+  usageMeter,
+});
 const started = Date.now(),
   usage = emptyUsage();
 const metadata = {
+  usageBudget: usageMeter.manifest,
   spendingPolicy,
   runId,
   model: config.model,
@@ -52,7 +65,8 @@ const jobs = cases.flatMap((c) =>
   Array.from({ length: trials }, (_, i) => ({ scenario: c, trial: i + 1 })),
 );
 const results: EvalTrial[] = [];
-await Promise.all(
+const usageBudget = await settleEvalWorkers(
+  usageMeter,
   Array.from({ length: 1 }, async () => {
     for (;;) {
       const job = jobs.shift();
@@ -100,6 +114,7 @@ await Promise.all(
 const finalInputs = await captureEvalProvenance(new URL('../', import.meta.url));
 const report = {
   ...metadata,
+  usageBudget,
   passed: results.filter((r) => r.passed).length,
   total: results.length,
   durationMs: Date.now() - started,

@@ -143,10 +143,13 @@ test('in-run cache cannot extend evidence freshness', async () => {
   let now = Date.now();
   const fixture = createSalesFixture(() => now);
   const run = (await fixture.service.openTools(trusted, signal())).run!;
-  await run.execute('get_context', '{}', signal());
+  const initial = await run.execute('get_context', '{}', signal());
   now += 360001;
-  assert.equal((await run.execute('get_context', '{}', signal())).ok, false);
-  assert.equal(fixture.state.calls.length, 1);
+  const refreshed = await run.execute('get_context', '{}', signal());
+  assert.equal(refreshed.ok, true);
+  assert.notEqual(refreshed.evidence_id, initial.evidence_id);
+  assert.equal(refreshed.reused_in_run, undefined);
+  assert.equal(fixture.state.calls.length, 2);
 });
 
 async function dealEvidence() {

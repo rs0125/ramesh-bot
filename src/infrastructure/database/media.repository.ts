@@ -78,6 +78,15 @@ export class MediaRepository implements MediaStore {
       db.release();
     }
   }
+  async findSource(owner: string, source: string): Promise<string | undefined> {
+    const row = (
+      await this.pool.query(
+        `SELECT id FROM ${this.table} WHERE namespace=$1 AND owner_hash=$2 AND source_id=$3 AND expires_at>clock_timestamp()`,
+        [this.namespace, owner, source],
+      )
+    ).rows[0];
+    return row?.id;
+  }
   async get(owner: string, ids?: string[]): Promise<MediaRecord[]> {
     const rows = (
       await this.pool.query(

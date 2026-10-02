@@ -4,7 +4,7 @@ Updated: **2 October 2026**. Status: **Specifications prepared first; the person
 
 These files expand the [architecture plan](../assistant-architecture-plan.md#23-agent-architecture-draft-informed-by-the-factory-talk) into module contracts. They describe a target system, including changes to existing modules. A proposed interface, table, configuration option or test below does not exist merely because it is documented here.
 
-The deployed baseline contains the converser, formatter and separate queues. This checkout adds native model-directed reads over every employee-permitted CRM, supply, knowledge, shortlist and analytics tool, deterministic source checks, fresh semantic answer review, encrypted receipts and delivery reauthorization. See the [personal-assistant runbook](../sales-manager-agent.md). Separate planner/worker model roles, private media ingestion, and durable sliding debounce are implemented locally; durable paused-task checkpoints, reminders and writes remain proposed. Documentation and local tests do not activate production reads.
+The [2 October capability review](../capability-review-2026-10-02.md) records the deployed baseline: separate graph roles, employee-scoped CRM/supply/knowledge reads, private media and sliding debounce. This checkout additionally implements currency accounting, model-free readiness and the [3 October adversarial fixes](../adversarial-audit-2026-10-03.md); currency caps and automated readiness gating require separate configuration at rollout. Durable paused-task checkpoints, reminders and writes remain proposed. Documentation and local tests do not activate production features.
 
 ## Module map
 
@@ -119,7 +119,7 @@ Use the parent plan for product intent and this directory for detailed contracts
 - [31. Private outcome evals](31-private-outcome-evals.md): real-data operator tests, excluded from git and CI artifacts.
 - [32. Inbound debounce](32-inbound-debounce.md): forwarded text/media use a sliding 3-second window; ordinary text uses 1 second; total collection capped at 8 seconds.
 
-Production schema migration `202610020005` is a prerequisite for this worker revision. Audio is uploaded directly to STT, so the worker does not require `ffmpeg`. The separate Supabase capture schema is upgraded through `202610020002`. The local real-data playground uses Sol at medium tool effort. No WhatsApp connection or production queue migration is performed by its setup.
+Production media/message schema migration `202610020005` remains a prerequisite. Usage accounting adds production migration `202610020006` and independent capture migration `202610020003`; provision the appropriate ledger before enabling runtime metering. Audio is uploaded directly to STT, so the worker does not require `ffmpeg`. The local real-data playground uses Sol at medium tool effort. No WhatsApp connection or production queue migration is performed by its setup.
 
 - [33. Evaluation refinement](33-eval-refinement.md): calibrated per-turn judgments,
   consistent fixtures and clocks, semantic query checks, and bounded research with
@@ -137,5 +137,7 @@ Production schema migration `202610020005` is a prerequisite for this worker rev
 
 - [41. Recall and source labels](41-recall-and-source-labels.md): changed-result recovery, current-source continuations and inert labels across CRM, knowledge and analytics.
 - [42. Evaluation spending](42-evaluation-spend-controls.md): Luna defaults, bounded case selection, explicit Sol approval and manual-only paid CI.
+- [43. Usage ledger and budgets](43-usage-ledger-and-budgets.md): HTTP-attempt reservations, operator-reviewed pricing, atomic currency caps, isolated capture accounting and retained unknown usage. Implemented locally; runtime metering defaults off.
+- [44. Capability readiness](44-capability-readiness.md): bounded checks of a configured employee's actual source and receipt path, without model calls or WhatsApp delivery. Implemented locally; not automatically added to deployment.
 
 See the [2 October production capability review](../capability-review-2026-10-02.md) for deployed versus local-only capabilities, remaining work and AI Engineer research.

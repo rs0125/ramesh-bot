@@ -1,6 +1,7 @@
 /** Content lives behind an owner-scoped storage port, never in durable chat text. */
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { cancellable } from '../../lib/cancellable.js';
 import {
   MAX_MEDIA_BYTES,
   MAX_MEDIA_ITEMS,
@@ -40,8 +41,13 @@ export class MediaService {
   constructor(
     readonly store: MediaStore,
     private readonly processor: MediaProcessor,
-  ) {}
+    private readonly contextWaitMs = 95000,
+  ) {
+    if (!Number.isSafeInteger(contextWaitMs) || contextWaitMs < 1 || contextWaitMs > 95000)
+      throw new Error('INVALID_MEDIA_WAIT');
+  }
   async ingest(owner: string, source: string, upload: MediaUpload, receivedAt?: Date) {
+    this.stopping.signal.throwIfAborted();
     const id = await this.store.put(owner, source, validateMedia(upload), receivedAt);
     // Start immediately; collection and media processing overlap. Caller later awaits ready state.
     void this.prepare(owner, id).catch(() => {});
@@ -63,6 +69,9 @@ export class MediaService {
             ? 'image'
             : 'document';
         try {
+          // A claim may finish after shutdown began. Resolve that lease without starting
+          // a new provider request; already-running shared requests receive the stop signal.
+          this.stopping.signal.throwIfAborted();
           const text = await this.processor.extract(
             row.upload,
             AbortSignal.any([AbortSignal.timeout(90000), this.stopping.signal]),
@@ -99,21 +108,48 @@ export class MediaService {
         request,
       );
     if (!ids.length && !referBack) return '';
-    let records = await this.store.get(owner, ids.length ? ids : undefined);
-    const deadline = Date.now() + 95000;
-    while (
-      records.some((r) => r.state === 'pending' || r.state === 'processing') &&
-      Date.now() < deadline
-    ) {
-      signal.throwIfAborted();
-      await Promise.all(
-        records
-          .filter((r) => r.state === 'pending' || r.state === 'processing')
-          .map((r) => this.prepare(owner, r.id)),
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), this.contextWaitMs);
+    const waiting = AbortSignal.any([signal, deadline.signal, this.stopping.signal]);
+    let records: Awaited<ReturnType<MediaStore['get']>> = [];
+    try {
+      records = await cancellable(
+        () => this.store.get(owner, ids.length ? ids : undefined),
+        waiting,
       );
-      records = await this.store.get(owner, ids.length ? ids : records.map((r) => r.id));
-      if (records.some((r) => r.state === 'pending' || r.state === 'processing'))
-        await delay(250, undefined, { signal });
+      while (records.some((r) => r.state === 'pending' || r.state === 'processing')) {
+        waiting.throwIfAborted();
+        const work: Promise<void>[] = [];
+        for (const row of records.filter(
+          (r) => r.state === 'pending' || r.state === 'processing',
+        )) {
+          const active = this.active.get(`${owner}:${row.id}`);
+          if (active) work.push(active);
+          // Context readers never enqueue new extraction behind the worker limit. Recheck
+          // cancellation before starting another item; eager ingestion owns its own work.
+          else if (this.processing < 3) {
+            waiting.throwIfAborted();
+            work.push(this.prepare(owner, row.id));
+          }
+        }
+        // Cancel only this reader's wait. Other readers can still use the same extraction.
+        if (work.length) await cancellable(() => Promise.race(work), waiting);
+        records = await cancellable(
+          () => this.store.get(owner, ids.length ? ids : records.map((r) => r.id)),
+          waiting,
+        );
+        if (records.some((r) => r.state === 'pending' || r.state === 'processing'))
+          await delay(250, undefined, { signal: waiting });
+      }
+      waiting.throwIfAborted();
+    } catch (error) {
+      signal.throwIfAborted();
+      this.stopping.signal.throwIfAborted();
+      if (!deadline.signal.aborted) throw error;
+      // The finite context window returns the last known states. Pending media is not
+      // reported as failed, erased or re-leased; background extraction can still finish.
+    } finally {
+      clearTimeout(timer);
     }
     // Storage insertion/download completion order can differ from inbound message order.
     if (ids.length) records.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));

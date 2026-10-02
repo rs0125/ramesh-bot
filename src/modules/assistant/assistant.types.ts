@@ -76,4 +76,6 @@ export interface AgentTrace {
   outcome: 'completed' | 'unavailable' | 'input_rejected';
   limitedBy?: 'research_deadline';
   failureCode?: 'DEADLINE_EXCEEDED' | 'RUN_FAILED';
+  usage?: import('../usage/usage.types.js').UsageSummary;
+  usageUnavailable?: boolean;
 }

@@ -1,4 +1,6 @@
 /** OpenAI settings shared by the worker, local playground, and opt-in live evaluations. */
+import { loadUsagePolicy, type UsagePolicy } from './usage.js';
+import type { UsageMeter } from '../modules/usage/usage-meter.js';
 export interface AssistantConfig {
   apiKey: string;
   sttApiKey?: string;
@@ -7,6 +9,9 @@ export interface AssistantConfig {
   timeoutMs: number;
   maxOutputTokens: number;
   toolReasoningEffort?: 'low' | 'medium' | 'high';
+  usagePolicy?: UsagePolicy;
+  /** Runtime dependency shared by text, judges and media; never serialized into provider requests. */
+  usageMeter?: UsageMeter;
 }
 
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
@@ -40,6 +45,7 @@ export function loadAssistantConfig(
     sttApiKey: env.OPENAI_STT_API_KEY?.trim() || apiKey,
     transcriptionModel,
     model,
+    usagePolicy: loadUsagePolicy(env),
     toolReasoningEffort: toolReasoningEffort as 'low' | 'medium' | 'high',
     timeoutMs: integer('AGENT_TIMEOUT_MS', 45_000, 1000, 300_000),
     maxOutputTokens: integer('AGENT_MAX_OUTPUT_TOKENS', 800, 128, 8000),

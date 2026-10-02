@@ -1,13 +1,17 @@
 /** Matched screening experiment; fictional source fixtures, fixed independent judge. */
+import { evalAllowanceMicros, evalBudgetOptions, splitEvalAllowance } from './lib/usage-budget.js';
+import { config as dotenv } from 'dotenv';
 import { spawn } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { assertEvalRun, evalPolicyOptions } from './lib/run-policy.js';
 
+dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     trials: { type: 'string', default: '1' },
     concurrency: { type: 'string', default: '1' },
   },
@@ -38,6 +42,8 @@ assertEvalRun(
   cases.length * profiles.length * Number(values.trials),
   values,
 );
+const maxMicros = evalAllowanceMicros(values);
+const profileMaxUsd = splitEvalAllowance(maxMicros, profiles.length);
 const root = new URL('../', import.meta.url);
 const directory = new URL(
   `.local/model-comparisons/${new Date().toISOString().replaceAll(':', '-')}/`,
@@ -49,6 +55,8 @@ await writeFile(
   JSON.stringify(
     {
       cases,
+      maxMicros,
+      profileMaxUsd,
       profiles,
       trials: Number(values.trials),
       judgeModel: 'gpt-5.6-terra',
@@ -86,6 +94,8 @@ for (const profile of profiles) {
         profile.effort,
         '--judge-model',
         'gpt-5.6-terra',
+        '--max-usd',
+        profileMaxUsd,
         '--max-trials',
         values['max-trials']!,
         ...(values['sol-approval'] ? ['--sol-approval', values['sol-approval']] : []),

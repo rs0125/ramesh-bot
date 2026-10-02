@@ -1,4 +1,5 @@
 /** Paid synthetic speech regression comparison through the real media adapter; no WhatsApp. */
+import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
 import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -13,6 +14,7 @@ dotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 const { values } = parseArgs({
   options: {
     ...evalPolicyOptions,
+    ...evalBudgetOptions,
     case: { type: 'string' },
     models: { type: 'string', default: 'gpt-4o-transcribe,gpt-4o-mini-transcribe,gpt-transcribe' },
     trials: { type: 'string', default: '1' },
@@ -31,11 +33,17 @@ if (
   throw new Error('INVALID_STT_EVAL_OPTIONS');
 const cases = STT_CASES.filter((c) => !values.case || values.case.split(',').includes(c.id));
 assertEvalRun(models, cases.length * trials * models.length, values);
-const config = loadAssistantConfig();
-if (!config) throw new Error('OPENAI_API_KEY_REQUIRED');
+const loaded = loadAssistantConfig();
+if (!loaded) throw new Error('OPENAI_API_KEY_REQUIRED');
 const runId = new Date().toISOString().replaceAll(':', '-') + '-' + randomUUID().slice(0, 8);
 const directory = new URL(`../.local/stt-evals/${runId}/`, import.meta.url);
 await mkdir(directory, { recursive: true, mode: 0o700 });
+const usageMeter = await createEvalUsageMeter(
+  { ...values, campaignId: runId, directory },
+  process.env,
+  models,
+);
+const config = { ...loaded, usageMeter };
 const run = promisify(execFile);
 const recordings: Array<{ id: string; bytes: Buffer; duration: number; hash: string }> = [];
 for (const c of cases) {
@@ -93,7 +101,8 @@ const results: any[] = [];
 const jobs = Array.from({ length: trials }, (_, trial) =>
   cases.flatMap((c) => models.map((model) => ({ c, model, trial: trial + 1 }))),
 ).flat();
-await Promise.all(
+const usageBudget = await settleEvalWorkers(
+  usageMeter,
   Array.from({ length: 1 }, async () => {
     for (;;) {
       const item = jobs.shift();
@@ -141,6 +150,7 @@ await writeFile(
   JSON.stringify(
     {
       runId,
+      usageBudget,
       models,
       trials,
       references: STT_CASES.map((c) => ({ id: c.id, segments: c.segments })),

@@ -27,6 +27,8 @@ export interface MediaRecord {
 export interface MediaStore {
   put(owner: string, source: string, upload: MediaUpload, receivedAt?: Date): Promise<string>;
   get(owner: string, ids?: string[]): Promise<MediaRecord[]>;
+  /** Exact retained-source lookup; unlike recent-context reads, this has no last-eight window. */
+  findSource?(owner: string, source: string): Promise<string | undefined>;
   claim(owner: string, id: string): Promise<MediaRecord | null>;
   finish(owner: string, id: string, token: string, result: MediaExtraction): Promise<void>;
   clear(owner: string): Promise<void>;

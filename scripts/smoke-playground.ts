@@ -14,13 +14,16 @@ import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { toolDeliverySchema } from '../src/modules/assistant/tool-evidence.js';
 import { LiveChat } from './lib/live-chat.js';
 import { assertEvalRun, evalPolicyOptions } from '../evals/lib/run-policy.js';
+import { createEvalUsageMeter, evalBudgetOptions } from '../evals/lib/usage-budget.js';
 
 async function main() {
-  const { values } = parseArgs({ options: evalPolicyOptions });
+  const { values } = parseArgs({ options: { ...evalPolicyOptions, ...evalBudgetOptions } });
   const config = loadLivePlaygroundConfig(
     parse(await readFile(resolve(process.env.PLAYGROUND_ENV_FILE ?? '.local/live-playground.env'))),
   );
   assertEvalRun([config.model.model], 5, values);
+  const usageMeter = await createEvalUsageMeter(values, process.env, [config.model.model]);
+  const modelConfig = { ...config.model, usageMeter };
   const pool = new Pool(messagePoolOptions(config.databaseUrl, config.ca));
   pool.on('error', () => {});
   const repo = new PlaygroundRepository(
@@ -30,8 +33,8 @@ async function main() {
     config.encryptionKey,
   );
   const chat = new LiveChat(
-    config.model,
-    new OpenAITextModel(config.model),
+    modelConfig,
+    new OpenAITextModel(modelConfig),
     repo,
     createPlaygroundAccess(config, pool),
     config.context.timeoutMs,
@@ -190,8 +193,15 @@ async function main() {
       }),
     );
   } finally {
-    await chat.drain();
-    await pool.end();
+    try {
+      await chat.drain();
+    } finally {
+      try {
+        await usageMeter.report();
+      } finally {
+        await pool.end();
+      }
+    }
   }
 }
 main().catch((error: unknown) => {

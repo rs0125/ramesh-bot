@@ -16,6 +16,8 @@ import { MediaService, mediaOwner } from '../../modules/media/media.service.js';
 import { toInboxCandidate } from './message.mapper.js';
 import { encodeReply, decodeReply } from '../../modules/messaging/reply-payload.js';
 import { renderVoiceReply, type VoiceReplyReference } from '../../modules/media/voice-reply.js';
+import { currentUsageScope, withUsageScope } from '../../modules/usage/usage-scope.js';
+import { cancellable } from '../../lib/cancellable.js';
 
 export interface DurableMessageOptions {
   encryptionKey: string;
@@ -28,6 +30,14 @@ export interface DurableMessageOptions {
   agentRuns?: boolean;
   media?: MediaService;
   accountId?: string;
+  usageMode?: 'off' | 'observe' | 'enforce';
+  onUsageAttributionFailure?: (
+    reason: 'USAGE_IDENTITY_UNAVAILABLE' | 'USAGE_RUN_ATTRIBUTION_UNAVAILABLE',
+  ) => void;
+  usageEmployee?: (
+    key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null },
+    signal: AbortSignal,
+  ) => Promise<number | undefined>;
   businessPreflight?: (
     message: Pick<WAMessage, 'key'>,
     evidence: unknown,
@@ -53,6 +63,7 @@ type DurableRepository = Pick<
       | 'recordAgentEvent'
       | 'nextInboundDelay'
       | 'replaceWithDeliveryNotice'
+      | 'usageRunId'
     >
   >;
 
@@ -61,6 +72,9 @@ export class DurableMessages {
   private wake?: () => void;
   private revision = 0;
   private readonly ingesting = new Map<string, Promise<string | undefined>>();
+  private activeDownloads = 0;
+  private readonly downloadWaiters = new Set<() => void>();
+  private readonly stoppingDownloads = new AbortController();
   // Conversation memory is intentionally process-local. Persisted reply text survives restarts.
   private readonly sentCallbacks = new Map<string, { expiresAt: number; run: () => void }>();
 
@@ -69,6 +83,83 @@ export class DurableMessages {
     private readonly options: DurableMessageOptions,
   ) {
     this.cipher = authCipher(options.encryptionKey);
+    this.stoppingDownloads.signal.addEventListener(
+      'abort',
+      () => {
+        for (const wake of this.downloadWaiters) wake();
+      },
+      { once: true },
+    );
+  }
+
+  private get usageEnabled() {
+    return this.options.usageMode === 'observe' || this.options.usageMode === 'enforce';
+  }
+
+  /** Stop queue admission synchronously before waiting for the WhatsApp consumer to drain. */
+  stopMediaIngress(): void {
+    this.stoppingDownloads.abort();
+  }
+
+  async drainMediaIngress(): Promise<void> {
+    await Promise.allSettled(this.ingesting.values());
+  }
+
+  private async downloadSlot(): Promise<() => void> {
+    const signal = this.stoppingDownloads.signal;
+    while (this.activeDownloads >= 3) {
+      signal.throwIfAborted();
+      await new Promise<void>((resolve) => {
+        const ready = () => {
+          this.downloadWaiters.delete(ready);
+          resolve();
+        };
+        this.downloadWaiters.add(ready);
+      });
+    }
+    signal.throwIfAborted();
+    this.activeDownloads++;
+    return () => {
+      this.activeDownloads--;
+      this.downloadWaiters.values().next().value?.();
+    };
+  }
+
+  private usageFailure(reason: 'USAGE_IDENTITY_UNAVAILABLE' | 'USAGE_RUN_ATTRIBUTION_UNAVAILABLE') {
+    // Log only a fixed event. Observer failures must not turn attribution into an access grant.
+    try {
+      this.options.onUsageAttributionFailure?.(reason);
+    } catch {
+      /* Best-effort diagnostics. */
+    }
+    if (this.options.usageMode === 'enforce') throw new Error(reason);
+  }
+
+  private async usageSubject(
+    key: WAMessage['key'],
+    candidate: GreetingCandidate,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const fallback = `sender:${createHash('sha256')
+      .update(candidate.senderId ?? candidate.chatId)
+      .digest('hex')}`;
+    if (!this.usageEnabled) return fallback;
+    try {
+      if (!this.options.usageEmployee) throw new Error('USAGE_IDENTITY_RESOLVER_REQUIRED');
+      const attributionSignal = AbortSignal.any([signal, AbortSignal.timeout(10000)]);
+      const employee = await cancellable(
+        () => this.options.usageEmployee!(key, attributionSignal),
+        attributionSignal,
+      );
+      if (employee === undefined) return fallback; // An actual unknown user still gets ordinary chat.
+      if (!Number.isSafeInteger(employee) || employee <= 0)
+        throw new Error('INVALID_USAGE_EMPLOYEE');
+      return `employee:${employee}`;
+    } catch {
+      signal.throwIfAborted();
+      this.usageFailure('USAGE_IDENTITY_UNAVAILABLE');
+      return fallback;
+    }
   }
 
   async enqueue(
@@ -120,6 +211,7 @@ export class DurableMessages {
     candidate: GreetingCandidate,
     session: WhatsAppSession,
     receivedAt?: Date,
+    admittedRunId?: string,
   ): Promise<string | undefined> {
     if (
       !this.options.media ||
@@ -136,11 +228,48 @@ export class DurableMessages {
       candidate.senderId ?? candidate.chatId,
     );
     const work = (async () => {
-      const old = await this.options.media!.store.get(owner);
-      const stored = old.find((r) => r.source === candidate.messageId);
-      if (stored) return stored.id;
-      const upload = await session.downloadMedia!(message, AbortSignal.timeout(35000));
-      return this.options.media!.ingest(owner, candidate.messageId, upload, receivedAt);
+      const store = this.options.media!.store;
+      const findStored = () =>
+        store.findSource
+          ? store.findSource(owner, candidate.messageId)
+          : store
+              .get(owner)
+              .then((rows) => rows.find((row) => row.source === candidate.messageId)?.id);
+      const stored = await findStored();
+      if (stored) return stored;
+      const release = await this.downloadSlot();
+      try {
+        // Another ingress path may have persisted this source while this one waited.
+        const duplicate = await findStored();
+        if (duplicate) return duplicate;
+        const signal = AbortSignal.any([this.stoppingDownloads.signal, AbortSignal.timeout(35000)]);
+        signal.throwIfAborted();
+        const upload = await session.downloadMedia!(message, signal);
+        signal.throwIfAborted();
+        if (!this.usageEnabled)
+          return await this.options.media!.ingest(owner, candidate.messageId, upload, receivedAt);
+        const upstream = currentUsageScope()?.scope;
+        let runId = admittedRunId;
+        if (!runId) {
+          try {
+            if (!this.repository.usageRunId) throw new Error('USAGE_MESSAGE_RESOLVER_REQUIRED');
+            runId = await this.repository.usageRunId(candidate.chatId, candidate.messageId);
+          } catch {
+            this.usageFailure('USAGE_RUN_ATTRIBUTION_UNAVAILABLE');
+            runId = createHash('sha256').update(key).digest('hex');
+          }
+        }
+        const subjectId =
+          (upstream?.runId === runId ? upstream.subjectId : undefined) ??
+          (await this.usageSubject(message.key, candidate, signal));
+        signal.throwIfAborted();
+        return await withUsageScope({ runId, subjectId }, () =>
+          this.options.media!.ingest(owner, candidate.messageId, upload, receivedAt),
+        );
+      } finally {
+        // Hold the slot through durable persistence so decoded buffers cannot queue behind SQL.
+        release();
+      }
     })().finally(() => this.ingesting.delete(key));
     this.ingesting.set(key, work);
     return work;
@@ -231,6 +360,17 @@ export class DurableMessages {
     signal: AbortSignal,
     report: (outcome: 'sent' | 'error') => void,
   ): Promise<void> {
+    return withUsageScope({ runId: job.id }, () =>
+      this.processScoped(job, session, signal, report),
+    );
+  }
+
+  private async processScoped(
+    job: MessageJob,
+    session: WhatsAppSession,
+    signal: AbortSignal,
+    report: (outcome: 'sent' | 'error') => void,
+  ): Promise<void> {
     let sendInvoked = false;
     try {
       if (signal.aborted) {
@@ -261,6 +401,12 @@ export class DurableMessages {
       }
       if (job.direction === 'inbound') {
         if (!candidate || !message) throw new Error('Missing inbound message');
+        if (this.usageEnabled) {
+          // Covers fresh and restarted/pending media before any extractor or model can run.
+          const scope = currentUsageScope()?.scope;
+          if (!scope) throw new Error('USAGE_RUN_SCOPE_REQUIRED');
+          scope.subjectId = await this.usageSubject(message.key, candidate, signal);
+        }
         if (
           this.options.agentRuns &&
           (!this.repository.beginAgentRun ||
@@ -291,7 +437,13 @@ export class DurableMessages {
         const attachments = await Promise.all(
           originals.map(async (item, index) => {
             try {
-              const id = await this.ingest(item.message, item.candidate, session, item.receivedAt);
+              const id = await this.ingest(
+                item.message,
+                item.candidate,
+                session,
+                item.receivedAt,
+                job.id,
+              );
               return { id };
             } catch {
               return { failure: `An attachment in message ${index + 1} could not be read.` };
