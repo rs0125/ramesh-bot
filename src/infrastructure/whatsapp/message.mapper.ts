@@ -13,7 +13,7 @@ export function toGreetingCandidate(
   return mapMessage(message, botJids, false);
 }
 
-/** Media appears as a labelled entry; file contents are not downloaded or sent to the model. */
+/** Mapping produces labels only; the separately gated media service processes eligible files. */
 export function toInboxCandidate(
   message: WAMessage,
   botJids: readonly string[],
@@ -62,6 +62,14 @@ function mapMessage(
       : undefined);
   if (!text?.trim()) return null;
 
+  const context =
+    content.extendedTextMessage?.contextInfo ??
+    content.imageMessage?.contextInfo ??
+    content.videoMessage?.contextInfo ??
+    content.audioMessage?.contextInfo ??
+    content.documentMessage?.contextInfo ??
+    content.stickerMessage?.contextInfo;
+  const forwarded = context?.isForwarded === true || (context?.forwardingScore ?? 0) > 0;
   const mentions =
     content.extendedTextMessage?.contextInfo?.mentionedJid ??
     content.imageMessage?.contextInfo?.mentionedJid ??
@@ -80,6 +88,7 @@ function mapMessage(
     mentionsBot: mentions.some((jid) => identities.has(jidNormalizedUser(jid))),
     text: text.trim(),
     kind,
+    forwarded,
     senderName: message.pushName?.slice(0, 256) || undefined,
     senderId: isGroup
       ? message.key.participant

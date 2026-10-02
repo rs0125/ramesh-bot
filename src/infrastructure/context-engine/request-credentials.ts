@@ -13,9 +13,9 @@ import {
 import { cancellable } from '../../lib/cancellable.js';
 
 const scopes = z
-  .array(z.enum(['knowledge:read', 'warehouses:read', 'crm:read']))
+  .array(z.enum(['knowledge:read', 'warehouses:read', 'crm:read', 'analytics:read']))
   .min(1)
-  .max(3)
+  .max(4)
   .refine((v) => new Set(v).size === v.length);
 const signing = z
   .object({

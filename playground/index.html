@@ -18,13 +18,13 @@
         <p class="muted">Try a conversation, change the tone, or pick up where you left off.</p>
         <div class="contact selected">
           <div class="avatar">R</div>
-          <div><strong>Ramesh</strong><small>Converser + formatter</small></div>
+          <div><strong>Ramesh</strong><small>__ASSISTANT_ROLE__</small></div>
           <span class="dot"></span>
         </div>
         <label for="sender">Speaking as</label>
         <select id="sender">
-          <option value="me">You</option>
-          <option value="teammate">Test teammate</option>
+          <option value="me">__EMPLOYEE__</option>
+          <option value="teammate">__SECOND_ACTOR__</option>
         </select>
         <label for="audience">Conversation</label>
         <select id="audience">
@@ -36,19 +36,17 @@
           <span class="safety-icon">◉</span>
           <div>
             <strong>Local sandbox</strong>
-            <p>SQLite + a fake chat transport. Nothing here goes to WhatsApp.</p>
+            <p>__STORAGE__</p>
           </div>
         </div>
-        <div class="model-label">
-          __MODEL__<br /><span>Real OpenAI calls · No CRM tools yet</span>
-        </div>
+        <div class="model-label">__MODEL__<br /><span>Real OpenAI calls · __CRM_MODE__</span></div>
       </aside>
       <main class="chat">
         <header class="chat-header">
           <div class="avatar small">R</div>
           <div>
             <h1>Ramesh</h1>
-            <p><span class="dot"></span> Ready · local sandbox</p>
+            <p><span class="dot"></span> Ready · capture only</p>
           </div>
           <button id="reset" class="quiet-button">New conversation</button>
         </header>
@@ -62,18 +60,50 @@
           <section class="empty" id="empty">
             <div class="large-avatar">r.</div>
             <h2>Say hello to Ramesh.</h2>
-            <p>Short replies. Plain words. A bit more human.</p>
+            <p>Plan your day, prepare a decision, find a fact or draft a message.</p>
             <div class="suggestions">
               <button data-message="hey Ramesh, what's up?">Start with a hello</button
               ><button
                 data-message="Help me write a casual message asking a client when they're free for a call."
               >
                 Draft a quick message</button
-              ><button data-message="yaar aaj kaafi hectic din tha">Try Hinglish</button>
+              ><button data-message="Show all my assigned CRM follow-ups, across all dates.">
+                All my follow-ups</button
+              ><button data-message="Show my assigned CRM follow-ups for today.">
+                My follow-ups today
+              </button>
+              <button data-message="Find warehouses in Bengaluru around 25,000 square feet.">
+                Find warehouse options
+              </button>
+              <button data-message="Help me prepare for my workday using CRM priorities.">
+                Prepare my workday
+              </button>
+              <button
+                data-message="Compare GA4 traffic for the last 7 complete days with the previous period."
+              >
+                GA4 traffic
+              </button>
+              <button data-message="Show Google Search performance for the last 28 days.">
+                Google Search performance
+              </button>
             </div>
           </section>
         </div>
         <div class="run-info" id="run-info">Your messages stay in this simulated conversation.</div>
+        <div class="attachment-controls">
+          <label><input id="forwarded" type="checkbox" /> Forwarded message</label
+          ><label class="attach-label"
+            >Attach image, PDF or voice note
+            <input
+              id="attachment"
+              type="file"
+              multiple
+              accept="image/jpeg,image/png,image/webp,application/pdf,audio/*" /></label
+          ><small
+            >Private copies expire after 24 hours. Send a few messages, then ask your
+            question.</small
+          >
+        </div>
         <form class="composer" id="composer">
           <label class="sr-only" for="message">Message Ramesh</label
           ><textarea

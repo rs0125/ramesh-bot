@@ -2,7 +2,7 @@
 
 Ramesh's preferred credential adapter uses service request signatures and live employee authorization. Each trusted WhatsApp phone/LID maps to exactly one active `VerifiedNumber` employee. Unknown users can still chat but cannot access business data. Business reads remain limited to DMs.
 
-The conversational graph still contains only the converser and formatter. This increment prepares authenticated CRM/supply/knowledge services for the future worker; it does not activate business tools, planner/verifier agents, reminders or writes.
+The default production graph remains conversational. The disabled-by-default [personal-assistant integration](sales-manager-agent.md) composes these adapters for all permitted CRM, supply, knowledge, shortlist and analytics reads, with source verification, independent answer review and private delivery rechecks. The live capture playground enables that path as Raghav. Separate planner/worker/verifier roles are implemented in this checkout; reminders and writes remain deferred.
 
 ## Composition
 
@@ -16,19 +16,25 @@ An attacker with a phone number cannot forge a signature. Compromising the worke
 
 ## Setup and rollout
 
-1. Use the existing `npm run db:identity` procedure to give the restricted worker connection SELECT on four roster columns. Never give the worker a migration-owner connection.
+1. Use the existing `npm run db:identity` procedure to give the restricted worker connection SELECT on four roster columns. Column grants alone do not bypass RLS: verify that a SELECT policy permits the worker login and that the runtime can actually resolve the chosen employee. Never give the worker a migration-owner connection.
 2. On Context Engine, complete its restricted runtime/security migration, generate a key pair with `scripts/create-ramesh-key.mjs`, then check/apply `scripts/migrate-ramesh-auth.mjs`. Register only the public key there and enable the dedicated endpoint.
 3. Set `CONTEXT_MCP_URL=https://<canonical-context-origin>/mcp/ramesh` and `CONTEXT_RAMESH_SIGNING_KEY_JSON` to the generated `worker-signing.json` contents in the protected worker environment. Keep the private JSON in the encrypted deployment secret store and root-readable runtime file; never echo it into commands, logs or chat.
-4. Explicitly compose `createSignedEmployeeContextAccess` when implementing the future worker. Merely setting the environment does not connect these services to LangGraph.
+4. Apply worker migration `202610010004`, then explicitly enable `BUSINESS_READS_ENABLED=true` and use `BUSINESS_READ_EMPLOYEE_IDS=all` (the default) or an explicit list for a staged rollout. `createBusinessReads` composes the signed adapter and pins each operation to the initially resolved employee. Merely setting Context Engine credentials does not enable graph tools.
 
 No OAuth callback, employee consent screen, per-employee credential table or scheduled refresh job is required for this trusted first-party path. Claude continues using its existing OAuth connector. `/mcp` accepts the existing OAuth token type; `/mcp/ramesh` accepts the signed request type. The client rejects mismatched credential/endpoint combinations.
 
 `CONTEXT_MCP_TIMEOUT_MS` defaults to 30000 and `CONTEXT_MCP_MAX_RESPONSE_BYTES` to 1048576. HTTPS is required except for explicit loopback development. Generated public registrations expire after 90 days. Rotate by deploying overlapping public keys, switching the worker signer, verifying the new key, then removing the old registration and redeploying Context Engine. Removing a key or changing the feature flag takes effect on deployments using the updated configuration. Retire or protect old deployment URLs too.
 
-The worker's running conversational application does not currently read these new settings. Keep existing encryption, account namespace, API and model credentials intact during deployment. Signed access does not use the encrypted OAuth snapshots, so an OAuth restore/re-enrollment procedure is irrelevant to this path.
+The worker reads the signed configuration only when the business feature is explicitly enabled. Keep existing encryption, account namespace, API and model credentials intact during deployment. Signed access does not use the encrypted OAuth snapshots, so an OAuth restore/re-enrollment procedure is irrelevant to this path.
 
 ## Tests and next work
 
+`dev:chat:live` now reuses this signed path against the configured Context Engine, with Raghav pinned by private server configuration. The browser cannot choose an employee ID or number. Its dedicated Supabase login reads the minimal roster columns through its own SELECT policy; capture-only tables replace WhatsApp delivery. This is an explicitly authorized operator test identity, not a claim that the GUI received a trusted WhatsApp event. Five live checks passed, including actual signed CRM reads, replay reauthorization and unknown/group denial. See the [live-data runbook](live-data-playground.md).
+
 `tests/integration/signed-context.test.ts` uses fresh keys, the real MCP SDK, original phone/LID mapping and synthetic employees. It checks independent signatures, no OAuth writes, offboarding, group/unknown/ambiguous denial, cancellation, fixed endpoints and configuration redaction. Existing OAuth tests continue covering the optional legacy path. The Context Engine suite verifies forged/tampered/replayed requests and real PostgreSQL permissions. These tests never open WhatsApp or use production employee data.
 
-Next, wire a single read operation through the future worker and verifier with evidence and private delivery. Follow with supply queries. Reminder scheduling, recipient revalidation and assignee-then-admin escalation remain separate work.
+The general scoped tool loop is wired and tested in this checkout, with deployment still separate. Protected 32-message business recall is implemented. Separate planning/worker/verifier roles and owner-scoped media context are implemented. Finer-grained entity references and durable paused-task support remain future work. Reminder scheduling and assignee-then-admin escalation remain separate work.
+
+## Analytics scope compatibility
+
+The signed route supports the same four read scopes as the regular connector: `crm:read`, `warehouses:read`, `knowledge:read` and `analytics:read`. New registrations include all four; existing three-scope registrations remain valid without gaining analytics. Roll out the matching Context Engine code and explicitly extend both public key registration and private worker scope configuration before enabling Google tools. Effective access still intersects current employee permissions; analytics requires Analyst access, including admins. The local four-scope capture profile has been tested, while production registration/deployment remains separate.

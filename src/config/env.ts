@@ -1,7 +1,9 @@
 /** Validates environment input once, before the application opens any resources. */
 import type { LevelWithSilent } from 'pino';
 import type { MessageDatabaseConfig } from '../infrastructure/database/message-pool.js';
+import { loadDebounce, type DebouncePolicy } from '../modules/messaging/debounce.js';
 import { loadAssistantConfig, type AssistantConfig } from './assistant.js';
+import { loadBusinessReadConfig, type BusinessReadConfig } from './business-reads.js';
 
 export interface AppConfig {
   readonly databaseUrl: string;
@@ -13,7 +15,9 @@ export interface AppConfig {
   readonly autoConnect: boolean;
   readonly messageDatabase?: MessageDatabaseConfig;
   readonly assistant?: AssistantConfig;
+  readonly businessReads?: BusinessReadConfig;
   readonly whatsapp: {
+    readonly debounce?: DebouncePolicy;
     readonly maxMessageAgeMs: number;
     readonly maxPendingMessages: number;
     readonly sendTimeoutMs: number;
@@ -78,15 +82,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const shutdownTimeoutMs = positiveInteger(env, 'SHUTDOWN_TIMEOUT_MS', 10_000);
   if (shutdownTimeoutMs > 300_000) throw new Error('SHUTDOWN_TIMEOUT_MS must be at most 300000');
 
+  const messageDatabase = messageDatabaseConfig(env);
+  const assistant = loadAssistantConfig(env);
+  const businessReads = loadBusinessReadConfig(env);
+  if (businessReads && (!messageDatabase || !assistant))
+    throw new Error('Business reads require Supabase message storage and the configured assistant');
   return {
     databaseUrl,
     logLevel: logLevel as LevelWithSilent,
     shutdownTimeoutMs,
     encryptionKey,
     release,
-    messageDatabase: messageDatabaseConfig(env),
-    assistant: loadAssistantConfig(env),
+    messageDatabase,
+    assistant,
+    businessReads,
     whatsapp: {
+      debounce: loadDebounce(env),
       maxMessageAgeMs: maxAgeSeconds * 1000,
       maxPendingMessages,
       sendTimeoutMs,

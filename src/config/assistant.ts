@@ -1,9 +1,18 @@
 /** OpenAI settings shared by the worker, local playground, and opt-in live evaluations. */
 export interface AssistantConfig {
   apiKey: string;
+  sttApiKey?: string;
+  transcriptionModel?: string;
   model: string;
   timeoutMs: number;
   maxOutputTokens: number;
+  toolReasoningEffort?: 'low' | 'medium' | 'high';
+}
+
+export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
+/** GPT-6.1 Sol requires at least low, including simple formatting. */
+export function effectiveReasoningEffort(model: string, requested: ReasoningEffort) {
+  return /^gpt-6\.1-sol(?:-|$)/.test(model) && requested === 'none' ? 'low' : requested;
 }
 
 export function loadAssistantConfig(
@@ -13,6 +22,12 @@ export function loadAssistantConfig(
   if (!apiKey) return undefined;
   const model = env.OPENAI_MODEL?.trim() || 'gpt-5.6-terra';
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(model)) throw new Error('Invalid OPENAI_MODEL');
+  const transcriptionModel = env.OPENAI_TRANSCRIBE_MODEL?.trim() || 'gpt-4o-transcribe';
+  if (!/^[a-zA-Z0-9._-]{1,100}$/.test(transcriptionModel))
+    throw new Error('Invalid OPENAI_TRANSCRIBE_MODEL');
+  const toolReasoningEffort = env.AGENT_TOOL_REASONING_EFFORT?.trim() || 'medium';
+  if (!['low', 'medium', 'high'].includes(toolReasoningEffort))
+    throw new Error('AGENT_TOOL_REASONING_EFFORT must be low, medium or high');
   const integer = (name: string, fallback: number, min: number, max: number) => {
     const raw = env[name] ?? String(fallback);
     const value = Number(raw);
@@ -22,8 +37,11 @@ export function loadAssistantConfig(
   };
   return {
     apiKey,
+    sttApiKey: env.OPENAI_STT_API_KEY?.trim() || apiKey,
+    transcriptionModel,
     model,
-    timeoutMs: integer('AGENT_TIMEOUT_MS', 45_000, 1000, 120_000),
-    maxOutputTokens: integer('AGENT_MAX_OUTPUT_TOKENS', 800, 128, 2000),
+    toolReasoningEffort: toolReasoningEffort as 'low' | 'medium' | 'high',
+    timeoutMs: integer('AGENT_TIMEOUT_MS', 45_000, 1000, 300_000),
+    maxOutputTokens: integer('AGENT_MAX_OUTPUT_TOKENS', 800, 128, 8000),
   };
 }

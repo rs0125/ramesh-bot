@@ -18,6 +18,7 @@ import {
 } from '../../src/modules/assistant/assistant.service.js';
 import type { TextModel } from '../../src/modules/assistant/assistant.types.js';
 import { SerialQueue } from '../../src/lib/serial-queue.js';
+import type { createFollowupFixture } from './followup-fixture.js';
 
 export interface LocalChatInput {
   conversation: string;
@@ -25,6 +26,8 @@ export interface LocalChatInput {
   group?: boolean;
   text: string;
   messageId?: string;
+  forwarded?: boolean;
+  mediaIds?: string[];
 }
 
 export class LocalChat {
@@ -34,8 +37,16 @@ export class LocalChat {
     config: Pick<AssistantConfig, 'model' | 'timeoutMs'>,
     model: TextModel,
     private readonly db: PrismaClient,
+    private readonly fixture?: ReturnType<typeof createFollowupFixture>,
   ) {
-    this.assistant = new AssistantService(config, model);
+    this.assistant = new AssistantService(
+      config,
+      model,
+      undefined,
+      undefined,
+      undefined,
+      fixture?.service,
+    );
   }
 
   private message(input: LocalChatInput) {
@@ -67,7 +78,7 @@ export class LocalChat {
     };
     const candidate = toGreetingCandidate(message, ['local-ramesh@s.whatsapp.net']);
     if (!candidate) throw new Error('Enter a text message');
-    return candidate;
+    return { candidate, key: message.key };
   }
 
   send(input: LocalChatInput, signal?: AbortSignal): Promise<AssistantReply & { outcome: string }> {
@@ -75,7 +86,7 @@ export class LocalChat {
       if (
         !this.queue.push(async () => {
           signal?.throwIfAborted();
-          const message = this.message(input);
+          const { candidate: message, key } = this.message(input);
           let prepared: AssistantReply | undefined;
           let text: string | undefined;
           const service = new GreetingService(
@@ -84,13 +95,25 @@ export class LocalChat {
             Date.now,
             async () => true,
             async (candidate, abort) => {
-              prepared = await this.assistant.prepare(candidate, abort);
+              prepared = await this.assistant.prepare(candidate, abort, {
+                runId: randomUUID(),
+                key,
+              });
               return prepared;
             },
           );
           const outcome = await service.handle(
             message,
             async (reply) => {
+              if (
+                prepared?.businessEvidence !== undefined &&
+                !(await this.fixture?.service.canDeliver(
+                  key,
+                  prepared.businessEvidence,
+                  signal ?? new AbortController().signal,
+                ))
+              )
+                throw new Error('Fixture delivery was suppressed');
               text = reply;
             },
             signal,
@@ -105,7 +128,7 @@ export class LocalChat {
   }
 
   clear(input: Omit<LocalChatInput, 'text'>) {
-    this.assistant.clear(this.message({ ...input, text: 'reset' }));
+    this.assistant.clear(this.message({ ...input, text: 'reset' }).candidate);
   }
   drain() {
     return this.queue.drain();

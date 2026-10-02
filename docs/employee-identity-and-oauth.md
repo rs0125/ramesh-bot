@@ -2,7 +2,7 @@
 
 > The preferred Ramesh integration is now [signed Context Engine access](signed-context-auth.md), which needs no employee OAuth enrollment or grant storage. This document describes the retained optional OAuth adapter and its recovery procedures. Trusted phone/LID and roster rules still apply.
 
-Implemented on **1 October 2026**. This is the concrete adapter behind `ContextCredentialResolver`, ready for the future tool worker. The conversational graph still contains only converser and formatter. Unknown users can chat; neither chat text nor phone recognition alone authorizes business reads. No planner, worker, verifier, reminder, or write tools are activated by this increment.
+Implemented on **1 October 2026**. This is the retained OAuth adapter behind `ContextCredentialResolver`. The newer [personal-assistant tool loop](sales-manager-agent.md) uses the signed adapter, and the [real-data capture harness](live-data-playground.md) exercises that path as Raghav without OAuth tables. Unknown users can chat; neither chat text nor phone recognition alone authorizes business reads. OAuth provisioning itself does not activate graph tools.
 
 ## Trust boundary
 
@@ -100,7 +100,7 @@ npm run context:auth -- retry-revocations --env-file /private/ramesh-enrollment.
 
 Status returns state, scopes, and expiry metadata, never tokens. Clear temporary callback/environment files when finished. Do not pass the callback URL, employee key, access token, or refresh token on a command line. Enrollment commands never create a WhatsApp connection or send a message; they do contact the roster and Context Engine when explicitly run.
 
-Shipping these adapters does not require changing the running conversational bot's environment. Live enrollment needs the callback setup and explicit employee consent. Business tools still need the future worker integration.
+Shipping these adapters does not require changing the running conversational bot's environment. Live enrollment needs the callback setup and explicit employee consent. The general assistant integration uses the signed adapter instead; see [its runbook](sales-manager-agent.md). This OAuth procedure remains optional compatibility support.
 
 ## Future worker composition
 
@@ -125,7 +125,7 @@ if (scoped) {
 }
 ```
 
-`createEmployeeContextAccess` composes identity, encrypted storage, OAuth, and MCP services without opening a WhatsApp connection. `createContextEngineServices` still defaults to a resolver that grants no access for callers that do not explicitly opt in. The future worker must handle `AUTH_REQUIRED` without disrupting ordinary chat, keep credentials out of the model, and recheck authorization before delayed sensitive delivery. Current encrypted inbox history is available to trusted operators; review that audience before adding personal CRM content to stored replies.
+`createEmployeeContextAccess` composes identity, encrypted storage, OAuth, and MCP services without opening a WhatsApp connection. `createContextEngineServices` still defaults to a resolver that grants no access for callers that do not explicitly opt in. The read executor must handle `AUTH_REQUIRED` without disrupting ordinary chat, keep credentials out of the model, and recheck authorization before delayed sensitive delivery. Protected business reply bodies are hidden from operators behind a placeholder and excluded from model history; a content-free completion marker records that a reply occurred; the signed path does not use these OAuth grants.
 
 ## Verification
 

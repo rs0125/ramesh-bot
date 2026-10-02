@@ -70,11 +70,37 @@ function evidence(result: CallToolResult): ContextEvidence {
       .object({
         status: z.number().int(),
         retry_after_seconds: z.number().nonnegative().max(3600).optional(),
+        error: z.unknown().optional(),
       })
       .safeParse(value);
-    throw failure.success
-      ? statusError(failure.data.status, failure.data.retry_after_seconds)
-      : new ContextEngineError('UNAVAILABLE', true);
+    if (!failure.success) throw new ContextEngineError('UNAVAILABLE', true);
+    const error = statusError(failure.data.status, failure.data.retry_after_seconds);
+    const details = z
+      .object({
+        code: z.string().regex(/^[A-Z_]{1,80}$/),
+        recovery: z.object({
+          retryable: z.boolean(),
+          action: z.enum([
+            'check_source_configuration',
+            'check_google_access',
+            'check_capabilities',
+            'correct_query',
+            'check_engine_access',
+            'retry_later',
+            'investigate_source_response',
+          ]),
+        }),
+      })
+      .safeParse(failure.data.error);
+    const recovery = details.success ? details.data.recovery : undefined;
+    throw recovery
+      ? new ContextEngineError(
+          error.code,
+          recovery.retryable,
+          recovery.retryable ? error.retryAfterSeconds : undefined,
+          { sourceCode: details.success ? details.data.code : 'UNKNOWN', action: recovery.action },
+        )
+      : error;
   }
   const checked = envelope.safeParse(value);
   if (!checked.success) throw new ContextEngineError('INVALID_RESPONSE');
@@ -97,14 +123,18 @@ export class ContextEngineMcpClient implements ContextToolGateway {
     if (!this.config) throw new ContextEngineError('NOT_CONFIGURED');
   }
 
-  discover(sender: ContextSender, signal?: AbortSignal): Promise<ContextToolDefinition[]> {
-    return this.withConnection(sender, signal, async (_client, tools) =>
-      tools.map((tool) => ({
+  async discover(sender: ContextSender, signal?: AbortSignal): Promise<ContextToolDefinition[]> {
+    return (await this.describe(sender, signal)).tools;
+  }
+  describe(sender: ContextSender, signal?: AbortSignal) {
+    return this.withConnection(sender, signal, async (client, tools) => ({
+      guidance: client.getInstructions(),
+      tools: tools.map((tool) => ({
         name: tool.name as ContextReadTool,
         description: tool.description,
         inputSchema: tool.inputSchema,
       })),
-    );
+    }));
   }
 
   async call(

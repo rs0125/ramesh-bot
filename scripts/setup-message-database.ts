@@ -68,6 +68,8 @@ async function main() {
           'ramesh-inbound-queue',
           'ramesh-outbound-queue',
           'ramesh-message-events',
+          'ramesh-agent-runs',
+          'ramesh-agent-events',
           'ramesh-schema-migrations',
         ],
         runtimeRole: 'ramesh_worker',

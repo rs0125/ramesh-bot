@@ -51,6 +51,7 @@ function fakeServer(
     tools?: string[];
     scopes?: string[];
     readOnly?: boolean;
+    guidance?: string;
   } = {},
 ) {
   const calls: { rpc: Rpc; auth: string }[] = [];
@@ -71,6 +72,7 @@ function fakeServer(
         protocolVersion: rpc.params?.protocolVersion,
         capabilities: { tools: {} },
         serverInfo: { name: 'context-fixture', version: '1' },
+        instructions: options.guidance,
       };
     else if (rpc.method === 'tools/list')
       reply = {
@@ -375,4 +377,36 @@ test('domain services map to existing MCP tools while keeping identity out of ar
     { name: 'read_warehouse', args: { id: 4 } },
     { name: 'read_knowledge', args: { id: 'leasing-guide' } },
   ]);
+});
+
+test('server guidance and analytics error recovery survive the MCP adapter without raw messages', async () => {
+  const guidance = 'Search Console uses its source timezone.';
+  const fixture = fakeServer({
+    guidance,
+    tools: ['get_context', 'ga4_report'],
+    scopes: ['analytics:read'],
+    call: () => ({
+      isError: true,
+      content: [],
+      structuredContent: {
+        status: 503,
+        error: {
+          code: 'ANALYTICS_SOURCE_DENIED',
+          message: token(),
+          recovery: { retryable: false, action: 'check_google_access', guidance: token() },
+        },
+        retry_after_seconds: 10,
+      },
+    }),
+  });
+  const client = new ContextEngineMcpClient(config, resolver, fixture.fetch);
+  assert.equal((await client.describe(sender)).guidance, guidance);
+  await assert.rejects(client.call(sender, 'ga4_report', {}), (e: unknown) => {
+    assert.ok(e instanceof ContextEngineError);
+    assert.equal(e.retryable, false);
+    assert.equal(e.retryAfterSeconds, undefined);
+    assert.equal(e.recovery?.action, 'check_google_access');
+    assert.ok(!JSON.stringify(e).includes(token()));
+    return true;
+  });
 });

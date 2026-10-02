@@ -1,6 +1,10 @@
 # Private EC2 operations
 
-Reviewed **1 October 2026** through release `5eb14d0`. The Terra conversational flow and split Supabase queues are deployed. MCP services are scaffolded but disconnected from the active bot; this scaffold requires no additional production environment setting.
+Current local increment (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
+
+The optional business-read flag in this checkout now enables the full employee-permitted CRM, supply, knowledge and shortlist catalogue through the [sales loop](sales-manager-agent.md). Validate production migration `202610010004`, roster RLS, signed scopes and model limits before enabling it. Local Supabase capture tests do not change that production configuration.
+
+Reviewed **1 October 2026** through release `5eb14d0`. The Terra conversational flow and split Supabase queues are deployed. The first-read route in the current checkout is disabled by default and not rolled out here. It requires migration `202610010004`, the signed Context Engine setup and an explicit feature enablement; employee eligibility defaults to all active trusted employees, with optional numeric rollout lists; see [first-read rollout](first-crm-read.md).
 
 The `ramesh-bot-production` CloudFormation stack in Mumbai (`ap-south-1`) owns a dedicated Ubuntu 24.04 `t3.micro`, a security group with **no inbound rules**, its instance profile, a fixed SSM deployment document, the GitHub deployment role, and a private backup bucket. The instance uses an automatically assigned public IPv4 address for outbound traffic. The application listens only on `127.0.0.1:3011`.
 
@@ -28,7 +32,7 @@ aws ssm start-session --region ap-south-1 --target INSTANCE_ID \
   --parameters '{"portNumber":["3011"],"localPortNumber":["3013"]}'
 ```
 
-The tunneled API is `http://127.0.0.1:3013`. Point a local admin instance's `WORKER_API_URL` there and set its `WORKER_API_TOKEN` to the production token from the protected `/ramesh-bot/production/runtime` SecureString parameter. Do not reuse the development token or commit credentials. Keep the tunnel running while using that admin instance. Port **3012** is reserved for the worker's independent fake chat playground, which never opens WhatsApp or Supabase.
+The tunneled API is `http://127.0.0.1:3013`. Point a local admin instance's `WORKER_API_URL` there and set its `WORKER_API_TOKEN` to the production token from the protected `/ramesh-bot/production/runtime` SecureString parameter. Do not reuse the development token or commit credentials. Keep the tunnel running while using that admin instance. Port **3012** is reserved for the independent chat playground, which never opens WhatsApp. `dev:chat:live` reads real Supabase/Context Engine using separate capture queues; `dev:chat` retains isolated SQLite fixtures. See the [live harness runbook](live-data-playground.md). Its private configuration belongs on the operator machine, not in the EC2 worker environment.
 
 Open an operator shell with:
 
@@ -75,7 +79,7 @@ Supabase migrations are separate from release automation. Migrations `2026100100
 
 - Live SQLite database: `/var/lib/wareongo-sales-bot/bot.db`, private to `wareongo-bot`.
 - The retained optional OAuth adapter has encrypted `ContextOAuthGrant`, `ContextOAuthEnrollment`, and `ContextOAuthRevocation` tables through the normal additive Prisma migration. Preserve the existing encryption key and account namespace. After restoring an old grant snapshot, revoke/re-enroll instead of replaying potentially consumed refresh tokens.
-- Supabase: `ramesh-messages`, `ramesh-inbound-queue`, `ramesh-outbound-queue`, `ramesh-message-events`, and `ramesh-schema-migrations`; these are outside the EC2 SQLite snapshots.
+- Supabase: `ramesh-messages`, `ramesh-inbound-queue`, `ramesh-outbound-queue`, `ramesh-message-events`, `ramesh-schema-migrations`, and migration 004’s `ramesh-agent-runs` / `ramesh-agent-events`; these are outside the EC2 SQLite snapshots.
 - Runtime secrets: `/etc/wareongo-sales-bot/worker.env`, root-only; a separate encrypted copy lives in Parameter Store at `/ramesh-bot/production/runtime`.
 - Daily consistent database snapshots: the stack's private S3 bucket, `daily/`, encrypted with SSE-S3, expiring after 14 days.
 - Local pre-deployment snapshots: `/var/backups/wareongo-sales-bot`; snapshots older than seven days are removed only after a successful S3 upload.
@@ -94,3 +98,7 @@ Stack termination protection is enabled. The instance and backup bucket are reta
 Historical infrastructure estimate: the AWS Price List API on September 30, 2026 returned $0.0112/hour for Linux `t3.micro` in Mumbai and $0.0912/GB-month for gp3. At 730 hours, compute is $8.18, 20 GiB storage is $1.82, and the public IPv4 address is $3.65: **$13.65/month before tax, credits, backup storage, and billable transfer**. OpenAI usage and Supabase costs are separate. CPU credits use `standard` mode, so sustained CPU load is throttled instead of incurring unlimited-mode credit charges. Resize only after observing resource use.
 
 [EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing](https://aws.amazon.com/ebs/pricing/), [IPv4 pricing](https://aws.amazon.com/vpc/pricing/), and [SSM pricing](https://aws.amazon.com/systems-manager/pricing/) are the pricing references. No NAT gateway, load balancer, RDS database, or public HTTPS endpoint is provisioned by this stack.
+
+## Graph/media release prerequisites prepared on 2 October 2026
+
+Production message migrations through `202610020005` have been applied and verified through the restricted worker login. The separate capture schema remains isolated. `ffmpeg` is installed on the EC2 host; the bootstrap script also includes it for new hosts. Parameter Store runtime version 6 adds `OPENAI_STT_API_KEY` and `OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe`, with the matching host file installed atomically and existing fields preserved. The normal CD restart loads these settings. Inbound windows are `INBOUND_TEXT_QUIET_MS=1000`, `INBOUND_BURST_QUIET_MS=3000` and `INBOUND_MAX_WAIT_MS=8000`. These collect per-sender bursts; outbound pacing is separate. Sol medium is selected in the local test profile and paid CI, not in deployed AWS environment settings.

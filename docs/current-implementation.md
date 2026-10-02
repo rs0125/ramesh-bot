@@ -1,8 +1,10 @@
 # WareOnGo WhatsApp bot: current implementation and architecture
 
-Reviewed: **2026-10-01, Asia/Kolkata**, through trusted identity and signed Context Engine access.
+Current local increment (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
 
-This reference describes the two-node OpenAI Terra flow, separate Supabase queues, inactive Context Engine services, trusted identity and signed request adapters, optional legacy OAuth adapter, and independent pairing admin. The [architecture plan](assistant-architecture-plan.md) records future agents and workflows.
+Reviewed: **2026-10-02, Asia/Kolkata**, through the personal-assistant tool loop and real-data capture playground. Production business-read activation remains separate.
+
+This reference describes ordinary two-node OpenAI Terra chat, the opt-in personal-assistant tool loop, separate Supabase queues, trusted identity and signed request adapters, optional legacy OAuth adapter, and independent pairing admin. The read loop handles the full employee-permitted CRM, supply, knowledge and analytics catalogue. The [architecture plan](assistant-architecture-plan.md) records future agents and workflows.
 
 The linked WhatsApp session belongs to EC2; the earlier local pairing is retired. Supabase migrations `202610010001` and `202610010002` are provisioned. CI and EC2 deployment succeeded for the conversational, queue-split, and MCP scaffold changes. The EC2 API remains private; the Caddy/Vercel network rollout is not implied by those deployments. Local playground/evaluation replies use fake delivery and never go to WhatsApp.
 
@@ -29,7 +31,7 @@ The linked WhatsApp session belongs to EC2; the earlier local pairing is retired
 
 ## Purpose and scope
 
-The current product is a WhatsApp bot intended for internal sales-team use. It responds conversationally to qualifying text DMs and actual group mentions of the linked account. OpenAI Responses with `gpt-5.6-terra` powers a LangGraph converser and formatter; `hello` remains the fallback when no API key is configured.
+The current product is a personal assistant for WareOnGo employees on WhatsApp. It responds conversationally to qualifying text DMs and actual group mentions of the linked account. OpenAI Responses with `gpt-5.6-terra` powers a LangGraph converser and formatter; `hello` remains the fallback when no API key is configured.
 
 The implementation already includes:
 
@@ -37,15 +39,15 @@ The implementation already includes:
 - QR pairing, encrypted credential persistence, and automatic reconnection for transient failures.
 - A bounded admission buffer, separate PostgreSQL inbound/outbound queues, atomic finalized-reply handoff, lease recovery, and persistent duplicate suppression.
 - Two thin conversational stages, bounded memory, generation deadlines/cancellation, and reply-style enforcement.
-- A capture-only SQLite chat GUI and repeated live-model evaluation harness.
-- Employee-scoped MCP read services with fake-server tests, ready for future integration.
+- A real Supabase/Context Engine capture GUI as a server-configured employee, plus optional synthetic SQLite chat and repeated model evaluations.
+- Employee-scoped MCP services, a bounded native tool loop across CRM/supply/knowledge/shortlists, deterministic source checks, independent answer review, private delivery rechecks and encrypted Supabase run/event storage, disabled until explicitly configured.
 - Trusted phone/LID resolution to an active employee and fresh signed Context Engine requests, with no per-employee OAuth enrollment.
 - A configurable random delay before each eligible reply.
 - Cancellation of pending timers, recovery of unsent jobs after reconnect, and conservative handling of uncertain sends.
 - A separate authenticated admin application for pairing, status, and session controls.
 - Local tests, independent CI/CD workflows, and EC2 provisioning, release, and backup assets.
 
-The active graph does **not** include business tools, planner/worker/verifier agents, reminders or CRM writes. Qualifying DMs can trigger conversation. The signed identity adapter denies business credentials to unknown, inactive or ambiguous senders, and its services deny group reads. It is explicitly composed for a future worker; the running graph does not import it. Operator sends remain restricted to existing inbox chats.
+The default graph remains conversational. With BUSINESS_READS_ENABLED, active employee eligibility and signed Supabase/MCP configuration, it exposes the sender’s permitted Context Engine read catalogue in a DM, without a fixed question list or date restriction. Unknown, inactive and ambiguous users can chat but cannot read business data. BUSINESS_READ_EMPLOYEE_IDS defaults to all active employees; an optional explicit list can restrict a staged rollout. A separate planner, native-tool worker, verifier, media ingestion and durable inbound batching are implemented locally. Durable paused workflows, reminders and writes remain deferred. Operator sends remain restricted to existing inbox chats. See [first-read behavior and rollout](first-crm-read.md); this checkout has not been deployed.
 
 ## System topology
 
@@ -71,11 +73,11 @@ flowchart LR
 
 The two applications have different lifetimes:
 
-| Application | Local default    | Owns                                                               | Lifetime                                               |
-| ----------- | ---------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
-| Worker      | `127.0.0.1:3011` | WhatsApp socket, bot behavior, SQLite state, control API           | Must remain running to receive and respond to messages |
-| Admin       | `127.0.0.1:3010` | Operator login, dashboard, QR rendering, server-side worker client | Browser can be closed without stopping the bot         |
-| Playground  | `127.0.0.1:3012` | Fake chat UI, isolated SQLite, real model calls, captured replies  | Optional development process; never owns WhatsApp      |
+| Application | Local default    | Owns                                                                        | Lifetime                                                   |
+| ----------- | ---------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Worker      | `127.0.0.1:3011` | WhatsApp socket, bot behavior, SQLite state, control API                    | Must remain running to receive and respond to messages     |
+| Admin       | `127.0.0.1:3010` | Operator login, dashboard, QR rendering, server-side worker client          | Browser can be closed without stopping the bot             |
+| Playground  | `127.0.0.1:3012` | Fake chat UI, real Supabase capture queues or synthetic SQLite, model calls | Optional operator/development process; never owns WhatsApp |
 
 The worker initiates the connection to WhatsApp. Messages arrive through that established connection. There is no inbound WhatsApp HTTP webhook and no application loop that polls WhatsApp for new messages.
 
@@ -89,7 +91,7 @@ Versions below are pinned in the current package manifests, not a claim about th
 | ---------------------- | --------------------------------------------------------------------------------- |
 | Runtime                | Node.js `>=22.16 <23`; TypeScript; ECMAScript modules                             |
 | WhatsApp transport     | `@whiskeysockets/baileys` `7.0.0-rc14`                                            |
-| Agent runtime          | `@langchain/langgraph` `1.4.18`, typed two-node state graph                       |
+| Agent runtime          | `@langchain/langgraph` `1.4.18`, typed conversational and general tool graphs     |
 | Model client           | `openai` `7.25.0`, Responses API, `gpt-5.6-terra` default                         |
 | MCP scaffold           | `@modelcontextprotocol/client` `2.1.0`, Streamable HTTP                           |
 | Worker database        | SQLite/Prisma `6.19.3` for auth/admin; PostgreSQL/`pg` `8.16.3` for messages/jobs |
@@ -120,8 +122,8 @@ The application follows a layered structure: domain behavior depends on small in
 | [`src/modules/assistant/assistant.service.ts`](../src/modules/assistant/assistant.service.ts)                 | Prepares replies, combines cancellation/deadlines, commits accepted conversation turns                   |
 | [`src/modules/assistant/conversation-memory.ts`](../src/modules/assistant/conversation-memory.ts)             | Bounded chat-and-sender memory with expiry                                                               |
 | [`src/infrastructure/openai/text-model.ts`](../src/infrastructure/openai/text-model.ts)                       | Responses adapter, bounded retries/output, and redacted model failures                                   |
-| [`src/app/context-engine.ts`](../src/app/context-engine.ts)                                                   | Explicit, inactive composition point for future MCP services                                             |
-| [`src/modules/context-engine/context.service.ts`](../src/modules/context-engine/context.service.ts)           | Employee-bound CRM, supply, and knowledge read services                                                  |
+| [`src/app/context-engine.ts`](../src/app/context-engine.ts)                                                   | Reusable signed/OAuth service factories, composed by the opt-in personal-assistant loop                  |
+| [`src/modules/context-engine/context.service.ts`](../src/modules/context-engine/context.service.ts)           | Employee-bound CRM, supply, knowledge and analytics read services                                        |
 | [`src/infrastructure/context-engine/mcp-client.ts`](../src/infrastructure/context-engine/mcp-client.ts)       | MCP transport, scope/identity checks, and source-evidence envelopes                                      |
 | [`src/infrastructure/whatsapp/baileys-session.ts`](../src/infrastructure/whatsapp/baileys-session.ts)         | Creates the real SDK socket; supplies auth storage, reply deadlines, and group metadata caching          |
 | [`src/infrastructure/whatsapp/baileys-client.ts`](../src/infrastructure/whatsapp/baileys-client.ts)           | Owns connection state, subscriptions, message admission, cancellation, reconnects, and transient metrics |
@@ -149,7 +151,7 @@ Consequently, `GreetingService` does not import Baileys or Prisma. It can be tes
 
 1. `src/index.ts` loads the repository-root `.env`. In compiled execution, its relative path still resolves from `dist/index.js` to the repository/release root.
 2. `loadConfig()` validates secrets, database URL, numeric limits, and flags.
-3. The application constructs Prisma, the configured assistant/model adapter, greeting service, optional PostgreSQL repository/consumer, Baileys client, admin-session storage, and control server. It does not construct the inactive MCP services.
+3. The application constructs Prisma, the configured assistant/model adapter, greeting service, optional PostgreSQL repository/consumer, Baileys client, admin-session storage, and control server. With the business feature enabled it also composes the live roster, signed MCP client and general read gateway; composition itself makes no business request.
 4. `start()` verifies local SQLite access and checks the durable-storage activation marker. If enabled, it verifies the PostgreSQL schema/runtime login, imports old greeting claims without jobs, cleans stale work, and records `message-storage=postgres`. Missing Supabase configuration after activation fails startup.
 5. Expired admin sessions/login buckets and old greeting claims are cleaned.
 6. The worker starts its HTTP listener.
@@ -263,7 +265,7 @@ sequenceDiagram
 
 The SDK listener accepts only `type === 'notify'` from the current running session. It considers every message in each batch. `append` history batches and events from retired sessions are ignored. A small in-memory FIFO bounds admission; its work in Supabase mode is persistence, so reply delays do not block incoming database inserts.
 
-The mapper supports phone DMs (`@s.whatsapp.net`), LID DMs (`@lid`), and groups (`@g.us`). It unwraps content and accepts nonempty conversation/extended text or image/video captions. Reactions, protocol traffic, and captionless media do not trigger a greeting. Real structured bot mentions are required in groups; typing the display name is insufficient. No media understanding is implemented.
+The mapper supports phone DMs (`@s.whatsapp.net`), LID DMs (`@lid`), and groups (`@g.us`). It unwraps content and accepts nonempty conversation/extended text or image/video captions. Reactions and protocol traffic are ignored. Supported captionless media can enter the assistant path when media processing is configured. Real structured bot mentions are required in groups; typing the display name is insufficient. Image/PDF extraction and voice transcription are now available through the private media lifecycle when Supabase and the assistant are configured. Unsupported formats remain unread.
 
 The `GreetingCandidate` contract carries chat/message/sender IDs, text, time, own-message and group/mention flags. In durable mode, the original protobuf message is additionally encrypted and persisted for reconstructing the quoted reply after restart. The sender ID separates conversation context; it does not establish an employee identity or CRM permissions.
 
@@ -279,23 +281,25 @@ Fresh development databases without `MESSAGE_DATABASE_URL` use the `GreetingServ
 
 ## Conversational graph and local playground
 
-The graph is `START → converser → formatter → END`. Both nodes use the same model adapter. The converser handles the request with recent context; the formatter preserves facts and uncertainty while making the reply suitable for WhatsApp. Prompts prohibit pretending to have business tools or completed actions. A final code guard removes em dashes. Planner, worker, and verifier nodes are intentionally deferred.
+The ordinary-chat graph is `START → converser → formatter → END`. Both nodes use the same model adapter. The converser handles the request with recent context; the formatter preserves facts and uncertainty while making the reply suitable for WhatsApp. Prompts prohibit pretending to have business tools or completed actions. A final code guard removes em dashes. The opt-in personal-assistant graph adds native tool selection, schema-checked execution, source verification, formatting and a fresh semantic review. See [the personal-assistant runbook](sales-manager-agent.md) for limits, recovery and actual capabilities. The research graph now separates converser, planner, worker, deterministic executor, formatter and verifier; paused-task checkpoints remain deferred.
 
-Input is capped at 6,000 characters, output defaults to 800 tokens per model response, and the whole graph has a 45-second deadline with one bounded SDK retry. Generation also observes session cancellation. OpenAI calls use the fixed official endpoint and `store: false`. Ordinary logs record stage timings and token counts, not prompts, responses, or keys.
+Single-message input is capped at 6,000 characters; durable bursts have separate bounded combined-text and media budgets. Output defaults to 800 tokens per model response, and the whole graph has a 45-second deadline with one bounded SDK retry. Generation also observes session cancellation. OpenAI calls use the fixed official endpoint and `store: false`. Ordinary logs record stage timings and token counts, not prompts, responses, or keys.
 
-With Supabase configured, the encrypted inbox supplies up to 40 preceding rows and 16,000 characters of context. Participants share their group's history, including untagged messages; other groups and DMs stay separate. Successfully sent replies, including admin messages, enter context; failed/uncertain output does not. History survives restart and expires after 30 days. The isolated SQLite playground still uses bounded process-local memory. Supabase history is not a LangGraph checkpoint. A crash before handoff may repeat generation; saved outbound replies survive restart without another model call.
+With Supabase configured, the encrypted inbox supplies the last 32 messages within 48,000 characters of context, selected from up to 40 preceding rows. Participants share their group's history, including untagged messages; other groups and DMs stay separate. Successfully sent replies, including admin messages, enter context; failed/uncertain output does not. Protected replies enter ordinary model history as markers; the local recall tool restores their content only after fresh scoped reads match the saved fingerprints and current employee. Protected replies show only a private placeholder in the admin inbox. History survives restart and expires after 30 days. The isolated SQLite playground still uses bounded process-local memory. Supabase history is not a LangGraph checkpoint. A crash before handoff may repeat generation; saved outbound replies survive restart without another model call.
 
 Run `npm run dev:chat` for the fake chat GUI at `http://127.0.0.1:3012`. It exercises the mapper, SQLite claims, and graph with synthetic identities and a captured sender. `.local/playground.db` is separately migrated on startup. The command ignores production SQLite/Supabase connection settings, never loads linked-device credentials, and creates no WhatsApp socket. **New conversation** clears the selected context's process-local memory. Real OpenAI calls require a local key and incur model usage.
 
+For real business data, use **`npm run dev:chat:live`** at the same port. Its separate private configuration pins Raghav and uses a restricted `ramesh_playground` login, `ramesh-test-inbound-queue`, `ramesh-test-outbound-queue` and encrypted test receipts. It calls the configured signed Context Engine through the shared scoped reader and verifier. A browser capture sink replaces delivery; neither SQLite nor the production queue consumer is constructed. Unknown users and groups cannot read CRM data. Startup checks roster RLS visibility and queue isolation. See the [live harness runbook](live-data-playground.md) for the complete boundary and setup.
+
 ## Context Engine service scaffold
 
-`createContextEngineServices(config, credentials)` builds reusable CRM, supply, and knowledge services. It is not imported by `createApplication`, the graph, or the playground. No production MCP environment update is required for this release. Setting `CONTEXT_MCP_URL` alone does not activate business reads.
+`createContextEngineServices(config, credentials)` builds reusable CRM, supply, knowledge and analytics services. The opt-in `createBusinessReads` composition discovers the complete employee-permitted read catalogue; the fixed daily query is only a legacy regression preset. Setting `CONTEXT_MCP_URL` alone does not activate business reads. Apply migration `202610010004`, provide signed credentials and choose all active employees or an optional rollout list before enabling the feature. The playground uses synthetic services only with `PLAYGROUND_CRM_FIXTURES=true`.
 
 `createSignedEmployeeContextAccess` supplies the preferred `ContextCredentialResolver`. It composes trusted phone/reciprocal LID mapping, a live roster, request signer and scoped services. `forMessage()` derives identity from the original Baileys key and each POST rechecks employee binding. Identity and keys are never model arguments. See [signed access](signed-context-auth.md); the earlier OAuth factory remains optional.
 
 Each read uses a fresh MCP connection, verifies `get_context`, and intersects the local allowlist, server read-only annotations and employee scopes. Group reads and writes are denied. Signed credentials require the exact HTTPS `/mcp/ramesh` endpoint; the optional OAuth adapter requires `/mcp`. Redirects are rejected. Calls have bounded duration/response size, cancellation and safe errors; failed calls are not automatically retried.
 
-Results preserve source paths, request IDs, timestamps, cursors, coverage, access scope, uncertainty, and field evidence. The scaffold validates the envelope; a future verifier must assess its business meaning. See [the full service contract and integration example](assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold).
+Results preserve source paths, request IDs, timestamps, cursors, coverage, access scope, uncertainty, and field evidence. The MCP client validates the envelope; the general evidence validator checks tool-specific dates, freshness and coverage, including Google source calendars. A separate model reviews the final answer. One repair can return directly to formatting or to the tool loop; neither resets the budget. See [the full service contract and integration example](assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold).
 
 ## Reply pacing and cancellation
 
@@ -309,7 +313,7 @@ The default inclusive range is 1,500–4,000 ms. This delays each reply; it does
 
 Each WhatsApp session owns an `AbortController`. Stop, connection loss, and fatal auth-storage errors cancel its consumer/timers. In durable mode, already-admitted events finish their persistence step, and work known not to have been sent is released to `QUEUED` for inbound work or `READY_TO_SEND` for saved outbound replies. A new connection can resume it while it remains eligible. Already-started sends are awaited subject to send/process deadlines; interrupted sends become `UNCERTAIN` and are not retried.
 
-The lease window includes the configured agent deadline, maximum reply delay, send timeout, and 30 seconds of database margin. A new UUID token fences each lease; expired pre-send work can be recovered, but an expired `SENDING` marker cannot be automatically replayed. The original SQLite-only development path retains cancelled `CLAIMED` rows instead of requeuing them.
+The lease window covers the larger of the generation and business-preflight deadlines, plus maximum reply delay, send timeout and 30 seconds of database margin. Inbound processing and outbound preflight own separate leases. A new UUID token fences each lease; expired pre-send work can be recovered, but an expired `SENDING` marker cannot be automatically replayed. The original SQLite-only development path retains cancelled `CLAIMED` rows instead of requeuing them.
 
 Pacing smooths traffic; it does not guarantee avoidance of platform restrictions. No fake typing, randomized SDK heartbeat, account rotation, or message-polling camouflage is implemented.
 
@@ -323,6 +327,8 @@ The implementation has two stores with separate responsibilities.
 | Supabase `ramesh-inbound-queue`       | Durable agent-input jobs, leases, attempts, processing outcomes                                          |
 | Supabase `ramesh-outbound-queue`      | Encrypted finalized replies, due times, delivery leases and outcomes                                     |
 | Supabase `ramesh-message-events`      | Transactional state-transition history                                                                   |
+| Supabase `ramesh-agent-runs`          | Fenced run state and atomic output finalization                                                          |
+| Supabase `ramesh-agent-events`        | Encrypted append-only tool receipts and finalization history                                             |
 | Supabase `ramesh-schema-migrations`   | Version/checksum of the separately provisioned PostgreSQL schema                                         |
 | SQLite `WhatsAppAuthEntry`            | Encrypted linked-device credentials and Signal keys                                                      |
 | SQLite `ContextOAuthGrant`            | Optional legacy adapter: encrypted employee OAuth tokens/binding, grant state, version and refresh lease |
@@ -524,9 +530,9 @@ The worker reads configuration once at startup. `npm run dev` runs `tsx src/inde
 
 The additional message-store variables are `MESSAGE_DATABASE_URL`, `MESSAGE_DB_SSL_CA`, `MESSAGE_ACCOUNT_ID` (default `primary`), and `MESSAGE_QUEUE_POLL_MS` (default 5000, range 250–30000). The connection must use the dedicated `ramesh_worker` login. Keep `DATABASE_URL` as SQLite. Full configuration and migration commands are in the [Supabase queue guide](supabase-message-queue.md#authentication-and-configuration).
 
-For signed access, use `CONTEXT_MCP_URL` and protected `CONTEXT_RAMESH_SIGNING_KEY_JSON`; no OAuth callback is required. `npm run db:identity` provisions SELECT on four roster columns. Context Engine needs its public-key configuration and replay migration. These settings are not consumed by the current conversational graph. See [signed access configuration](signed-context-auth.md).
+For signed access, use `CONTEXT_MCP_URL` and protected `CONTEXT_RAMESH_SIGNING_KEY_JSON`; no OAuth callback is required. `npm run db:identity` provisions SELECT on four roster columns. Context Engine needs its public-key configuration and replay migration. `BUSINESS_READS_ENABLED=true` plus explicit `BUSINESS_READ_EMPLOYEE_IDS` activates the general permitted read catalogue after migration `202610010004`; otherwise these settings do not connect tools. See [signed access configuration](signed-context-auth.md).
 
-The inactive MCP factory accepts `CONTEXT_MCP_URL`, `CONTEXT_MCP_TIMEOUT_MS` (30000; range 1000–60000), and `CONTEXT_MCP_MAX_RESPONSE_BYTES` (1048576; range 16384–4194304). The endpoint is exactly `/mcp/ramesh` for signatures or `/mcp` for optional OAuth, with no user info/query/fragment. `loadContextSigningConfig` reads the strict private-key JSON. No employee bearer token is shared.
+The MCP factory accepts `CONTEXT_MCP_URL`, `CONTEXT_MCP_TIMEOUT_MS` (30000; range 1000–60000), and `CONTEXT_MCP_MAX_RESPONSE_BYTES` (1048576; range 16384–4194304). The endpoint is exactly `/mcp/ramesh` for signatures or `/mcp` for optional OAuth, with no user info/query/fragment. `loadContextSigningConfig` reads the strict private-key JSON. The pilot accepts only the signed route. No employee bearer token is shared.
 
 ### Admin environment
 
@@ -754,28 +760,50 @@ Browser tests require a built admin and an installed compatible Chromium, as des
 BOT_WORKER_DIR=../baileys-ramesh npm run test:e2e
 ```
 
-The scaffold release passed **81 worker tests**, including the isolated PostgreSQL suite, with zero failures/skips; its GitHub CI and EC2 deployment also succeeded. The earlier live-model evaluation passed **26/26 trials** across 13 synthetic cases. The latest documentation-only pass does not rerun paid evaluations or send real WhatsApp messages.
+The scaffold release passed **81 worker tests** and deployed successfully. Subsequent first-read checks passed **123 tests** and **45/45 synthetic business-model trials**. The real-data harness increment passed **131 tests, zero skipped** on 2 October 2026, plus five live Supabase/Context Engine checks as Raghav. A headless Chrome test submitted and displayed a real captured CRM response with no page errors. The earlier conversational evaluation passed **26/26 trials** across 13 synthetic cases. No WhatsApp message was sent by these tests.
 
-For nondeterministic model checks, run `npm run eval:agent -- --trials 3`; a held-out split is available with `--split holdout`. Each trial uses fresh conversation state and isolated SQLite with fake delivery. Mechanical checks cover stage completion, persisted outcomes, length, em dashes, stock phrases, and clarification where required. A schema-validated Terra judge checks relevance, naturalness, fidelity, and capability honesty. Reports under `.local/evals/` retain drafts, final replies, reasons, prompt/dataset hashes, latency, and token usage. Review transcripts as well as scores: synthetic coverage and a same-model judge do not guarantee quality on real tasks. This paid suite is separate from CI.
+For nondeterministic model checks, run `npm run eval:agent -- --trials 3`; a held-out split is available with `--split holdout`. Each trial uses fresh conversation state and isolated SQLite with fake delivery. Mechanical checks cover stage completion, persisted outcomes, length, em dashes, stock phrases, and clarification where required. A schema-validated Terra judge checks relevance, naturalness, fidelity, and capability honesty. Reports under `.local/evals/` retain drafts, final replies, reasons, prompt/dataset hashes, latency, and token usage. Review transcripts as well as scores: synthetic coverage and a same-model judge do not guarantee quality on real tasks. This historical paid suite remains available. The current [multi-turn CI harness](../evals/README.md) covers 74 personal-assistant, CRM, supply, knowledge, analytics and boundary scenarios with repeated real-model trials.
 
 ## Current limitations and extension boundaries
 
 The existing split between domain services, transport adapters, and repositories is a useful base for additional sales-team workflows. The following boundaries explain what would have to change; the additions in the right column are **not implemented**.
 
-| Current implementation                                                         | Extension boundary                                                                                                       |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| Every eligible DM can trigger a conversational reply                           | Resolve the sender to an active verified employee before business reads                                                  |
-| Converser and formatter with bounded process-local memory                      | Add optional planning, tool execution, evidence verification, and durable conversation state as needed                   |
-| Signed identity/MCP services implemented but inactive in chat                  | Configure the service keys and server nonce cache, then wire scoped reads through the future worker                      |
-| Group replies stay in the triggering group                                     | Define which information is permitted in shared channels before returning employee-specific CRM results                  |
-| One durable leased reply job per account                                       | Introduce per-conversation ordering and bounded parallelism if slow business operations become common                    |
-| Separate inbound/outbound queues preserve final replies and uncertain outcomes | Add durable workflow/action state and idempotency for future business side effects                                       |
-| Single account/session owner                                                   | Add account isolation and exclusive session ownership before introducing multiple accounts or replicas                   |
-| Shared operator password                                                       | Introduce named operator identities and roles if the admin needs individual accountability or differentiated permissions |
-| In-memory metrics and 30 recent events                                         | Add durable operational telemetry and delivery-status tracking if those become product requirements                      |
-| Caption text only for media                                                    | Add explicitly authorized media download/processing before supporting documents, voice, or image understanding           |
-| Outbound due timestamps support immediate quoted replies with incoming expiry  | Add long-lived reminder intents, cancellation, recipient checks, and due-time business revalidation                      |
+| Current implementation                                                                              | Extension boundary                                                                                                               |
+| --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Every eligible DM can trigger a conversational reply                                                | Identity resolution is implemented; additional employee login methods need their own trusted adapter                             |
+| Distinct converser, planner, worker, executor, formatter and verifier with bounded Supabase history | Add durable intermediate-step checkpoints when paused or write workflows need them                                               |
+| General permitted read catalogue implemented, disabled by default                                   | Apply migration 004, verify roster RLS and configure the signed pilot; add durable entity references and paused tasks separately |
+| Group replies stay in the triggering group                                                          | Define which information is permitted in shared channels before returning employee-specific CRM results                          |
+| One durable leased reply job per account                                                            | Introduce per-conversation ordering and bounded parallelism if slow business operations become common                            |
+| Separate inbound/outbound queues preserve final replies and uncertain outcomes                      | Add durable workflow/action state and idempotency for future business side effects                                               |
+| Single account/session owner                                                                        | Add account isolation and exclusive session ownership before introducing multiple accounts or replicas                           |
+| Shared operator password                                                                            | Introduce named operator identities and roles if the admin needs individual accountability or differentiated permissions         |
+| In-memory metrics and 30 recent events                                                              | Add durable operational telemetry and delivery-status tracking if those become product requirements                              |
+| Private image/PDF/voice extraction and expiring exact voice quotes                                  | Add richer document-analysis tools with scoped artifacts and supported evidence semantics                                        |
+| Outbound due timestamps support immediate quoted replies with incoming expiry                       | Add long-lived reminder intents, cancellation, recipient checks, and due-time business revalidation                              |
 
-The current chat graph does not invoke Context Engine or CRM-Automations. The service scaffold establishes the future MCP boundary. [`CONTEXT.md`](../CONTEXT.md) preserves the product decisions: employee-scoped CRM reads first, supply next, then reminders/escalation and controlled writes. Escalations go to assignee(s), then existing CRM admins. Dedicated domain-backend read endpoints remain deferred.
+The opt-in read route invokes Context Engine through signed MCP. CRM-Automations scheduling remains separate. [`CONTEXT.md`](../CONTEXT.md) preserves the product decisions: employee-scoped CRM reads first, supply next, then reminders/escalation and controlled writes. Escalations go to assignee(s), then existing CRM admins. Dedicated domain-backend read endpoints remain deferred.
 
-The next business increment is wiring a verified employee message through the signed MCP services to one read operation, with evidence verification and private delivery. No employee enrollment is needed. Planner, worker and verifier remain deferred. Tests use synthetic identities and isolated SQLite/PostgreSQL without WhatsApp test sends. Multiple workers still lack a distributed linked-device ownership lease.
+The personal-assistant tool loop is implemented with source verification, independent answer review, Supabase run/event storage and delivery reauthorization. No employee enrollment is needed. The real-data playground runs as Raghav with Supabase capture only; CI uses synthetic identities and isolated PostgreSQL. Typed durable entity references and paused-task checkpoints remain extensions; see the [module specifications](agent-modules/README.md) and [old-bot reference](agent-modules/23-context-and-media-reference.md). Multiple workers still lack a distributed linked-device ownership lease.
+
+### Evaluation refinement
+
+The [evaluation refinement contract](agent-modules/33-eval-refinement.md) adds
+per-turn external judgments, explicit evidence-backed failure findings, a
+contrastive grader-calibration command, complete tool schema context and stable
+synthetic clocks. Native-date absence now remains consistent across fixture
+search/detail reads; Search Console query/page fixtures preserve their query
+subtotals. Query checks compare calendar and date-field meaning while enforcing
+assignment scope. Source input changes during a run invalidate the snapshot.
+
+Research now stops before the hard graph deadline, reserving up to 60 seconds
+(one quarter of the configured deadline) for a supported reply and verification.
+Completed stage metrics survive subsequent errors/timeouts. This does not bypass
+authorization or freshness checks, and does not guarantee completion before every
+hard deadline.
+
+### Voice display and STT configuration
+
+The transcript is rendered after answer verification and delivery authorization, directly from same-owner unexpired media. It appears in quotes and italics before the common response; a batch preserves receipt order. Version 2 encrypted outbound payloads store the answer and media references, not transcript copies. Inbox history decodes only the answer; business replies retain their protected recall receipts. The capture API exposes quoted display data with no owner key, and the GUI renders it with text nodes inside `em`. Failed/expired notes are explicit, and oversized extracts are labelled as excerpts.
+
+`OPENAI_STT_API_KEY` optionally separates audio credentials from `OPENAI_API_KEY`; `OPENAI_TRANSCRIBE_MODEL` defaults to `gpt-4o-transcribe`. Both the current model and newer `gpt-transcribe` were exercised through the real adapter with the authorized legacy key. See [module 35](agent-modules/35-voice-transcripts.md), [model evaluation](agent-modules/36-transcription-evaluation.md) and the [retained result](../evals/results/2026-10-02-stt-comparison.md).

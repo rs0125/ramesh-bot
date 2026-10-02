@@ -248,7 +248,7 @@ export class BaileysClient {
         }
         this.status.metrics.received++;
         const outcome = this.options.durableMessages
-          ? await this.options.durableMessages.enqueue(message, candidate)
+          ? await this.options.durableMessages.enqueue(message, candidate, session)
           : toGreetingCandidate(message, session.botJids)
             ? await this.options.handleMessage(
                 candidate,

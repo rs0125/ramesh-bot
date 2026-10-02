@@ -105,8 +105,8 @@ test('memory expires and evicts older conversations and complete turns', () => {
   let now = 0;
   const memory = new ConversationMemory(() => now, 100, 2);
   for (let i = 0; i < 20; i++) memory.remember('a', `q${i}`, `a${i}`);
-  assert.equal(memory.get('a').length, 12);
-  assert.equal(memory.get('a')[0]!.content, 'q14');
+  assert.equal(memory.get('a').length, 32);
+  assert.equal(memory.get('a')[0]!.content, 'q4');
   memory.remember('b', 'q', 'a');
   memory.remember('c', 'q', 'a');
   assert.deepEqual(memory.get('a'), []);
@@ -178,4 +178,16 @@ test('Terra configuration is explicit, optional without a key, and bounded', () 
   assert.equal(configured?.model, 'gpt-5.6-terra');
   assert.throws(() => loadAssistantConfig({ OPENAI_API_KEY: 'x', AGENT_TIMEOUT_MS: '999999' }));
   assert.throws(() => loadAssistantConfig({ OPENAI_API_KEY: 'x', AGENT_MAX_OUTPUT_TOKENS: '0' }));
+});
+
+test('punctuation cleanup preserves date, quantity and time ranges', async () => {
+  const { finishReply } = await import('../../src/modules/assistant/style.js');
+  assert.equal(
+    finishReply('1–30 September; 25,000–30,000 sq ft; 9–10 am. All set — thanks.'),
+    '1-30 September; 25,000-30,000 sq ft; 9-10 am. All set, thanks.',
+  );
+  assert.equal(
+    finishReply('25 Sep–1 Oct; 9 am–5 pm; 1 – 30 Sep; 10 — 20 ft.'),
+    '25 Sep-1 Oct; 9 am-5 pm; 1 - 30 Sep; 10-20 ft.',
+  );
 });

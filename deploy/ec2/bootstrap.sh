@@ -12,7 +12,7 @@ bucket=${3:?Expected private backup bucket}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq ca-certificates curl gnupg git openssh-client tar util-linux unzip sqlite3
+apt-get install -y ffmpeg -qq ca-certificates curl gnupg git openssh-client tar util-linux unzip sqlite3
 install -d -m 0755 /etc/apt/keyrings
 curl --fail --silent --show-error --retry 5 https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/wareongo-nodesource.asc
 gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg /tmp/wareongo-nodesource.asc

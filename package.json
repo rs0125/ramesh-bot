@@ -9,8 +9,14 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "dev:chat": "tsx scripts/playground.ts",
+    "dev:chat:live": "tsx scripts/playground-live.ts",
+    "db:playground": "tsx scripts/setup-playground.ts",
+    "smoke:chat:live": "tsx scripts/smoke-playground.ts",
     "eval:agent": "tsx evals/run.ts",
-    "build": "tsc -p tsconfig.build.json",
+    "eval:business": "tsx evals/business-run.ts",
+    "eval:sales": "tsx evals/sales-run.ts",
+    "eval:conversations": "tsx evals/conversation-run.ts --suite conversation",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-prompts.mjs",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/unit/*.test.ts tests/integration/*.test.ts deploy/tests/*.test.ts",
@@ -23,7 +29,15 @@
     "context:auth": "tsx scripts/context-auth.ts",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
-    "db:migrate": "prisma migrate deploy"
+    "db:migrate": "prisma migrate deploy",
+    "eval:journeys": "tsx evals/conversation-run.ts --suite journeys",
+    "eval:adversarial": "tsx evals/conversation-run.ts --suite adversarial",
+    "eval:compare-models": "tsx evals/compare-models.ts",
+    "eval:ci": "tsx evals/conversation-run.ts --suite all --trials 2 --concurrency 3 --output .local/ci-evals",
+    "eval:private": "tsx evals/private-run.ts",
+    "eval:judge": "tsx evals/judge-calibration-run.ts",
+    "eval:regrade": "tsx evals/regrade-run.ts",
+    "eval:stt": "tsx evals/stt-run.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.4",

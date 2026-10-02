@@ -1,12 +1,18 @@
 # Ramesh: assistant architecture and implementation plan
 
-Date: **1 October 2026**
+Updated: **2 October 2026**
 
-Status: **Living design and implementation plan, updated through signed Context Engine access**
+Status: **Living design informed by the Factory talk; module specifications prepared first, personal-assistant tool loop implemented, and real-data capture harness verified. The production read pilot remains disabled by default.**
 
 This document consolidates the discussion about moving WareOnGo's basic OpenClaw assistant functions into the in-house Baileys bot. It covers CRM and supply reads, the conversational agent loop, reminders and escalation, later writes, migration, and evaluation.
 
-The conversational pilot, separate inbound/outbound queues and inactive MCP services are implemented. Sections 18–20 describe those foundations. Section 21 preserves the optional OAuth adapter; section 22 defines the preferred signed first-party integration with no employee enrollment. Tool-using agents, reminders and writes remain proposed. Repository observations do not establish current live CRM or scheduler behavior.
+The conversational pilot, separate inbound/outbound queues and MCP services are implemented. Sections 18–20 describe those foundations. Section 21 preserves the optional OAuth adapter; section 22 defines the preferred signed first-party integration with no employee enrollment. The current checkout adds a personal chief-of-staff tool loop with employee-scoped company tools, deterministic source checks, independent final answer review and a Supabase run journal; see [the personal-assistant runbook](sales-manager-agent.md) and section 25. Separate planner/worker/verifier roles, private media and inbound batching are implemented locally in modules 29–32. Durable paused tasks, reminders and writes remain proposed. Repository observations do not establish current live CRM or scheduler behavior.
+
+The current test choice is real Supabase and Context Engine as Raghav, with isolated capture queues and no Baileys delivery. Section 24 and the [live-data runbook](live-data-playground.md) document that implemented path. The synthetic SQLite GUI/evaluations remain optional fixtures.
+
+**Latest architecture draft:** [section 23](#23-agent-architecture-draft-informed-by-the-factory-talk) adapts the linked video's transcript to Ramesh, with a system diagram, role boundaries, task contracts, persistence, recovery, and an implementation sequence. Sections 6 and 8 incorporate that direction. This revision documents a proposal; it does not activate business tools or change production behavior.
+
+The [module specifications](agent-modules/README.md) expand this design into separate interfaces, ownership, lifecycle, failure handling, acceptance cases and implementation dependencies for each sub-module. They were prepared before starting the first CRM-read implementation.
 
 ## 1. Requirements and recommended decisions
 
@@ -30,17 +36,17 @@ The conversational pilot, separate inbound/outbound queues and inactive MCP serv
 | Decision         | Recommendation                                                                                          | Reason                                                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | Read integration | Scaffold Context Engine MCP services now; connect the worker later                                      | Reuses employee scopes, record access, projection, and freshness through the existing MCP catalogue. |
-| Agent runtime    | One conversational agent inside an explicit workflow                                                    | Supports multiple tool turns while keeping evaluation and debugging manageable.                      |
-| Planning         | Add a short explicit plan for complex requests                                                          | Simple lookups can choose their next tool directly.                                                  |
+| Agent runtime    | One LangGraph runtime with a conversational orchestrator, scoped workers and an independent verifier    | Shared task state keeps delegation and recovery inspectable without extra services.                  |
+| Planning         | A preset contract for simple reads; an explicit plan and contract for complex requests                  | Define successful outcomes before execution without adding a planning call to every message.         |
 | Execution        | Application code executes approved tools                                                                | Identity, permissions, destinations, and side effects remain enforceable.                            |
-| Verification     | Code checks every tool outcome; optional model review for complex answers                               | Persisted state and source evidence establish operational success.                                   |
+| Verification     | Code checks every tool outcome; a fresh model context reviews complex business answers                  | Source evidence establishes facts; independent review checks whether the request was fulfilled.      |
 | Reminder rules   | Keep CRM rules in CRM-Automations                                                                       | Reuse the existing sync, ownership logic, and activity clocks.                                       |
 | Delivery         | A durable notification queue consumed by Ramesh                                                         | Supports restarts, deduplication, failure tracking, and controlled retries.                          |
 | Future writes    | Narrow commands through Twenty and the WAG backend                                                      | Preserve the systems that own business validation and records.                                       |
 | Deployment       | Extend the existing worker with modules; retain the separate admin app                                  | These boundaries do not initially require more independently deployed services.                      |
 | Persistence      | Keep SQLite for WhatsApp session state initially; use private Postgres tables for shared workflow state | CRM-Automations and the bot need durable coordination.                                               |
 
-OpenAI Terra/LangGraph, the queue split and MCP reads are selected. The graph has only two stages. Trusted identity and signed request services are implemented separately and remain disconnected from it. Service-key setup and future worker integration replace employee OAuth enrollment. Exact notification cadence and write policies remain open.
+OpenAI Terra/LangGraph, the queue split and MCP reads are selected. Ordinary chat has two stages. This checkout adds a disabled-by-default personal-assistant tool loop with trusted identity, signed requests, source validation, independent answer review and durable private delivery. See the [personal-assistant runbook](sales-manager-agent.md) for the implemented subset. Service-key setup and future worker integration replace employee OAuth enrollment. Exact notification cadence and write policies remain open.
 
 The deferred endpoint refactor applies to the internal implementation of business reads. Ramesh still calls bounded, employee-scoped Context Engine tools. Later CRM writes must use Twenty, and supply changes must preserve WAG's validation and review paths. HRMS remains a future integration whose capabilities and permissions need mapping.
 
@@ -75,14 +81,14 @@ The existing TypeScript worker provides:
 - Encrypted Baileys credentials and Signal-key storage in SQLite through Prisma.
 - Separate durable inbound/outbound queues, reconnect handling, bounded admission, send deadlines, and cancellation of unsent replies.
 - OpenAI Terra converser/formatter nodes, bounded process-local memory, an isolated SQLite chat GUI, and a live-model evaluation harness.
-- An inactive Context Engine MCP service scaffold with employee-grant checks and read-only tool discovery.
+- Context Engine MCP services with signed employee binding and read-only discovery; the current composition exposes all employee-permitted reads when explicitly enabled.
 - Trusted phone/LID resolution to the active roster and a signed request adapter; the earlier OAuth lifecycle implementation remains optional.
 - A separate Next.js admin application for pairing, status, and connection controls.
 - One send attempt per claimed greeting; uncertain sends retain the claim. This is not a delivery guarantee.
 
 Production uses PostgreSQL message state, encrypted inbound/outbound payloads, leases, restart recovery, and explicit uncertain-send handling. The agent atomically saves the final reply in `ramesh-outbound-queue`; the sender delivers the stored text without another model call. The original `hello` remains only the no-key fallback. This supports immediate quoted replies, not yet general reminders or proactive notifications. Both queue migrations are provisioned and the implementation has deployed successfully.
 
-The domain handler receives a `GreetingCandidate`, now extended with text and the transport sender ID for the first conversational implementation. Its reply callback is bound to the original chat. The optional two-node LangGraph flow and bounded in-process conversation history are described in section 18; the Supabase inbox now supplies persistent recent context in the running worker. Employee authorization adapters exist outside the graph. Connecting business tools, durable conversation checkpoints, and proactive notification delivery remain future work.
+The domain handler receives a `GreetingCandidate`, now extended with text and the transport sender ID for the first conversational implementation. Its reply callback is bound to the original chat. The optional two-node LangGraph flow and bounded in-process conversation history are described in section 18; the Supabase inbox now supplies persistent recent context in the running worker. Employee authority is injected outside model state into the opt-in first CRM-read route. General checkpoints and proactive notification delivery remain future work.
 
 Processing is currently serialised per account across the two queue stages. A slow model request can hold up other conversations. Separate table responsibilities do not yet introduce independent processes or concurrent agent runs; per-conversation ordering with bounded concurrency is a later extension.
 
@@ -135,7 +141,7 @@ Sources: [current routing](../../../whatsapp-logistics-bot/src/routes/whatsapp.j
 
 ### System design from the discussion
 
-The diagram below was supplied on 1 October 2026. It captures durable queues, one agent runtime and employee-scoped reads through Context Engine. The queues, converser, formatter, identity resolver and signed credential adapter are implemented; tool-using agents and their graph integration remain deferred. Dedicated domain read endpoints remain deferred.
+The diagram below was supplied on 1 October 2026. It captures durable queues, one agent runtime and employee-scoped reads through Context Engine. The queues, converser, formatter, identity resolver and signed credential adapter are implemented, along with one fixed CRM read and deterministic verifier. General tool-using agents remain deferred. Dedicated domain read endpoints remain deferred.
 
 ![Ramesh system design: WhatsApp and Baileys, Supabase data and message queues, the conversational agent loop, and Context/MCP with employee-scoped access](assets/ramesh-system-design.png)
 
@@ -144,7 +150,7 @@ Interpret the diagram's shorthand as follows:
 - **User phone number for auth scope:** application code resolves the trusted WhatsApp sender to an active employee and supplies that employee's authenticated Context credential. A phone number passed as a tool argument alone does not establish access.
 - **Database as source of truth:** Supabase holds the shared read data and bot workflow state. CRM records in that store are a mirror; Twenty remains authoritative for CRM records and writes. HRMS is a future integration, not a claim that its data is already available here. The ownership table in section 2 defines the current authorities.
 - **Converser-to-formatter shortcut:** use it for greetings, help, and clarification. Business facts and actions follow the scoped tool and verification path; simple tool requests can skip explicit planning.
-- **Outbound queue:** it can hold both immediate responses and scheduled reminder intents. The due-time checks and ready-to-send distinction are expanded below and in section 9.
+- **Outbound queue:** holds prepared delivery work and supports delayed availability. The proposed reminder service keeps editable schedules separately and prepares delivery after due-time checks, as expanded in section 9.
 
 ### Processing and delivery details
 
@@ -158,11 +164,13 @@ flowchart TD
     C --> CRM[CRM mirror and live Twenty reads]
     C --> S[Permitted WAG warehouse tables]
 
-    T -->|Ready responses or scheduled reminder intents| OUT[(Outbound jobs)]
-    CA[CRM-Automations: sync and reminder rules] -->|Scheduled notification intents| OUT
-    OUT -->|Due scheduled jobs| DUE[Deterministic due-job processor]
+    T -->|Verified responses| OUT[(Outbound jobs)]
+    T -->|Reminder tool| R[(Reminder schedules)]
+    CA[CRM-Automations: sync and reminder rules] -->|Alert occurrence| R
+    R -->|Due work| DUE[Deterministic due-job processor]
     DUE -->|Check current access and business conditions| C
-    DUE -->|Mark ready, cancel or reschedule| OUT
+    DUE -->|Prepare ready delivery| OUT
+    DUE -->|Cancel or reschedule intent| R
     OUT -->|Claim ready messages| B
 
     T -. Future confirmed commands .-> W[CRM and WAG command handlers]
@@ -171,7 +179,7 @@ flowchart TD
 
 Baileys owns the persistent WhatsApp connection for both incoming and outgoing messages. The agent runtime claims inbound work, applies identity/audience policy, executes bounded tools, verifies results, and queues responses. Context Engine owns read authorisation and projection. CRM-Automations owns CRM compliance decisions. Source-system handlers own writes.
 
-The queues, conversation/run state, and scheduled reminders can share private tables in the existing Supabase/Postgres instance. Keep their database permissions separate from business-data access. The diagram shows logical responsibilities: the agent runtime and due-job processor can start as modules in the existing worker rather than separate deployments. A scheduled intent is claimed by the due-job processor; Baileys only claims messages that are ready and due for transport.
+The queues, conversation/run state, and scheduled reminders can share the existing Supabase/Postgres instance, using tables restricted to their application roles. Keep their database permissions separate from business-data access. The diagram shows logical responsibilities: the agent runtime and due-job processor can start as modules in the existing worker rather than separate deployments. A scheduled intent is claimed by the due-job processor; Baileys only claims messages that are ready and due for transport. A cancellation or reschedule updates the schedule and invalidates any obsolete pending delivery.
 
 Keep Context Engine's current database access underneath its approved tools for now. Dedicated backend read endpoints are deferred and do not block the first CRM assistant milestone.
 
@@ -189,7 +197,7 @@ Resolve:
 
 Use immutable employee IDs internally. A name in a message, WhatsApp display name, or model-generated phone number cannot establish identity. Resolve phone/LID aliases using trustworthy protocol information, and reject ambiguous or missing mappings. Baileys v7 documents separate phone/LID identifiers and alternate sender fields; group resolution must use the participant identity. [Baileys v7 migration guidance](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/migration/to-v7.0.0.md)
 
-The roster-resolution adapter is implemented: a normalized phone must match exactly one active employee. LIDs require reciprocal mappings already persisted by Baileys; group identity uses the participant. The PostgreSQL adapter selects only four roster columns. Credential use rechecks immutable employee ID, current phone/email, and active status. No persistent identity cache grants permission. The future worker must also revalidate before delayed sensitive delivery.
+The roster-resolution adapter is implemented: a normalized phone must match exactly one active employee. LIDs require reciprocal mappings already persisted by Baileys; group identity uses the participant. The PostgreSQL adapter selects only four roster columns. Credential use rechecks immutable employee ID, current phone/email, and active status. No persistent identity cache grants permission. The first-read sender now revalidates identity, scope and the saved result before sensitive delivery.
 
 ### Employee credentials
 
@@ -212,32 +220,38 @@ Partition conversation state by employee and audience. Do not replay personal hi
 
 ## 6. Conversational → planner → executor → verifier loop
 
-These are logical stages. They do not require four independent agents, four model providers, or a fixed number of model calls for every message. A single conversational agent can plan and use tools over several turns.
+Use one LangGraph runtime with distinct responsibilities. The converser and optional planner form the **orchestrator**: understand the request, choose a preset workflow or create a bounded plan, and decide what to do with verified results. Workers receive a task-specific context and tool subset. The executor is application code. A verifier evaluates completed work independently. The formatter remains the final language stage.
+
+These roles do not require separate deployments or model providers. Greetings retain the current two-node path. Simple reads use a preset contract and deterministic checks. Complex business requests use explicit planning and a separate verifier model call, with its value measured against the simpler path. The detailed proposed design is in section 23.
 
 ```mermaid
 flowchart TD
     M[Message] --> I[Identity, deduplication and audience policy]
-    I --> C[Understand request]
-    C --> P[Choose next action or make a short plan]
-    C --> Q[Ask for missing information]
-    P --> G[Validate tool, permissions and arguments]
-    G --> E[Execute approved tool]
-    E --> V[Verify result]
-    V -->|More evidence needed| P
-    V -->|Complete or blocked| R[Compose grounded reply]
-    G -->|Confirmation required| A[Persist proposal and wait]
-    A --> G
+    I --> C[Conversational orchestrator]
+    C -->|Chat or clarification| F[Formatter]
+    C -->|Simple read| T[Preset task contract]
+    C -->|Complex request| P[Planner: steps and success criteria]
+    T --> W[Scoped task worker]
+    P --> W
+    W --> E[Application executor and scoped tools]
+    E --> W
+    W -->|Structured result and evidence| V[Verifier: code checks and independent review]
+    V -->|Bounded corrective task| P
+    V -->|Verified result or explicit limitation| F
+    F --> G[Final evidence and audience gate]
+    G --> O[Persist outbound response]
 ```
 
-| Stage        | Implementation                               | Contract                                                                                        |
-| ------------ | -------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Conversation | LLM                                          | Identify the objective, constraints, references, and missing information.                       |
-| Planner      | Same agent, used explicitly for complex work | Produce short steps, dependencies, and expected outcomes; revise them from tool evidence.       |
-| Executor     | Application code                             | Validate arguments and permissions, call approved adapters, and record structured outcomes.     |
-| Verifier     | Code plus optional model review              | Check operational success and evidence; optionally review completeness and explanation quality. |
-| Response     | LLM or template                              | Report supported facts, completed actions, uncertainty, and any unresolved work.                |
+| Role                     | Owns                                                                             | Must not own                                                             |
+| ------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Converser / orchestrator | Intent, missing information, routing, task lifecycle and shared state            | Employee authority or WhatsApp destination selection                     |
+| Planner                  | Typed steps, dependencies, expected evidence and success assertions              | Changing server policy or removing failed assertions to claim completion |
+| Worker                   | Bounded tool selection and a structured result for one assigned task             | Other workers' private context, credentials or raw database access       |
+| Executor                 | Tool allowlist, argument validation, current access checks, budgets and receipts | Treating a model's approval as authorization                             |
+| Verifier                 | Assertion outcomes, evidence gaps and a scoped correction request                | Granting permissions, sending messages or repeating uncertain writes     |
+| Formatter                | Clear WhatsApp wording from an authorized result bundle                          | Adding business facts or changing names, dates, amounts and caveats      |
 
-The plan is an operational artifact, not a reasoning transcript. Store tool names, validated inputs, dependencies, and expected outcomes. Employee identity, grants, approval state, and delivery destinations are runtime-controlled fields.
+Persist the plan, contract version, concise decisions, evidence references and handoffs. Do not store private model reasoning. Employee identity, credentials, approval state and delivery destinations remain runtime-controlled fields. Worker and verifier prompts are assembled separately; the verifier receives the request, contract and source evidence without the worker's reasoning history.
 
 ### Route by task complexity
 
@@ -277,7 +291,7 @@ Use a focused catalogue over Context Engine, exposing relevant capabilities for 
 | Lead-to-property comparison         | `assess_shortlist`                                                              |
 | Reviewed company guidance           | `search_knowledge`, `read_knowledge`                                            |
 
-These are the MCP tools represented by the repository's read-only service scaffold. Context Engine also exposes related REST endpoints, but MCP is the selected Ramesh adapter. Services remain disconnected from the current chat graph; see section 20 for discovery, employee binding, and the callable service contract.
+These are the MCP tools represented by the repository's read-only service scaffold. Context Engine also exposes related REST endpoints, but MCP is the selected Ramesh adapter. The general read graph is connected behind the feature flag; the fixed query is now a regression preset; see section 20 for discovery, employee binding, and the callable service contract.
 
 The executor injects the actor, credential, run ID, and audience. Model-selected arguments contain domain inputs such as lead ID, city, area, or date filters. Do not expose arbitrary SQL, arbitrary HTTP destinations, shell execution, or a general send-message tool.
 
@@ -304,11 +318,17 @@ Use code and source observations to establish:
 
 Verify writes against the authoritative system. A successful Twenty write can precede the CRM mirror update; a stale mirror must not trigger a duplicate write. Separate committed-but-not-yet-verified, confirmed, failed, and uncertain outcomes.
 
-### Answer-quality review
+### Independent task verification
 
-A second model pass can review complex answers for unsupported conclusions, omitted requirements, and clarity. Give it the request, selected evidence, and a specific rubric. Treat its verdict as advisory: it cannot grant access or prove that a record changed.
+Define success assertions before the worker starts. For a simple read, use an application-owned preset contract. For a complex request, the planner adds request-specific assertions to mandatory server rules. Workers cannot edit those rules. If clarification changes the objective, version the contract and keep the change attributable.
 
-Use a separate model reviewer only where evaluations show that its improvement justifies the additional latency and cost. Simple reads still receive code-based validation.
+The complex path uses a separate model context to assess unsupported conclusions, missing requirements and uncertainty against that contract. Its input is the request, contract, candidate result and executor-recorded evidence. It does not inherit the worker's reasoning or accept the worker's claim of success as proof. The proposed verdict is `pass`, `repair`, `needs_input`, or `blocked`, with assertion IDs and evidence references.
+
+Application checks remain authoritative for identity, scope, freshness, pagination coverage, persisted effects and delivery audience. A model can reject an incomplete answer; it cannot override a failed access check or prove a write succeeded. When independent source rechecks are needed, the runtime grants only bounded, read-only tools under the same employee authority.
+
+Allow at most a configured number of corrective passes. Unavailable data leads to an explicit limitation, and ambiguous entities lead to clarification. Do not repeatedly regenerate an answer until a judge happens to pass it. Compare this path with deterministic-only verification in the evaluation harness before broad rollout.
+
+Formatting happens after task verification, so it needs its own final gate. Render IDs, dates, amounts and immutable fact fields from the verified bundle; check scope, length and style in code. Open-ended wording that introduces a new factual claim must return to evidence review. A pre-format verifier cannot guarantee a later model preserved meaning.
 
 ## 9. Reminders, SLA breaches, and escalation
 
@@ -329,13 +349,15 @@ Acknowledging or snoozing an alert changes notification state. It does not itsel
 
 Creating, listing, changing, snoozing, and cancelling personal reminders are bot-owned tool operations. A simple request can invoke the tool directly after clarification; the optional planner is useful when the request spans several steps. Persist the reminder before confirming that it is set. These operations do not require CRM write access unless they also change a CRM record.
 
-For the first version, scheduled reminders and immediate replies can use the same physical outbound store with explicit job kind and phase. A scheduled job contains a stable ID, the requesting employee, an authorised recipient reference, linked business record/rule where relevant, `scheduled_for`, deduplication key, status, and version. The server supplies identity and routing fields. Reminder edits or cancellations must invalidate any prepared delivery for the older version.
+The selected draft uses a separate `ramesh-reminders` schedule store and the existing `ramesh-outbound-queue` for prepared delivery. A schedule contains a stable ID, the requesting employee, an authorised recipient reference, linked business record/rule where relevant, due time, deduplication key, status, and version. The server supplies identity and routing fields. Reminder edits or cancellations invalidate any prepared delivery for the older version. This is a future migration, not an existing table.
 
 `SCHEDULED → due-time checks → READY → SENDING → SENT`
 
 The due-job processor claims due work under a lease and can cancel, reschedule, or mark it ready. CRM-linked reminders retain their intent and record references so current ownership, access, source freshness, and the outstanding condition can be checked at delivery time. A personal reminder may keep the employee's requested text. Baileys consumes only ready, due messages; a timestamp in a row needs an active processor to cause delivery.
 
-Conversational tools and scheduled CRM-Automations evaluations are two producers for this store. Automatic SLA discovery must run without an incoming chat message. Delivery and due-time checking use deterministic code and do not require a new model conversation for each tick.
+Conversational tools and scheduled CRM-Automations evaluations are two producers of notification intents. CRM-Automations remains the owner of SLA alert episodes; the bot's schedule references the episode and occurrence rather than duplicating the rule state. Automatic SLA discovery must run without an incoming chat message. Delivery and due-time checking use deterministic code and do not require a new model conversation for each tick.
+
+The outbound queue can still delay a prepared message until its availability time. That timestamp alone does not provide reminder edits, cancellation, recurrence, access rechecks or breach resolution. Separating the schedule keeps these business decisions visible. Current immediate-reply expiry rules also need an explicit reminder job kind before long-lived notifications can be enabled.
 
 ### Deterministic evaluation
 
@@ -455,7 +477,7 @@ These are proposed locations, not files created by this document. Keep business 
 | Notification intent / delivery attempt | Durable handoff, deduplication, lease, provider reference, and outcome; bot delivery boundary |
 | Action proposal                        | Exact pending change, confirmation binding, expiry, and source preconditions; bot-owned       |
 
-These are logical entities, not a requirement for one table per row. In particular, scheduled personal reminder intents and prepared messages may share the outbound store as long as their phases, ownership, versions, and delivery attempts remain explicit.
+These are logical entities, not a requirement for one table per row. The latest draft separates reminder schedules from prepared outbound messages and adds explicit task-run and event records; section 23 names those proposed tables. Alert episodes remain owned by CRM-Automations.
 
 Use additive private Postgres tables and explicit producer/consumer contracts. Assign one migration owner per table; do not apply an introspected shared Prisma schema as a bot migration.
 
@@ -494,7 +516,7 @@ Primary sources were reviewed during the discussion on 1 October 2026. Their rec
 - **Pause/resume needs explicit side-effect handling.** LangGraph documents durable checkpoints and warns that resumed nodes can rerun preceding code. Persistence does not remove the need for idempotency and external-operation reconciliation. [Persistence](https://docs.langchain.com/oss/javascript/langgraph/persistence), [interrupts](https://docs.langchain.com/oss/javascript/langgraph/interrupts)
 - **Evaluate the actual outcome.** Anthropic distinguishes claimed success from final environment state and recommends code, model, and human graders according to the task. [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)
 
-The resulting recommendation is one agent with an explicit executor and verifier, optional short planning, and a separate deterministic notification workflow. A framework such as LangGraph becomes worth evaluating if branching and durable pause/resume become difficult to maintain in the existing TypeScript implementation.
+LangGraph is already selected and used by the two-node pilot. The updated recommendation is a conversational orchestrator, bounded workers, application-controlled execution, independent verification for complex requests, and a deterministic notification workflow. Section 23 records the additional video source and its application to this design.
 
 ## 15. Evaluation and acceptance checks
 
@@ -522,7 +544,7 @@ Code-based checks establish deterministic conditions. Model rubrics assess expla
 
 ## 16. Delivery milestones
 
-Delivered foundation: two-node Terra/LangGraph conversation, isolated SQLite GUI/evals, separate Supabase message queues, inactive MCP services, trusted employee identity and signed first-party credentials. Service configuration and explicit worker/verifier integration precede the following business milestones. Employee OAuth enrollment is not required for the selected path.
+Delivered foundation: two-node Terra/LangGraph conversation, isolated SQLite GUI/evals, separate Supabase queues, MCP services, trusted employee identity and signed credentials. The current checkout implements the first fixed read and run journal, disabled by default; deployment is separate. General worker/verifier integration remains an expansion milestone. Employee OAuth enrollment is not required for the selected path. Section 23 breaks down the first two milestones into implementation increments.
 
 | Milestone                   | Deliverable                                                                                                   | Exit evidence                                                                                                                   |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -555,7 +577,7 @@ The architecture is sufficient to begin the first CRM-read milestone. The remain
 
 The following product and rollout choices remain open; notification-specific choices need resolution before that milestone, not before basic CRM reads:
 
-- Pilot employee cohort and owned callback origin; use the implemented enrollment/renewal flow.
+- Pilot employee cohort and rollout limits; the selected signed path does not require an employee OAuth callback or enrollment.
 - Exact permitted group-knowledge scope and treatment of groups containing external members.
 - Whether personal briefing ownership uses strict current assignment only or an explicit unassigned-lead fallback.
 - Consistent SLA boundary semantics, missing-clock handling, and the policy distribution/versioning mechanism.
@@ -563,7 +585,7 @@ The following product and rollout choices remain open; notification-specific cho
 - Which first write commands require confirmation, who can use them, and how conflicts are handled by the deployed Twenty version.
 - Retention periods and access controls for conversation data, tool evidence, and audit.
 - Which legacy reminders/tasks to migrate and the per-employee cutover plan.
-- Whether evaluation demonstrates a benefit from explicit planning or a separate model reviewer when the deferred agents are built.
+- Which complex request classes justify explicit planning and independent model review at the measured latency and cost.
 
 The escalation destination order is already settled: **assignee(s), then existing CRM admins**.
 
@@ -577,9 +599,9 @@ The worker's protected EC2 environment and SSM SecureString backup contain the O
 
 The converser handles the request with limited recent context. The formatter preserves facts and capability limits while producing short, natural WhatsApp language. A code guard removes em dashes. No CRM, supply, HRMS, reminder, browsing or write tools are connected yet, and the prompts explicitly state those limits. Recognising a transport sender in conversation is separate from the employee authorization adapter in sections 5 and 21.
 
-Runtime controls include a total generation deadline, input/output limits, one SDK retry, a fixed two-node graph with a recursion cap, session cancellation, and a durable lease sized for the full generation/send budget. Memory is partitioned by chat and sender, bounded to six turns and 16,000 characters across at most 200 contexts, and expires after 30 idle minutes. It only records replies accepted by the transport and resets on process restart. Graph checkpoints and durable conversation memory are deferred; inbound work may repeat generation after a restart before the atomic handoff, while saved outbound replies survive restarts without regeneration.
+Runtime controls include a total generation deadline, input/output limits, one SDK retry, a fixed two-node graph with a recursion cap, session cancellation, and a durable lease sized for the full generation/send budget. Memory is partitioned by chat and sender, bounded to 32 messages and 48,000 characters across at most 200 contexts, and expires after 30 idle minutes. It only records replies accepted by the transport and resets on process restart. Graph checkpoints and durable conversation memory are deferred; inbound work may repeat generation after a restart before the atomic handoff, while saved outbound replies survive restarts without regeneration.
 
-Per the latest testing decision, local tests use the SQLite path. `npm run dev:chat` opens a loopback-only dummy chat interface at `http://127.0.0.1:3012` with its own `.local/playground.db` and a capture-only sender. It does not start a WhatsApp socket, load linked-device credentials, or use Supabase. Existing production queue configuration is left intact.
+The original synthetic path remains `npm run dev:chat`: a loopback dummy chat interface at `http://127.0.0.1:3012` with its own `.local/playground.db` and a capture-only sender. It does not start a WhatsApp socket, load linked-device credentials, or use Supabase. The newer `dev:chat:live` path deliberately uses real Supabase and Context Engine through separate test queues, as described in section 24. Existing production queue configuration is left intact.
 
 `npm run eval:agent -- --trials 3` runs repeated synthetic conversations through a separate SQLite database and the real model. Thirteen scenarios cover tone, Hinglish, drafting, follow-up context, missing tools, adversarial instructions, group privacy and factual preservation. Mechanical checks and a schema-validated model judge produce per-trial reports, prompt/dataset hashes, usage and latency in `.local/evals/`. Reports retain both drafts and final replies for human review; same-model judging and synthetic coverage have limits. Unit/integration tests use model fakes and cover cancellation, isolation, duplicates, failure handling and transport acceptance.
 
@@ -591,11 +613,11 @@ The production Supabase path now has explicit `ramesh-inbound-queue` and `ramesh
 
 Migration `202610010002` preserves the old job rows by renaming the table. The former `ramesh-message-jobs` name is a compatibility view for the pre-split deployment window. The explicit table names are used by all new runtime queries. Outbound availability timestamps are supported, but the current rows remain immediate quoted replies with the original message expiry; long-lived reminders and business-state revalidation are still separate future work.
 
-Local GUI/model evaluations remain SQLite-only. The queue migration, atomic handoff, crash recovery, lease fencing, due times, encryption, and existing-row preservation are exercised against an isolated local PostgreSQL instance with fake transports. See [the queue contract](supabase-message-queue.md) for table responsibilities, deployment order, and rollback limitations.
+Synthetic GUI/model evaluations remain SQLite-based. The queue migration, atomic handoff, crash recovery, lease fencing, due times, encryption, and existing-row preservation are exercised against an isolated local PostgreSQL instance with fake transports. The live-data GUI has additional Supabase capture queues, independent of these production tables. See [the queue contract](supabase-message-queue.md) for table responsibilities, deployment order, and rollback limitations.
 
 ## 20. Context Engine MCP service scaffold
 
-The reusable boundary is implemented inside this repository. It is not imported by `createApplication`, the two-node chat graph, or the local playground. No planner, worker or verifier agent is introduced in this step, and no live business read is enabled merely by deploying these files.
+The reusable boundary is implemented inside this repository. Its original scaffold was disconnected from chat; the first-read increment now composes it from `createApplication` only when business reads are explicitly enabled; active employees are eligible by default. The separate live playground reuses the scoped reader with a server-pinned employee and captured output; the synthetic playground retains fixtures. No production business read is enabled merely by deploying these files.
 
 | Module                                            | Responsibility                                                                                |
 | ------------------------------------------------- | --------------------------------------------------------------------------------------------- |
@@ -607,7 +629,7 @@ The reusable boundary is implemented inside this repository. It is not imported 
 
 The client uses `@modelcontextprotocol/client` 2.1.0 and Streamable HTTP. Signed credentials require `/mcp/ramesh`; optional OAuth credentials require `/mcp`. HTTPS is required except on loopback. Requests stay on the configured URL and refuse redirects; stdio processes, arbitrary HTTP tools, sampling and consent automation are not exposed.
 
-`ContextCredentialResolver.resolve` is a server-side port implemented by `SignedEmployeeCredentials` for the selected path and `EmployeeContextCredentials` for optional legacy OAuth. The signed factory derives the trusted sender and active employee, rechecks them per POST, and signs a short-lived body-bound request. The MCP client checks binding/expiry and verifies the server employee through `get_context` before any business tool. Identity and secrets stay outside model arguments; the graph remains disconnected.
+`ContextCredentialResolver.resolve` is a server-side port implemented by `SignedEmployeeCredentials` for the selected path and `EmployeeContextCredentials` for optional legacy OAuth. The signed factory derives the trusted sender and active employee, rechecks them per POST, and signs a short-lived body-bound request. The MCP client checks binding/expiry and verifies the server employee through `get_context` before any business tool. Identity and secrets stay outside model arguments; only the explicitly enabled first-read route calls this boundary.
 
 One connection and tool catalogue belong to one read operation. There is no cross-employee session, token cache or result cache. The server continues to revalidate current scopes and live record permissions on each read. The first service boundary accepts DMs only; group business reads need an explicit audience policy later. A claimed read-only annotation is insufficient on its own: the tool must also be in the local allowlist and the employee's discovered/scoped catalogue.
 
@@ -620,11 +642,11 @@ Available service methods:
 | Supply    | `filters`, `search`, `readWarehouse`, `summary`                                          |
 | Knowledge | `search`, `readPage`                                                                     |
 
-These map to fourteen existing read tools. The server's discovered input schemas remain the authoritative filter catalogue; service filters are passed through without guessing or coercing business values. Analytical reports, writes, arbitrary sends and HRMS tools are outside this initial allowlist. CRM-related context uses one lead ID and one of `notes`, `tasks`, `company` or `stage_history`.
+The catalogue now maps to seventeen existing read tools, including the analytics family (`capabilities`, `ga4`, `searchConsole`). The server's discovered input schemas remain the authoritative filter catalogue; service filters are passed through without guessing or coercing business values. GA4 and Search Console reports are included when the registered scopes and current employee permit them. Writes, arbitrary sends and HRMS remain outside the current catalogue. CRM-related context uses one lead ID and one of `notes`, `tasks`, `company` or `stage_history`.
 
-Successful calls preserve the Context Engine envelope: `source_path`, `status`, `data`, and `meta` including `requestId` and `generatedAt`. Nested cursors, source status, coverage, redactions, access scope, field evidence and verification flags survive unchanged. The client validates the envelope; interpreting and checking business evidence remains the future verifier's job. Tool text and record contents are data, not instructions. Errors expose stable codes such as `AUTH_REQUIRED`, `ACCESS_DENIED`, `TOOL_UNAVAILABLE`, `RATE_LIMITED`, `TIMEOUT` and `UNAVAILABLE`, without raw upstream bodies or SDK errors. Credential resolution may refresh before use; failed MCP calls are not automatically retried.
+Successful calls preserve the Context Engine envelope: `source_path`, `status`, `data`, and `meta` including `requestId` and `generatedAt`. Nested cursors, source status, coverage, redactions, access scope, field evidence and verification flags survive unchanged. The client validates the envelope; tool-specific source validation and independent semantic review check the evidence before delivery. Tool text and record contents are data, not instructions. Errors expose stable codes such as `AUTH_REQUIRED`, `ACCESS_DENIED`, `TOOL_UNAVAILABLE`, `RATE_LIMITED`, `TIMEOUT` and `UNAVAILABLE`, without raw upstream bodies or SDK errors. Credential resolution may refresh before use; failed MCP calls are not automatically retried.
 
-Explicit service composition after employee enrollment (the trusted transport composition is documented in section 21):
+Explicit service composition with an application-owned credential resolver (the selected trusted transport and signed composition is documented in section 22):
 
 ```ts
 import { loadContextEngineConfig } from './config/context-engine.js';
@@ -665,4 +687,222 @@ Each POST binds issuer, audience, employee, canonical phone, DM audience, HTTP m
 
 No employee OAuth enrollment or refresh storage is needed. SQLite remains the existing linked-device/LID store; old optional OAuth tables are retained without destructive cleanup. The private signing key stays in the protected worker environment. Key overlap supports rotation; removing registrations requires deployment on the server, while employee deactivation uses live roster checks. Gateway/private-key compromise can assert employees, which is the trust boundary of this first-party integration.
 
-The [signed access runbook](signed-context-auth.md) covers configuration, rollout and tests. Synthetic integration tests exercise real JOSE and MCP code, employee/LID checks, no OAuth writes and denied forwarding. Context Engine tests additionally cover real PostgreSQL privileges and replay races. The conversational graph, dummy GUI and evals still have no business tools. Planner, worker, verifier, reminders and writes remain deferred.
+The [signed access runbook](signed-context-auth.md) covers configuration, rollout and tests. Synthetic integration tests exercise real JOSE and MCP code, employee/LID checks, no OAuth writes and denied forwarding. Context Engine tests additionally cover real PostgreSQL privileges and replay races. The first fixed CRM read now uses this path, including in the real-data capture GUI. General planning, model-directed execution/review, reminders and writes remain deferred.
+
+## 23. Agent architecture draft informed by the Factory talk
+
+**Proposal, not implemented.** Extend the existing LangGraph application into a task-oriented runtime. A business request becomes a bounded run with an objective, success assertions, scoped work, recorded evidence and an explicit outcome. The existing conversational path remains available to everyone, including unrecognised senders.
+
+### Source and interpretation
+
+Read the publisher's complete timestamped transcript of Luke Alvoeiro's **The Multi-Agent Architecture That Actually Ships**. The relevant ideas are:
+
+| Transcript point                                                  | Design influence                                                                                    |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| [4:27–5:48](https://www.youtube.com/watch?v=ow1we5PzK-o&t=267s)   | Orchestrator, workers and validators share structured state; success is specified before execution. |
+| [6:34–8:48](https://www.youtube.com/watch?v=ow1we5PzK-o&t=394s)   | Independent validation and explicit handoffs support correction.                                    |
+| [9:17–10:15](https://www.youtube.com/watch?v=ow1we5PzK-o&t=557s)  | Sequential work can coexist with targeted parallel reads.                                           |
+| [14:48–15:32](https://www.youtube.com/watch?v=ow1we5PzK-o&t=888s) | Adaptable model instructions sit inside deterministic execution controls.                           |
+
+The talk concerns coding agents. The following architecture is our adaptation for employee-scoped business operations, not a claim that Factory implements CRM assistants this way. [Publisher's transcript](https://ai.engineer/talks/ow1we5PzK-o-production-multi-agent-architecture)
+
+### Proposed system
+
+```mermaid
+flowchart TD
+    WA[WhatsApp] <--> B[Baileys gateway and sender]
+    B --> IN[(ramesh-inbound-queue)]
+    IN --> A[Trusted identity and audience admission]
+
+    subgraph AG[One LangGraph runtime]
+        O[Conversational orchestrator and optional planner]
+        W[Scoped task worker]
+        X[Application tool executor]
+        V[Independent verifier]
+        F[Formatter and final evidence gate]
+        O -->|Task contract| W
+        W <-->|Typed calls and receipts| X
+        W -->|Candidate result and handoff| V
+        V -->|Corrective task within budget| O
+        V -->|Verified facts or explicit limitations| F
+        O -->|Chat or clarification| F
+    end
+
+    A --> O
+    O <--> STATE[(Supabase run state and checkpoints)]
+    X --> EVENTS[(Supabase evidence and run events)]
+    EVENTS --> V
+    X <-->|Signed employee-scoped MCP| CE[Context Engine]
+    CE --> DATA[CRM mirror, live Twenty reads and permitted WAG data]
+    F --> OUT[(ramesh-outbound-queue)]
+    OUT --> B
+
+    X -. Future reminder tools .-> R[(ramesh-reminders)]
+    R --> DUE[Due-time checks and notification preparation]
+    CA[CRM-Automations alert episodes] --> DUE
+    DUE -->|Prepared notification| OUT
+```
+
+Supabase holds shared operational state. Business reads continue through Context Engine's current scoped database/live-source adapters; dedicated domain-backend read endpoints remain deferred. Twenty remains authoritative for CRM records and writes. The graph, executor and scheduler can start in the existing worker process. Baileys remains the only WhatsApp sender.
+
+### Roles and context boundaries
+
+**Converser and planner form one orchestrator.** Reuse the current converser for intent and conversational continuity. For a known lookup, select a preset task contract. For a request spanning CRM and supply, invoke planning to propose steps and assertions. The orchestrator owns the plan and decides whether to continue, clarify, finish with limitations or stop. Routine reads do not need user approval of an internal plan.
+
+**Workers are scoped by task, not autonomous employee accounts.** Begin with one read-worker implementation and a CRM tool profile. Add supply and knowledge profiles as required. A worker receives the task contract, relevant entity references, permitted tool definitions and prior verified facts. It does not inherit the full conversation or another worker's scratch context. A worker's selected tool still passes through the application executor and the existing `ContextEngineServices.forSender` boundary.
+
+**The verifier starts with separate context.** It sees the request, contract, candidate answer and independently recorded tool receipts. It can identify missing evidence and request a correction. It cannot simply lower the success criteria. Deterministic checks cover a simple lookup; complex recommendations also receive an independent model review. Initially use the configured OpenAI model with separate role prompts and contexts. Choosing different models later should follow eval results, not require a provider migration now.
+
+**The formatter only renders the result.** Preserve the current human WhatsApp style, including no em dashes or canned assistant phrases. Pass it an authorized answer bundle containing facts, source references, caveats and any unresolved question. Keep CRM notes and arbitrary tool text out of its instruction channel. The final gate catches altered factual fields or requires renewed evidence review for new claims.
+
+Logical roles can be nodes or subgraphs. They do not imply five always-running agents or five model calls per message. Worker-to-worker communication goes through the orchestrator's structured state. Versioned role instructions guide decomposition; permissions, tool schemas, deadlines and state transitions remain code-owned.
+
+### Contracts and handoffs
+
+A **task contract** states what the user wants and what evidence would establish completion. Runtime policy supplies mandatory identity, audience, access and freshness checks. Planning can add criteria, but cannot remove that baseline.
+
+For the illustrative request, “Find up to three warehouses for the Acme lead and tell me what still needs checking,” the contract would include:
+
+| Assertion             | Completion evidence                                                                           |
+| --------------------- | --------------------------------------------------------------------------------------------- |
+| Correct lead          | One unambiguous, accessible lead ID; otherwise ask the employee to choose.                    |
+| Correct requirements  | Requirements come from lead fields or explicit user input; missing requirements stay unknown. |
+| Authorized candidates | Warehouse reads succeed under this employee's current permissions.                            |
+| Supported comparison  | Candidate facts and requirement matches reference actual tool evidence, with units preserved. |
+| Honest limitations    | Missing availability, incomplete coverage and unverified requirements are disclosed.          |
+| Correct audience      | A private result is prepared for the same authorized employee's DM.                           |
+
+The planned sequence is lead resolution → requirements → supply search → `assess_shortlist` for a bounded candidate set → verification → formatting. Searches that depend on lead requirements run after those requirements are established. Independent candidate detail reads can share a small concurrency limit. If only two candidates are supported, the correct result is two with an explanation.
+
+The following is an internal handoff shape, not an existing MCP schema or a model-selected identity:
+
+```json
+{
+  "runId": "server-generated-run-id",
+  "stepId": "compare-candidates",
+  "contractVersion": 1,
+  "status": "partial",
+  "completedAssertions": ["correct-lead", "authorized-candidates"],
+  "evidenceRefs": ["tool-call-3", "tool-call-4"],
+  "unresolved": ["Current availability is not recorded"],
+  "proposedNextStep": "Report availability as needing confirmation"
+}
+```
+
+The executor, rather than the model, records receipts: actor reference, tool name, validated arguments, call ID, source path, returned entity IDs, source timestamps, coverage/cursors, outcome and evidence reference. A worker cannot invent a valid receipt by adding a string to its handoff. The verifier checks assertion claims against these records.
+
+Persist concise decisions and results, not private reasoning. Store sensitive result bodies encrypted with restricted access and bounded retention. A source's response-generation time is not necessarily its underlying data-refresh time; preserve both when available.
+
+### Paths through the runtime
+
+| Request class                               | Path                                                                                                                         |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Greeting, small talk or help                | Existing converser → formatter. No business credential is required.                                                          |
+| Unknown/inactive sender asking for CRM data | Admission denies business access; converser explains the limitation without querying business tools.                         |
+| Simple personal lookup                      | Preset contract → scoped read → deterministic verification → formatter.                                                      |
+| CRM-to-supply recommendation                | Planner → CRM/supply worker steps → independent verifier → bounded repair or formatter.                                      |
+| Ambiguous lead/date                         | Save the pending question and pause; resume only from the matching sender and audience.                                      |
+| Personal reminder                           | Resolve the intent/time → persist a reminder through a narrow tool → verify the saved schedule → acknowledge.                |
+| SLA breach                                  | CRM-Automations evaluates policy → durable alert occurrence → due-time recipient checks → templated notification.            |
+| Future CRM change                           | Prepare a typed proposal → apply the command's confirmation policy → execute idempotently → authoritative read-back → reply. |
+
+Business tools remain DM-only for the first rollout. Group chat may receive a generic instruction to continue privately; the current graph cannot initiate a private handoff itself. The product may add that routing later, under an explicit audience policy. An employee's personal record access never authorizes disclosure to the group.
+
+For “my follow-ups today,” use an explicitly assigned view and the employee's configured date boundary, initially `Asia/Kolkata`. Do not substitute an admin's full visibility or the current broad briefing endpoint for personal responsibility. Section 7 records that existing briefing limitation.
+
+### Durable state and queue ownership
+
+Use Supabase/Postgres for production task state. LangGraph documents persistent checkpoints for resumption; a checkpoint restores execution state, while application records describe the business task. The proposed checkpoint adapter must use a private schema and production database credentials with appropriate grants. [LangGraph persistence](https://docs.langchain.com/oss/javascript/langgraph/persistence)
+
+| Table or store                                                 | Status                                                       | Responsibility                                                                                                       |
+| -------------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `ramesh-inbound-queue`                                         | Existing                                                     | Durable inbound work, duplicate admission and processing leases.                                                     |
+| `ramesh-outbound-queue`                                        | Existing                                                     | Finalized delivery content, availability, fenced leases and send outcomes.                                           |
+| `ramesh-agent-runs`                                            | Minimal journal implemented; richer schema proposed          | Objective, employee/audience binding, plan and contract versions, status, budget, deadline and checkpoint reference. |
+| `ramesh-agent-events`                                          | Encrypted tool receipts implemented; broader events proposed | Append-only step handoffs, tool receipts, verification outcomes and correction history.                              |
+| LangGraph checkpoint tables in a private `ramesh_agent` schema | Proposed                                                     | Framework execution snapshots; adapter-managed table names, separate from application event history.                 |
+| `ramesh-reminders`                                             | Proposed for reminder milestone                              | Owner, requested intent, due time, linked entity/episode, version, snooze and cancellation.                          |
+| `ramesh-action-proposals`                                      | Proposed for write milestone                                 | Exact intended change, authorization/confirmation binding, expiry and reconciliation state.                          |
+
+Run records own plan/status; checkpoints own the execution cursor; receipts own observed outcomes. Avoid three independently writable copies of the same business decision. Record versions and lease fencing must prevent an old worker from advancing a newer run.
+
+Bind a graph thread to one run and its employee/audience, with conversation history handled separately. This allows a paused task to coexist with an unrelated new request. On resume, validate the responding sender, refresh current authority and re-read time-sensitive evidence. A saved grant or checkpoint is not proof of current access. Interrupted nodes can execute again, so side effects require idempotency and reconciliation outside model memory. [LangGraph interrupts](https://docs.langchain.com/oss/javascript/langgraph/interrupts)
+
+Preserve the existing atomic reply handoff. The first-read finalization transaction now associates the completed run with one outbound row and finishes inbound processing. If the graph checkpoint lags that transaction, recovery finds the finalized run and reuses the saved reply. Do not regenerate it. For clarification, persist the waiting state and clarification response, then release the inbound lease; waiting for a person must not hold a database connection or active job lease.
+
+A finalized run means task processing finished and its response was saved; detailed status names are defined in the [shared contracts](agent-modules/00-shared-contracts.md). WhatsApp acceptance, delivery and reading remain separate transport facts. Existing `UNCERTAIN` send handling stays intact. A queue and graph checkpoint cannot guarantee exactly-once delivery to WhatsApp.
+
+Before sending queued business content, application code must recheck the bound recipient and current access to its referenced records. If access has changed, suppress the sensitive output; if time-sensitive evidence has expired, suppress the output. The first preset expires changed/stale results; bounded automatic refresh belongs to the later general workflow. The sender performs these checks through application services, without asking a model to decide authorization. Protect stored conversation history the same way when assembling context after an employee's permissions change.
+
+SQLite remains an optional synthetic chat/eval path and the existing local linked-device store. The real-data playground and production task state use Supabase with separate tables and credentials. Test new task/queue migrations against isolated PostgreSQL with captured transport, as with the existing queue tests; reserve explicitly requested live smoke checks for the real-data harness.
+
+### Concurrency, budgets and correction
+
+Sequence dependent steps inside a task and use one active coordinator per run. Serialize conflicting work within a conversation; allow bounded concurrency across unrelated conversations. Parallelize only independent authorized reads within a step. Future writes also need entity-version checks and application-level coordination across chats acting on the same record.
+
+This requires a deliberate change to the current account-wide queue lease: today one slow inbound job can delay other chats and outbound delivery. Do not remove the existing lock and assume ordering remains correct. Introduce per-conversation run fencing, a bounded generation pool and a separately paced sender, retaining one active Baileys socket owner per account.
+
+Start complex-read evaluation with candidate limits of six planned steps, ten business-tool calls, two corrective passes and a shared 60-second active-execution deadline. These are proposed tuning values, not current settings or guaranteed latency. Transport handshake/discovery calls also count toward time and request limits. Retries, rechecks and repairs consume the same budget. Enforce model token/spend caps and restrict each tool deadline to the remaining run time.
+
+A permission denial ends that operation. A transient read failure gets at most one retry within the shared budget. Stale or incomplete data produces an explicit limitation. User ambiguity pauses for input. Exhausted budgets end with a partial result or a clear failure. An uncertain future write enters reconciliation; another agent must not blindly repeat it.
+
+New user instructions can cancel or revise a run. Increment its version and invalidate superseded pending output before sending. Waiting tasks need an explicit expiry policy. Timers schedule resumptions or notifications; no model loop stays alive until a reminder becomes due.
+
+### Reminders and future writes
+
+The planner can choose a reminder tool, but the durable reminder service owns execution. Creation ends when the schedule is committed and verified. At due time, code rechecks the active recipient, authority, schedule version and relevant source/condition, then prepares an outbound message. Cancellation and reassignment invalidate obsolete delivery. Templates should handle routine reminders without a model call.
+
+SLA policies stay in CRM-Automations. Escalation remains **assignee(s), then existing CRM admins**. Use distinct alert episodes and delivery occurrences, preserving the meaningful-activity and stage clocks in section 9. A reminder being delivered, acknowledged or snoozed does not count as sales activity. Grace periods, quiet hours and repetition limits remain product decisions.
+
+Background automation needs its own defined authority and recipient policy. Do not borrow the last chatting employee's grant or assume the signed service key authorizes proactive messaging. The currently implemented signed MCP route supports interactive employee reads; unattended notification preparation needs a separately reviewed integration contract.
+
+For later business writes, use typed CRM/WAG commands with source-system validation, exact payload binding, idempotency keys and authoritative read-back. Bind any required confirmation to actor, command, record version and expiry. Refresh scope on execution. A successful model review or user confirmation never expands backend permissions. Writes to the CRM mirror are not a substitute for Twenty commands.
+
+### Implementation sequence and evaluation
+
+| Increment                | Concrete change                                                                                                                                                                                                 | Acceptance evidence                                                                                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. First scoped lookup   | Add typed run/evidence contracts and a preset assigned-follow-ups workflow; compose the existing identity and Context Engine services into the graph.                                                           | Correct employee, assigned view, date bounds, empty/partial/stale outcomes, group denial and final reply grounding.                                 |
+| 2. Durable execution     | Add Supabase run/event storage and atomic finalization/recovery. The preset implements these in migration 004; a Postgres checkpointer is required later for intermediate-step resumption and human interrupts. | Restart at each boundary, stale lease fencing, no duplicate reply, reauthorization on resume and before delivery, and no credential in checkpoints. |
+| 3. Complex read workflow | Add optional planning, a scoped worker and independent verifier for CRM-to-supply requests.                                                                                                                     | Better supported task completion than the preset/direct baseline at acceptable measured latency and cost.                                           |
+| 4. Operational expansion | Add reminder tools, due processing and SLA delivery; later introduce typed writes.                                                                                                                              | Correct recipients, cancellation, resolved breaches, uncertain sends and write reconciliation before enabling effects.                              |
+
+Suggested code locations are `src/modules/assistant/assistant.graph.ts` for routing, new task/evidence contracts beside `assistant.types.ts`, and the existing `src/app/context-engine.ts` composition plus `src/modules/context-engine/context.service.ts` for reads. Keep execution guards and verification in testable modules. Put new Supabase migrations beside the queue migrations. The first-read implementation is mapped in [its runbook](first-crm-read.md); this section also describes future modules and migrations.
+
+Extend `evals/cases.ts`, `evals/judge.ts` and `evals/run.ts` with repeated model trials over synthetic CRM/supply fixtures. Compare the same held-out requests through preset/direct execution, explicit planning, and planning plus independent review. Score the actual authorized result and unresolved limitations, rather than exact wording or one preferred tool sequence.
+
+Include ambiguous leads, admin-versus-assignee visibility, unknown/inactive employees, denied group disclosure, revoked access on resume, partial pagination, stale source clocks, prompt injection in a CRM note, missing warehouse units/availability, false worker success, formatter fact changes and repair-budget exhaustion. Use deterministic assertions for permissions and recorded effects; model graders assess nuanced completeness and tone. Calibrate judge decisions with human review. Repeat nondeterministic trials and retain failures; do not rerun until one passes.
+
+The fake chat GUI should show an optional developer trace with run status, planned steps, evidence references, verifier findings, latency and usage. The operational admin view needs the same run-to-queue correlation with access-controlled detail. Neither view should expose secrets or private model reasoning. Test delivery through captured transports; no real WhatsApp message is needed to validate this architecture.
+
+**First vertical slice:** an active employee asks “What follow-ups do I have today?” in a DM. Ramesh resolves trusted identity, performs an assigned-only Context Engine read, checks evidence and coverage, formats the answer and saves one outbound response. Complete that path and its failure cases before introducing a general planner.
+
+## 24. Implemented real-data capture harness
+
+The user selected real Supabase and the actual Context Engine for the playground, with Raghav as the fixed employee and no messages going to WhatsApp. The [module specification](agent-modules/21-live-data-playground.md) was written before implementation. The earlier SQLite choice remains available only as the synthetic fixture path.
+
+`npm run dev:chat:live` starts a separate loopback process: browser → `ramesh-test-inbound-queue` → shared LangGraph and signed CRM read → code verification → `ramesh-test-outbound-queue` → fresh authorization/result check → browser. `ramesh-test-agent-events` stores encrypted receipts. None of these rows enters the Baileys consumer. A dedicated `ramesh_playground` login, capture-only SQL constraint and absence of a sender/session factory make the boundary independent of a runtime test flag.
+
+Employee ID is server configuration, never model or browser input. The live roster must yield one active employee with a unique canonical phone; Context Engine repeats its own scope checks. At the user's request, Raghav's duplicated number was cleared from the support account. The playground's four-column roster grant includes a scoped SELECT policy for the live table's RLS. Unknown users can chat, and both unknown and group CRM requests are denied without business-tool calls.
+
+Test input, result and receipts are encrypted with a separate key. Finalization is atomic, request UUIDs are idempotent, stale leases cannot finalize and replay does not regenerate saved text. Sensitive replay repeats employee and evidence checks before display. Old test rows are removed after 24 hours when the harness next runs cleanup. This entry point uses no SQLite, user OAuth grant or WhatsApp device state. It does not drain abandoned requests automatically or support promotion to real delivery.
+
+The initial capture implementation supported assigned follow-ups due today; its five smoke checks and Chrome submission passed, and the repository check passed 131 tests with zero skipped. Section 25 supersedes that capability limit. Production migration/enablement remains separate.
+
+See the [runbook](live-data-playground.md) for provisioning, commands, named tables and limits. This uses an isolated capture adapter alongside the established separation between outbox persistence and delivery; [AWS's transactional outbox guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html) describes that separation. [Supabase queue permissions](https://supabase.com/docs/guides/queues/quickstart) and [Twilio's non-delivering test credentials](https://www.twilio.com/docs/iam/test-credentials) provide related primary-source patterns.
+
+## 25. Personal assistant tool loop and legacy context reference
+
+Following the user's correction, the agent now receives every current Context Engine read tool permitted for its employee. The Raghav signed catalogue contains seventeen tools across CRM, supply, knowledge, shortlist assessment, GA4 and Search Console with all four registered scopes. There is no fixed question allowlist or today-only business route. The [module 22 contract](agent-modules/22-sales-manager-tool-loop.md) was written before implementation; the [personal-assistant runbook](sales-manager-agent.md) maps that contract to code, limits and checks.
+
+The implemented graph runs a bounded converser/tool-executor loop, then formatter and fresh evidence review, allowing one repair routed to the formatter or the tool session according to the missing requirement. Tool execution, identity, schemas, receipts and delivery remain application-owned. This is model-directed read orchestration, not a separate planning agent or durable intermediate-step checkpointer. Source metadata and employee scope are verified in code, and saved business outputs are reauthorized and fingerprint-checked before display/send.
+
+App-owned Supabase history now preserves a content-free completion marker for delivered private answers, so subsequent requests do not repeat already-completed work. The local recall tool can restore the earlier selection after current scoped reads match its protected receipt; changed or revoked results cannot restore old wording. The [legacy logistics-bot review](agent-modules/23-context-and-media-reference.md) supplies concrete context/media references: bounded Postgres history, transient media resolution, a two-hour pin with a shorter relevance window, voice-to-text and separate artifact processing. The replacement is now implemented in module 30, with 24-hour private media, durable batching and the transcript display contract in module 35.
+
+The live harness still runs as the server-configured Raghav, with real Supabase/MCP and physically isolated capture queues. Production environment, pending migration 004 and WhatsApp deployment are separate. `eval:sales` tests repeated real-model decisions with synthetic evidence; `smoke:chat:live` checks real scoped reads, replay and capture isolation. Tests retain failures and do not claim deterministic model correctness.
+
+## 26. Personal chief-of-staff refinement and measured evaluation
+
+The latest role is a personal assistant for each messaging user, with company tools as capabilities. Ordinary planning, drafting and casual conversation should not become a sales intake or an unsolicited project. The graph retains bounded native tool decisions rather than adding separate agents for every reasoning step. The formatter gets relevant history and the actual previous answer when repairing; source-only checks stay deterministic.
+
+Modules [25](agent-modules/25-analytics-and-continuous-evaluation.md) and [26](agent-modules/26-coworker-loop-and-context.md) were specified before these changes. They cover source-specific analytics clocks, capability/error handling, editable Markdown prompts, the Claude transcript comparison and old logistics-bot content/media storage. The current [evaluation guide](../evals/README.md) documents 74 multi-turn scenarios, repeated real-model trials, retained failures and protected CI. Production and the real-data capture route remain separate.

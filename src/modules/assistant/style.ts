@@ -12,22 +12,45 @@ export const STOCK_PHRASES = [
 ];
 
 export function finishReply(text: string): string {
-  return text
-    .replace(/[\u2012-\u2015]/g, ', ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/ +([,.!?])/g, '$1')
-    .replace(/,\s*,/g, ',')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  return (
+    text
+      // En/figure dashes normally denote ranges, including 25 Sep–1 Oct and 9 am–5 pm.
+      .replace(/[\u2012\u2013]/g, '-')
+      .replace(/(?<=\d)\s*[\u2014\u2015]\s*(?=\d)/g, '-')
+      .replace(/[\u2012-\u2015]/g, ', ')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/ +([,.!?])/g, '$1')
+      .replace(/,\s*,/g, ',')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  );
 }
 
-export function styleViolations(text: string): string[] {
+export function styleViolations(text: string, maximumCharacters = 4000): string[] {
   return [
     ...(/[\u2014\u2015]/.test(text) ? ['em_dash'] : []),
     ...(!text.trim() ? ['empty_reply'] : []),
-    ...(text.length > 4000 ? ['reply_too_long'] : []),
+    ...(text.length > maximumCharacters ? ['reply_too_long'] : []),
     ...STOCK_PHRASES.filter((phrase) => phrase.test(text)).map(
       (phrase) => `stock_phrase:${phrase.source}`,
     ),
+  ];
+}
+
+/** Mechanical chat layout checks belong in code, independently of semantic model review. */
+export function chatLayoutIssues(text: string): string[] {
+  return [
+    ...STOCK_PHRASES.filter((phrase) => phrase.test(text)).map(
+      (phrase) =>
+        `Rephrase the stock wording matching ${phrase.source} naturally while preserving its facts.`,
+    ),
+    ...(/^\s*\|.*\|\s*$/m.test(text)
+      ? [
+          'Replace the table with short labelled bullets. No tables, including narrow tables, in a WhatsApp reply.',
+        ]
+      : []),
+    ...(/```/.test(text)
+      ? ['Remove code fences and present the answer as ordinary chat text.']
+      : []),
   ];
 }

@@ -1,6 +1,7 @@
 /** PostgreSQL state + queue transactions. No connection is held during pacing or WhatsApp sends. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import { batchDeadline, type DebouncePolicy } from '../../modules/messaging/debounce.js';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
 
 export type TerminalState = 'SENT' | 'EXPIRED' | 'FAILED' | 'UNCERTAIN';
@@ -14,10 +15,14 @@ export interface MessageJob {
   token: string;
   payload: string;
   attempts: number;
+  receivedAt?: Date;
   direction: QueueDirection;
   replyPayload?: string;
   origin?: 'whatsapp' | 'admin';
   chatId?: string;
+  replyKind?: 'conversation' | 'business';
+  businessEvidence?: string;
+  members?: Array<{ id: string; payload: string; receivedAt?: Date }>;
 }
 interface OwnedRow {
   id: string;
@@ -30,11 +35,12 @@ export class MessageQueueRepository {
   constructor(
     private readonly pool: Pool,
     readonly accountId: string,
+    private readonly debounce?: DebouncePolicy,
   ) {}
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610010003'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610020005'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -117,10 +123,57 @@ export class MessageQueueRepository {
         ],
       );
       if (!queued) return full ? 'full' : 'observed';
+      const senderKey = createHash('sha256')
+        .update(JSON.stringify([message.chatId, message.senderId ?? message.chatId]))
+        .digest('hex');
+      const media = ['audio', 'image', 'document'].includes(message.kind ?? '');
+      const first = this.debounce
+        ? (
+            await db.query(
+              `SELECT j.message_id,j.created_at FROM public."ramesh-inbound-queue" j
+        JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.account_id=$1 AND j.sender_key=$2
+        AND j.batch_parent IS NULL AND NOT j.batch_closed AND j.state='READY' AND j.available_at>clock_timestamp()
+        AND j.created_at+($3*interval '1 millisecond')>clock_timestamp() AND j.batch_count<16 AND j.batch_chars+$4<=24000
+        AND j.media_count+$5<=8 AND m.expires_at>clock_timestamp()+interval '10 seconds'
+        ORDER BY j.created_at DESC LIMIT 1 FOR UPDATE OF j`,
+              [
+                this.accountId,
+                senderKey,
+                this.debounce.maxMs,
+                message.text?.length ?? 0,
+                media ? 1 : 0,
+              ],
+            )
+          ).rows[0]
+        : undefined;
+      const available = this.debounce
+        ? new Date(
+            batchDeadline(
+              first?.created_at.getTime() ?? Date.now(),
+              Date.now(),
+              { media, forwarded: message.forwarded },
+              this.debounce,
+            ),
+          )
+        : new Date();
       await db.query(
-        `INSERT INTO public."ramesh-inbound-queue" (message_id,account_id) VALUES ($1,$2)`,
-        [id, this.accountId],
+        `INSERT INTO public."ramesh-inbound-queue" (message_id,account_id,sender_key,batch_parent,available_at,batch_chars,media_count)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          id,
+          this.accountId,
+          senderKey,
+          first?.message_id ?? null,
+          available,
+          message.text?.length ?? 0,
+          media ? 1 : 0,
+        ],
       );
+      if (first)
+        await db.query(
+          `UPDATE public."ramesh-inbound-queue" SET available_at=$2,batch_count=batch_count+1,batch_chars=batch_chars+$3,media_count=media_count+$4 WHERE message_id=$1`,
+          [first.message_id, available, message.text?.length ?? 0, media ? 1 : 0],
+        );
       return 'queued';
     });
   }
@@ -200,6 +253,24 @@ export class MessageQueueRepository {
       finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND account_id=$2`,
       [job.id, this.accountId, state, reason],
     );
+    await this.finishMembers(db, job.id, state, reason);
+    await db.query(
+      `UPDATE public."ramesh-agent-runs" SET state='failed',updated_at=clock_timestamp()
+       WHERE id=$1 AND account_id=$2 AND state='running'`,
+      [job.id, this.accountId],
+    );
+  }
+
+  private async finishMembers(db: PoolClient, id: string, state: string, reason: string | null) {
+    await db.query(
+      `UPDATE public."ramesh-messages" m SET state=$3,reason=$4,payload_encrypted=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
+      FROM public."ramesh-inbound-queue" j WHERE j.message_id=m.id AND j.batch_parent=$1 AND j.account_id=$2 AND m.state='QUEUED'`,
+      [id, this.accountId, state, reason],
+    );
+    await db.query(
+      `UPDATE public."ramesh-inbound-queue" SET state='DONE',updated_at=clock_timestamp() WHERE batch_parent=$1 AND account_id=$2`,
+      [id, this.accountId],
+    );
   }
 
   private async requeue(
@@ -256,6 +327,30 @@ export class MessageQueueRepository {
         [this.accountId],
       );
     }
+    await db.query(
+      `UPDATE public."ramesh-agent-runs" r SET state='failed',updated_at=clock_timestamp()
+       FROM public."ramesh-messages" m WHERE r.id=m.id AND r.account_id=$1 AND r.state='running'
+       AND m.state IN ('FAILED','EXPIRED','UNCERTAIN')`,
+      [this.accountId],
+    );
+    const terminalParents = (
+      await db.query(
+        `SELECT m.id,m.state,m.reason FROM public."ramesh-messages" m WHERE m.account_id=$1 AND m.state IN ('FAILED','EXPIRED','UNCERTAIN') AND EXISTS(SELECT 1 FROM public."ramesh-inbound-queue" j WHERE j.batch_parent=m.id AND j.state='READY')`,
+        [this.accountId],
+      )
+    ).rows;
+    for (const parent of terminalParents)
+      await this.finishMembers(db, parent.id, parent.state, parent.reason);
+  }
+
+  async nextInboundDelay(maxMs: number) {
+    const row = (
+      await this.pool.query(
+        `SELECT extract(epoch FROM min(available_at)-clock_timestamp())*1000 AS wait FROM public."ramesh-inbound-queue" WHERE account_id=$1 AND state='READY' AND batch_parent IS NULL`,
+        [this.accountId],
+      )
+    ).rows[0];
+    return row?.wait === null ? maxMs : Math.min(maxMs, Math.max(25, Number(row.wait)));
   }
 
   claimInbound(leaseMs: number) {
@@ -284,10 +379,12 @@ export class MessageQueueRepository {
         attempts: number;
         replyPayload?: string;
       }>(
-        `SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId"
+        `SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId",m.created_at AS "receivedAt",
+          m.reply_kind AS "replyKind",m.business_evidence_encrypted AS "businessEvidence"
         ${direction === 'outbound' ? ',j.payload_encrypted AS "replyPayload"' : ''}
         FROM ${queueTable(direction)} j JOIN public."ramesh-messages" m ON m.id=j.message_id
         WHERE j.account_id=$1 AND j.state='READY' AND j.available_at<=clock_timestamp()
+        ${direction === 'inbound' ? 'AND j.batch_parent IS NULL' : ''}
         ORDER BY j.available_at,j.created_at,j.message_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`,
         [this.accountId],
       );
@@ -297,6 +394,7 @@ export class MessageQueueRepository {
       await db.query(
         `UPDATE ${queueTable(direction)} SET state='LEASED',lease_token=$2,
         lease_until=clock_timestamp()+$3*interval '1 millisecond',attempts=attempts+1,updated_at=clock_timestamp()
+        ${direction === 'inbound' ? ',batch_closed=true' : ''}
         WHERE message_id=$1`,
         [row.id, token, leaseMs],
       );
@@ -304,12 +402,32 @@ export class MessageQueueRepository {
         `UPDATE public."ramesh-messages" SET state=$2,reason=NULL,updated_at=clock_timestamp() WHERE id=$1`,
         [row.id, direction === 'inbound' ? 'PROCESSING' : 'READY_TO_SEND'],
       );
-      return { ...row, direction, token, attempts: row.attempts + 1 };
+      const members =
+        direction === 'inbound'
+          ? (
+              await db.query(
+                `SELECT m.id,m.payload_encrypted AS payload,m.created_at AS "receivedAt" FROM public."ramesh-inbound-queue" j JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.batch_parent=$1 AND j.account_id=$2 AND m.payload_encrypted IS NOT NULL ORDER BY j.created_at,j.message_id`,
+                [row.id, this.accountId],
+              )
+            ).rows
+          : undefined;
+      return {
+        ...row,
+        direction,
+        token,
+        attempts: row.attempts + 1,
+        ...(members?.length ? { members } : {}),
+      };
     });
   }
 
   /** Commit the final reply and inbound completion together, before the sender can see it. */
-  async handoff(job: MessageJob, replyPayload: string, availableAt = new Date()): Promise<boolean> {
+  async handoff(
+    job: MessageJob,
+    replyPayload: string,
+    availableAt = new Date(),
+    businessEvidence?: string,
+  ): Promise<boolean> {
     if (job.direction !== 'inbound') return false;
     return this.transaction(async (db) => {
       const row = await this.owned(db, job);
@@ -332,10 +450,66 @@ export class MessageQueueRepository {
       );
       await db.query(
         `UPDATE public."ramesh-messages" SET state='READY_TO_SEND',reason=NULL,
-         reply_encrypted=$2,reply_created_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1`,
-        [job.id, replyPayload],
+         reply_encrypted=$2,reply_kind=$3,business_evidence_encrypted=$4,
+         reply_created_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1`,
+        [
+          job.id,
+          replyPayload,
+          businessEvidence ? 'business' : 'conversation',
+          businessEvidence ?? null,
+        ],
       );
+      await this.finishMembers(db, job.id, 'OBSERVED', 'batched_into_reply');
+      const finalized = await db.query(
+        `UPDATE public."ramesh-agent-runs" SET state='finalized',finalized_at=clock_timestamp(),updated_at=clock_timestamp()
+         WHERE id=$1 AND account_id=$2 AND lease_token=$3 AND state='running' RETURNING id`,
+        [job.id, this.accountId, job.token],
+      );
+      if (businessEvidence && !finalized.rowCount)
+        throw new Error('Business reply requires a fenced agent run');
+      if (finalized.rowCount)
+        await db.query(
+          `INSERT INTO public."ramesh-agent-events" (account_id,run_id,attempt,kind) VALUES ($1,$2,$3,'finalized')`,
+          [this.accountId, job.id, job.attempts],
+        );
       return true;
+    });
+  }
+
+  /** One journal row per inbound message; a new lease advances the retry attempt, never a completed run. */
+  async beginAgentRun(job: MessageJob): Promise<boolean> {
+    if (job.direction !== 'inbound') return false;
+    return this.transaction(async (db) => {
+      const row = await this.owned(db, job);
+      if (!row || row.state !== 'PROCESSING') return false;
+      const result = await db.query(
+        `INSERT INTO public."ramesh-agent-runs" (id,account_id,state,attempt,lease_token)
+         VALUES ($1,$2,'running',$3,$4) ON CONFLICT (id) DO UPDATE SET
+         attempt=EXCLUDED.attempt,lease_token=EXCLUDED.lease_token,updated_at=clock_timestamp()
+         WHERE "ramesh-agent-runs".account_id=EXCLUDED.account_id AND "ramesh-agent-runs".state='running'
+         RETURNING id`,
+        [job.id, this.accountId, job.attempts, job.token],
+      );
+      return !!result.rowCount;
+    });
+  }
+
+  async recordAgentEvent(
+    job: MessageJob,
+    kind: 'tool_started' | 'tool_succeeded' | 'tool_failed',
+    payload: string,
+  ): Promise<void> {
+    if (job.direction !== 'inbound') throw new Error('Invalid agent event owner');
+    await this.transaction(async (db) => {
+      const row = await this.owned(db, job);
+      if (!row || row.state !== 'PROCESSING') throw new Error('Agent lease expired');
+      const inserted = await db.query(
+        `INSERT INTO public."ramesh-agent-events" (account_id,run_id,attempt,kind,payload_encrypted)
+         SELECT account_id,id,attempt,$4,$5 FROM public."ramesh-agent-runs"
+         WHERE id=$1 AND account_id=$2 AND lease_token=$3 AND state='running' RETURNING id`,
+        [job.id, this.accountId, job.token, kind, payload],
+      );
+      if (!inserted.rowCount) throw new Error('Agent run is not active');
     });
   }
 

@@ -49,6 +49,9 @@ export const CONTEXT_READ_TOOLS = {
   read_crm_lead_context: 'crm:read',
   crm_briefing: 'crm:read',
   assess_shortlist: 'crm:read',
+  analytics_capabilities: 'analytics:read',
+  ga4_report: 'analytics:read',
+  search_console_report: 'analytics:read',
 } as const;
 export type ContextReadTool = keyof typeof CONTEXT_READ_TOOLS;
 export const isContextReadTool = (name: string): name is ContextReadTool =>
@@ -68,6 +71,10 @@ export interface ContextToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 export interface ContextToolGateway {
+  describe?(
+    sender: ContextSender,
+    signal?: AbortSignal,
+  ): Promise<{ tools: ContextToolDefinition[]; guidance?: string }>;
   discover(sender: ContextSender, signal?: AbortSignal): Promise<ContextToolDefinition[]>;
   call(
     sender: ContextSender,
@@ -94,6 +101,17 @@ export class ContextEngineError extends Error {
     readonly code: ContextErrorCode,
     readonly retryable = false,
     readonly retryAfterSeconds?: number,
+    readonly recovery?: {
+      sourceCode: string;
+      action:
+        | 'check_source_configuration'
+        | 'check_google_access'
+        | 'check_capabilities'
+        | 'correct_query'
+        | 'check_engine_access'
+        | 'retry_later'
+        | 'investigate_source_response';
+    },
   ) {
     super(`Context Engine: ${code}`);
     this.name = 'ContextEngineError';

@@ -1,4 +1,4 @@
-/** Thin domain services for future agents. Nothing imports these into the chat graph yet. */
+/** Employee-bound domain methods and a generic read port for the personal-assistant tool loop. */
 import type { ContextReadTool, ContextSender, ContextToolGateway } from './context.types.js';
 
 export type ReadFilters = Record<
@@ -18,7 +18,12 @@ export class ContextEngineServices {
       signal?: AbortSignal,
     ) => this.gateway.call(identity, tool, input, signal);
     return {
+      call: read,
       discover: (signal?: AbortSignal) => this.gateway.discover(identity, signal),
+      describe: async (signal?: AbortSignal) =>
+        this.gateway.describe
+          ? this.gateway.describe(identity, signal)
+          : { tools: await this.gateway.discover(identity, signal) },
       context: (signal?: AbortSignal) => read('get_context', {}, signal),
       crm: {
         filters: (input: ReadFilters = {}, signal?: AbortSignal) =>
@@ -59,6 +64,12 @@ export class ContextEngineServices {
         readWarehouse: (id: number, signal?: AbortSignal) => read('read_warehouse', { id }, signal),
         summary: (input: ReadFilters = {}, signal?: AbortSignal) =>
           read('warehouse_summary', input, signal),
+      },
+      analytics: {
+        capabilities: (signal?: AbortSignal) => read('analytics_capabilities', {}, signal),
+        ga4: (input: ReadFilters = {}, signal?: AbortSignal) => read('ga4_report', input, signal),
+        searchConsole: (input: ReadFilters = {}, signal?: AbortSignal) =>
+          read('search_console_report', input, signal),
       },
       knowledge: {
         search: (

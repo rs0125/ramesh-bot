@@ -1,11 +1,19 @@
 /** Runs the graph within a deadline; keeps conversation context out of transport and prompts out of logs. */
 import { createHash, randomUUID } from 'node:crypto';
 import type { AssistantConfig } from '../../config/assistant.js';
-import type { GreetingCandidate, PreparedReply } from '../greetings/greeting.types.js';
+import type {
+  GreetingCandidate,
+  PreparedReply,
+  TrustedReplyContext,
+} from '../greetings/greeting.types.js';
 import type { AgentTrace, ChatMessage, TextModel } from './assistant.types.js';
 import { buildAssistantGraph } from './assistant.graph.js';
-import { ConversationMemory } from './conversation-memory.js';
+import { ConversationMemory, PRIVATE_HISTORY_REPLY } from './conversation-memory.js';
 import { PROMPT_VERSION } from './prompts.js';
+import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
+import type { BusinessReadService } from './business-reads.js';
+import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js';
+import { SALES_PROMPT_VERSION } from './sales-prompts.js';
 
 export interface AssistantReply extends PreparedReply {
   trace: AgentTrace;
@@ -17,10 +25,15 @@ export class AssistantService {
   private readonly graph;
   constructor(
     private readonly modelConfig: Pick<AssistantConfig, 'model' | 'timeoutMs'>,
-    model: TextModel,
+    private readonly model: TextModel,
     private readonly memory = new ConversationMemory(),
     private readonly observe: (trace: AgentTrace) => void = () => {},
     private readonly readHistory?: (message: GreetingCandidate) => Promise<ChatMessage[]>,
+    private readonly businessReads?: BusinessReadService,
+    private readonly runtime: {
+      now?: () => number;
+      observeContext?: (context: GraphContextObservation) => void;
+    } = {},
   ) {
     this.graph = buildAssistantGraph(model);
   }
@@ -51,13 +64,21 @@ export class AssistantService {
     if (key) this.memory.clear(key);
   }
 
-  async prepare(message: GreetingCandidate, signal?: AbortSignal): Promise<AssistantReply> {
+  async prepare(
+    message: GreetingCandidate,
+    signal?: AbortSignal,
+    trusted?: TrustedReplyContext,
+  ): Promise<AssistantReply> {
     signal?.throwIfAborted();
     const started = Date.now();
     const trace: AgentTrace = {
-      runId: randomUUID(),
+      runId: trusted?.runId ?? randomUUID(),
       model: this.modelConfig.model,
-      promptVersion: PROMPT_VERSION,
+      promptVersion: this.businessReads?.toolLoop
+        ? SALES_PROMPT_VERSION
+        : this.businessReads
+          ? READ_PROMPT_VERSION
+          : PROMPT_VERSION,
       durationMs: 0,
       stages: [],
       outcome: 'completed',
@@ -68,7 +89,7 @@ export class AssistantService {
       return { ...reply, trace };
     };
     const input = message.text?.trim() ?? '';
-    if (!input || input.length > 6000) {
+    if (!input || input.length > (message.batchMessageIds ? 32000 : 6000)) {
       trace.outcome = 'input_rejected';
       return finish({
         text: input
@@ -90,23 +111,62 @@ export class AssistantService {
           ? this.memory.get(key)
           : [];
       combined.throwIfAborted();
-      const result = await this.graph.invoke(
-        {
-          input: this.input(message),
-          history,
-          audience: message.isGroup ? 'group' : 'dm',
-        },
-        { signal: combined, recursionLimit: 4 },
-      );
+      const inputState = {
+        input:
+          this.input(message) +
+          (trusted?.mediaContext ? `\nAttachment source data:\n${trusted.mediaContext}` : ''),
+        history,
+        audience: message.isGroup ? ('group' as const) : ('dm' as const),
+      };
+      const graphConfig = { signal: combined, recursionLimit: 6 };
+      const result = this.businessReads?.toolLoop
+        ? await buildSalesGraph(
+            this.model,
+            (readSignal) =>
+              this.businessReads!.openTools(
+                trusted?.key.remoteJid === message.chatId ? trusted : undefined,
+                readSignal,
+              ),
+            {
+              now: this.runtime.now,
+              researchDeadlineMs:
+                started +
+                this.modelConfig.timeoutMs -
+                Math.min(60000, this.modelConfig.timeoutMs / 4),
+              onStage: (stage) => trace.stages.push(stage),
+              onContext: this.runtime.observeContext,
+            },
+          ).invoke(inputState, { signal: combined, recursionLimit: 76 })
+        : this.businessReads
+          ? await buildBusinessGraph(this.model, (readSignal) =>
+              this.businessReads!.read(
+                trusted?.key.remoteJid === message.chatId ? trusted : undefined,
+                readSignal,
+              ),
+            ).invoke(inputState, graphConfig)
+          : await this.graph.invoke(inputState, graphConfig);
       combined.throwIfAborted();
       trace.stages = result.stages;
+      if ('researchExhausted' in result && result.researchExhausted)
+        trace.limitedBy = 'research_deadline';
+      const business = 'business' in result ? result.business : undefined;
+      if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
+      if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
       let remembered = false;
       return finish({
         text: result.reply,
         draft: result.draft,
+        ...(business?.outcome === 'verified' ? { businessEvidence: business.delivery } : {}),
         onSent: () => {
           if (!remembered && key) {
-            this.memory.remember(key, this.input(message), result.reply);
+            this.memory.remember(
+              key,
+              this.input(message),
+              business?.outcome === 'verified' ? PRIVATE_HISTORY_REPLY : result.reply,
+              business?.outcome === 'verified'
+                ? { text: result.reply, receipt: business.delivery }
+                : undefined,
+            );
             remembered = true;
           }
         },
@@ -114,6 +174,7 @@ export class AssistantService {
     } catch {
       signal?.throwIfAborted();
       trace.outcome = 'unavailable';
+      trace.failureCode = deadline.signal.aborted ? 'DEADLINE_EXCEEDED' : 'RUN_FAILED';
       return finish({ text: UNAVAILABLE_REPLY });
     } finally {
       clearTimeout(timer);

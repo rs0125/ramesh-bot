@@ -18,6 +18,10 @@ import { AssistantService } from '../modules/assistant/assistant.service.js';
 import { OpenAITextModel } from '../infrastructure/openai/text-model.js';
 import type { TextModel } from '../modules/assistant/assistant.types.js';
 import { InboxRepository } from '../infrastructure/database/inbox.repository.js';
+import { MediaRepository } from '../infrastructure/database/media.repository.js';
+import { MediaService } from '../modules/media/media.service.js';
+import { OpenAIMediaProcessor } from '../infrastructure/openai/media-processor.js';
+import { createBusinessReads } from './business-reads.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -38,11 +42,31 @@ export function createApplication(
     : undefined;
   const messageRepository =
     messagePool && config.messageDatabase
-      ? new MessageQueueRepository(messagePool, config.messageDatabase.accountId)
+      ? new MessageQueueRepository(
+          messagePool,
+          config.messageDatabase.accountId,
+          config.whatsapp.debounce,
+        )
       : undefined;
   const inboxRepository =
     messagePool && config.messageDatabase
       ? new InboxRepository(messagePool, config.messageDatabase.accountId, config.encryptionKey)
+      : undefined;
+  const businessReads =
+    config.businessReads && messagePool
+      ? createBusinessReads(config.businessReads, db, messagePool, config.encryptionKey)
+      : undefined;
+  const media =
+    config.assistant && messagePool && config.messageDatabase
+      ? new MediaService(
+          new MediaRepository(
+            messagePool,
+            config.messageDatabase.accountId,
+            config.encryptionKey,
+            'production',
+          ),
+          new OpenAIMediaProcessor(config.assistant),
+        )
       : undefined;
   const assistant = config.assistant
     ? new AssistantService(
@@ -51,6 +75,7 @@ export function createApplication(
         undefined,
         (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
         inboxRepository ? (message) => inboxRepository.context(message) : undefined,
+        businessReads,
       )
     : undefined;
   const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
@@ -60,15 +85,32 @@ export function createApplication(
           encryptionKey: config.encryptionKey,
           maxAgeMs: config.whatsapp.maxMessageAgeMs,
           capacity: config.whatsapp.maxPendingMessages,
-          // Covers the entire bounded graph, pacing, sending and database round trips.
+          // Inbound generation and outbound rechecks own separate leases. Cover either budget.
           leaseMs:
-            (config.assistant?.timeoutMs ?? 0) +
+            Math.max(
+              config.assistant?.timeoutMs ?? 0,
+              config.businessReads?.context.timeoutMs ?? 0,
+            ) +
             config.whatsapp.replyDelay.maxMs +
             config.whatsapp.sendTimeoutMs +
-            30000,
+            150000,
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
           prepareReply,
+          agentRuns: !!businessReads,
+          media,
+          accountId: config.messageDatabase.accountId,
+          businessPreflight: businessReads
+            ? (message, evidence, signal) =>
+                businessReads.canDeliver(
+                  message.key,
+                  evidence,
+                  AbortSignal.any([
+                    signal,
+                    AbortSignal.timeout(config.businessReads!.context.timeoutMs),
+                  ]),
+                )
+            : undefined,
         })
       : undefined;
   const greetings = new GreetingService(
@@ -156,6 +198,7 @@ export function createApplication(
           // Existing local claims suppress replies after the storage transition too.
           await messageRepository.importLegacy(await db.greeting.findMany());
           await messageRepository.clean();
+          await media?.clean();
           await db.botSetting.upsert({
             where: { key: 'message-storage' },
             create: { key: 'message-storage', value: 'postgres' },
@@ -171,8 +214,9 @@ export function createApplication(
           cleaning = cleaning
             .then(() => adminAccess.clean())
             .then(() => messageRepository?.clean())
+            .then(() => media?.clean())
             .catch((error) => logger.error({ err: error }, 'State cleanup failed'));
-        }, 3_600_000);
+        }, 60_000);
         maintenance.unref();
         const preference = await db.botSetting.findUnique({ where: { key: 'whatsapp-enabled' } });
         if ((preference ? preference.value === 'true' : config.autoConnect) && !stopped)
@@ -194,6 +238,7 @@ export function createApplication(
             await whatsapp.stop();
           } finally {
             await cleaning;
+            await media?.stop();
             await db.$disconnect();
             await messagePool?.end();
           }

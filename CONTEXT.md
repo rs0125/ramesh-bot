@@ -1,6 +1,8 @@
 # Ramesh: product context and decisions
 
-Initial context captured on **2026-09-30**; updated on **2026-10-01** through signed Context Engine access. This preserves earlier options; the [implementation reference](docs/current-implementation.md) and [architecture plan](docs/assistant-architecture-plan.md) describe the current direction.
+Current local increment (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](docs/agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
+
+Initial context captured on **2026-09-30**; updated on **2026-10-02** through the personal-assistant tool loop and real-data capture playground. This preserves earlier options; the [implementation reference](docs/current-implementation.md) and [architecture plan](docs/assistant-architecture-plan.md) describe the current direction.
 
 ## Current scope
 
@@ -12,13 +14,13 @@ The live linked account belongs to the EC2 worker. The earlier local pairing is 
 
 Supabase now holds `ramesh-inbound-queue`, `ramesh-outbound-queue`, message state, and transition history. Agent processing atomically saves the final reply before the sender delivers it. SQLite retains encrypted Baileys credentials/Signal keys, admin sessions, login limits, operator settings, and legacy claims. The two queue migrations and conversational/MCP releases have deployed successfully.
 
-Local chat testing uses the isolated SQLite playground at `http://127.0.0.1:3012`; it captures replies without opening WhatsApp or connecting to Supabase. Live model evaluations also use fake delivery. Queue integration tests use a separate local PostgreSQL database, never the production queue. **Do not send real WhatsApp test messages or start a second process with the production pairing.**
+The selected real-data test path is `npm run dev:chat:live` at `http://127.0.0.1:3012`: real Supabase and signed Context Engine as the server-configured Raghav, with separate `ramesh-test-inbound-queue` and `ramesh-test-outbound-queue` tables and a dedicated capture login. It never constructs a WhatsApp sender. The duplicated phone was cleared from the support account at the user's request so Raghav resolves uniquely. See the [live playground runbook](docs/live-data-playground.md). Synthetic SQLite GUI/evals remain available for repeatable fixtures, and queue regression tests use isolated local PostgreSQL. **Do not send real WhatsApp test messages or start a second process with the production pairing.**
 
-CRM, supply and knowledge services remain outside the active graph. `createSignedEmployeeContextAccess` now supplies trusted phone/LID resolution, live active-employee checks and signed requests to the parallel Context Engine endpoint. No employee OAuth enrollment is needed. Unknown users can chat without business access. Planner/worker/verifier, reminders and writes remain future work; dedicated domain endpoints remain deferred.
+The default production graph has no live business tools until explicitly enabled. This checkout connects all permitted CRM, supply, knowledge, shortlist and analytics tools through a bounded LangGraph tool loop, with independent review and an encrypted run journal; see [personal-assistant implementation](docs/sales-manager-agent.md). The live capture playground enables that loop as Raghav. `createSignedEmployeeContextAccess` now supplies trusted phone/LID resolution, live active-employee checks and signed requests to the parallel Context Engine endpoint. No employee OAuth enrollment is needed. Unknown users can chat without business access. Separate planner/worker roles, media ingestion and durable debounce are implemented locally. Durable paused tasks, reminders and writes remain future work; dedicated domain endpoints remain deferred.
 
 ## Intended product
 
-A WhatsApp assistant for the sales team, with access to relevant existing team groups and the ability to DM salespeople. Potential uses include follow-up reminders, morning digests, urgent lead/task alerts, and questions about permitted CRM leads. Group access matters because useful context already lives in existing WhatsApp groups.
+A personal chief of staff for each messaging user, helping with thinking, planning, prioritization, preparation, drafting and authorized company research. Sales is one capability; the role is not limited to salespeople. Potential uses include follow-up reminders, morning digests, urgent lead/task alerts, and questions about permitted CRM leads. Group access matters because useful context already lives in existing WhatsApp groups.
 
 The harness should own WhatsApp connections, trigger rules, scheduling, permissions, and outbound delivery. An LLM can interpret requests and propose narrow actions, while application code decides whether and how to execute them. Keep reminder polling, due-time rules, and deduplication deterministic rather than calling a model on each scheduler tick.
 
@@ -32,17 +34,17 @@ The user's direction: **scope authorization to the person messaging the bot, and
 4. Route personal CRM results and reminder details to the requesting employee's DM. Tools should not accept arbitrary destinations or a user-selected identity.
 5. Recheck active employee status and permissions when executing work. A future group knowledge policy also needs to consider guest/external group members: open within the organisation does not mean public.
 
-The active conversational graph does not load business credentials. The inactive services enforce trusted identity, DM audience, read allowlists and server identity match. Explicit worker integration remains a separate step. See [signed access](docs/signed-context-auth.md); the legacy OAuth factory is optional.
+Business credentials are loaded only with BUSINESS_READS_ENABLED; all active employees are eligible by default (`BUSINESS_READ_EMPLOYEE_IDS=all`), with optional numeric rollout lists. The general loop enforces trusted identity, DM audience, schema-validated tool proposals, server identity match and delivery reauthorization. Private CRM replies stay hidden from the admin inbox. Model history retains the last 32 messages; private answers are available only through employee-bound recall with fresh scoped reads and matching source fingerprints. See [business recall and display](docs/agent-modules/24-business-recall-and-deal-display.md). Migration 004 and deployment remain separate operational steps. See [signed access](docs/signed-context-auth.md); the legacy OAuth factory is optional.
 
 ## Selected AI and MCP direction
 
-The selected provider is OpenAI, model `gpt-5.6-terra`, through the Responses API. LangGraph owns the two-node conversational flow. The repository's MCP client uses Streamable HTTP with an employee-scoped credential resolver; see the [service contract](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). Planner, worker, and verifier agents will be added later. Simple requests need not traverse every future stage.
+OpenAI Responses is the provider. Production configuration still defaults to `gpt-5.6-terra`; the current capture playground tests `gpt-6.1-sol` at medium tool reasoning effort. LangGraph owns ordinary chat and the separate research graph. The repository's MCP client uses Streamable HTTP with an employee-scoped credential resolver; see the [service contract](docs/assistant-architecture-plan.md#20-context-engine-mcp-service-scaffold). The read loop now separates converser, planner, native-tool worker, deterministic executor, formatter and verifier. Paused tasks remain deferred. Role prompts are editable Markdown under `src/prompts/`.
 
 Earlier options, retained for context:
 
 - **Claude's API MCP connector:** the discussion suggested starting here because the model can call a remote MCP server without a harness-side MCP client. Tool allowlisting, bearer authorization, employee consent, and token refresh still need explicit configuration. The original discussion also flagged a possible zero-data-retention limitation; recheck current Anthropic terms before choosing this path.
 - **MCP client in the harness:** discover allowed tools and expose them to a model as ordinary tool definitions. More code, but the harness can audit calls, validate arguments, trim results, and enforce routing.
-- Allowlist only relevant CRM tools. The Context Engine also has warehouse, knowledge, GA4, and Search Console tools; do not hand the full catalog to a sales bot by default.
+- Superseded restriction: the early CRM-only allowlist is no longer the product boundary. The user chose the full current employee-authorized read catalogue, including GA4 and Search Console.
 - A proposed first CRM allowlist is `crm_filters`, `search_crm_leads`, `crm_summary`, `read_crm_lead`, `read_crm_lead_context`, and `crm_briefing`.
 - Treat group messages and CRM notes as untrusted data, not instructions. Do not grant shell access, arbitrary HTTP requests, bulk messaging, or arbitrary database queries to the model.
 - Cap steps, tokens, and per-person daily spend. Keep API keys server-side. Audit triggers, tool calls, results, and responses with suitable access controls and retention; use representative, sanitized runs as a regression set.
@@ -85,4 +87,13 @@ Paths below are relative to this folder. The initial organisational inspection w
 
 CRM-Automations uses Supabase `pg_cron`/`pg_net` to call secret-protected HTTP workers. Its “meaningful update” clock combines manual business-field changes with separate note/task activity streams; Twenty's generic `updatedAt` is not a substitute. The bot should reuse those clocks and the existing sync rather than create another poller.
 
-Next: configure the service keys/replay storage, then wire trusted identity and scoped services into one private read with evidence verification when worker development resumes. Supply assistance follows. Reminder tools and due-time checks come later, reusing CRM-Automations rules and **assignee(s), then existing CRM admins** escalation. Long-lived reminder state, cancellation and recipient rechecks remain to build.
+General CRM, supply, knowledge, shortlist and analytics reads now work through the real-data capture harness. Production pilot enablement remains a separate migration/configuration/deployment step. The old logistics bot's app-owned context and media-pin patterns are documented in [module 23](docs/agent-modules/23-context-and-media-reference.md); the replacement media lifecycle is implemented in module 30 and exact voice delivery in module 35. Reminder tools and due-time checks come later, reusing CRM-Automations rules and **assignee(s), then existing CRM admins** escalation. Long-lived reminder state, cancellation and recipient rechecks remain to build.
+
+Evaluation refinement is specified in `docs/agent-modules/33-eval-refinement.md`.
+The current grader validates each delivered turn against full tool schemas and
+converted source clocks; `npm run eval:judge` calibrates it on generic positive and
+negative outcomes. Research reserves up to one quarter of the deadline (maximum
+60 seconds) for formatting/verifying retained evidence. Trace metadata preserves
+completed stages on failures. Original model-eval reports remain immutable.
+
+Current voice delivery uses deterministic quoted/italic transcripts before one shared answer. The private media record is the transcript source of truth; queued replies hold references. The logistics-bot OpenAI credential is reused only in ignored local STT configuration. Model research and synthetic results are in [the transcription comparison](evals/results/2026-10-02-stt-comparison.md). No production STT environment or deployment was changed in this refinement.

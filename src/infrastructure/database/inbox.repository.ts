@@ -2,9 +2,15 @@
 import type { Pool } from 'pg';
 import type { ConversationPage, InboxMessage, InboxPage } from '../../contracts/admin-api.js';
 import type { ChatMessage } from '../../modules/assistant/assistant.types.js';
+import {
+  MAX_HISTORY_MESSAGES,
+  MAX_HISTORY_CHARACTERS,
+  PRIVATE_HISTORY_REPLY,
+} from '../../modules/assistant/conversation-memory.js';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
 import { GROUP_REPLIES_REQUIRE_MENTION } from '../../config/group-policy.js';
 import { authCipher } from './auth-store.js';
+import { decodeReply } from '../../modules/messaging/reply-payload.js';
 
 export interface InboxContent {
   text: string;
@@ -20,6 +26,8 @@ interface InboxRow {
   mentions_bot: boolean;
   content_encrypted: string;
   reply_encrypted: string | null;
+  reply_kind?: 'conversation' | 'business';
+  business_evidence_encrypted?: string | null;
   state: string;
   sent_at: Date;
   created_at: Date;
@@ -99,7 +107,14 @@ export class InboxRepository {
             },
           ];
     if (row.reply_encrypted) {
-      const text = this.cipher.open('outbound-reply', row.id, row.reply_encrypted);
+      // The operational admin session grants no employee CRM authority.
+      const text =
+        row.reply_kind === 'business'
+          ? '[Private CRM reply]'
+          : decodeReply(
+              this.cipher.open('outbound-reply', row.id, row.reply_encrypted),
+              'conversation',
+            ).text;
       if (typeof text !== 'string') throw new Error('Invalid inbox reply');
       messages.push({
         id: `${row.id}:reply`,
@@ -200,9 +215,31 @@ export class InboxRepository {
     const history = rows
       .reverse()
       .flatMap((row) =>
-        this.messagesFor(row).filter(
-          (item) => item.direction === 'inbound' || item.status === 'SENT',
-        ),
+        this.messagesFor(row)
+          .filter((item) => item.direction === 'inbound' || item.status === 'SENT')
+          .map((item) =>
+            row.reply_kind === 'business' && item.direction === 'outbound'
+              ? {
+                  ...item,
+                  text: PRIVATE_HISTORY_REPLY,
+                  ...(!message.isGroup && row.reply_encrypted && row.business_evidence_encrypted
+                    ? {
+                        protectedReply: {
+                          text: decodeReply(
+                            this.cipher.open('outbound-reply', row.id, row.reply_encrypted),
+                            'business',
+                          ).text,
+                          receipt: this.cipher.open(
+                            'business-delivery',
+                            row.id,
+                            row.business_evidence_encrypted,
+                          ),
+                        },
+                      }
+                    : {}),
+                }
+              : item,
+          ),
       )
       .sort((a, b) => a.at.localeCompare(b.at));
     const result: ChatMessage[] = [];
@@ -213,10 +250,14 @@ export class InboxRepository {
           ? JSON.stringify({ sender: item.senderName, senderId: item.senderId, text: item.text })
           : item.text;
       const bounded = content.slice(0, 6000);
-      if (size + bounded.length > 16000) break;
+      if (size + bounded.length > MAX_HISTORY_CHARACTERS || result.length >= MAX_HISTORY_MESSAGES)
+        break;
       result.unshift({
         role: item.direction === 'inbound' ? 'user' : 'assistant',
         content: bounded,
+        ...('protectedReply' in item
+          ? { protectedReply: item.protectedReply as ChatMessage['protectedReply'] }
+          : {}),
       });
       size += bounded.length;
     }

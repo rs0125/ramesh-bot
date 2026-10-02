@@ -15,6 +15,8 @@ export interface GreetingCandidate extends GreetingKey {
   readonly senderName?: string;
   readonly chatName?: string;
   readonly kind?: string;
+  readonly forwarded?: boolean;
+  readonly batchMessageIds?: readonly string[];
 }
 
 export interface GreetingRepository {
@@ -26,14 +28,27 @@ export interface GreetingRepository {
 }
 
 export type Reply = (text: string) => Promise<void>;
+/** Supplied only by the transport after decoding the saved original message, never by a model. */
+export interface TrustedReplyContext {
+  readonly runId: string;
+  readonly mediaContext?: string;
+  readonly key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null };
+  readonly record?: (
+    kind: 'tool_started' | 'tool_succeeded' | 'tool_failed',
+    value: unknown,
+  ) => Promise<void>;
+}
 export interface PreparedReply {
   text: string;
+  /** Opaque, validated by the business module and encrypted separately for delivery preflight. */
+  businessEvidence?: unknown;
   /** Called only after the transport accepts the reply. Never performs network work. */
   onSent?: () => void;
 }
 export type PrepareReply = (
   message: GreetingCandidate,
   signal?: AbortSignal,
+  trusted?: TrustedReplyContext,
 ) => Promise<PreparedReply>;
 /** False means the pending reply was cancelled before sending. */
 export type BeforeReply = (signal?: AbortSignal) => Promise<boolean>;

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { LocalChat } from '../../scripts/lib/local-chat.js';
 import { temporaryDatabase } from '../fixtures/database.js';
 import type { ModelRequest } from '../../src/modules/assistant/assistant.types.js';
+import { createFollowupFixture } from '../../scripts/lib/followup-fixture.js';
 
 test('local DM/group replies persist in SQLite, deduplicate and keep histories separate', async () => {
   const temp = await temporaryDatabase();
@@ -45,6 +46,41 @@ test('local DM/group replies persist in SQLite, deduplicate and keep histories s
       0,
       'Local tests never pair a WhatsApp account',
     );
+  } finally {
+    await chat.drain();
+    await temp.close();
+  }
+});
+
+test('local CRM fixtures use the graph and preflight with captured output, never pairing state', async () => {
+  const temp = await temporaryDatabase();
+  const fixture = createFollowupFixture();
+  const chat = new LocalChat(
+    { model: 'fake', timeoutMs: 2000 },
+    {
+      async complete() {
+        return {
+          text: JSON.stringify({ intent: 'assigned_followups_today', language: 'en', draft: '' }),
+          inputTokens: 1,
+          outputTokens: 1,
+        };
+      },
+    },
+    temp.db,
+    fixture,
+  );
+  try {
+    const reply = await chat.send({ conversation: 'fixture', text: 'my follow-ups today' });
+    assert.match(reply.text, /Fixture Acme Storage/);
+    assert.ok(reply.businessEvidence);
+    assert.equal(fixture.state.calls, 2, 'read and delivery recheck both execute');
+    fixture.state.active = false;
+    const unknown = await chat.send({ conversation: 'unknown', text: 'my follow-ups today' });
+    assert.equal(unknown.businessEvidence, undefined);
+    assert.match(unknown.text, /access isn't available/);
+    assert.equal(fixture.state.calls, 2);
+    assert.equal(await temp.db.greeting.count({ where: { status: 'SENT' } }), 2);
+    assert.equal(await temp.db.whatsAppAuthEntry.count(), 0);
   } finally {
     await chat.drain();
     await temp.close();

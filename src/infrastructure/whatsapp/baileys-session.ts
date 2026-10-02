@@ -1,10 +1,13 @@
 /** Adapts Baileys sockets, durable encrypted auth, send deadlines, and group metadata caching. */
 import type { PrismaClient } from '@prisma/client';
 import makeWASocket, {
+  downloadMediaMessage,
+  normalizeMessageContent,
   type BaileysEventMap,
   type GroupMetadata,
   type WAMessage,
 } from '@whiskeysockets/baileys';
+import { MAX_MEDIA_BYTES, type MediaUpload } from '../../modules/media/media.types.js';
 import type { Logger } from 'pino';
 import { createAuthStore } from '../database/auth-store.js';
 
@@ -17,6 +20,7 @@ export interface WhatsAppSession {
   saveCredentials(): Promise<void>;
   reply(message: WAMessage, text: string): Promise<void>;
   sendText?(chatId: string, text: string): Promise<void>;
+  downloadMedia?(message: WAMessage, signal: AbortSignal): Promise<MediaUpload>;
   chatName?(chatId: string): Promise<string | undefined>;
   close(): Promise<void>;
 }
@@ -87,6 +91,63 @@ export function createSessionFactory(
       saveCredentials: () => auth.saveCredentials(),
       reply: (message, text) => send(message.key.remoteJid!, text, message),
       sendText: (chatId, text) => send(chatId, text),
+      async downloadMedia(message, signal) {
+        if (
+          message.message?.viewOnceMessage ||
+          message.message?.viewOnceMessageV2 ||
+          message.message?.viewOnceMessageV2Extension
+        )
+          throw new Error('VIEW_ONCE_MEDIA_UNSUPPORTED');
+        const content = normalizeMessageContent(message.message);
+        const attachment =
+          content?.imageMessage ?? content?.audioMessage ?? content?.documentMessage;
+        if (!attachment || Number(attachment.fileLength ?? 0) > MAX_MEDIA_BYTES)
+          throw new Error('MEDIA_UNSUPPORTED_OR_TOO_LARGE');
+        if (attachment.url) {
+          const url = new URL(attachment.url);
+          if (
+            url.protocol !== 'https:' ||
+            (url.port !== '' && url.port !== '443') ||
+            url.username ||
+            url.password ||
+            !(url.hostname === 'mmg.whatsapp.net' || url.hostname.endsWith('.whatsapp.net'))
+          )
+            throw new Error('UNTRUSTED_MEDIA_HOST');
+        }
+        if (
+          attachment.directPath &&
+          (!attachment.directPath.startsWith('/') ||
+            attachment.directPath.startsWith('//') ||
+            attachment.directPath.includes('\\'))
+        )
+          throw new Error('INVALID_MEDIA_PATH');
+        signal.throwIfAborted();
+        const stream = await downloadMediaMessage(
+          message,
+          'stream',
+          { options: { signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]) } },
+          { logger, reuploadRequest: socket.updateMediaMessage },
+        );
+        const chunks: Buffer[] = [];
+        let size = 0;
+        try {
+          for await (const chunk of stream) {
+            signal.throwIfAborted();
+            const data = Buffer.from(chunk);
+            size += data.length;
+            if (size > MAX_MEDIA_BYTES) throw new Error('MEDIA_SIZE_LIMIT');
+            chunks.push(data);
+          }
+        } finally {
+          stream.destroy();
+        }
+        return {
+          bytes: Buffer.concat(chunks),
+          mime: attachment.mimetype ?? '',
+          name:
+            'fileName' in attachment ? String(attachment.fileName ?? 'attachment') : 'attachment',
+        };
+      },
       chatName: async (chatId) =>
         chatId.endsWith('@g.us') ? (await groupMetadata(chatId)).subject : undefined,
       async close() {
