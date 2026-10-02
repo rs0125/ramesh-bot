@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Private Ramesh bot worker, SSM deployment, and encrypted backups. No inbound ports.
+Description: Ramesh bot worker, SSM deployment, encrypted backups, and optional public HTTPS.
 
 # Existing networking and GitHub OIDC are reused; application resources belong to this stack.
 Parameters:
@@ -22,9 +22,17 @@ Parameters:
     Type: String
     AllowedPattern: '^repo:rs0125(@[0-9]+)?/ramesh-bot(@[0-9]+)?:environment:production$'
     Description: Exact subject returned by the repository OIDC settings API, plus production environment
+  EnablePublicHttps:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Open TCP 80/443 only after installing Caddy; the worker remains on loopback
+
+Conditions:
+  PublicHttpsEnabled: !Equals [!Ref EnablePublicHttps, 'true']
 
 Resources:
-  # A public address supplies outbound internet access. The empty ingress list keeps the API private.
+  # Keep this existing resource unchanged. Separate optional rules avoid replacing the group or host.
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -37,6 +45,28 @@ Resources:
       Tags:
         - Key: Name
           Value: ramesh-bot-production
+
+  PublicHttpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: PublicHttpsEnabled
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: Caddy HTTPS redirect and ACME certificate validation
+
+  PublicHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: PublicHttpsEnabled
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Caddy HTTPS for the authenticated worker API
 
   BackupBucket:
     Type: AWS::S3::Bucket

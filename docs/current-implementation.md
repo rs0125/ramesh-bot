@@ -6,7 +6,7 @@ Reviewed: **2026-10-02, Asia/Kolkata**. Production business reads are enabled fo
 
 This reference describes the ordinary two-node fallback, enabled personal-assistant tool loop, separate Supabase queues, trusted identity and signed request adapters, optional legacy OAuth adapter, and independent pairing admin. The read loop supports the employee-permitted CRM, supply, knowledge and analytics catalogue, subject to the deployment scopes above. The [architecture plan](assistant-architecture-plan.md) records future workflows.
 
-The linked WhatsApp session belongs to EC2; the earlier local pairing is retired. Supabase migrations `202610010001` and `202610010002` are provisioned. CI and EC2 deployment succeeded for the conversational, queue-split, and MCP scaffold changes. The EC2 API remains private; the Caddy/Vercel network rollout is not implied by those deployments. Local playground/evaluation replies use fake delivery and never go to WhatsApp.
+The linked WhatsApp session belongs to EC2; the earlier local pairing is retired. Supabase migrations `202610010001` and `202610010002` are provisioned. CI and EC2 deployment succeeded for the conversational, queue-split, and MCP scaffold changes. The authenticated API is now reachable at `https://wareongo-ramesh.duckdns.org` through Caddy on the worker's EC2 instance; public TLS and API authentication were verified on 3 October 2026. Vercel deployment remains separate. Local playground/evaluation replies use fake delivery and never go to WhatsApp.
 
 ## Contents
 
@@ -608,22 +608,22 @@ Recurring work includes hourly database retention cleanup and the connected cons
 
 ## Deployment and recovery assets
 
-This section describes checked-in automation and its assumptions. The conversational flow, split queues, and inactive MCP scaffold have passed CI and deployed to the private EC2 worker. A previous host inspection also confirmed its backup timer was active. See [EC2 operations](ec2-operations.md) for current access/configuration and [Supabase cutover requirements](supabase-message-queue.md#authentication-and-configuration) for the separate queue migrations.
+This section describes checked-in automation and its assumptions. The application deploys to EC2 through CI and SSM; public HTTPS uses Caddy on the same host. A previous host inspection also confirmed its backup timer was active. See [EC2 operations](ec2-operations.md) for current access/configuration and [Supabase cutover requirements](supabase-message-queue.md#authentication-and-configuration) for the separate queue migrations.
 
 ### Hosting split and network assumptions
 
 The worker needs a persistent process, local durable storage, and outbound connectivity to WhatsApp. The admin is independently deployable to Vercel, provided its server-side requests can reach the worker API.
 
-Two different network arrangements appear in the repository:
+The network boundary is split between these assets:
 
-| Asset                                                                                                  | Network assumption                                                                                                                                            |
-| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`deploy/aws/infrastructure.yml`](../deploy/aws/infrastructure.yml)                                    | Private worker access: the EC2 security group has **no inbound rules**, including no SSH, HTTP, HTTPS, or worker-port ingress; management/deployment uses SSM |
-| [`deploy/ec2/Caddyfile`](../deploy/ec2/Caddyfile) and the [Vercel/EC2 guide](deployment-vercel-ec2.md) | A separately configured DNS name and reachable HTTPS reverse proxy expose only the four authenticated `/v1` routes                                            |
+| Asset                                                                                                  | Network assumption                                                                                                      |
+| ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| [`deploy/aws/infrastructure.yml`](../deploy/aws/infrastructure.yml)                                    | `EnablePublicHttps=true` opens only TCP 80/443. SSH and the worker port stay closed; management and deployment use SSM. |
+| [`deploy/ec2/Caddyfile`](../deploy/ec2/Caddyfile) and the [Vercel/EC2 guide](deployment-vercel-ec2.md) | Caddy on the same instance exposes the seven authenticated `/v1` routes; local health and other routes return 404.      |
 
-The CloudFormation template assigns a public address for outbound internet access; that does not open inbound access. Bootstrap does not install or configure Caddy. Deploying that stack alone does **not** make its worker API reachable from Vercel.
+The CloudFormation template assigns a public address and defaults to no inbound access until `EnablePublicHttps` is explicitly enabled. Bootstrap does not install or configure Caddy. Production has the separate Caddy installation and HTTPS ingress enabled; a new stack still needs the documented proxy and DNS setup.
 
-A remote admin therefore requires an explicitly configured access path, such as an appropriate private gateway/tunnel or reviewed HTTPS ingress and reverse proxy. An operator can alternatively use a local admin with suitable local forwarding. Those connections are not provisioned automatically by the current template. The worker's bearer-token check remains part of the boundary in either arrangement.
+A remote admin uses `WORKER_API_URL=https://wareongo-ramesh.duckdns.org` and the matching private worker token. An operator can alternatively use an SSM tunnel on local port 3013. A dedicated DNS timer follows public IPv4 changes without depending on the geocoder server. The worker's bearer-token check remains part of both access paths.
 
 ### Provisioning and host layout
 

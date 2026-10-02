@@ -183,8 +183,8 @@ Read the [detailed current implementation and architecture](docs/current-impleme
 | [Live-data playground](docs/live-data-playground.md)                          | Real CRM as Raghav, isolated Supabase capture queues, setup and live smoke checks           |
 | [Signed Context Engine access](docs/signed-context-auth.md)                   | Preferred first-party identity, signing, keys and replay protection                         |
 | [Employee identity and OAuth](docs/employee-identity-and-oauth.md)            | Trusted sender mapping, encrypted grants, enrollment commands, expiry, and revocation       |
-| [EC2 operations](docs/ec2-operations.md)                                      | Current private deployment, SSM tunnel, runtime configuration, and backups                  |
-| [Deployment guide](docs/deployment-vercel-ec2.md)                             | Independent release automation and the future public HTTPS/Vercel rollout                   |
+| [EC2 operations](docs/ec2-operations.md)                                      | Production HTTPS, SSM tunnel, runtime configuration, and backups                            |
+| [Deployment guide](docs/deployment-vercel-ec2.md)                             | Independent release automation, production HTTPS, and Vercel setup                          |
 | [Usage ledger and budgets](docs/agent-modules/43-usage-ledger-and-budgets.md) | Runtime modes, reviewed pricing, atomic reservations, capture isolation and eval allowances |
 | [Capability readiness](docs/agent-modules/44-capability-readiness.md)         | Bounded employee-scoped source verification without a model or WhatsApp session             |
 | [Product context](CONTEXT.md)                                                 | Confirmed decisions, organisational sources, and earlier options                            |

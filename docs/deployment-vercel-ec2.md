@@ -2,9 +2,9 @@
 
 The optional business-read flag in this checkout now enables the full employee-permitted CRM, supply, knowledge and shortlist catalogue through the [sales loop](sales-manager-agent.md). Validate production migration `202610010004`, roster RLS, signed scopes and model limits before enabling it. Local Supabase capture tests do not change that production configuration.
 
-The worker repository is `baileys-ramesh`; the admin repository is `baileys-ramesh-admin`. Each installs, builds, tests and deploys independently. Only their versioned HTTP contract and matching API token connect them. The current EC2 installation uses private SSM access; see [EC2 operations](ec2-operations.md). The public HTTPS and Vercel sections below describe a later rollout.
+The worker repository is `baileys-ramesh`; the admin repository is `baileys-ramesh-admin`. Each installs, builds, tests and deploys independently. Only their versioned HTTP contract and matching API token connect them. The EC2 API is available at `https://wareongo-ramesh.duckdns.org`, with SSM for operator access; see [EC2 operations](ec2-operations.md). Public HTTPS was verified on 3 October 2026; Vercel deployment remains separate.
 
-Reviewed **1 October 2026** through release `5eb14d0`: the conversational Terra graph, split Supabase queues, and inactive MCP scaffold have passed CI and deployed to EC2. The model settings are installed in the protected host environment and its SSM backup. This guide distinguishes that running private deployment from optional public hosting setup.
+The model settings are installed in the protected host environment and its SSM backup. See [EC2 operations](ec2-operations.md) for the current application release and runtime configuration; the HTTPS setup does not deploy application code or change those settings.
 
 The EC2 workflow follows the existing `../../warehouse-enricher` pattern: trusted successful main CI, exact commit selection, GitHub OIDC, a narrowly scoped SSM document, unprivileged builds, health checks, and rollback. Account/instance/repository identifiers are placeholders, not copies of another service's credentials.
 
@@ -14,7 +14,7 @@ Use Ubuntu 24.04 x86-64, system-wide Node.js 22.16+ in the 22 release line, npm,
 
 A `t3.micro` (1 GiB RAM) is a starting trial size for one lightly used account, not a measured capacity guarantee. Provision swap for on-instance builds and watch pairing/sync memory; use `t3.small` (2 GiB) if the small instance is constrained. The admin never builds on EC2. See [AWS T3 specifications](https://aws.amazon.com/ec2/instance-types/t3/). Use encrypted persistent EBS with enough space for three dependency installations, deployment backups and swap; 16–20 GiB is a reasonable initial allocation.
 
-For a later public HTTPS rollout, point a stable DNS name at the instance and allow inbound 80/443 for Caddy; leave 3011 closed. The current private stack does not do this. SSM avoids an inbound SSH requirement. Outbound access is needed for GitHub/npm, SSM, WhatsApp, Supabase, OpenAI, and certificate issuance when HTTPS is enabled. Include public IPv4, disk, model usage, and CPU-credit costs when estimating hosting. Require IMDSv2 and use the restricted instance role described by the stack, including its designated runtime parameter and backup prefix.
+For public HTTPS, point a dedicated DNS name at this instance and install Caddy, then enable `EnablePublicHttps=true` in the stack. This adds only TCP 80/443; leave 3011 closed. The parameter defaults to `false`. SSM avoids an inbound SSH requirement. Outbound access is needed for GitHub/npm, SSM, WhatsApp, Supabase, OpenAI, and certificate issuance when HTTPS is enabled. Include public IPv4, disk, model usage, and CPU-credit costs when estimating hosting. Require IMDSv2 and use the restricted instance role described by the stack, including its designated runtime parameter and backup prefix.
 
 ## One-time host setup
 
@@ -46,9 +46,37 @@ The service runs as `wareongo-bot`, with read-only code and its private state di
 
 Install [Caddy's official package](https://caddyserver.com/docs/install#debian-ubuntu-raspbian), then merge `deploy/ec2/Caddyfile` into the instance's Caddy configuration. Replace the example hostname, validate the file and reload Caddy. On a dedicated instance the template can be the entire Caddyfile; preserve existing sites on a shared instance.
 
-Caddy forwards only `/v1/status`, `/v1/control`, `/v1/admin/attempt`, and `/v1/admin/session`. All require the worker token. It does not expose `/healthz`, which is for local deployment checks. Access logging is not enabled; QR/session data must not be copied into logs. Certificate provisioning requires correct DNS and reachable 80/443. See [automatic HTTPS](https://caddyserver.com/docs/automatic-https).
+Caddy forwards only `/v1/status`, `/v1/control`, `/v1/admin/attempt`, `/v1/admin/session`, `/v1/inbox/conversations`, `/v1/inbox/messages`, and `/v1/inbox/send`. All require the worker token. It does not expose `/healthz`, which is for local deployment checks. Access logging is not enabled; QR/session data must not be copied into logs. Certificate provisioning requires correct DNS and reachable 80/443. See [automatic HTTPS](https://caddyserver.com/docs/automatic-https).
 
 Verify that anonymous `https://WORKER_HOSTNAME/v1/status` returns 401 and `/healthz` returns 404. The worker itself remains bound to `127.0.0.1:3011`.
+
+### Dedicated DuckDNS hostname
+
+Register a separate free hostname in the DuckDNS web account and point it at the Ramesh instance's public IPv4 address. Keep the geocoder hostname and proxy independent. The [DuckDNS API](https://www.duckdns.org/spec.jsp) updates registered names; it does not register a new name. This setup adds no instance, load balancer, Elastic IP or paid DNS zone. Existing EC2, IPv4 and transfer charges still apply. It remains a single-server deployment with an external DNS dependency, without high availability.
+
+The automatically assigned IPv4 address can change after a stop/start. Install the reviewed updater and timer on the Ramesh host:
+
+```sh
+sudo install -o root -g root -m 0644 deploy/ec2/duckdns-update.py /usr/local/lib/wareongo-bot-deploy/duckdns-update.py
+sudo install -o root -g root -m 0644 deploy/ec2/wareongo-duckdns.service deploy/ec2/wareongo-duckdns.timer /etc/systemd/system/
+sudo test -e /etc/wareongo-sales-bot/duckdns.json || sudo install -o root -g root -m 0600 /dev/null /etc/wareongo-sales-bot/duckdns.json
+sudoedit /etc/wareongo-sales-bot/duckdns.json
+```
+
+Create the credentials file only on first installation; preserve it on later upgrades. In the protected editor, set a JSON object with `domain` (the registered label, without `.duckdns.org`) and `token` (the DuckDNS account token). Do not put the token in shell commands, SSM command payloads, Git or logs. The updater sends it only over verified HTTPS and reports a generic error on failure. Back it up through the existing secure credential process. A DuckDNS token controls every hostname in that account; using a dedicated account limits that scope.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl start wareongo-duckdns.service
+sudo systemctl enable --now wareongo-duckdns.timer
+sudo systemctl status wareongo-duckdns.timer --no-pager
+```
+
+Check that the hostname resolves to the instance, replace the example hostname in `deploy/ec2/Caddyfile`, and validate the rendered file with `caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile` before reloading. Keep existing Caddy configuration backed up. The proxy installation does not require restarting the worker.
+
+Create a CloudFormation update change set with `EnablePublicHttps=true` and `UsePreviousValue=true` for all existing parameters, especially `BootstrapCommit`, `ImageId` and `SubnetId`. Review it before execution: the first HTTPS update should add only `PublicHttpIngress` and `PublicHttpsIngress`, with no modifications or replacements of the instance, security group, IAM resources or deployment document. After execution, check valid public TLS, anonymous 401 responses on all seven API paths, 404 on `/healthz` and unknown paths, HTTP-to-HTTPS redirect, and unchanged local worker readiness. Do not call authenticated send/control routes during verification.
+
+To remove public access, update the same stack with `EnablePublicHttps=false`; verify that only the two ingress resources are removed. SSM access and the local worker remain available. Stop Caddy and the DNS timer if retiring the hostname. Do not delete the retained instance or worker state as an HTTPS rollback.
 
 ## Model, queue, and MCP configuration
 
@@ -111,6 +139,6 @@ The admin's CD remains disabled until `VERCEL_DEPLOY_ENABLED=true`. Its `vercel.
 
 Local checks cover real SQLite migrations, encrypted credentials/key batches, dedupe, HTTP controls, persistent pause, shared limits, copied-cookie revocation, queue bounds, failure recovery, rollback ordering and WAL backups. Isolated PostgreSQL tests cover the queue split, atomic handoff, preserved replies, lease fencing, due times, and populated-table upgrades. MCP tests use the real SDK with fake HTTP and employee grants. Browser tests run both against an independent API fixture and against the separately installed real worker with a simulated WhatsApp transport.
 
-The current private EC2/SSM release path has succeeded. Public Caddy/Vercel connectivity, disaster-recovery rehearsal, and capacity under expanded business workloads are separate rollout checks. The latest scaffold release passed 81 worker tests including PostgreSQL, and the conversational evaluation passed 26/26 synthetic live-model trials. Local simulations and deploy readiness checks do not guarantee model quality or end-user WhatsApp delivery.
+The EC2/SSM release path and public Caddy connectivity have succeeded. On 3 October 2026, external checks verified TLS, HTTPS redirects, authenticated status 200, anonymous 401 on all seven public API paths, and 404 on local health and unknown paths. Vercel deployment, disaster-recovery rehearsal, and capacity under expanded business workloads remain separate checks. Local simulations and deploy readiness checks do not guarantee model quality or end-user WhatsApp delivery.
 
 Use `npm run dev:chat` and `npm run eval:agent` for model testing through isolated SQLite and captured delivery. Neither opens WhatsApp or Supabase; do not send production test messages as part of release verification. Identity/OAuth integration checks use synthetic token/MCP responses and isolated SQLite/PostgreSQL, including concurrent rotation and revocation races. The opt-in general read loop now includes tools, a deterministic worker and independent review; the real-data Supabase capture harness tests it without WhatsApp. Separate planner/worker roles and private media are deployed; reminders and writes remain future work. See the [assistant runbook](sales-manager-agent.md) and [evaluation guide](../evals/README.md).

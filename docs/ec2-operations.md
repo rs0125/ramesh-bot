@@ -1,4 +1,4 @@
-# Private EC2 operations
+# EC2 operations
 
 Current implementation (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
 
@@ -10,13 +10,17 @@ business reads, and the employee-permitted signed Context Engine catalogue. Rost
 Concurrent LID resolution and delivery acknowledgements are corrected; see
 [the delivery incident](agent-modules/40-delivery-acknowledgements.md). Analytics signing scopes were enabled on 3 October; the actual production probe passed GA4 and Search Console. Reminders and writes remain separate work.
 
-The `ramesh-bot-production` CloudFormation stack in Mumbai (`ap-south-1`) owns a dedicated Ubuntu 24.04 `t3.micro`, a security group with **no inbound rules**, its instance profile, a fixed SSM deployment document, the GitHub deployment role, and a private backup bucket. The instance uses an automatically assigned public IPv4 address for outbound traffic. The application listens only on `127.0.0.1:3011`.
+The `ramesh-bot-production` CloudFormation stack in Mumbai (`ap-south-1`) owns a dedicated Ubuntu 24.04 `t3.micro`, its security group, instance profile, fixed SSM deployment document, GitHub deployment role, and private backup bucket. The instance uses an automatically assigned public IPv4 address. The application listens only on `127.0.0.1:3011`.
 
-The Next.js admin remains a separate application. A Vercel deployment cannot directly reach this private API; HTTPS or another authenticated network path must be configured before connecting Vercel. Local administration uses an SSM tunnel.
+Public HTTPS was enabled on **3 October 2026** at **`https://wareongo-ramesh.duckdns.org`**. Set the separate Next.js admin's server-side `WORKER_API_URL` to that origin and configure its matching production `WORKER_API_TOKEN` privately. Caddy 2.11.6 runs on this same EC2 instance and automatically renews its TLS certificate. CloudFormation `EnablePublicHttps=true` adds only TCP 80/443; port 3011 and SSH remain closed at the security group. The geocoder's hostname, proxy and instance remain independent.
+
+External checks verified public TLS, HTTP-to-HTTPS redirection, authenticated status 200, anonymous 401 on all seven allowlisted API routes, and 404 on `/healthz` and unknown paths. The worker remained healthy without a proxy-related restart. This verifies API connectivity and access control, not WhatsApp message delivery or a Vercel deployment. The SSM tunnel remains available for local administration.
+
+`wareongo-duckdns.timer` updates only `wareongo-ramesh` every five minutes and after boot, using the instance's outbound public IPv4 address. Its first update succeeded. `/etc/wareongo-sales-bot/duckdns.json` holds the registered label and account token with root ownership and mode `0600`; the updater never prints credentials. The token was copied encrypted from the geocoder's existing updater without changing that host. Because both names use the same DuckDNS account token, rotate the protected credentials on both hosts together. This remains a single-server deployment with an external DNS dependency.
 
 ## Infrastructure and deployment
 
-`deploy/aws/infrastructure.yml` describes the resources. `deploy/ec2/bootstrap.sh` installs the reviewed host helpers from a pinned commit, creates separate runtime/build accounts, configures 2 GiB swap and bounded logs, and generates fresh production secrets. It does not copy a local WhatsApp session. Bootstrap changes require a deliberate host installation; ordinary app deployments cannot replace the privileged helpers.
+`deploy/aws/infrastructure.yml` describes the resources. `deploy/ec2/bootstrap.sh` installs the reviewed host helpers from a pinned commit, creates separate runtime/build accounts, configures 2 GiB swap and bounded logs, and generates fresh production secrets. It does not copy a local WhatsApp session. Bootstrap changes require a deliberate host installation; ordinary app deployments cannot replace the privileged helpers. Caddy and DNS maintenance are installed separately using the [HTTPS procedure](deployment-vercel-ec2.md#https-boundary). The public address can change after an EC2 stop/start; keep DNS updates working before doing so.
 
 GitHub `production` is limited to `main`. Its OIDC subject includes the owner/repository IDs. Successful CI invokes only the pinned version of `ramesh-bot-deploy` on this instance. No long-lived AWS credential is stored in GitHub. The EC2 repository deploy key is read-only.
 
@@ -52,6 +56,8 @@ sudo journalctl -u wareongo-bot -n 50 --no-pager
 curl --fail http://127.0.0.1:3011/healthz
 sudo systemctl status wareongo-bot-backup.timer --no-pager
 sudo journalctl -u wareongo-bot-backup.service -n 20 --no-pager
+sudo systemctl status caddy wareongo-duckdns.timer --no-pager
+sudo journalctl -u wareongo-duckdns.service -n 10 --no-pager
 ```
 
 New-host bootstrap disables WhatsApp auto-connect until an operator pairs an account through the admin. The production account is already linked on EC2; its persisted operator preference controls reconnection after deployment. The earlier local pairing is retired. Never copy a running account's database onto another active worker. Session migration needs a controlled stop and consistent snapshot; it is separate from provisioning.
@@ -102,7 +108,7 @@ Stack termination protection is enabled. The instance and backup bucket are reta
 
 Historical infrastructure estimate: the AWS Price List API on September 30, 2026 returned $0.0112/hour for Linux `t3.micro` in Mumbai and $0.0912/GB-month for gp3. At 730 hours, compute is $8.18, 20 GiB storage is $1.82, and the public IPv4 address is $3.65: **$13.65/month before tax, credits, backup storage, and billable transfer**. OpenAI usage and Supabase costs are separate. CPU credits use `standard` mode, so sustained CPU load is throttled instead of incurring unlimited-mode credit charges. Resize only after observing resource use.
 
-[EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing](https://aws.amazon.com/ebs/pricing/), [IPv4 pricing](https://aws.amazon.com/vpc/pricing/), and [SSM pricing](https://aws.amazon.com/systems-manager/pricing/) are the pricing references. No NAT gateway, load balancer, RDS database, or public HTTPS endpoint is provisioned by this stack.
+[EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [EBS pricing](https://aws.amazon.com/ebs/pricing/), [IPv4 pricing](https://aws.amazon.com/vpc/pricing/), and [SSM pricing](https://aws.amazon.com/systems-manager/pricing/) are the pricing references. The HTTPS setup uses the existing instance and public IPv4 address, a free DuckDNS hostname, and Caddy with automatic certificates. It adds no fixed hosting or DNS charge; existing usage and transfer charges still apply. No NAT gateway, load balancer, Elastic IP or RDS database was added.
 
 ## Graph/media release prerequisites prepared on 2 October 2026
 

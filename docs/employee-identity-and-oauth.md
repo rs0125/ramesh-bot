@@ -81,7 +81,7 @@ CONTEXT_MCP_MAX_RESPONSE_BYTES=1048576
 CONTEXT_OAUTH_REDIRECT_URI=https://your-owned-callback.example/oauth/callback
 ```
 
-Before live enrollment, provide an owned HTTPS callback and allowlist its origin in Context Engine's `CONTEXT_MCP_ALLOWED_REDIRECT_ORIGINS`. The callback must safely preserve the response without exposing its code in logs or third-party requests. This increment provides the operator CLI, not a public callback server or admin enrollment UI. The private EC2 worker does not expose one. HTTP loopback is accepted only with a local HTTP Context Engine. The default Claude callback allowlist is not a Ramesh callback.
+Before live enrollment, provide an owned HTTPS callback and allowlist its origin in Context Engine's `CONTEXT_MCP_ALLOWED_REDIRECT_ORIGINS`. The callback must safely preserve the response without exposing its code in logs or third-party requests. This increment provides the operator CLI, not a public callback server or admin enrollment UI. The EC2 worker's HTTPS allowlist does not expose an OAuth callback. HTTP loopback is accepted only with a local HTTP Context Engine. The default Claude callback allowlist is not a Ramesh callback.
 
 ```sh
 npm run context:auth -- begin --env-file /private/ramesh-enrollment.env --employee-id 23

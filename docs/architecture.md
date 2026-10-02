@@ -57,7 +57,7 @@ With Supabase configured, recent context comes from the persistent inbox: the la
 
 ## HTTP boundary
 
-Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Responses are JSON with `Cache-Control: private, no-store`. The server binds to loopback. Current EC2 access is through SSM; the security group has no inbound rules. The checked-in Caddy template allowlists the control, session, and inbox paths for a later HTTPS rollout; it is not installed by the current stack.
+Every `/v1` endpoint requires `Authorization: Bearer <WORKER_API_TOKEN>`. Responses are JSON with `Cache-Control: private, no-store`. The server binds to loopback. Production HTTPS at `https://wareongo-ramesh.duckdns.org` terminates at Caddy on the same EC2 instance; the security group opens only TCP 80/443. The Caddy template allowlists the control, session, and inbox paths while keeping `/healthz` private. SSM provides operator access and an optional local tunnel. The geocoder instance is not part of this request path.
 
 | Endpoint                 | Body / response                                                                                                                         |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |

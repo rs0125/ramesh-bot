@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep the Ramesh DuckDNS address current
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=wareongo-duckdns.service
+
+[Install]
+WantedBy=timers.target
