@@ -20,12 +20,12 @@ export function loadDebounce(env: NodeJS.ProcessEnv): DebouncePolicy {
 export function batchDeadline(
   firstAt: number,
   receivedAt: number,
-  item: { forwarded?: boolean; media?: boolean },
+  item: { forwarded?: boolean; media?: boolean; location?: boolean },
   policy = DEFAULT_DEBOUNCE,
 ) {
   return Math.min(
     firstAt + policy.maxMs,
-    receivedAt + (item.forwarded || item.media ? policy.burstMs : policy.textMs),
+    receivedAt + (item.forwarded || item.media || item.location ? policy.burstMs : policy.textMs),
   );
 }
 export interface TurnPart {

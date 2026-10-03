@@ -11,6 +11,7 @@ import type { GreetingCandidate } from '../../modules/greetings/greeting.types.j
 import { GROUP_REPLIES_REQUIRE_MENTION } from '../../config/group-policy.js';
 import { authCipher } from './auth-store.js';
 import { decodeReply } from '../../modules/messaging/reply-payload.js';
+import type { NativeLocation } from '../../modules/messaging/native-location.js';
 
 export interface InboxContent {
   text: string;
@@ -18,6 +19,7 @@ export interface InboxContent {
   senderName: string;
   chatName: string | null;
   kind: string;
+  location?: NativeLocation;
 }
 interface InboxRow {
   id: string;

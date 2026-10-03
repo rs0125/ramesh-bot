@@ -1,0 +1,15 @@
+# Native WhatsApp locations
+
+Status: implemented locally; not deployed. The GIS creation tool lives in Context Engine. Ramesh's generic business-write executor remains pending; see [the integration boundary](agent-modules/52-gis-poi-writes.md).
+
+Ramesh accepts native WhatsApp pins as conversation source data. A pin's latitude and longitude are validated and kept as numbers in the encrypted Supabase inbox, alongside a bounded name, address and caption when supplied. The same data is rendered in the current agent input and ordinary chat history, so a following question can refer to the pin. No database migration or additional model call is needed.
+
+Both regular pins and live-location messages are supported. Live sharing is only the received coordinate snapshot: Ramesh does not subscribe to movement, infer missing updates, or claim that the sender is still there. Missing, non-finite or out-of-range coordinates produce a request to resend the pin; explicit zero coordinates remain valid. Sender-provided URLs, thumbnails and movement telemetry are not used as normalized location data.
+
+Pins join the existing same-sender inbound burst: 3 seconds of quiet, shortened to 1 second by a following text message, with the existing 8-second maximum. They do not consume attachment quota or trigger downloads. Forwarded pins retain their forwarded status. Group reply rules still require a genuine mention; unmentioned group pins are available only as ordinary recorded group context. View-once content is discarded before extraction. A pin embedded inside a quoted message is not promoted into a new native location source.
+
+Transport-owned `locationMessages` preserve each current batch member's queue ID, WhatsApp message ID, receipt time, forwarding status and normalized coordinates. Labels and captions remain untrusted source data, and **location messages are excluded from personal-command authorization**. A separate direct user text or voice instruction is required to authorize any supported write. Receiving a pin does not create a POI, warehouse or other business record; a future GIS write tool must independently check permissions, user intent and source freshness. Historical location text is useful context, not a substitute for a private source lookup for future writes.
+
+Location data uses the existing encrypted inbox retention and access rules, including its 30-day terminal-record cleanup, rather than the 24-hour private attachment lifecycle. New location records remain readable after raw queue payloads are removed. Pins already recorded by the old implementation as only `[Location message]` with no raw payload cannot be recovered; the sender must resend those pins.
+
+Focused checks are in `tests/unit/native-location.test.ts`, `tests/unit/inbound-media.test.ts` and `tests/integration/native-locations.test.ts`. The integration fixture permits only the isolated local `ramesh_queue_test` database and makes no WhatsApp connection.

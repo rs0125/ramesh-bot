@@ -1,4 +1,6 @@
 /** Domain contracts: greeting code has no dependency on Baileys or Prisma. */
+import type { NativeLocation } from '../messaging/native-location.js';
+
 export interface GreetingKey {
   readonly chatId: string;
   readonly messageId: string;
@@ -16,6 +18,7 @@ export interface GreetingCandidate extends GreetingKey {
   readonly chatName?: string;
   readonly kind?: string;
   readonly forwarded?: boolean;
+  readonly location?: NativeLocation;
   readonly batchMessageIds?: readonly string[];
 }
 
@@ -39,6 +42,14 @@ export interface TrustedReplyContext {
     readonly text: string;
     readonly receivedAtMs: number;
     readonly forwarded: boolean;
+  }[];
+  /** Decoded native pins, bound to original transport members; labels never grant write intent. */
+  readonly locationMessages?: readonly {
+    readonly id: string;
+    readonly messageId: string;
+    readonly receivedAtMs: number;
+    readonly forwarded: boolean;
+    readonly location: NativeLocation;
   }[];
   readonly mediaContext?: string;
   readonly key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null };

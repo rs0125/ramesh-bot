@@ -152,3 +152,4 @@ See the [2 October production capability review](../capability-review-2026-10-02
 - [49. Personal tasks](49-personal-tasks.md): durable commitments, owned mutations, ordered selection and linked reminder cancellation. Implemented; schema applied, activation via flags.
 - [50. Reminder scheduler](50-reminder-scheduler.md): due occurrences, leases, fixed deadlines, command receipts and final delivery fences. Implemented; schema applied, activation via flags.
 - [51. Reminder migration and evaluation](51-reminder-migration-and-evaluation.md): shared-table assessment, optional legacy import, outcome tests and phased rollout. New schema implemented; legacy import deferred.
+- [52. Native locations and GIS writes](52-gis-poi-writes.md): native coordinate capture, the Context Engine GIS tool and signed dashboard endpoint; generic bot write execution and production activation remain pending.

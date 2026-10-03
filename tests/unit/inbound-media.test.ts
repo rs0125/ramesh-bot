@@ -7,6 +7,7 @@ test('debounce slides for forwards/media, shortens after text and cannot exceed 
   assert.equal(batchDeadline(10000, 10000, {}), 11000);
   assert.equal(batchDeadline(10000, 10000, { forwarded: true }), 13000);
   assert.equal(batchDeadline(10000, 12000, { media: true }), 15000);
+  assert.equal(batchDeadline(10000, 12000, { location: true }), 15000);
   assert.equal(batchDeadline(10000, 13000, {}), 14000);
   assert.equal(batchDeadline(10000, 17500, { forwarded: true }), 18000);
   assert.throws(() =>

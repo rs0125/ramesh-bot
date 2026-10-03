@@ -183,7 +183,7 @@ export class MessageQueueRepository {
             batchDeadline(
               first?.created_at.getTime() ?? Date.now(),
               Date.now(),
-              { media, forwarded: message.forwarded },
+              { media, forwarded: message.forwarded, location: message.kind === 'location' },
               this.debounce,
             ),
           )

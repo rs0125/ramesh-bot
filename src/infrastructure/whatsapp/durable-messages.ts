@@ -216,6 +216,7 @@ export class DurableMessages {
           senderName: candidate.senderName || candidate.senderId?.split('@')[0] || 'Unknown sender',
           chatName: candidate.chatName ?? null,
           kind: candidate.kind ?? 'text',
+          ...(candidate.location ? { location: candidate.location } : {}),
         }),
       },
     );
@@ -564,6 +565,8 @@ export class DurableMessages {
               )
             : [];
         const commandMessages = originals.flatMap((item, index) => {
+          // Native pin names/addresses/captions are source material, never command authority.
+          if (item.candidate.kind === 'location') return [];
           const receivedAtMs = item.receivedAt?.getTime();
           if (receivedAtMs === undefined || !Number.isFinite(receivedAtMs)) return [];
           const audio = commandAudio.find(
@@ -583,11 +586,30 @@ export class DurableMessages {
             },
           ];
         });
+        const locationMessages = originals.flatMap((item) => {
+          const receivedAtMs = item.receivedAt?.getTime();
+          if (
+            !item.candidate.location ||
+            receivedAtMs === undefined ||
+            !Number.isFinite(receivedAtMs)
+          )
+            return [];
+          return [
+            {
+              id: item.id,
+              messageId: item.candidate.messageId,
+              receivedAtMs,
+              forwarded: item.candidate.forwarded === true,
+              location: item.candidate.location,
+            },
+          ];
+        });
         const prepared = this.options.prepareReply
           ? await this.options.prepareReply(candidate, signal, {
               runId: job.id,
               checkpointLease: { leaseToken: job.token },
               commandMessages,
+              locationMessages,
               mediaContext,
               key: {
                 remoteJid: message.key.remoteJid,

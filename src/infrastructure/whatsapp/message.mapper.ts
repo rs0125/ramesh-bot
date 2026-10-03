@@ -2,6 +2,8 @@
 import { jidNormalizedUser, type WAMessage } from '@whiskeysockets/baileys';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
 import { persistableMessageContent } from './media-privacy.js';
+import { mapNativeLocation } from './location.mapper.js';
+import { renderNativeLocation } from '../../modules/messaging/native-location.js';
 
 export function toGreetingCandidate(
   message: WAMessage,
@@ -10,7 +12,7 @@ export function toGreetingCandidate(
   return mapMessage(message, botJids, false);
 }
 
-/** Mapping produces labels only; the separately gated media service processes eligible files. */
+/** Files remain labels; native pins contain bounded, validated coordinate source data. */
 export function toInboxCandidate(
   message: WAMessage,
   botJids: readonly string[],
@@ -54,15 +56,18 @@ function mapMessage(
                     content.pollCreationMessageV3
                   ? 'poll'
                   : 'text';
+  const location = kind === 'location' ? mapNativeLocation(content) : undefined;
   const text =
-    content.conversation ??
-    content.extendedTextMessage?.text ??
-    content.imageMessage?.caption ??
-    content.videoMessage?.caption ??
-    content.documentMessage?.caption ??
-    (includeMedia && kind !== 'text'
-      ? `[${kind[0]!.toUpperCase()}${kind.slice(1)} message]`
-      : undefined);
+    kind === 'location'
+      ? renderNativeLocation(location)
+      : (content.conversation ??
+        content.extendedTextMessage?.text ??
+        content.imageMessage?.caption ??
+        content.videoMessage?.caption ??
+        content.documentMessage?.caption ??
+        (includeMedia && kind !== 'text'
+          ? `[${kind[0]!.toUpperCase()}${kind.slice(1)} message]`
+          : undefined));
   if (!text?.trim()) return null;
 
   const context =
@@ -71,16 +76,11 @@ function mapMessage(
     content.videoMessage?.contextInfo ??
     content.audioMessage?.contextInfo ??
     content.documentMessage?.contextInfo ??
-    content.stickerMessage?.contextInfo;
+    content.stickerMessage?.contextInfo ??
+    content.locationMessage?.contextInfo ??
+    content.liveLocationMessage?.contextInfo;
   const forwarded = context?.isForwarded === true || (context?.forwardingScore ?? 0) > 0;
-  const mentions =
-    content.extendedTextMessage?.contextInfo?.mentionedJid ??
-    content.imageMessage?.contextInfo?.mentionedJid ??
-    content.videoMessage?.contextInfo?.mentionedJid ??
-    content.audioMessage?.contextInfo?.mentionedJid ??
-    content.documentMessage?.contextInfo?.mentionedJid ??
-    content.stickerMessage?.contextInfo?.mentionedJid ??
-    [];
+  const mentions = context?.mentionedJid ?? [];
   const identities = new Set(botJids.filter(Boolean).map(jidNormalizedUser));
   return {
     chatId,
@@ -92,6 +92,7 @@ function mapMessage(
     text: text.trim(),
     kind,
     forwarded,
+    ...(location ? { location } : {}),
     senderName: message.pushName?.slice(0, 256) || undefined,
     senderId: isGroup
       ? message.key.participant
