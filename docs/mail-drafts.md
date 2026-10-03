@@ -30,8 +30,10 @@ operation ID and frozen arguments. No send tool is introduced.
 Recovery replies expose only application-owned guidance for allowlisted error
 codes, independently of the closed mail history policy. A changed connection or
 required reconnect leads to connection-check and fresh-proposal instructions
-only when the service confirms no draft was created and there is no earlier uncertain
-attempt. Definite rate-limit rejection keeps the same approved operation and
+only when the service confirms no draft was created and there is no earlier
+uncertain attempt. Pending revocation directs the employee to finish disconnecting
+on the connection page before reconnecting. Definite rate-limit rejection keeps
+the same approved operation and
 asks the employee to retry its existing code later. An uncertain attempt always
 takes precedence over later errors: check Gmail and recover the same operation,
 without creating a replacement. Provider error prose and stored email contents
@@ -76,8 +78,11 @@ the current employee and active mailbox connection, then read the selected
 first, with a bounded page size and `nextCursor` for older entries. It does not
 redisclose historical bodies, recipients or subjects, nor prove that a draft
 still exists. Clarify an ambiguous selection rather than assuming the newest
-entry is necessarily the one intended. Reconnection invalidates older references
-and cursors. Current content and permission are checked again before delivery.
+entry is necessarily the one intended. Reconnecting the same verified Google
+account preserves saved references and cursors; a different Google account cannot
+use them. Reconnection still invalidates unexecuted creation proposals, while an
+uncertain creation must continue recovery of the same operation. Current content
+and permission are checked again before delivery.
 Retrieval timing stays in the standard `meta.generatedAt` envelope so a fresh
 check of unchanged content does not invalidate its delivery fingerprint.
 

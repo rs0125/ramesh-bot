@@ -256,6 +256,10 @@ test('mail recovery exposes only allowlisted actions without redisclosing stored
     ['GMAIL_RECONNECT_REQUIRED', /Gmail connection link.*draft access/s],
     ['GMAIL_AUTH_REQUIRED', /Gmail connection link/],
     ['GMAIL_SCOPE_REQUIRED', /draft access/],
+    [
+      'GMAIL_REVOCATION_PENDING',
+      /finish disconnecting there before reconnecting.*cancel ABCDEF12/s,
+    ],
     ['GMAIL_RATE_LIMITED', /Wait before replying retry ABCDEF12.*same approved draft/],
     ['GMAIL_RETRY_LATER', /Wait before replying retry ABCDEF12/],
     ['GMAIL_UNAVAILABLE', /retry ABCDEF12 after the service recovers/],
@@ -281,6 +285,7 @@ test('earlier uncertainty always forbids replacing a mail draft despite a later 
   for (const code of [
     'GMAIL_CONNECTION_CHANGED',
     'GMAIL_RECONNECT_REQUIRED',
+    'GMAIL_REVOCATION_PENDING',
     'GMAIL_RATE_LIMITED',
   ]) {
     const value = operation();

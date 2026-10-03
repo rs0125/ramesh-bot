@@ -94,6 +94,8 @@ export function mailDraftRecoveryText(operation: WriteOperation): string | undef
     case 'GMAIL_AUTH_REQUIRED':
     case 'GMAIL_SCOPE_REQUIRED':
       return `This attempt did not create a draft. Ask me for the Gmail connection link and connect your work account with draft access. After reconnecting, reply cancel ${code} and ask for a fresh draft proposal.`;
+    case 'GMAIL_REVOCATION_PENDING':
+      return `This attempt did not create a draft. Gmail disconnect is still pending. Ask me for the Gmail connection page and finish disconnecting there before reconnecting. Then reply cancel ${code} and ask for a fresh draft proposal.`;
     case 'GMAIL_RATE_LIMITED':
     case 'GMAIL_RETRY_LATER':
       return `Gmail is temporarily limiting requests. This attempt did not create a draft. Wait before replying retry ${code} to retry the same approved draft.`;
