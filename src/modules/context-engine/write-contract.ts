@@ -34,7 +34,7 @@ const contractSchema = z
     effect: z.enum(['create', 'update', 'delete', 'compensate']),
     // Explicit tool policy permitting employee-owned journal redisclosure. Omission grants none.
     auditHistory: z.literal('actor_scoped').optional(),
-    // Preserve original selected source text for domains such as CRM intake.
+    // Application-supplied complete source text; hidden from model arguments.
     sourceTextArgument: z
       .string()
       .regex(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)

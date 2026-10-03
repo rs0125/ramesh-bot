@@ -106,9 +106,10 @@ function directContext(
 }
 function safeSchema(tool: ContextToolDefinition): Record<string, unknown> {
   const schema = structuredClone(tool.inputSchema);
-  const id = writeContract(tool)!.idempotencyArgument;
+  const contract = writeContract(tool)!;
+  const suppliedByApp = [contract.idempotencyArgument, contract.sourceTextArgument];
   const properties = schema.properties as Record<string, unknown>;
-  delete properties[id];
+  for (const name of suppliedByApp) if (name) delete properties[name];
   properties._source_message_ids = {
     type: 'array',
     items: { type: 'string', minLength: 1, maxLength: 200 },
@@ -117,7 +118,7 @@ function safeSchema(tool: ContextToolDefinition): Record<string, unknown> {
     description:
       'Original message IDs supplying source data, from current trusted context or write_sources. Never an authorization claim.',
   };
-  schema.required = (schema.required as string[]).filter((name) => name !== id);
+  schema.required = (schema.required as string[]).filter((name) => !suppliedByApp.includes(name));
   return schema;
 }
 function visibleArguments(operation: WriteOperation) {
@@ -529,16 +530,22 @@ export class BusinessWriteRun {
     private readonly now: () => number,
   ) {
     this.tools = [
-      ...definitions.map((tool) => ({
-        name: tool.name,
-        description: `${tool.description ?? tool.name}\nSTAGE ONLY: prepares a reviewable proposal. Does not execute the business change. The application generates its operation ID. A later exact direct confirmation authorizes dispatch.`,
-        inputSchema: safeSchema(tool),
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: tool.annotations?.destructiveHint ?? false,
-          idempotentHint: true,
-        },
-      })),
+      ...definitions.map((tool) => {
+        const sourceText = writeContract(tool)!.sourceTextArgument;
+        const sourceInstruction = sourceText
+          ? ` The application fills ${sourceText} from complete stored messages; do not supply it. Select source message IDs through _source_message_ids, using write_sources for earlier messages. Without a selection, the current direct request supplies the text.`
+          : '';
+        return {
+          name: tool.name,
+          description: `${tool.description ?? tool.name}\nSTAGE ONLY: prepares a reviewable proposal. Does not execute the business change. The application generates its operation ID. A later exact direct confirmation authorizes dispatch.${sourceInstruction}`,
+          inputSchema: safeSchema(tool),
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: tool.annotations?.destructiveHint ?? false,
+            idempotentHint: true,
+          },
+        };
+      }),
       ...structuredClone(localTools),
     ];
   }
@@ -660,15 +667,16 @@ export class BusinessWriteRun {
       if (ids?.some((id) => !sources.some((s) => s.id === id)))
         throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
       if (contract.sourceTextArgument) {
-        // Model paraphrases must never replace the original RFQ. The caller
-        // chooses source IDs, but can only use complete stored source text.
+        // Copy from the trusted store, never from model-transcribed text. Bind
+        // before hashing, persistence, review and confirmation.
         const selected = ids?.length ? ids.map((id) => sources.find((s) => s.id === id)!) : sources;
-        if (
-          !selected.length ||
-          selected.some((s) => !s.text.trim()) ||
-          args[contract.sourceTextArgument] !== selected.map((s) => s.text).join('\n\n')
-        )
-          throw new WriteStorageError('WRITE_SOURCE_TEXT_MISMATCH');
+        if (!selected.length || selected.some((s) => !s.text.trim()))
+          throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
+        const text = selected.map((s) => s.text).join('\n\n');
+        const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
+        if (!schemaAccepts(properties[contract.sourceTextArgument]!, text))
+          throw new WriteStorageError('WRITE_SOURCE_TEXT_INVALID');
+        args[contract.sourceTextArgument] = text;
       }
       let parent: WriteOperation | null = null;
       if (contract.effect === 'compensate') {
