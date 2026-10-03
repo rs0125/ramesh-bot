@@ -14,4 +14,6 @@ The OAuth vocabulary now accepts explicit `crm.rfq:write`; enrollment still defa
 
 Recovery returns the original receipt without another POST. If the original response could not be persisted, retain the uncertain operation for administrator reconciliation; never generate a new UUID just to retry a timeout. The journal is not an atomic transaction with Twenty and cannot undo a committed creation.
 
+If an attempt was explicitly not dispatched and has no earlier uncertain attempt, Ramesh shows the public error code and offers cancellation for a corrected proposal or a retry after temporary access/service recovery. It does not redisplay stored RFQ details or upstream messages. An earlier uncertain attempt continues to require recovery with the same operation, even when the latest attempt was not dispatched.
+
 Full setup, SOP evidence and extension boundaries are in Context Engine's `docs/crm-rfq-writes.md`. When merging the independent mail work, retain both OAuth capabilities and both sets of executor changes. Model-free tests cover exact source preservation, forwarded/historical selection, confirmation and grant narrowing.

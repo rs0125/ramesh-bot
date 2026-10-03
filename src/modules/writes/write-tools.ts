@@ -150,6 +150,13 @@ function proposalText(operation: WriteOperation) {
   }).format(new Date(operation.expiresAt));
   return `*Review this change*\n${operation.payload.summary}\n${lines.join('\n')}${original}\n\nNothing has been changed yet. Reply with exactly:\nconfirm ${operation.confirmationCode}\n\nOr cancel ${operation.confirmationCode}. Confirm before ${expires} (IST).`;
 }
+function unsentText(operation: WriteOperation): string | undefined {
+  if (operation.result?.outcome !== 'not_dispatched' || operation.hasUncertainAttempt)
+    return undefined;
+  // Only the public error code is shown; the stored business arguments and
+  // upstream message still require the tool's history-disclosure permission.
+  return `That attempt was not sent (${operation.result.code}). To change the reviewed details, reply cancel ${operation.confirmationCode} and ask for a corrected proposal. For a temporary access or service problem, reply retry ${operation.confirmationCode} to retry the same approved change.`;
+}
 function resultText(operation: WriteOperation, now = Date.now()) {
   const label = operation.payload.summary;
   switch (operation.state) {
@@ -168,9 +175,10 @@ function resultText(operation: WriteOperation, now = Date.now()) {
     case 'REJECTED':
       return `That change was not completed (${operation.result?.code ?? 'REJECTED'}). Please review the target or your access before preparing it again.`;
     case 'APPROVED':
-      if (operation.result?.outcome === 'not_dispatched' && !operation.hasUncertainAttempt)
-        return `That attempt was not sent (${operation.result.code}). Reply retry ${operation.confirmationCode} to retry the same approved change after access or service availability is restored.`;
-      return `The change is approved but has no confirmed outcome yet. Reply retry ${operation.confirmationCode} to resume the same operation safely.`;
+      return (
+        unsentText(operation) ??
+        `The change is approved but has no confirmed outcome yet. Reply retry ${operation.confirmationCode} to resume the same operation safely.`
+      );
     default:
       return `I cannot yet confirm the outcome of: ${label}. It may already have completed. Reply retry ${operation.confirmationCode} to check or retry this same operation safely. Do not create a replacement yet.`;
   }
@@ -227,8 +235,13 @@ function recoverableText(
       return Date.parse(operation.expiresAt) <= now
         ? 'That proposal has expired. Please ask me to prepare a fresh one.'
         : 'That proposal is awaiting confirmation. Please refer to the original reviewed preview; its stored business details cannot be redisplayed without current record authorization.';
+    case 'APPROVED':
+      return (
+        unsentText(operation) ??
+        `The audit has no confirmed completion for that operation. Use retry ${operation.confirmationCode} to recover the same approved operation safely.`
+      );
     default:
-      return `The audit has no confirmed completion for that operation. Use retry ${operation.confirmationCode} to recover the same approved operation safely.`;
+      return `The operation may already have completed. Use retry ${operation.confirmationCode} to recover the same approved operation safely. If it remains unresolved, ask an administrator to reconcile it before requesting a replacement.`;
   }
 }
 function sourceProjection(source: WriteSourceMessage) {

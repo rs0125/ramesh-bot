@@ -14,6 +14,7 @@ import {
 import type {
   BoundContextWriter,
   ContextToolDefinition,
+  ContextWriteResult,
 } from '../../src/modules/context-engine/context.types.js';
 import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.types.js';
 
@@ -99,6 +100,7 @@ function harness() {
   const calls: Array<{ tool: string; args: Record<string, unknown>; operationId: string }> = [];
   const proposals: WriteOperation[] = [];
   let definitions = [create, rollback, crm].map((t) => structuredClone(t));
+  let remoteResult: Omit<ContextWriteResult, 'operation_id'> | undefined;
   let currentActor = { ...actor };
   let allowed = true,
     capture = false,
@@ -188,16 +190,18 @@ function harness() {
     async finish(_ctx, id, _token, result) {
       const op = operations.get(id)!;
       op.result = structuredClone(result);
-      op.hasUncertainAttempt ||= result.outcome === 'outcome_unknown';
+      const success = ['created', 'replayed', 'rolled_back'].includes(result.outcome);
+      op.hasUncertainAttempt =
+        !success && (op.hasUncertainAttempt || result.outcome === 'outcome_unknown');
       return transition(
         id,
-        result.outcome === 'outcome_unknown'
-          ? 'UNKNOWN'
-          : result.outcome === 'created' ||
-              result.outcome === 'replayed' ||
-              result.outcome === 'rolled_back'
-            ? 'SUCCEEDED'
-            : 'REJECTED',
+        success
+          ? 'SUCCEEDED'
+          : op.hasUncertainAttempt
+            ? 'UNKNOWN'
+            : result.outcome === 'not_dispatched'
+              ? 'APPROVED'
+              : 'REJECTED',
       );
     },
     async cancel(ctx, id, expectedVersion) {
@@ -240,6 +244,7 @@ function harness() {
     },
     async call(name, args, operationId) {
       calls.push({ tool: name, args: structuredClone(args), operationId });
+      if (remoteResult) return { ...remoteResult, operation_id: operationId };
       return {
         operation_id: operationId,
         outcome: unknown ? 'outcome_unknown' : name === rollback.name ? 'rolled_back' : 'created',
@@ -299,6 +304,9 @@ function harness() {
     useUnknown: (value: boolean) => {
       unknown = value;
     },
+    useResult: (result: Omit<ContextWriteResult, 'operation_id'>) => {
+      remoteResult = result;
+    },
     changeDefinitions: (next: ContextToolDefinition[]) => {
       definitions = structuredClone(next);
     },
@@ -317,6 +325,54 @@ const rfqCreate = tool(
   { raw_text: { type: 'string', minLength: 1, maxLength: 3000 } },
   { requiredScopes: ['crm.rfq:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
 );
+test('an RFQ validation failure offers correction without redisclosing stored business details', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(
+    h.trusted('Save this RFQ: a large warehouse in Hoskote'),
+    signal(),
+  ))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  await run.finalize(signal());
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'CRM_RFQ_INCOMPLETE',
+    message: 'Private upstream details',
+  });
+  const result = await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.equal(h.operations.values().next().value!.state, 'APPROVED');
+  assert.match(result!.text, /not sent/);
+  assert.match(result!.text, /CRM_RFQ_INCOMPLETE/);
+  assert.match(result!.text, /cancel ABCDEF12/);
+  assert.match(result!.text, /corrected proposal/);
+  assert.doesNotMatch(result!.text, /Private upstream|large warehouse|Hoskote/);
+  assert.equal(h.calls.length, 1);
+  const cancelled = await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  assert.match(cancelled!.text, /cancelled/i);
+  assert.equal(h.calls.length, 1);
+});
+test('an RFQ with an earlier uncertain attempt never suggests cancellation or replacement after a rejected retry', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(h.trusted('Save an RFQ for 5000 sqft in Hoskote'), signal()))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  await run.finalize(signal());
+  h.useUnknown(true);
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'FORBIDDEN',
+    message: 'Private upstream details',
+  });
+  const result = await h.service.recover(h.trusted('retry ABCDEF12'), signal());
+  assert.equal(h.operations.values().next().value!.state, 'UNKNOWN');
+  assert.match(result!.text, /same approved operation/);
+  assert.match(result!.text, /administrator to reconcile/);
+  assert.doesNotMatch(result!.text, /cancel ABCDEF12|corrected proposal|not sent|Private upstream/);
+  assert.deepEqual(h.calls[1], h.calls[0]);
+  await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  assert.equal(h.operations.values().next().value!.state, 'UNKNOWN');
+});
 test('RFQ proposals preserve original source text and keep the normal confirmation boundary', async () => {
   const h = harness();
   h.changeDefinitions([rfqCreate]);
