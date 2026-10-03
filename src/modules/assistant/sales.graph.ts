@@ -109,8 +109,32 @@ export function buildSalesGraph(
   let utilities: UtilityToolRun | undefined;
   const personal = options.personal;
   const writes = options.writes;
-  const remainingTools = () =>
-    Math.max(run?.remaining ?? 0, personal?.remaining ?? 0, writes?.remaining ?? 0);
+  const toolFamily = (name: string) =>
+    personal?.hasTool(name) ? 'personal' : writes?.hasTool(name) ? 'write' : 'business';
+  const familyBudgets = () => ({
+    business: run?.remaining ?? 0,
+    personal: personal?.remaining ?? 0,
+    write: writes?.remaining ?? 0,
+  });
+  const remainingTools = () => {
+    const budgets = familyBudgets();
+    // A direct-route review may request research before the first worker session exists.
+    const families = new Set((session ? sessionTools : tools).map(({ name }) => toolFamily(name)));
+    return Math.max(
+      0,
+      Math.min(
+        28 - toolSteps,
+        [...families].reduce((n, f) => n + budgets[f], 0),
+      ),
+    );
+  };
+  const callableTools = () => {
+    const budgets = familyBudgets();
+    return remainingTools() > 0
+      ? sessionTools.filter(({ name }) => budgets[toolFamily(name)] > 0).map(({ name }) => name)
+      : [];
+  };
+  const toolBudget = () => ({ remaining: remainingTools(), families: familyBudgets() });
   const currentRecalls = () => {
     return recalled.flatMap(({ value, sources }) => {
       const current = currentRecall(value, sources, run?.evidence ?? []);
@@ -307,7 +331,7 @@ export function buildSalesGraph(
     .addNode('worker', async (value, config) => {
       const started = Date.now();
       const attempt = await research(
-        (signal) => session!.next(Math.min(remainingTools(), Math.max(0, 28 - toolSteps)), signal),
+        (signal) => session!.next(remainingTools(), signal, callableTools()),
         config.signal,
       );
       if (attempt.limited) return { calls: [], researchExhausted: true };
@@ -330,34 +354,42 @@ export function buildSalesGraph(
     })
     .addNode('executor', async (value, config) => {
       const started = Date.now();
-      if (value.calls.length !== 1 || remainingTools() <= 0 || toolSteps >= 28)
-        throw new Error('Invalid model tool proposal');
+      if (value.calls.length !== 1) throw new Error('Invalid model tool proposal');
       const call = value.calls[0]!;
       if (!sessionTools.some((tool) => tool.name === call.name))
         throw new Error('UNAVAILABLE_TOOL');
       toolSteps++;
       const attempt = await research(
         (signal) =>
-          personal?.hasTool(call.name)
-            ? personal.execute(call.name, call.arguments, signal)
-            : writes?.hasTool(call.name)
-              ? writes.execute(call.name, call.arguments, signal)
-              : call.name === RECALL_TOOL && run && run.remaining > 0
-                ? recall.execute(call.arguments, signal)
-                : isUtilityTool(call.name) && utilities && run && run.remaining > 0
-                  ? run!.executeUtility(
-                      (authorizeResult) =>
-                        utilities!.execute(
-                          call.name as UtilityToolName,
-                          call.arguments,
-                          signal,
-                          authorizeResult,
-                        ),
-                      signal,
-                    )
-                  : run && run.remaining > 0
-                    ? run.execute(call.name, call.arguments, signal)
-                    : Promise.reject(new Error('UNAVAILABLE_TOOL')),
+          toolSteps > 28 || familyBudgets()[toolFamily(call.name)] <= 0
+            ? Promise.resolve({
+                ok: false,
+                code: 'TOOL_BUDGET_EXHAUSTED',
+                family: toolFamily(call.name),
+                remaining: toolBudget(),
+                message:
+                  'This tool family has no remaining calls. Preserve the evidence already gathered, complete other requested work with callable tools, and state any unfinished coverage.',
+              })
+            : personal?.hasTool(call.name)
+              ? personal.execute(call.name, call.arguments, signal)
+              : writes?.hasTool(call.name)
+                ? writes.execute(call.name, call.arguments, signal)
+                : call.name === RECALL_TOOL && run
+                  ? recall.execute(call.arguments, signal)
+                  : isUtilityTool(call.name) && utilities && run
+                    ? run!.executeUtility(
+                        (authorizeResult) =>
+                          utilities!.execute(
+                            call.name as UtilityToolName,
+                            call.arguments,
+                            signal,
+                            authorizeResult,
+                          ),
+                        signal,
+                      )
+                    : run
+                      ? run.execute(call.name, call.arguments, signal)
+                      : Promise.reject(new Error('UNAVAILABLE_TOOL')),
         config.signal,
       );
       if (attempt.limited) return { calls: [], researchExhausted: true };
@@ -409,6 +441,7 @@ export function buildSalesGraph(
                 request: value.input,
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
+                tool_budget: toolBudget(),
                 history: modelHistory,
                 request_clock: requestClock,
                 application_context: applicationContext(),
@@ -497,6 +530,7 @@ export function buildSalesGraph(
                 request: value.input,
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
+                tool_budget: toolBudget(),
                 history: modelHistory,
                 recalled: currentRecalls(),
                 deal_display: dealDisplayFacts(run?.evidence ?? []),
@@ -656,7 +690,7 @@ export function buildSalesGraph(
     .addConditionalEdges('executor', (value) =>
       value.blocked
         ? 'finish'
-        : value.researchExhausted || (value.personalOnly && !!personal?.pendingOperations.length)
+        : value.researchExhausted || remainingTools() <= 0
           ? 'formatter'
           : 'worker',
     )

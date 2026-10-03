@@ -4,6 +4,18 @@ Status: **Separate native worker model session and deterministic executor implem
 
 The converser routes intent, the planner creates an outcome contract, and the worker chooses native function calls to fulfil it. A distinct executor node validates and performs those calls. The worker may adapt to actual results without resetting its 24-source/28-total proposal budgets. The independent verifier receives the task plan and current evidence; one bounded repair can continue the same worker session. See [module 29](29-planner-worker-verifier.md). Generic durable multi-worker task handoffs below remain future design.
 
+The worker's callable subset is refreshed on every continuation from the remaining
+business, personal and write allowances, bounded by the same 28 total proposals.
+Exhausted families cannot borrow another family's allowance. A stale exhausted
+proposal returns `TOOL_BUDGET_EXHAUSTED` without a remote call; gathered evidence
+remains available to the formatter and verifier. Responses uses the documented
+[`allowed_tools` selection](https://developers.openai.com/api/docs/guides/function-calling#tool-choice)
+to restrict calls while retaining the original schemas for prompt caching.
+
+Personal requests continue after staging a change so the worker can also retrieve
+a requested list. Staging never commits the change; independent review still
+precedes the transactional mutation and its authoritative receipt.
+
 ## Responsibility
 
 Complete one assigned step using only its permitted tools and context, then return a structured handoff. The worker proposes calls; it does not hold database credentials, sign requests, mutate queue state or send WhatsApp messages.

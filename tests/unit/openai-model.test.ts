@@ -241,3 +241,56 @@ test('native tool sessions redact provider failures and reject parallel proposal
     /OpenAI tool request failed/,
   );
 });
+
+test('continuations restrict callable tools without changing schemas or losing earlier tool outputs', async () => {
+  const bodies: any[] = [];
+  const model = new OpenAITextModel(config, async (_input, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({
+      id: `response-${bodies.length}`,
+      object: 'response',
+      status: 'completed',
+      output:
+        bodies.length === 1
+          ? [
+              {
+                type: 'function_call',
+                call_id: 'read-call',
+                name: 'read_inventory',
+                arguments: '{}',
+              },
+            ]
+          : [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Partial findings retained.' }],
+              },
+            ],
+    });
+  });
+  const session = model.startToolSession({
+    ...request,
+    tools: ['read_inventory', 'personal_list'].map((name) => ({
+      name,
+      inputSchema: { type: 'object', properties: {} },
+    })),
+  });
+  await session.next(28, AbortSignal.timeout(1000), ['read_inventory', 'personal_list']);
+  session.accept('read-call', { ok: true, records: ['synthetic'] });
+  await session.next(4, AbortSignal.timeout(1000), ['personal_list', 'unadvertised_tool']);
+  await session.next(4, AbortSignal.timeout(1000), []);
+  assert.equal(bodies[0].tool_choice, 'auto');
+  assert.deepEqual(bodies[1].tool_choice, {
+    type: 'allowed_tools',
+    mode: 'auto',
+    tools: [{ type: 'function', name: 'personal_list' }],
+  });
+  assert.deepEqual(bodies[1].tools, bodies[0].tools);
+  assert.ok(
+    bodies[1].input.some(
+      (item: any) => item.type === 'function_call_output' && item.call_id === 'read-call',
+    ),
+  );
+  assert.equal(bodies[2].tool_choice, 'none');
+});

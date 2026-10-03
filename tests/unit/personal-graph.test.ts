@@ -41,8 +41,9 @@ async function scenario(options: {
   approve?: boolean;
   recallOnly?: boolean;
   recallBeforeWrite?: boolean;
+  listOrder?: 'before' | 'after';
 }) {
-  const requestText = `Remind me in 20 minutes to ${reminderText}.${options.workflow === 'general' ? ' Also tell me what to check first.' : ''}`;
+  const requestText = `Remind me in 20 minutes to ${reminderText}.${options.workflow === 'general' ? ' Also tell me what to check first.' : ''}${options.listOrder ? ' Also show my reminders.' : ''}`;
   const trusted: TrustedReplyContext = {
     runId: randomUUID(),
     key: { remoteJid: actor.chatId },
@@ -54,11 +55,26 @@ async function scenario(options: {
   const sessions: ToolSessionRequest[] = [];
   const applied: PersonalOperation[][] = [];
   let receipt: PersonalCommandReceipt | null = null;
+  const list = {
+    selectionId: randomUUID(),
+    nextCursor: null,
+    records: [
+      {
+        kind: 'reminder' as const,
+        id: randomUUID(),
+        text: 'Earlier synthetic reminder',
+        state: 'scheduled',
+        version: 2,
+        createdAt: new Date(now).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+      },
+    ],
+  };
   const repository: PersonalRepositoryPort = {
     async getReceipt() {
       return receipt;
     },
-    async applyBatch(context, operations) {
+    async applyBatch(context, operations, selectionIds = []) {
       events.push('commit');
       applied.push(structuredClone(operations));
       receipt = {
@@ -79,11 +95,15 @@ async function scenario(options: {
             nextDueAt: operation.schedule.dueAt,
           };
         }),
+        ...(options.listOrder ? { lists: [{ kind: 'reminder' as const, result: list }] } : {}),
       };
+      assert.deepEqual(selectionIds, options.listOrder ? [list.selectionId] : []);
       return receipt;
     },
     async list() {
-      throw new Error('Unexpected list');
+      assert.ok(options.listOrder);
+      events.push('personal_list');
+      return list;
     },
     async saveContext() {
       events.push('context_saved');
@@ -168,7 +188,13 @@ async function scenario(options: {
     ...(options.recallOnly || options.recallBeforeWrite
       ? [{ name: 'personal_recall', args: { kind: 'instructions' } }]
       : []),
+    ...(options.listOrder === 'before'
+      ? [{ name: 'personal_list', args: { kind: 'reminder' } }]
+      : []),
     ...(options.recallOnly ? [] : [apply]),
+    ...(options.listOrder === 'after'
+      ? [{ name: 'personal_list', args: { kind: 'reminder' } }]
+      : []),
   ];
   const model: TextModel = {
     async complete(request) {
@@ -276,7 +302,7 @@ test('personal workflow saves the requested IST reminder using only router, work
     h.events.filter((event) =>
       ['converser', 'planner', 'worker', 'formatter', 'verifier'].includes(event),
     ),
-    ['converser', 'worker', 'verifier'],
+    ['converser', 'worker', 'worker', 'verifier'],
   );
   assert.equal(h.events.includes('business_read'), false);
   assert.equal(
@@ -289,6 +315,21 @@ test('personal workflow saves the requested IST reminder using only router, work
   assert.match(h.reply.text, /9:50 am IST/i);
   assert.ok(h.events.indexOf('commit') > h.events.indexOf('verifier'));
   assert.ok(getPersonalDelivery(h.reply.businessEvidence)?.commandId);
+});
+
+test('personal graph completes requested lists on either side of a staged mutation', async () => {
+  for (const listOrder of ['before', 'after'] as const) {
+    const h = await scenario({ workflow: 'personal', listOrder });
+    assert.equal(h.reply.trace.outcome, 'completed', listOrder);
+    assert.match(h.reply.text, /Saved reminder: review the synthetic proposal/);
+    assert.match(h.reply.text, /Your reminders \(this page\):\n1\. Earlier synthetic reminder/);
+    assert.equal(h.applied.length, 1);
+    assert.ok(h.events.indexOf('commit') > h.events.lastIndexOf('verifier'));
+    assert.ok(h.events.indexOf('personal_list') < h.events.indexOf('commit'));
+    const delivery = getPersonalDelivery(h.reply.businessEvidence);
+    assert.ok(delivery?.commandId);
+    assert.ok(delivery?.selectionId);
+  }
 });
 
 test('rejected personal proposal never reaches persistence even on the short workflow', async () => {

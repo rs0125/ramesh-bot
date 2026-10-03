@@ -64,6 +64,8 @@ export interface ToolModelSession {
   next(
     remainingCalls: number,
     signal: AbortSignal,
+    /** Current callable subset of the original catalogue; exhausted families are excluded. */
+    allowedToolNames?: readonly string[],
   ): Promise<ModelResult & { calls: ModelToolCall[] }>;
   accept(callId: string, output: unknown): void;
   /** Continue the current task after a failed independent review; never resets tool budgets. */

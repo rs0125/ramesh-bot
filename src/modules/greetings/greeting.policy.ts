@@ -11,7 +11,8 @@ export function selectGreetingTarget(
   if (message.fromMe || (message.isGroup && requireGroupMention && !message.mentionsBot))
     return null;
   const age = now - message.sentAtMs;
-  // Small forward clock skew is tolerated; offline/history messages are not greeted.
+  // Small forward clock skew is tolerated; stale messages are not greeted,
+  // while recent deliveries received during a reconnect remain eligible.
   if (!Number.isFinite(age) || age < -60_000 || age > maxMessageAgeMs) return null;
   return { chatId: message.chatId, messageId: message.messageId };
 }

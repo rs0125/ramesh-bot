@@ -29,6 +29,14 @@ The user receives exact material fields and `confirm CODE` / `cancel CODE`. The 
 
 A draft can be revised during verifier repair; every revision is audited and invalidates its earlier unpublished code. Once published, its payload is immutable. A changed request needs a new reviewed operation. No capture queue or playground identity has production journal access, and the live-data playground does not compose the writer.
 
+Cancelling an owned pending proposal is a local journal action. It remains
+available when the remote write catalogue is empty or discovery is unavailable;
+the sender must still resolve to the same active employee, phone and private chat.
+The cancellation reply contains no stored business details and uses a constrained
+delivery receipt that checks the cancelled operation's current state and version
+without requiring remote write permission. It cannot authorize confirmation,
+redisclose the proposal, cancel an uncertain dispatch, or undo a committed write.
+
 ## Storage and audit coverage
 
 Supabase migration `202610030009_write_journal.sql` adds:

@@ -75,6 +75,8 @@ export interface PersonalCommandReceipt {
   runId: string;
   records: PersonalRecord[];
   replayed?: boolean;
+  /** Exact post-change presentations, committed with the mutation for crash-safe recovery. */
+  lists?: Array<{ kind: 'task' | 'reminder'; result: PersonalListResult }>;
 }
 export interface PersonalListResult {
   records: PersonalRecord[];

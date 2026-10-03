@@ -29,13 +29,22 @@ export const writeDeliverySchema = z
     operations: z
       .array(z.object({ id: z.string().uuid(), version: z.number().int().positive() }).strict())
       .max(11),
-    tools: z.array(z.string().min(1).max(64)).min(1).max(64),
+    tools: z.array(z.string().min(1).max(64)).max(64),
     toolContracts: z
       .record(z.string().min(1).max(64), z.string().regex(/^[a-f0-9]{64}$/))
       .optional(),
+    /** Local cancellation replies contain no stored business details or remote tool authority. */
+    localCancellation: z.literal(true).optional(),
     expiresAt: z.string().datetime(),
   })
-  .strict();
+  .strict()
+  .refine((value) =>
+    value.localCancellation
+      ? value.tools.length === 0 &&
+        Object.keys(value.toolContracts ?? {}).length === 0 &&
+        value.operations.length <= 1
+      : value.tools.length > 0,
+  );
 export type WriteDelivery = z.infer<typeof writeDeliverySchema>;
 export interface BusinessWriteReply {
   text: string;
@@ -283,11 +292,25 @@ export class BusinessWriteService {
     const match = confirmation.exec(source.text.trim());
     const existing = await this.repository.findByRun(command);
     if (!match && (!existing || existing.state === 'DRAFT')) return undefined;
-    const definitions = (await access.writer.describe(signal)).tools.filter(contextWriteDescriptor);
-    if (!definitions.length) return undefined;
+    // Cancelling a local journal entry must remain available after remote write access changes.
+    // Only generic cancellation text can use this path; redisclosure and dispatch still discover tools.
+    const localCancellation = match?.[1]?.toLowerCase() === 'cancel';
+    const definitions = localCancellation
+      ? []
+      : (await access.writer.describe(signal)).tools.filter(contextWriteDescriptor);
+    if (!localCancellation && !definitions.length) return undefined;
     const reply = (text: string, operations: WriteOperation[] = []): BusinessWriteReply => ({
       text,
-      delivery: receipt(access.actor, command.runId, definitions, operations, this.now()),
+      delivery: {
+        ...receipt(
+          access.actor,
+          command.runId,
+          definitions,
+          localCancellation ? operations.filter((op) => op.state === 'CANCELLED') : operations,
+          this.now(),
+        ),
+        ...(localCancellation ? { localCancellation: true as const } : {}),
+      },
     });
     if (!match && existing)
       return reply(recoverableText(existing, definitions, this.now()), [existing]);
@@ -307,13 +330,24 @@ export class BusinessWriteService {
       );
     try {
       if (action.toLowerCase() === 'cancel') {
+        const current = await this.resolve(trusted.key, signal);
+        signal.throwIfAborted();
+        if (
+          !current ||
+          !sameActor(current.actor, access.actor) ||
+          current.writer.employeeId !== access.actor.employeeId
+        )
+          return undefined;
+        // A repeated command recovers the same local outcome without touching the remote service.
+        if (operation.state === 'CANCELLED')
+          return reply(resultText(operation, this.now()), [operation]);
         operation = await this.repository.cancel(
           command,
           operation.operationId,
           operation.version,
           code.toUpperCase(),
         );
-        return reply(recoverableText(operation, definitions, this.now()), [operation]);
+        return reply(recoverableText(operation, [], this.now()), [operation]);
       }
       if (complete.has(operation.state))
         return reply(recoverableText(operation, definitions, this.now()), [operation]);
@@ -436,19 +470,26 @@ export class BusinessWriteService {
         current.writer.employeeId !== parsed.data.employeeId
       )
         return false;
-      const tools = (await current.writer.discover(signal)).filter(contextWriteDescriptor);
-      if (
-        !parsed.data.toolContracts ||
-        !parsed.data.tools.every((name) =>
-          tools.some(
-            (t) => t.name === name && parsed.data.toolContracts![name] === descriptorHash(t),
-          ),
+      if (!parsed.data.localCancellation) {
+        const tools = (await current.writer.discover(signal)).filter(contextWriteDescriptor);
+        if (
+          !parsed.data.toolContracts ||
+          !parsed.data.tools.every((name) =>
+            tools.some(
+              (t) => t.name === name && parsed.data.toolContracts![name] === descriptorHash(t),
+            ),
+          )
         )
-      )
-        return false;
+          return false;
+      }
       for (const stored of parsed.data.operations) {
         const operation = await this.repository.receiptLookup(current.actor, stored.id);
-        if (!operation || operation.version !== stored.version || operation.state === 'DRAFT')
+        if (
+          !operation ||
+          operation.version !== stored.version ||
+          operation.state === 'DRAFT' ||
+          (parsed.data.localCancellation && operation.state !== 'CANCELLED')
+        )
           return false;
       }
       signal.throwIfAborted();

@@ -41,15 +41,20 @@ function describe(record: PersonalRecord, receipt = false): string {
   return `${compactText.length > 280 ? compactText.slice(0, 277) + '...' : compactText}${time}${recurrence}${rule?.until ? `; until ${formatIst(rule.until)}` : ''}`;
 }
 export function renderReceipt(receipt: PersonalCommandReceipt): string {
-  return receipt.records
+  const mutations = receipt.records
     .map(
       (record) =>
         `${record.kind === 'task' ? (record.state === 'done' ? 'Completed task' : record.state === 'cancelled' ? 'Cancelled task' : 'Saved task') : record.state === 'cancelled' ? 'Cancelled reminder' : 'Saved reminder'}: ${describe(record, true)}.${record.affectedReminders ? ` Cancelled ${record.affectedReminders} linked reminder${record.affectedReminders === 1 ? '' : 's'}.` : ''}${record.alreadySending ? ' A notification has already started sending and may still arrive.' : ''}`,
     )
     .join('\n');
+  return [mutations, ...(receipt.lists ?? []).map(({ kind, result }) => renderList(kind, result))]
+    .filter(Boolean)
+    .join('\n\n');
 }
 export function renderList(kind: 'task' | 'reminder', result: PersonalListResult): string {
   if (!result.records.length)
-    return `No personal ${kind === 'task' ? 'tasks' : 'reminders'} match that filter.`;
+    return result.nextCursor
+      ? `No personal ${kind === 'task' ? 'tasks' : 'reminders'} match that filter on this page. More entries are available.`
+      : `No personal ${kind === 'task' ? 'tasks' : 'reminders'} match that filter.`;
   return `Your ${kind === 'task' ? 'tasks' : 'reminders'} (this page):\n${result.records.map((record, index) => `${index + 1}. ${describe(record)} [${record.state}${record.occurrenceState ? `; ${['pending', 'preparing', 'waiting_source', 'queued'].includes(record.occurrenceState) ? 'notification' : 'last occurrence'} ${record.occurrenceState}` : record.lastOutcome ? `; last delivery ${record.lastOutcome}` : ''}]`).join('\n')}${result.nextCursor ? '\nMore entries are available.' : ''}`;
 }

@@ -147,9 +147,15 @@ test(
       assert.equal(result, 'queued');
       return { id, ref };
     }
-    async function delivered(f: ReturnType<typeof fixture>, job: MessageJob) {
+    async function delivered(f: ReturnType<typeof fixture>, job: MessageJob, commandId?: string) {
       assert.equal(
-        await f.queue.handoff(job, 'synthetic-list', new Date(), 'encrypted-personal-proof'),
+        await f.queue.handoff(
+          job,
+          'synthetic-list',
+          new Date(),
+          'encrypted-personal-proof',
+          commandId,
+        ),
         true,
       );
       const outbound = await f.queue.claimOutbound(30000);
@@ -541,6 +547,159 @@ test(
           assert.equal(cancelled.records[0]!.version, 2);
           assert.equal(cancelled.records[0]!.nextDueAt, null);
           assert.equal(cancelled.records[0]!.alreadySending, false);
+        },
+      );
+      await t.test(
+        'mixed list and mutation commits refreshed filters, versions, linked cancellations and recoverable presentation together',
+        async () => {
+          const f = fixture();
+          const initial = await apply(f, [
+            { kind: 'task_create', text: 'First synthetic task', alias: 'first' },
+            { kind: 'task_create', text: 'Second synthetic task' },
+            {
+              kind: 'reminder_create',
+              text: 'Linked synthetic reminder',
+              taskRef: 'first',
+              schedule: future(),
+            },
+          ]);
+          const earlier = await command(f);
+          const earlierReminders = await f.repo.list(actor, 'reminder', earlier.ctx.runId);
+          await f.repo.finalizeSelections(earlier.ctx, [earlierReminders.selectionId]);
+          await delivered(f, earlier.job);
+          const c = await command(f);
+          const tasks = await f.repo.list(actor, 'task', c.ctx.runId);
+          const reminders = await f.repo.list(actor, 'reminder', c.ctx.runId);
+          const operations: PersonalOperation[] = [
+            { kind: 'task_complete', id: initial.records[0]!.id, expectedVersion: 1 },
+            {
+              kind: 'task_update',
+              id: initial.records[1]!.id,
+              expectedVersion: 1,
+              text: 'Updated second task',
+            },
+            { kind: 'task_create', text: 'Third synthetic task' },
+          ];
+          const receipt = await f.repo.applyBatch(c.ctx, operations, [
+            tasks.selectionId,
+            reminders.selectionId,
+          ]);
+          assert.deepEqual(
+            receipt.lists?.map(({ kind, result }) => ({
+              kind,
+              records: result.records.map(({ text, version }) => ({ text, version })),
+            })),
+            [
+              {
+                kind: 'task',
+                records: [
+                  { text: 'Updated second task', version: 2 },
+                  { text: 'Third synthetic task', version: 1 },
+                ],
+              },
+              { kind: 'reminder', records: [] },
+            ],
+          );
+          assert.deepEqual((await f.repo.getReceipt(c.ctx))?.lists, receipt.lists);
+          const replay = await f.repo.applyBatch(c.ctx, operations, [
+            tasks.selectionId,
+            reminders.selectionId,
+          ]);
+          assert.equal(replay.commandId, receipt.commandId);
+          assert.deepEqual(replay.lists, receipt.lists);
+          await assert.rejects(
+            f.repo.resolveSelection(actor, 'task', tasks.selectionId, 1),
+            code('PERSONAL_SELECTION_NOT_FOUND'),
+          );
+          await delivered(f, c.job, receipt.commandId);
+          assert.deepEqual(await f.repo.resolveSelection(actor, 'task', tasks.selectionId, 1), {
+            id: initial.records[1]!.id,
+            expectedVersion: 2,
+          });
+          assert.deepEqual(await f.repo.resolveSelection(actor, 'task', tasks.selectionId, 2), {
+            id: receipt.records[2]!.id,
+            expectedVersion: 1,
+          });
+          const recalledTasks = await f.repo.recall(actor, 'task');
+          assert.equal(recalledTasks.kind, 'task');
+          assert.equal(recalledTasks.selectionId, tasks.selectionId);
+          assert.deepEqual(recalledTasks.records, receipt.lists![0]!.result.records);
+          assert.deepEqual(await f.repo.recall(actor, 'reminder'), {
+            kind: 'reminder',
+            records: [],
+            selectionId: reminders.selectionId,
+          });
+          // A genuinely later delivered occurrence still supersedes the empty list.
+          const laterReminder = (
+            await apply(f, [
+              { kind: 'reminder_create', text: 'Later notification', schedule: future() },
+            ])
+          ).records[0]!;
+          await dueNow(laterReminder.id);
+          const due = await f.repo.claimDue(30000);
+          assert.ok(due);
+          const notification = await queued(f, due);
+          await db.admin.query(
+            `UPDATE public."ramesh-messages" SET state='SENT',finished_at=clock_timestamp()+interval '1 second' WHERE id=$1`,
+            [notification.id],
+          );
+          const recalledReminder = await f.repo.recall(actor, 'reminder');
+          assert.equal(recalledReminder.kind, 'reminder');
+          assert.equal(recalledReminder.records[0]?.id, laterReminder.id);
+          assert.equal(recalledReminder.records[0]?.occurrenceId, due.id);
+          assert.equal(recalledReminder.selectionId, undefined);
+        },
+      );
+      await t.test(
+        'mixed changes retain an incomplete page cursor instead of jumping to newly created records',
+        async () => {
+          const f = fixture();
+          const initial = await apply(f, [
+            { kind: 'task_create', text: 'First' },
+            { kind: 'task_create', text: 'Second' },
+          ]);
+          const c = await command(f);
+          const list = await f.repo.list(actor, 'task', c.ctx.runId, { limit: 1 });
+          const receipt = await f.repo.applyBatch(
+            c.ctx,
+            [{ kind: 'task_create', text: 'Third' }],
+            [list.selectionId],
+          );
+          const displayed = receipt.lists![0]!.result;
+          assert.deepEqual(
+            displayed.records.map((record) => record.id),
+            [initial.records[0]!.id],
+          );
+          assert.equal(displayed.nextCursor, list.nextCursor);
+          await delivered(f, c.job, receipt.commandId);
+          const later = await command(f);
+          const continued = await f.repo.list(actor, 'task', later.ctx.runId, {
+            continuation: 'latest',
+          });
+          assert.deepEqual(
+            continued.records.map((record) => record.text),
+            ['Second', 'Third'],
+          );
+        },
+      );
+      await t.test(
+        'a foreign or invalid presentation prevents the entire mixed mutation from committing',
+        async () => {
+          const f = fixture();
+          const previous = await command(f);
+          const oldSelection = await f.repo.list(actor, 'task', previous.ctx.runId);
+          await f.queue.complete(previous.job, 'FAILED', 'synthetic_turn_finished');
+          const c = await command(f);
+          await assert.rejects(
+            f.repo.applyBatch(
+              c.ctx,
+              [{ kind: 'task_create', text: 'Must roll back' }],
+              [oldSelection.selectionId],
+            ),
+            code('PERSONAL_SELECTION_INVALID'),
+          );
+          assert.equal(await f.repo.getReceipt(c.ctx), null);
+          assert.deepEqual((await f.repo.list(actor, 'task', c.ctx.runId)).records, []);
         },
       );
       await t.test(

@@ -40,6 +40,13 @@ Preserve source path, source request ID, actual retrieval time, underlying sync 
 
 Missing data is different from schema failure. A schema mismatch is an integration fault to surface in telemetry, not an invitation for the model to reinterpret arbitrary text.
 
+Budget exhaustion is a structured outcome, not an exception that discards the run.
+The graph restricts each continuation to families with remaining calls and checks
+the selected family's allowance again before dispatch. Stale exhausted proposals
+consume a total proposal slot but make no source request. Formatting and review
+receive the remaining family budgets alongside the evidence, so a partial answer
+can distinguish unchecked coverage from an empty result or authorization failure.
+
 ## Acceptance cases
 
 Test malformed and unknown tools, forged actor fields, denied employees, changed permissions mid-run, request-size limits, budget exhaustion, invalid envelopes, delayed cancellation, receipt-write failure and repeated read attempts. Verify that a stale lease cannot persist a completion and that a fake worker cannot create evidence by referencing arbitrary rows.

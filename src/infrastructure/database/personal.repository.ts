@@ -229,7 +229,7 @@ export class PersonalRepository {
           `SELECT c.*,m.finished_at AS delivered_at FROM public."ramesh-assistant-commands" c JOIN public."ramesh-messages" m ON m.id=c.run_id AND m.account_id=c.account_id
          WHERE c.account_id=$1 AND c.owner_employee_id=$2 AND c.kind IN('mutation','selection') AND c.expires_at>clock_timestamp()
          AND (c.kind='mutation' OR c.presented) AND m.origin='whatsapp' AND m.chat_id=$3 AND m.reply_kind='business' AND m.state='SENT'
-         ORDER BY m.finished_at DESC,c.created_at DESC LIMIT 50`,
+         ORDER BY m.finished_at DESC,m.id DESC,(c.kind='selection') DESC,c.created_at DESC LIMIT 50`,
           [this.accountId, actor.employeeId, actor.chatId],
         )
       ).rows;
@@ -249,7 +249,10 @@ export class PersonalRepository {
           if (payload.kind !== kind) continue;
           targets = payload.records;
         }
-        if (targets.length) {
+        // Within one delivered reply the presented list defines follow-up order. An
+        // empty list is also an authoritative result, not permission to revive an older
+        // selection or the mutation's affected (potentially now closed) records.
+        if (row.kind === 'selection' || targets.length) {
           selected = row;
           break;
         }
@@ -282,6 +285,7 @@ export class PersonalRepository {
   async applyBatch(
     ctx: PersonalCommandContext,
     operations: PersonalOperation[],
+    selectionIds: string[] = [],
   ): Promise<PersonalCommandReceipt> {
     this.actor(ctx);
     if (
@@ -290,6 +294,12 @@ export class PersonalRepository {
       Buffer.byteLength(JSON.stringify(operations)) > 24000
     )
       throw new SchedulingError('PERSONAL_BATCH_LIMIT');
+    if (
+      selectionIds.length > 2 ||
+      selectionIds.some((id) => !uuid(id)) ||
+      new Set(selectionIds).size !== selectionIds.length
+    )
+      throw new SchedulingError('PERSONAL_SELECTION_INVALID');
     const fingerprint = createHash('sha256').update(canonical(operations)).digest('hex');
     return this.tx(async (db) => {
       await this.fence(db, ctx);
@@ -332,7 +342,18 @@ export class PersonalRepository {
       const records: PersonalRecord[] = [];
       for (const [index, op] of operations.entries())
         records.push(await this.apply(db, ctx, op, `${ctx.runId}:${index}`, aliases));
-      const receipt: PersonalCommandReceipt = { commandId: id, runId: ctx.runId, records };
+      const lists = await this.reconcileSelections(
+        db,
+        ctx,
+        selectionIds,
+        records.filter((_, index) => operations[index]!.kind.endsWith('_create')),
+      );
+      const receipt: PersonalCommandReceipt = {
+        commandId: id,
+        runId: ctx.runId,
+        records,
+        ...(lists.length ? { lists } : {}),
+      };
       await db.query(
         `UPDATE public."ramesh-assistant-commands" SET result_encrypted=$2,finished_at=clock_timestamp() WHERE id=$1`,
         [id, this.cipher.seal(`personal-result:${ctx.employeeId}`, id, receipt)],
@@ -357,6 +378,98 @@ export class PersonalRepository {
       });
       return receipt;
     });
+  }
+  /** Refresh exactly the requested pages after the batch, including linked cancellations.
+   * The displayed versions/order and the mutation receipt commit together, so replay cannot
+   * lose the list or make an ordinal resolve to a pre-mutation version.
+   */
+  private async reconcileSelections(
+    db: PoolClient,
+    ctx: PersonalCommandContext,
+    ids: string[],
+    created: PersonalRecord[],
+  ): Promise<NonNullable<PersonalCommandReceipt['lists']>> {
+    const lists: NonNullable<PersonalCommandReceipt['lists']> = [];
+    for (const id of ids) {
+      const selected = (
+        await db.query(
+          `SELECT * FROM public."ramesh-assistant-commands" WHERE id=$1 AND account_id=$2 AND owner_employee_id=$3 AND run_id=$4 AND kind='selection' AND expires_at>clock_timestamp() FOR UPDATE`,
+          [id, this.accountId, ctx.employeeId, ctx.runId],
+        )
+      ).rows[0];
+      if (!selected) throw new SchedulingError('PERSONAL_SELECTION_INVALID');
+      const payload = this.cipher.open(
+        `personal-selection:${ctx.employeeId}`,
+        id,
+        selected.payload_encrypted,
+      ) as {
+        kind: 'task' | 'reminder';
+        records: VersionedTarget[];
+        state: string;
+        nextCursor: string | null;
+      };
+      if (
+        !['task', 'reminder'].includes(payload.kind) ||
+        !Array.isArray(payload.records) ||
+        payload.records.length > 50 ||
+        payload.records.some((record) => !uuid(record.id))
+      )
+        throw new SchedulingError('PERSONAL_STORAGE_INVALID');
+      // A completed page can include this batch's new records at its end. For an incomplete
+      // page, keep new records behind its saved cursor rather than jumping over unseen rows.
+      const recordIds = [
+        ...new Set([
+          ...payload.records.map((record) => record.id),
+          ...(!payload.nextCursor
+            ? created.filter((record) => record.kind === payload.kind).map((record) => record.id)
+            : []),
+        ]),
+      ];
+      const kind = payload.kind;
+      const rows = (
+        await db.query(
+          `SELECT t.*,t.created_at::text AS cursor_time ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at' : ''}
+         FROM public."ramesh-${kind === 'task' ? 'tasks' : 'reminders'}" t
+         ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
+         WHERE t.account_id=$1 AND t.owner_employee_id=$2 AND t.id=ANY($3::uuid[]) AND ($4='all' OR t.state=$4)
+         ORDER BY t.created_at,t.id FOR UPDATE OF t`,
+          [this.accountId, ctx.employeeId, recordIds, payload.state],
+        )
+      ).rows;
+      const records: PersonalRecord[] = [];
+      for (const row of rows) {
+        const candidate = this.record(kind, row);
+        if (
+          records.length >= 50 ||
+          renderList(kind, {
+            records: [...records, candidate],
+            selectionId: id,
+            nextCursor: 'more',
+          }).length > PERSONAL_LIST_MAX_CHARACTERS
+        )
+          break;
+        records.push(candidate);
+      }
+      const last = rows[records.length - 1];
+      const nextCursor =
+        rows.length > records.length && last
+          ? Buffer.from(JSON.stringify([last.cursor_time, last.id])).toString('base64url')
+          : payload.nextCursor;
+      await db.query(
+        `UPDATE public."ramesh-assistant-commands" SET payload_encrypted=$2 WHERE id=$1`,
+        [
+          id,
+          this.cipher.seal(`personal-selection:${ctx.employeeId}`, id, {
+            ...payload,
+            records: records.map((record) => ({ id: record.id, expectedVersion: record.version })),
+            nextCursor,
+          }),
+        ],
+      );
+      lists.push({ kind, result: { records, selectionId: id, nextCursor } });
+    }
+    if (ids.length) await this.markSelections(db, ctx, ids);
+    return lists;
   }
   /** Includes linked reminder cancellation and snooze occurrences, not only direct return records. */
   private async auditSnapshot(
@@ -829,19 +942,25 @@ export class PersonalRepository {
       throw new SchedulingError('PERSONAL_SELECTION_INVALID');
     await this.tx(async (db) => {
       await this.fence(db, ctx);
-      const found = (
-        await db.query(
-          `SELECT id FROM public."ramesh-assistant-commands" WHERE account_id=$1 AND owner_employee_id=$2 AND run_id=$3 AND kind='selection' AND id=ANY($4::uuid[]) AND expires_at>clock_timestamp()`,
-          [this.accountId, ctx.employeeId, ctx.runId, ids],
-        )
-      ).rows;
-      if (found.length !== new Set(ids).size)
-        throw new SchedulingError('PERSONAL_SELECTION_INVALID');
-      await db.query(
-        `UPDATE public."ramesh-assistant-commands" SET presented=(id=ANY($4::uuid[])) WHERE account_id=$1 AND owner_employee_id=$2 AND run_id=$3 AND kind='selection'`,
-        [this.accountId, ctx.employeeId, ctx.runId, ids],
-      );
+      await this.markSelections(db, ctx, ids);
     });
+  }
+  private async markSelections(
+    db: PoolClient,
+    ctx: PersonalCommandContext,
+    ids: string[],
+  ): Promise<void> {
+    const found = (
+      await db.query(
+        `SELECT id FROM public."ramesh-assistant-commands" WHERE account_id=$1 AND owner_employee_id=$2 AND run_id=$3 AND kind='selection' AND id=ANY($4::uuid[]) AND expires_at>clock_timestamp()`,
+        [this.accountId, ctx.employeeId, ctx.runId, ids],
+      )
+    ).rows;
+    if (found.length !== new Set(ids).size) throw new SchedulingError('PERSONAL_SELECTION_INVALID');
+    await db.query(
+      `UPDATE public."ramesh-assistant-commands" SET presented=(id=ANY($4::uuid[])) WHERE account_id=$1 AND owner_employee_id=$2 AND run_id=$3 AND kind='selection'`,
+      [this.accountId, ctx.employeeId, ctx.runId, ids],
+    );
   }
   async resolveSelection(
     actor: PersonalActor,

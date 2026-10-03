@@ -117,6 +117,8 @@ function harness(events: string[] = []) {
   let listFailure = false;
   let afterCommit: (() => void) | undefined;
   const applied: PersonalOperation[][] = [];
+  const appliedSelections: string[][] = [];
+  let receiptLists: PersonalCommandReceipt['lists'];
   const contexts: PersonalCommandContext[] = [];
   const finalized: string[][] = [];
   const selected: unknown[][] = [];
@@ -145,11 +147,12 @@ function harness(events: string[] = []) {
       contexts.push(context);
       return receipt;
     },
-    async applyBatch(context, operations) {
+    async applyBatch(context, operations, selectionIds = []) {
       events.push('commit');
       if (applyFailure) throw new Error('synthetic DB unavailable');
       contexts.push(context);
       applied.push(structuredClone(operations));
+      appliedSelections.push(selectionIds);
       receipt = {
         commandId: 'saved-command',
         runId: context.runId,
@@ -170,6 +173,7 @@ function harness(events: string[] = []) {
           updatedAt: new Date(now).toISOString(),
           ...('schedule' in operation ? { schedule: operation.schedule } : {}),
         })),
+        ...(receiptLists ? { lists: receiptLists } : {}),
       };
       afterCommit?.();
       return receipt;
@@ -214,6 +218,7 @@ function harness(events: string[] = []) {
     service,
     assistant,
     applied,
+    appliedSelections,
     contexts,
     finalized,
     selected,
@@ -240,6 +245,9 @@ function harness(events: string[] = []) {
     },
     setList: (value: PersonalRecord[]) => {
       listRecords = value;
+    },
+    setReceiptLists: (value: PersonalCommandReceipt['lists']) => {
+      receiptLists = value;
     },
   };
 }
@@ -586,6 +594,158 @@ test('list presentation is deterministic and finalized only after successful rev
     .assistant(fakeModel([{ name: 'personal_list', args: { kind: 'task' } }], [], false).model)
     .prepare(message, signal(), trusted);
   assert.deepEqual(rejected.finalized, []);
+});
+
+test('a mixed personal receipt retains its transaction-reconciled list and selection on recovery', async () => {
+  const h = harness();
+  const run = (await h.service.open(trusted, signal()))!;
+  await run.execute('personal_list', JSON.stringify({ kind: 'task' }), signal());
+  await run.execute(
+    'personal_apply',
+    JSON.stringify({ operations: [batch.operations[0]] }),
+    signal(),
+  );
+  const savedList = {
+    selectionId: 'saved-selection',
+    nextCursor: null,
+    records: [
+      {
+        kind: 'task' as const,
+        id: 'updated-record',
+        text: 'Authoritative refreshed task',
+        state: 'open',
+        version: 5,
+        createdAt: new Date(now).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+      },
+    ],
+  };
+  h.setReceiptLists([{ kind: 'task', result: savedList }]);
+  assert.match(run.preview()!, /Pending personal changes/);
+  assert.match(run.preview()!, /Your tasks/);
+  const reply = (await run.finish(signal()))!;
+  assert.match(reply.text, /Saved task: review the lease/);
+  assert.match(reply.text, /1\. Authoritative refreshed task/);
+  assert.doesNotMatch(reply.text, /Check the quote/);
+  assert.equal(reply.delivery.commandId, 'saved-command');
+  assert.equal(reply.delivery.selectionId, 'saved-selection');
+  assert.deepEqual(h.appliedSelections, [['saved-selection']]);
+  assert.deepEqual(h.finalized, [], 'mutation transaction owns selection finalization');
+  const recovered = (await h.service.open(trusted, signal()))!;
+  assert.deepEqual(await recovered.recover(signal()), reply);
+  assert.equal(h.applied.length, 1);
+});
+
+test('a rejected staged mutation still presents and finalizes an already requested personal list', async () => {
+  const h = harness();
+  const run = (await h.service.open(trusted, signal()))!;
+  await run.execute('personal_list', JSON.stringify({ kind: 'task' }), signal());
+  await run.execute(
+    'personal_apply',
+    JSON.stringify({ operations: [{ kind: 'task_create', source, text: 'fabricated text' }] }),
+    signal(),
+  );
+  const reply = (await run.finish(signal()))!;
+  assert.match(reply.text, /couldn't save/);
+  assert.match(reply.text, /1\. Check the quote/);
+  assert.deepEqual(h.finalized, [['saved-selection']]);
+  assert.equal(h.applied.length, 0);
+});
+
+test('unrelated conditional read requests do not block an ordinary reminder', async () => {
+  for (const text of [
+    'Remind me in 20 minutes to call Acme. Also check if Acme has an open deal.',
+    'Remind me in 20 minutes to call Acme and check if Acme has an open deal.',
+    'Remind me in 20 minutes to call Acme; please check if Acme has an open deal.',
+    'Remind me in 20 minutes to call Acme. Also tell me if the warehouse is available.',
+    'Check if Acme has an open deal. Also remind me in 20 minutes to call Acme.',
+  ]) {
+    const h = harness();
+    const run = (await h.service.open(
+      { ...trusted, commandMessages: [{ id: 'm', text, receivedAtMs: now, forwarded: false }] },
+      signal(),
+    ))!;
+    const output = await run.execute(
+      'personal_apply',
+      JSON.stringify({
+        operations: [
+          {
+            kind: 'reminder_create',
+            source: { messageId: 'm', quote: text },
+            text: 'call Acme',
+            time: { afterMinutes: 20 },
+          },
+        ],
+      }),
+      signal(),
+    );
+    assert.equal(output.ok, true, text);
+    assert.match((await run.finish(signal()))!.text, /Saved reminder: call Acme/);
+  }
+});
+
+test('separate-sentence conditions, shortened source quotes, and conditions hidden in reminder text stay blocked', async () => {
+  for (const text of [
+    'Remind me in 20 minutes to call Acme if the deal is open.',
+    'Remind me in 20 minutes to call Acme. Only if the deal is open.',
+    'Remind me in 20 minutes to call Acme. Also check if the deal is open before sending the reminder.',
+    'Remind me in 20 minutes to call Acme. Also check if the deal is open; only then send it.',
+  ]) {
+    const h = harness();
+    const run = (await h.service.open(
+      { ...trusted, commandMessages: [{ id: 'm', text, receivedAtMs: now, forwarded: false }] },
+      signal(),
+    ))!;
+    const output = await run.execute(
+      'personal_apply',
+      JSON.stringify({
+        operations: [
+          {
+            kind: 'reminder_create',
+            source: { messageId: 'm', quote: 'Remind me in 20 minutes to call Acme' },
+            text: text.startsWith('Remind me in 20 minutes to call Acme if')
+              ? 'call Acme if the deal is open'
+              : 'call Acme',
+            time: { afterMinutes: 20 },
+          },
+        ],
+      }),
+      signal(),
+    );
+    assert.equal(output.code, 'CONDITIONAL_REMINDERS_UNAVAILABLE', text);
+    assert.equal(h.applied.length, 0);
+  }
+});
+
+test('a model cannot turn a condition into content by copying an unrelated check-if clause', async () => {
+  for (const text of [
+    'Check if Acme signed before reminding me. Remind me in 20 minutes to call Acme.',
+    'Remind me in 20 minutes to check if Acme signed before reminding me.',
+  ]) {
+    const h = harness();
+    const run = (await h.service.open(
+      { ...trusted, commandMessages: [{ id: 'm', text, receivedAtMs: now, forwarded: false }] },
+      signal(),
+    ))!;
+    const output = await run.execute(
+      'personal_apply',
+      JSON.stringify({
+        operations: [
+          {
+            kind: 'reminder_create',
+            source: { messageId: 'm', quote: text },
+            text: text.startsWith('Check')
+              ? 'Check if Acme signed before reminding me'
+              : 'check if Acme signed before reminding me',
+            time: { afterMinutes: 20 },
+          },
+        ],
+      }),
+      signal(),
+    );
+    assert.equal(output.code, 'CONDITIONAL_REMINDERS_UNAVAILABLE');
+    assert.equal(h.applied.length, 0);
+  }
 });
 
 test('ordinal changes resolve the previous presented selection and use its observed version', async () => {

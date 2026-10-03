@@ -49,17 +49,29 @@ export class OpenAITextModel implements TextModel {
     }));
     const pending = new Set<string>();
     return {
-      next: async (remainingCalls, signal) => {
+      next: async (remainingCalls, signal, allowedToolNames) => {
         signal.throwIfAborted();
         if (pending.size) throw new Error('Tool outputs required before continuation');
         try {
+          // Retain the catalogue for prompt caching, but restrict calls on every continuation.
+          // Intersect with the original catalogue so this parameter cannot grant a new tool.
+          const allowed = tools.filter((tool) => allowedToolNames?.includes(tool.name) ?? true);
           const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
             model: this.config.model,
             service_tier: 'default',
             instructions: `${request.instructions}\nRemaining tool-call budget: ${remainingCalls}. If zero, give an honest answer from the evidence already retrieved and state any remaining limitation.`,
             input,
             tools,
-            tool_choice: remainingCalls > 0 ? 'auto' : 'none',
+            tool_choice:
+              remainingCalls <= 0 || !allowed.length
+                ? 'none'
+                : allowed.length === tools.length
+                  ? 'auto'
+                  : {
+                      type: 'allowed_tools',
+                      mode: 'auto',
+                      tools: allowed.map(({ name }) => ({ type: 'function', name })),
+                    },
             parallel_tool_calls: false,
             store: false,
             reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },

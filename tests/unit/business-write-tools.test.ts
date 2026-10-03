@@ -99,11 +99,14 @@ function harness() {
   const calls: Array<{ tool: string; args: Record<string, unknown>; operationId: string }> = [];
   const proposals: WriteOperation[] = [];
   let definitions = [create, rollback, crm].map((t) => structuredClone(t));
+  let currentActor = { ...actor };
   let allowed = true,
     capture = false,
-    unknown = false;
+    unknown = false,
+    discoveryUnavailable = false;
   let approveCount = 0,
-    publishCount = 0;
+    publishCount = 0,
+    discoveryCount = 0;
   const owned = (a: WriteActor, id: string) => {
     const op = operations.get(id);
     return op &&
@@ -197,7 +200,15 @@ function harness() {
             : 'REJECTED',
       );
     },
-    async cancel(_ctx, id) {
+    async cancel(ctx, id, expectedVersion) {
+      const operation = owned(ctx, id);
+      if (!operation || operation.version !== expectedVersion)
+        throw new WriteStorageError('WRITE_STATE_CONFLICT');
+      if (
+        !['DRAFT', 'PROPOSED', 'APPROVED'].includes(operation.state) ||
+        operation.hasUncertainAttempt
+      )
+        throw new WriteStorageError('WRITE_CANNOT_CANCEL_DISPATCHED');
       return transition(id, 'CANCELLED');
     },
     async receiptLookup(a, id) {
@@ -214,11 +225,17 @@ function harness() {
     },
   };
   const writer: BoundContextWriter = {
-    employeeId: actor.employeeId,
+    get employeeId() {
+      return currentActor.employeeId;
+    },
     async discover() {
+      discoveryCount++;
+      if (discoveryUnavailable) throw new Error('Synthetic discovery outage');
       return structuredClone(definitions);
     },
     async describe() {
+      discoveryCount++;
+      if (discoveryUnavailable) throw new Error('Synthetic discovery outage');
       return { tools: structuredClone(definitions), context: {} };
     },
     async call(name, args, operationId) {
@@ -233,7 +250,7 @@ function harness() {
   };
   const service = new BusinessWriteService(
     repository,
-    async () => (allowed ? { actor, writer } : null),
+    async () => (allowed ? { actor: { ...currentActor }, writer } : null),
     () => now,
   );
   function trusted(
@@ -272,7 +289,7 @@ function harness() {
     proposals,
     repository,
     sources,
-    counts: () => ({ approveCount, publishCount }),
+    counts: () => ({ approveCount, publishCount, discoveryCount }),
     revoke: () => {
       allowed = false;
     },
@@ -284,6 +301,12 @@ function harness() {
     },
     changeDefinitions: (next: ContextToolDefinition[]) => {
       definitions = structuredClone(next);
+    },
+    failDiscovery: () => {
+      discoveryUnavailable = true;
+    },
+    changeActor: (next: WriteActor) => {
+      currentActor = { ...next };
     },
   };
 }
@@ -316,6 +339,99 @@ test('a later exact direct text confirmation dispatches frozen arguments once', 
   assert.deepEqual(h.calls[0]!.args, operation.payload.arguments);
   await h.service.recover(confirmation, signal());
   assert.equal(h.calls.length, 1);
+});
+
+for (const unavailable of ['empty catalogue', 'discovery outage'] as const) {
+  test(`local cancellation and its receipt remain available during ${unavailable}`, async () => {
+    const h = harness();
+    const { operation, reply: proposal } = await h.proposed();
+    if (unavailable === 'empty catalogue') h.changeDefinitions([]);
+    else h.failDiscovery();
+    const before = h.counts().discoveryCount;
+    const command = h.trusted('cancel ABCDEF12');
+    const reply = await h.service.recover(command, signal());
+    assert.ok(reply);
+    assert.match(reply.text, /cancelled/i);
+    assert.equal(h.operations.get(operation.operationId)!.state, 'CANCELLED');
+    assert.equal(reply.delivery.localCancellation, true);
+    assert.deepEqual(reply.delivery.tools, []);
+    assert.deepEqual(reply.delivery.toolContracts, {});
+    assert.deepEqual(reply.delivery.operations, [
+      { id: operation.operationId, version: h.operations.get(operation.operationId)!.version },
+    ]);
+    assert.doesNotMatch(JSON.stringify(reply), /Example|create_example|arguments|summary/);
+    assert.equal(await h.service.canDeliver(command.key, reply.delivery, signal()), true);
+    const repeated = await h.service.recover(command, signal());
+    assert.match(repeated!.text, /cancelled/i);
+    assert.deepEqual(repeated!.delivery.operations, reply.delivery.operations);
+    assert.equal(h.counts().discoveryCount, before);
+    assert.equal(await h.service.canDeliver(command.key, proposal.delivery, signal()), false);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.counts().approveCount, 0);
+  });
+}
+
+test('local cancellation remains actor-bound and cannot authorize delivery of a pending proposal', async () => {
+  const h = harness();
+  const { operation, reply: proposal } = await h.proposed();
+  const command = h.trusted('cancel ABCDEF12');
+  h.changeDefinitions([]);
+  const forged = {
+    ...proposal.delivery,
+    localCancellation: true,
+    tools: [],
+    toolContracts: {},
+  };
+  assert.equal(await h.service.canDeliver(command.key, forged, signal()), false);
+  h.changeActor({ ...actor, employeeId: actor.employeeId + 1 });
+  const denied = await h.service.recover(command, signal());
+  assert.match(denied!.text, /could not find/i);
+  assert.deepEqual(denied!.delivery.operations, []);
+  assert.equal(h.operations.get(operation.operationId)!.state, 'PROPOSED');
+  h.changeActor(actor);
+  const cancelled = await h.service.recover(command, signal());
+  assert.ok(cancelled);
+  assert.equal(
+    await h.service.canDeliver(
+      command.key,
+      { ...cancelled.delivery, tools: [create.name] },
+      signal(),
+    ),
+    false,
+  );
+  assert.equal(
+    await h.service.canDeliver(
+      command.key,
+      {
+        ...cancelled.delivery,
+        operations: [
+          { id: operation.operationId, version: proposal.delivery.operations[0]!.version },
+        ],
+      },
+      signal(),
+    ),
+    false,
+  );
+  h.changeActor({ ...actor, employeeId: actor.employeeId + 1 });
+  assert.equal(await h.service.canDeliver(command.key, cancelled.delivery, signal()), false);
+  h.revoke();
+  assert.equal(await h.service.recover(command, signal()), undefined);
+  assert.equal(h.calls.length, 0);
+});
+
+test('restoring remote tools cannot confirm a locally cancelled proposal', async () => {
+  const h = harness();
+  const { operation } = await h.proposed();
+  h.changeDefinitions([]);
+  await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  h.changeDefinitions([create, rollback, crm]);
+  for (const action of ['confirm', 'retry']) {
+    const reply = await h.service.recover(h.trusted(`${action} ABCDEF12`), signal());
+    assert.match(reply!.text, /cancelled/i);
+  }
+  assert.equal(h.operations.get(operation.operationId)!.state, 'CANCELLED');
+  assert.equal(h.counts().approveCount, 0);
+  assert.equal(h.calls.length, 0);
 });
 
 test('delivery rechecks the exact current history policy, not just the tool name', async () => {

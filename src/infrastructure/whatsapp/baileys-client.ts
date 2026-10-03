@@ -129,12 +129,15 @@ export class BaileysClient {
       }),
       session.on('messages.upsert', (event) => {
         if (
-          event.type !== 'notify' ||
+          (event.type !== 'notify' && event.type !== 'append') ||
           !this.running ||
           this.session !== session ||
           replies.signal.aborted
         )
           return;
+        // Baileys emits recent offline deliveries as append, not notify. Both must
+        // reach the existing age, self-message and persistent deduplication checks.
+        // Historical sync uses messaging-history.set, which is not consumed here.
         // A single chain preserves order across batches; no unobserved async event work.
         for (const message of event.messages) {
           const admitted = this.messages.push(

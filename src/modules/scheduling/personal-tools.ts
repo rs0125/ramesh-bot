@@ -26,6 +26,7 @@ export interface PersonalRepositoryPort {
   applyBatch(
     context: PersonalCommandContext,
     operations: PersonalOperation[],
+    selectionIds?: string[],
   ): Promise<PersonalCommandReceipt>;
   list(
     actor: PersonalActor,
@@ -355,26 +356,33 @@ export class PersonalToolRun {
   }
   /** Deterministic material for review. Persistence is never claimed before finish commits. */
   preview(): string | undefined {
+    const lists = [...this.lists].map(([kind, result]) => renderList(kind, result)).join('\n\n');
     if (this.staged)
-      return `Pending personal changes, subject to verification and commit:\n${this.staged.operations
-        .map((operation) => {
-          const content = 'text' in operation ? operation.text : undefined;
-          const text = content
-            ? `: ${content.length > 280 ? content.slice(0, 277) + '...' : content}`
-            : '';
-          const time =
-            'schedule' in operation
-              ? `; ${formatIst(operation.schedule.dueAt)}`
-              : 'dueAt' in operation
-                ? `; ${formatIst(operation.dueAt)}`
-                : '';
-          return `${operation.kind}${text}${time}`;
-        })
-        .join('\n')}`;
+      return [
+        `Pending personal changes, subject to verification and commit:\n${this.staged.operations
+          .map((operation) => {
+            const content = 'text' in operation ? operation.text : undefined;
+            const text = content
+              ? `: ${content.length > 280 ? content.slice(0, 277) + '...' : content}`
+              : '';
+            const time =
+              'schedule' in operation
+                ? `; ${formatIst(operation.schedule.dueAt)}`
+                : 'dueAt' in operation
+                  ? `; ${formatIst(operation.dueAt)}`
+                  : '';
+            return `${operation.kind}${text}${time}`;
+          })
+          .join('\n')}`,
+        lists,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
     if (this.stagingFailure || (!this.lists.size && this.failures.length))
-      return renderFailure(this.stagingFailure ?? this.failures.at(-1)!.code);
-    if (this.lists.size)
-      return [...this.lists].map(([kind, result]) => renderList(kind, result)).join('\n\n');
+      return [renderFailure(this.stagingFailure ?? this.failures.at(-1)!.code), lists]
+        .filter(Boolean)
+        .join('\n\n');
+    if (this.lists.size) return lists;
     if (this.recalledRecords)
       return renderList(this.recalledRecords.kind, {
         records: this.recalledRecords.records,
@@ -428,7 +436,7 @@ export class PersonalToolRun {
     const receipt = await this.repository.getReceipt(this.command);
     await this.authorize(signal);
     return receipt
-      ? { text: renderReceipt(receipt), delivery: this.delivery({ commandId: receipt.commandId }) }
+      ? { text: renderReceipt(receipt), delivery: this.receiptDelivery(receipt) }
       : undefined;
   }
   async execute(
@@ -519,17 +527,9 @@ export class PersonalToolRun {
             : undefined;
         if ('text' in proposal && proposal.text !== undefined && !textMember)
           throw new SchedulingError('TEXT_MUST_BE_USER_AUTHORED');
-        // Inspect the scheduling instruction, not a condition inside the requested reminder
-        // text: "remind me tomorrow to check if the owner replied" is an ordinary reminder.
-        const instruction =
-          'text' in proposal && proposal.text
-            ? member.text.replace(proposal.text, '')
-            : member.text;
         if (
           ['reminder_create', 'reminder_reschedule'].includes(proposal.kind) &&
-          /\b(if|unless|provided that|only when)\b|\bremind\s+me\s+when\b|अगर|यदि|जब/iu.test(
-            instruction,
-          )
+          hasReminderCondition(member.text, 'text' in proposal ? proposal.text : undefined)
         )
           throw new SchedulingError('CONDITIONAL_REMINDERS_UNAVAILABLE');
         const target =
@@ -669,29 +669,31 @@ export class PersonalToolRun {
   async finish(signal: AbortSignal): Promise<PersonalReply | undefined> {
     if (!this.hasResult) return undefined;
     await this.authorize(signal);
-    if (this.stagingFailure || (!this.staged && !this.lists.size && !this.recalledRecords))
-      return {
-        text: renderFailure(this.stagingFailure ?? this.failures.at(-1)!.code),
-        delivery: this.delivery(),
-      };
+    let failure = this.stagingFailure;
     if (this.staged) {
       // The repository fences the original inbound lease and commits every mutation with its receipt.
-      let receipt: PersonalCommandReceipt;
+      let receipt: PersonalCommandReceipt | undefined;
       try {
-        receipt = await this.repository.applyBatch(this.command, this.staged.operations);
+        receipt = await this.repository.applyBatch(
+          this.command,
+          this.staged.operations,
+          [...this.lists.values()].map((result) => result.selectionId),
+        );
       } catch (error) {
         // Domain rejection is a rolled-back transaction. An unknown connection/commit error
         // remains uncertain and must retain the normal durable-receipt recovery path.
         if (!(error instanceof SchedulingError)) throw error;
         await this.authorize(signal);
-        return { text: renderFailure(error.code), delivery: this.delivery() };
+        failure = error.code;
       }
       await this.authorize(signal);
-      return {
-        text: renderReceipt(receipt),
-        delivery: this.delivery({ commandId: receipt.commandId }),
-      };
+      if (receipt) return { text: renderReceipt(receipt), delivery: this.receiptDelivery(receipt) };
     }
+    if (!this.lists.size && (failure || !this.recalledRecords))
+      return {
+        text: renderFailure(failure ?? this.failures.at(-1)!.code),
+        delivery: this.delivery(),
+      };
     if (!this.lists.size && this.recalledRecords)
       return {
         text: this.preview()!,
@@ -699,7 +701,10 @@ export class PersonalToolRun {
           this.recalledRecords.selectionId ? { selectionId: this.recalledRecords.selectionId } : {},
         ),
       };
-    const text = [...this.lists].map(([kind, result]) => renderList(kind, result)).join('\n\n');
+    const text = [
+      ...(failure ? [renderFailure(failure)] : []),
+      ...[...this.lists].map(([kind, result]) => renderList(kind, result)),
+    ].join('\n\n');
     signal.throwIfAborted();
     await this.repository.finalizeSelections(
       this.command,
@@ -711,6 +716,62 @@ export class PersonalToolRun {
       delivery: this.delivery({ selectionId: [...this.lists.values()].at(-1)!.selectionId }),
     };
   }
+  private receiptDelivery(receipt: PersonalCommandReceipt): PersonalDelivery {
+    const selectionId = receipt.lists?.at(-1)?.result.selectionId;
+    return this.delivery({ commandId: receipt.commandId, ...(selectionId ? { selectionId } : {}) });
+  }
+}
+
+/** Inspect the complete trusted instruction; a model-selected quote cannot hide a condition. */
+function hasReminderCondition(message: string, reminderText?: string): boolean {
+  // Exclude only clearly separate read requests. A clause that mentions reminder delivery,
+  // including "also check if X before reminding me", remains part of the schedule decision.
+  const clauses = message.split(
+    /(?<=[.!?;\n])\s+|\s+(?:and\s+also|also|and|plus)\s+(?=(?:please\s+)?(?:check|show|list|find|compare|summari[sz]e|tell|search|look\s+up)\b)/iu,
+  );
+  const scheduleReference =
+    /\b(?:remind\w*|notification\w*|schedule\w*|reschedule\w*|snooz\w*|send|deliver|alert\w*|notify|ping)\b|याद|रिमाइंड/iu;
+  const independentSchedule = clauses.some((clause) =>
+    /^(?:also|and|separately)\s+(?:please\s+)?(?:remind|set|schedule|reschedule|snooze)\b/iu.test(
+      clause.trim(),
+    ),
+  );
+  const instruction = clauses
+    .filter((clause, index) => {
+      const separateRead =
+        /^(?:(?:also|and|plus|then)\s+)?(?:please\s+)?(?:check|show|list|find|compare|summari[sz]e|tell|search|look\s+up)\b/iu.test(
+          clause.trim(),
+        );
+      return (
+        (index === 0 && !independentSchedule) || !separateRead || scheduleReference.test(clause)
+      );
+    })
+    .map((clause) => {
+      if (!reminderText || scheduleReference.test(reminderText)) return clause;
+      const contentAt = clause.indexOf(reminderText);
+      // A user-authored substring elsewhere in the message is not necessarily reminder
+      // content. Require it to follow the actual reminder instruction before masking if.
+      if (
+        contentAt < 0 ||
+        !/\b(?:remind\s+me|(?:set|schedule)\s+(?:a\s+)?reminder)\b[\s\S]*\b(?:to|about)\s*$/iu.test(
+          clause.slice(0, contentAt),
+        )
+      )
+        return clause;
+      return clause.replace(
+        reminderText,
+        reminderText.replace(
+          /\b(check|see|find\s+out|ask|confirm|verify|determine)\s+if\b/giu,
+          '$1 whether',
+        ),
+      );
+    })
+    .join(' ');
+  // Only an explicit check inside the requested reminder content is ordinary prose.
+  // Removing the entire model-chosen text would let it hide "call Acme if X" in that field.
+  return /\b(if|unless|provided that|only when|only then)\b|\bremind\s+me\s+when\b|अगर|यदि|जब/iu.test(
+    instruction,
+  );
 }
 
 function renderFailure(code: string): string {

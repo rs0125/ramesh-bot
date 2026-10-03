@@ -32,6 +32,13 @@ and message ID. This is not a read/played receipt, a model response or a busines
 authorization decision. Do not acknowledge failed persistence, self messages or
 unadmitted history. Persisted duplicates can be acknowledged again.
 
+Admit both `messages.upsert` kinds (`notify` and `append`). The pinned Baileys
+version emits messages received while offline as `append`, including new requests
+sent during a reconnect. Apply the same timestamp, sender, group-mention and
+persistent deduplication checks to both kinds. Stale deliveries may be archived as
+observed context but must not start a reply; the separate `messaging-history.set`
+event is not ingested. Self messages and protocol events remain excluded.
+
 Receipt dispatch must be bounded and must not hold up admission of the next item
 in a forwarded burst. Receipt failures must not change a saved queue job into a
 persistence failure. Keep error logs free of message content, JIDs and credentials.
