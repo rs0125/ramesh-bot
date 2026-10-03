@@ -1,9 +1,12 @@
 /** Exact Gmail draft previews and receipts. The application owns the outgoing link. */
 import { z } from 'zod';
+import type { ContextToolDefinition } from '../context-engine/context.types.js';
+import { gmailWriteRecoverySchema, writeContract } from '../context-engine/write-contract.js';
 import type { WriteOperation } from './write.types.js';
 
 const draftSubject = z
   .string()
+  .trim()
   .min(1)
   .max(200)
   .refine((value) => value.trim().length > 0 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value));
@@ -30,6 +33,23 @@ const draftArguments = z
       .refine((value) => !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= 20000),
   })
   .strict();
+
+/** Match CE's normalization before arguments are frozen and the user reviews them. */
+export function normalizeMailDraftArguments(
+  tool: ContextToolDefinition,
+  args: Record<string, unknown>,
+) {
+  const contract = writeContract(tool);
+  if (
+    tool.name !== 'create_email_draft' ||
+    contract?.sourceFamily !== 'mail' ||
+    contract.effect !== 'create' ||
+    contract.idempotencyArgument !== 'operation_id'
+  )
+    return args;
+  const parsed = draftArguments.omit({ operation_id: true }).safeParse(args);
+  return parsed.success ? { ...args, subject: parsed.data.subject } : args;
+}
 const draftReceipt = z
   .object({
     draft_ref: z.string().uuid(),
@@ -64,7 +84,10 @@ export function mailDraftProposalText(operation: WriteOperation): string | undef
 }
 
 /** Public recovery guidance uses state and allowlisted codes, never stored mail content or provider prose. */
-export function mailDraftRecoveryText(operation: WriteOperation): string | undefined {
+export function mailDraftRecoveryText(
+  operation: WriteOperation,
+  now = Date.now(),
+): string | undefined {
   if (
     operation.payload.toolName !== 'create_email_draft' ||
     operation.payload.sourceFamily !== 'mail' ||
@@ -76,17 +99,43 @@ export function mailDraftRecoveryText(operation: WriteOperation): string | undef
   )
     return undefined;
   const code = operation.confirmationCode;
+  const recovery = gmailWriteRecoverySchema.safeParse(operation.result?.recovery);
+  const retry = z.string().datetime().safeParse(operation.result?.retry_at);
+  const retryAt = retry.success ? Date.parse(retry.data) : undefined;
+  const when = (time: number) =>
+    new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      dateStyle: 'medium',
+      timeStyle: 'medium',
+    }).format(new Date(time)) + ' (IST)';
   // An earlier ambiguous attempt takes precedence over any later definite failure.
   if (
     operation.hasUncertainAttempt ||
     operation.state === 'UNKNOWN' ||
     operation.state === 'DISPATCHING' ||
     operation.result?.outcome === 'outcome_unknown'
-  )
-    return `I cannot yet confirm whether this draft was saved. Check Gmail Drafts, then reply retry ${code} to check the same operation. Do not create a replacement while its outcome is uncertain.`;
+  ) {
+    const repair = !recovery.success
+      ? ''
+      : recovery.data.action === 'finish_gmail_disconnect'
+        ? ' Ask me for the Gmail connection page, finish disconnecting there, then reconnect the same Google account.'
+        : recovery.data.action === 'check_gmail_connection'
+          ? ' Ask me to check the Gmail connection and restore access to the same Google account.'
+          : ' Ask me for the Gmail connection link and reconnect the same Google account.';
+    const wait =
+      retryAt !== undefined && retryAt > now ? ` Wait until ${when(retryAt)} before retrying.` : '';
+    const expiresAt = Date.parse(operation.expiresAt);
+    if (expiresAt <= now)
+      return `I cannot yet confirm whether this draft was saved.${repair} This approval has expired, so its code cannot make another draft-creation attempt. Check Gmail Drafts directly; automatic recovery of this operation is unavailable after expiry. Do not create a replacement while its outcome is uncertain.`;
+    if (retryAt !== undefined && Number.isFinite(expiresAt) && retryAt >= expiresAt)
+      return `I cannot yet confirm whether this draft was saved.${repair} Gmail's retry time is ${when(retryAt)}, after this approval expires at ${when(expiresAt)}. Check Gmail Drafts directly; this code cannot retry after expiry. Do not create a replacement while its outcome is uncertain.`;
+    return `I cannot yet confirm whether this draft was saved.${repair}${wait} Check Gmail Drafts, then reply retry ${code} to check the same operation. Do not create a replacement while its outcome is uncertain.`;
+  }
   if (operation.state !== 'APPROVED' || operation.result?.outcome !== 'not_dispatched')
     return undefined;
   switch (operation.result.code) {
+    case 'GMAIL_APPROVAL_EXPIRED':
+      return `This attempt did not create a draft because its approval expired. Reply cancel ${code}, then ask for a fresh reviewed draft proposal.`;
     case 'GMAIL_CONNECTION_CHANGED':
       return `This attempt did not create a draft because your Gmail connection changed. Reply cancel ${code}, then ask me to check your Gmail connection and prepare a fresh draft proposal.`;
     case 'GMAIL_CONNECT_REQUIRED':
@@ -97,8 +146,15 @@ export function mailDraftRecoveryText(operation: WriteOperation): string | undef
     case 'GMAIL_REVOCATION_PENDING':
       return `This attempt did not create a draft. Gmail disconnect is still pending. Ask me for the Gmail connection page and finish disconnecting there before reconnecting. Then reply cancel ${code} and ask for a fresh draft proposal.`;
     case 'GMAIL_RATE_LIMITED':
-    case 'GMAIL_RETRY_LATER':
+    case 'GMAIL_RETRY_LATER': {
+      const expiresAt = Date.parse(operation.expiresAt);
+      if (retryAt !== undefined && Number.isFinite(expiresAt)) {
+        if (expiresAt <= now || retryAt >= expiresAt)
+          return `This attempt did not create a draft. Gmail allows another attempt after ${when(retryAt)}, but this approval ${expiresAt <= now ? 'expired' : 'expires'} at ${when(expiresAt)}. Reply cancel ${code}, then ask for a fresh draft proposal after the wait. The old approval will not be extended.`;
+        return `Gmail is temporarily limiting requests. This attempt did not create a draft. Reply retry ${code} after ${when(retryAt)} and before this approval expires at ${when(expiresAt)} to retry the same approved draft.`;
+      }
       return `Gmail is temporarily limiting requests. This attempt did not create a draft. Wait before replying retry ${code} to retry the same approved draft.`;
+    }
     case 'GMAIL_UNAVAILABLE':
     case 'GMAIL_OAUTH_UNAVAILABLE':
       return `Gmail is temporarily unavailable. This attempt did not create a draft. Reply retry ${code} after the service recovers to retry the same approved draft.`;

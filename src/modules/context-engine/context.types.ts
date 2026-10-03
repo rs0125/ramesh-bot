@@ -123,7 +123,12 @@ export class ContextEngineError extends Error {
         | 'correct_query'
         | 'check_engine_access'
         | 'retry_later'
-        | 'investigate_source_response';
+        | 'investigate_source_response'
+        | 'connect_gmail'
+        | 'reconnect_gmail'
+        | 'finish_gmail_disconnect'
+        | 'check_gmail_connection'
+        | 'check_gmail_draft';
     },
   ) {
     super(`Context Engine: ${code}`);
@@ -139,6 +144,13 @@ export const disconnectedContextCredentials: ContextCredentialResolver = {
 };
 
 /** Separate action port. Reads, evidence replay and delivery verification never call this port. */
+export type GmailWriteRecovery = {
+  action:
+    | 'connect_gmail'
+    | 'reconnect_gmail'
+    | 'finish_gmail_disconnect'
+    | 'check_gmail_connection';
+};
 export interface ContextWriteResult {
   operation_id: string;
   outcome:
@@ -151,6 +163,8 @@ export interface ContextWriteResult {
   code: string;
   message: string;
   data?: Record<string, unknown>;
+  recovery?: GmailWriteRecovery;
+  retry_at?: string;
   meta?: { toolName: string; argumentsSha256: string; employeeId: number };
 }
 export interface ContextWriteGateway {

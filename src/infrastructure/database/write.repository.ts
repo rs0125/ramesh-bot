@@ -658,6 +658,17 @@ export class WriteRepository implements WriteRepositoryPort {
       if (row.state === 'DISPATCHING' && row.dispatch_until.getTime() > Date.now()) return null;
       if (
         row.expires_at.getTime() <= Date.now() &&
+        ['UNKNOWN', 'DISPATCHING'].includes(row.state)
+      ) {
+        const payload = this.operation(row).payload;
+        // A lost quota-rejection response may look uncertain here while Gmail
+        // storage permits another POST. An expired mail approval cannot retry
+        // the write endpoint, even for apparent recovery. Keep uncertainty intact.
+        if (payload.toolName === 'create_email_draft' && payload.sourceFamily === 'mail')
+          return null;
+      }
+      if (
+        row.expires_at.getTime() <= Date.now() &&
         row.state === 'APPROVED' &&
         !row.has_uncertain_attempt
       ) {

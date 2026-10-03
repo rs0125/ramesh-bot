@@ -1,4 +1,5 @@
 /** Durable business intent. Actor, leases and confirmation sources are supplied by the runtime. */
+import type { GmailWriteRecovery } from '../context-engine/context.types.js';
 export type WriteState =
   | 'DRAFT'
   | 'PROPOSED'
@@ -48,6 +49,8 @@ export interface WriteAttemptResult {
   code: string;
   message: string;
   data?: unknown;
+  recovery?: GmailWriteRecovery;
+  retry_at?: string;
   meta?: unknown;
 }
 export interface WriteOperation extends WriteActor {

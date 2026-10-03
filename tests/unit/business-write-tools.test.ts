@@ -477,6 +477,67 @@ async function proposedMail() {
   return h;
 }
 
+test('a normalized Gmail subject is shown and frozen before a later confirmation dispatches it', async () => {
+  const h = harness();
+  h.changeDefinitions([draft]);
+  const run = (await h.service.open(h.trusted('Save this email draft.'), signal()))!;
+  const args = {
+    subject: '  Reviewed subject  ',
+    body: 'Exact body',
+    to: [],
+    cc: [],
+    connection_id: randomUUID(),
+    connection_version: 1,
+  };
+  assert.equal(
+    ((await run.execute(draft.name, JSON.stringify(args), signal())) as { ok: boolean }).ok,
+    true,
+  );
+  const preview = (await run.finalize(signal()))!;
+  assert.match(preview.text, /Subject: "Reviewed subject"/);
+  assert.match(preview.text, /confirm ABCDEF12/);
+  assert.equal(h.calls.length, 0);
+  const frozen = [...h.operations.values()][0]!.payload.arguments;
+  assert.equal(frozen.subject, 'Reviewed subject');
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(h.calls[0]!.args, frozen);
+});
+
+for (const earlierUncertainty of [false, true]) {
+  test(`Gmail approval expiry after a claim blocks the remote call and preserves prior uncertainty=${earlierUncertainty}`, async () => {
+    const h = await proposedMail();
+    if (earlierUncertainty) {
+      h.useResult({
+        outcome: 'outcome_unknown',
+        code: 'GMAIL_OUTCOME_UNKNOWN',
+        message: 'Unknown',
+      });
+      await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+    }
+    const claim = h.repository.claim;
+    h.repository.claim = async (...args) => {
+      const result = await claim(...args);
+      result!.operation.expiresAt = new Date(now - 1).toISOString();
+      h.operations.get(result!.operation.operationId)!.expiresAt = result!.operation.expiresAt;
+      return result;
+    };
+    const reply = (await h.service.recover(
+      h.trusted(`${earlierUncertainty ? 'retry' : 'confirm'} ABCDEF12`),
+      signal(),
+    ))!;
+    const saved = [...h.operations.values()][0]!;
+    assert.equal(h.calls.length, earlierUncertainty ? 1 : 0);
+    assert.equal(saved.result!.code, 'GMAIL_APPROVAL_EXPIRED');
+    assert.equal(saved.state, earlierUncertainty ? 'UNKNOWN' : 'APPROVED');
+    if (earlierUncertainty) {
+      assert.match(reply.text, /automatic recovery.*unavailable after expiry/);
+      assert.match(reply.text, /Do not create a replacement/);
+      assert.doesNotMatch(reply.text, /retry ABCDEF12|cancel ABCDEF12|fresh.*proposal/);
+    } else assert.match(reply.text, /approval expired.*fresh reviewed draft proposal/);
+  });
+}
+
 test('a changed Gmail connection after confirmation gives safe cancel-and-reprepare guidance without history access', async () => {
   const h = await proposedMail();
   h.useResult({

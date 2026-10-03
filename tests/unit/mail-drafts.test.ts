@@ -14,6 +14,7 @@ import {
   mailDraftProposalText,
   mailDraftRecoveryText,
   mailDraftResultText,
+  normalizeMailDraftArguments,
 } from '../../src/modules/writes/mail-draft-presentation.js';
 import type { WriteOperation } from '../../src/modules/writes/write.types.js';
 
@@ -80,7 +81,7 @@ function operation(): WriteOperation {
     deliveryMode: 'production',
     createdAt: '2026-10-04T06:00:00Z',
     updatedAt: '2026-10-04T06:01:00Z',
-    expiresAt: '2026-10-04T07:00:00Z',
+    expiresAt: new Date(Date.now() + 3600000).toISOString(),
     dispatchAttempts: 1,
     hasUncertainAttempt: false,
     result: {
@@ -308,6 +309,117 @@ test('earlier uncertainty always forbids replacing a mail draft despite a later 
   unknown.state = 'DISPATCHING';
   delete unknown.result;
   assert.match(mailDraftRecoveryText(unknown)!, /cannot yet confirm/);
+});
+
+test('uncertain mail recovery keeps the operation while exposing only structured connection repair actions', () => {
+  for (const action of [
+    'connect_gmail',
+    'reconnect_gmail',
+    'finish_gmail_disconnect',
+    'check_gmail_connection',
+  ] as const) {
+    const value = operation();
+    value.state = 'UNKNOWN';
+    value.hasUncertainAttempt = true;
+    value.result = {
+      operation_id: operationId,
+      outcome: 'outcome_unknown',
+      code: 'GMAIL_OUTCOME_UNKNOWN',
+      message: 'PRIVATE_PROVIDER_MESSAGE',
+      recovery: { action },
+    };
+    const text = mailDraftRecoveryText(value)!;
+    assert.match(text, /same Google account/);
+    assert.match(text, /retry ABCDEF12 to check the same operation/);
+    assert.match(text, /Do not create a replacement/);
+    if (action === 'finish_gmail_disconnect') assert.match(text, /finish disconnecting/);
+    assert.doesNotMatch(
+      text,
+      /did not create|cancel ABCDEF12|fresh draft|PRIVATE_PROVIDER|employee@example/,
+    );
+    Object.assign(value.result.recovery!, {
+      url: 'https://untrusted.example',
+      action: 'send_email',
+    });
+    assert.doesNotMatch(mailDraftRecoveryText(value)!, /untrusted|send_email|connection link/);
+  }
+});
+
+test('retry deadlines show IST timing and never extend expired or insufficient approval windows', () => {
+  const now = Date.parse('2026-10-04T06:00:00Z');
+  const value = operation();
+  value.state = 'APPROVED';
+  value.expiresAt = new Date(now + 3600000).toISOString();
+  value.result = {
+    operation_id: operationId,
+    outcome: 'not_dispatched',
+    code: 'GMAIL_RATE_LIMITED',
+    message: 'PRIVATE_PROVIDER_DELAY',
+    retry_at: new Date(now + 7200000).toISOString(),
+  };
+  const original = structuredClone(value);
+  const tooLate = mailDraftRecoveryText(value, now)!;
+  assert.match(tooLate, /approval expires.*IST/);
+  assert.match(tooLate, /cancel ABCDEF12.*fresh draft proposal after the wait/);
+  assert.match(tooLate, /will not be extended/);
+  assert.doesNotMatch(tooLate, /retry ABCDEF12|PRIVATE_PROVIDER/);
+  assert.deepEqual(value, original);
+  value.state = 'UNKNOWN';
+  value.hasUncertainAttempt = true;
+  const uncertain = mailDraftRecoveryText(value, now)!;
+  assert.match(uncertain, /after this approval expires.*Check Gmail Drafts directly/s);
+  assert.match(uncertain, /Do not create a replacement/);
+  assert.doesNotMatch(uncertain, /retry ABCDEF12|cancel ABCDEF12|fresh draft|did not create/);
+  value.state = 'APPROVED';
+  value.hasUncertainAttempt = false;
+  value.result.retry_at = new Date(now + 60000).toISOString();
+  assert.match(
+    mailDraftRecoveryText(value, now)!,
+    /retry ABCDEF12 after .*IST.*before this approval expires.*same approved draft/,
+  );
+  assert.match(mailDraftRecoveryText(value, now + 3600001)!, /approval expired/);
+  value.result.retry_at = 'not-a-date';
+  assert.match(mailDraftRecoveryText(value, now)!, /Wait before replying retry/);
+});
+
+test('expired uncertain mail approval stays unresolved and cannot invite another write attempt', () => {
+  const now = Date.now();
+  for (const state of ['UNKNOWN', 'DISPATCHING'] as const) {
+    const value = operation();
+    value.state = state;
+    value.hasUncertainAttempt = true;
+    value.expiresAt = new Date(now - 1000).toISOString();
+    value.result = {
+      operation_id: operationId,
+      outcome: 'not_dispatched',
+      code: 'GMAIL_APPROVAL_EXPIRED',
+      message: 'PRIVATE_PROVIDER_MESSAGE',
+      recovery: { action: 'reconnect_gmail' },
+    };
+    const text = mailDraftRecoveryText(value, now)!;
+    assert.match(text, /approval has expired.*automatic recovery.*unavailable after expiry/);
+    assert.match(text, /same Google account/);
+    assert.match(text, /Do not create a replacement/);
+    assert.doesNotMatch(
+      text,
+      /retry ABCDEF12|cancel ABCDEF12|did not create|fresh draft|PRIVATE_PROVIDER/,
+    );
+  }
+});
+
+test('mail subject normalization changes only a fully known create payload before freezing', () => {
+  const tool = descriptor(),
+    value = proposal();
+  const { operation_id: _operation, ...args } = value.payload.arguments;
+  args.subject = '  Approved subject  ';
+  const normalized = normalizeMailDraftArguments(tool, args);
+  assert.equal(normalized.subject, 'Approved subject');
+  assert.equal(args.subject, '  Approved subject  ');
+  value.payload.arguments = { ...normalized, operation_id: operationId };
+  assert.match(mailDraftProposalText(value)!, /Subject: "Approved subject"/);
+  const future = { ...args, attachments: ['unknown effect'] };
+  assert.equal(normalizeMailDraftArguments(tool, future), future);
+  assert.equal(normalizeMailDraftArguments({ ...tool, name: 'send_email' }, args), args);
 });
 
 test('unknown codes, unrelated operations, mismatched receipts and terminal states retain generic recovery', () => {

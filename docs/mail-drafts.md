@@ -33,11 +33,23 @@ required reconnect leads to connection-check and fresh-proposal instructions
 only when the service confirms no draft was created and there is no earlier
 uncertain attempt. Pending revocation directs the employee to finish disconnecting
 on the connection page before reconnecting. Definite rate-limit rejection keeps
-the same approved operation and
-asks the employee to retry its existing code later. An uncertain attempt always
+the same approved operation and shows the structured `retry_at` time in IST,
+alongside the original approval deadline. If the wait extends beyond that deadline,
+the employee must cancel and review a fresh proposal after the wait; approvals
+are never extended automatically. An uncertain attempt always
 takes precedence over later errors: check Gmail and recover the same operation,
-without creating a replacement. Provider error prose and stored email contents
-are never copied into these replies.
+without creating a replacement. Optional structured `recovery.action` can direct
+the employee to reconnect the same Google account or finish disconnecting while
+keeping the uncertain operation unchanged. Provider error prose and stored email
+contents are never copied into these replies.
+
+After an uncertain Gmail operation's approval expires, the journal refuses another
+dispatch claim and the service rechecks expiry immediately before any write call.
+Its state remains uncertain; it is not marked failed or safely cancelled. Automatic
+reconciliation through the create endpoint is unavailable after expiry because a
+lost quota-rejection response could otherwise authorize a new creation. The employee
+must inspect Gmail directly. A separate read-only reconciliation capability would
+be needed to automate recovery after expiry safely.
 
 The WhatsApp preview shows the complete To, CC, subject and plain-text body, with
 JSON escaping to preserve their exact contents, and says that this action saves
@@ -45,6 +57,8 @@ a draft without sending email. Only a validated, closed draft payload hides the
 technical connection and operation identifiers; unknown additional fields use
 the generic full-field preview. The connection remains frozen in the stored
 arguments and is checked again when the user confirms.
+Leading and trailing subject whitespace is normalized before the preview and
+stored proposal, matching Context Engine's eventual draft subject.
 
 The existing WhatsApp proposal budget remains 4,800 characters for the serialized
 arguments plus summary. Although Context Engine accepts bodies up to 12,000
@@ -85,6 +99,13 @@ uncertain creation must continue recovery of the same operation. Current content
 and permission are checked again before delivery.
 Retrieval timing stays in the standard `meta.generatedAt` envelope so a fresh
 check of unchanged content does not invalidate its delivery fingerprint.
+
+Read failures marked `error.domain=gmail` retain only allowlisted source codes
+and recovery actions. A mailbox reconnect does not invalidate Context Engine
+credentials or disable unrelated reads; `get_email_connection` remains available
+for its verified connection link. Employee and Context authorization failures
+still stop access. Structured read backoff supports up to 86,400 seconds without
+shortening the cooldown or exposing provider error prose.
 
 The success reply includes the application-owned fixed link
 `https://mail.google.com/mail/#drafts` and tells the user to choose the stated

@@ -209,6 +209,45 @@ test('model-free delivery rediscovery never sends a write', async () => {
   await client.describeWrites(sender);
   assert.equal(state.dispatched, 0);
 });
+test('bound write receipts preserve allowlisted recovery and absolute retry timing without replaying the action', async () => {
+  const { state, call } = fixture();
+  Object.assign(state.tool.outputSchema!.properties as object, {
+    recovery: object({
+      action: {
+        type: 'string',
+        enum: [
+          'connect_gmail',
+          'reconnect_gmail',
+          'finish_gmail_disconnect',
+          'check_gmail_connection',
+        ],
+      },
+    }),
+    retry_at: { type: 'string', format: 'date-time' },
+  });
+  state.mutate = (receipt) => {
+    receipt.outcome = 'outcome_unknown';
+    delete receipt.data;
+    receipt.recovery = { action: 'reconnect_gmail' };
+    receipt.retry_at = '2026-10-04T09:00:00.000Z';
+  };
+  const result = await call();
+  assert.equal(result.outcome, 'outcome_unknown');
+  assert.deepEqual(result.recovery, { action: 'reconnect_gmail' });
+  assert.equal(result.retry_at, '2026-10-04T09:00:00.000Z');
+  assert.equal(state.dispatched, 1);
+  state.mutate = (receipt) => {
+    receipt.outcome = 'outcome_unknown';
+    delete receipt.data;
+    Object.assign(receipt, {
+      recovery: { action: 'send_email', url: 'https://untrusted.example' },
+    });
+  };
+  const invalid = await call();
+  assert.equal(invalid.outcome, 'outcome_unknown');
+  assert.equal(invalid.recovery, undefined);
+  assert.doesNotMatch(JSON.stringify(invalid), /untrusted|send_email/);
+});
 for (const outcome of ['created', 'replayed', 'rolled_back'] as const)
   test(`accepts actor/request-bound ${outcome} exactly once`, async () => {
     const { state, call } = fixture();

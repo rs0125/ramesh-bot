@@ -482,7 +482,7 @@ export class ContextToolRun {
           attempt.failure = failure;
           const delay = error instanceof ContextEngineError ? error.retryAfterSeconds : undefined;
           if (delay !== undefined && Number.isFinite(delay) && delay >= 0)
-            attempt.retryAt = this.now() + Math.min(delay, 3600) * 1000;
+            attempt.retryAt = this.now() + Math.min(delay, 86400) * 1000;
           if (failure.retryable === true && attempt.retryAt !== undefined)
             this.cooldowns.set(tool, { until: attempt.retryAt, failure });
         }

@@ -13,6 +13,7 @@ import {
   mailDraftProposalText,
   mailDraftRecoveryText,
   mailDraftResultText,
+  normalizeMailDraftArguments,
 } from './mail-draft-presentation.js';
 import {
   WriteStorageError,
@@ -214,7 +215,7 @@ function recoverableText(
   definitions: readonly ContextToolDefinition[],
   now = Date.now(),
 ) {
-  const mailRecovery = mailDraftRecoveryText(operation);
+  const mailRecovery = mailDraftRecoveryText(operation, now);
   if (mailRecovery) return mailRecovery;
   if (
     definitions.some(
@@ -390,7 +391,8 @@ export class BusinessWriteService {
         return reply(
           complete.has(operation.state)
             ? recoverableText(operation, definitions, this.now())
-            : 'This operation is already being checked. Please wait before retrying.',
+            : (mailDraftRecoveryText(operation, this.now()) ??
+                'This operation is already being checked. Please wait before retrying.'),
           [operation],
         );
       }
@@ -421,6 +423,18 @@ export class BusinessWriteService {
               outcome: 'not_dispatched',
               code: 'TOOL_CHANGED',
               message: 'The live write contract changed.',
+            };
+          else if (
+            operation.payload.toolName === 'create_email_draft' &&
+            operation.payload.sourceFamily === 'mail' &&
+            Date.parse(operation.expiresAt) <= this.now()
+          )
+            result = {
+              operation_id: operation.operationId,
+              outcome: 'not_dispatched',
+              code: 'GMAIL_APPROVAL_EXPIRED',
+              message:
+                'No new Gmail creation was dispatched after approval expiry. Earlier uncertain attempts remain unresolved.',
             };
           else
             result = await current.writer.call(
@@ -599,7 +613,7 @@ export class BusinessWriteRun {
       this.calls++;
       if (Buffer.byteLength(rawArgs) > 16_384)
         throw new WriteStorageError('WRITE_ARGUMENTS_TOO_LARGE');
-      const args = JSON.parse(rawArgs) as Record<string, unknown>;
+      let args = JSON.parse(rawArgs) as Record<string, unknown>;
       const definition = this.tools.find((t) => t.name === name)!;
       if (!schemaAccepts(definition.inputSchema, args))
         throw new WriteStorageError('WRITE_ARGUMENTS_INVALID');
@@ -658,6 +672,7 @@ export class BusinessWriteRun {
       const contract = writeContract(tool)!;
       let ids = args._source_message_ids as string[] | undefined;
       delete args._source_message_ids;
+      args = normalizeMailDraftArguments(tool, args);
       const source = await this.repository.authorizeSource(this.command);
       const coordinates = (
         contract as typeof contract & {

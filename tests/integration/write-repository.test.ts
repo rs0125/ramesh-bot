@@ -813,6 +813,53 @@ test(
           );
         },
       );
+      for (const state of ['UNKNOWN', 'DISPATCHING'] as const) {
+        await t.test(`expired Gmail ${state} cannot claim again or erase uncertainty`, async () => {
+          const f = fixture(),
+            initial = await command(f, 'Prepare this Gmail draft');
+          const content = { ...payload(), toolName: 'create_email_draft', sourceFamily: 'mail' };
+          const draft = await f.repo.propose(initial.ctx, content);
+          const published = await f.repo.publish(initial.ctx, draft.operationId, draft.version);
+          await deliver(f, initial.job);
+          const confirmation = await command(f, `confirm ${published.confirmationCode}`);
+          const approved = await f.repo.approve(
+            confirmation.ctx,
+            published.operationId,
+            published.version,
+            published.confirmationCode,
+          );
+          const first = await f.repo.claim(
+            confirmation.ctx,
+            approved.operationId,
+            approved.version,
+          );
+          assert.ok(first);
+          const pending =
+            state === 'UNKNOWN'
+              ? await f.repo.finish(confirmation.ctx, approved.operationId, first.dispatchToken, {
+                  operation_id: approved.operationId,
+                  outcome: 'outcome_unknown',
+                  code: 'TIMEOUT',
+                  message: 'Unknown response',
+                })
+              : first.operation;
+          await db.admin.query(
+            `UPDATE public."ramesh-write-operations"
+            SET expires_at=clock_timestamp()-interval '1 second',
+              dispatch_until=CASE WHEN state='DISPATCHING' THEN clock_timestamp()-interval '1 second' ELSE dispatch_until END WHERE id=$1`,
+            [pending.operationId],
+          );
+          assert.equal(
+            await f.repo.claim(confirmation.ctx, pending.operationId, pending.version),
+            null,
+          );
+          const stored = (await f.repo.receiptLookup(actor, pending.operationId))!;
+          assert.equal(stored.state, state);
+          assert.equal(stored.version, pending.version);
+          assert.equal(stored.dispatchAttempts, pending.dispatchAttempts);
+          assert.equal(stored.hasUncertainAttempt, pending.hasUncertainAttempt);
+        });
+      }
       await t.test(
         'personal edits audit exact before and after, including linked cancellation, with no replay duplicate',
         async () => {

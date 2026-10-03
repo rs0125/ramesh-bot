@@ -56,6 +56,16 @@ export const writeBindingSchema = z
     employeeId: z.number().int().positive().safe(),
   })
   .strict();
+export const gmailWriteRecoverySchema = z
+  .object({
+    action: z.enum([
+      'connect_gmail',
+      'reconnect_gmail',
+      'finish_gmail_disconnect',
+      'check_gmail_connection',
+    ]),
+  })
+  .strict();
 export const writeResultSchema = z
   .object({
     operation_id: z.string().uuid(),
@@ -70,6 +80,8 @@ export const writeResultSchema = z
     code: z.string().regex(/^[A-Z][A-Z0-9_]{0,95}$/),
     message: z.string().min(1).max(2000),
     data: z.record(z.string(), z.unknown()).optional(),
+    recovery: gmailWriteRecoverySchema.optional(),
+    retry_at: z.string().datetime().optional(),
     meta: writeBindingSchema.optional(),
   })
   .strict();

@@ -74,7 +74,35 @@ function statusError(status: number, retryAfter?: number): ContextEngineError {
   if (status >= 500) return new ContextEngineError('UNAVAILABLE', true, retryAfter);
   return new ContextEngineError('INVALID_ARGUMENTS');
 }
-function evidence(result: CallToolResult): ContextEvidence {
+const gmailReadTools = new Set(['get_email_connection', 'list_email_drafts', 'read_email_draft']);
+// Only authenticated, explicitly marked mailbox failures can bypass global
+// employee-auth handling. Employee/key errors are deliberately absent here.
+const gmailReadRecovery: Record<
+  string,
+  { action: NonNullable<ContextEngineError['recovery']>['action']; retryable: boolean }
+> = {
+  GMAIL_CONNECT_REQUIRED: { action: 'connect_gmail', retryable: false },
+  GMAIL_RECONNECT_REQUIRED: { action: 'reconnect_gmail', retryable: false },
+  GMAIL_AUTH_REQUIRED: { action: 'reconnect_gmail', retryable: false },
+  GMAIL_REVOCATION_PENDING: { action: 'finish_gmail_disconnect', retryable: false },
+  GMAIL_CONNECTION_CHANGED: { action: 'check_gmail_connection', retryable: false },
+  GMAIL_DRAFT_UNAVAILABLE: { action: 'check_gmail_draft', retryable: false },
+  GMAIL_NOT_FOUND: { action: 'check_gmail_draft', retryable: false },
+  GMAIL_RESPONSE_TOO_LARGE: { action: 'check_gmail_draft', retryable: false },
+  GMAIL_INVALID_INPUT: { action: 'correct_query', retryable: false },
+  GMAIL_INVALID_CURSOR: { action: 'correct_query', retryable: false },
+  GMAIL_ACCESS_DENIED: { action: 'check_google_access', retryable: false },
+  GMAIL_CONFIGURATION: { action: 'check_source_configuration', retryable: false },
+  GMAIL_ENCRYPTION_CONFIGURATION: { action: 'check_source_configuration', retryable: false },
+  GMAIL_RATE_LIMITED: { action: 'retry_later', retryable: true },
+  GMAIL_TIMEOUT: { action: 'retry_later', retryable: true },
+  GMAIL_UNAVAILABLE: { action: 'retry_later', retryable: true },
+  GMAIL_OAUTH_UNAVAILABLE: { action: 'retry_later', retryable: true },
+  GMAIL_STORAGE_UNAVAILABLE: { action: 'retry_later', retryable: true },
+  GMAIL_ABORTED: { action: 'investigate_source_response', retryable: false },
+  GMAIL_RESPONSE_INVALID: { action: 'investigate_source_response', retryable: false },
+};
+function evidence(result: CallToolResult, toolName?: string): ContextEvidence {
   let value: unknown = result.structuredContent;
   if (!value) {
     const text = result.content?.find((part) => part.type === 'text');
@@ -88,7 +116,7 @@ function evidence(result: CallToolResult): ContextEvidence {
     const failure = z
       .object({
         status: z.number().int(),
-        retry_after_seconds: z.number().nonnegative().max(3600).optional(),
+        retry_after_seconds: z.number().nonnegative().max(86400).optional(),
         error: z.unknown().optional(),
       })
       .safeParse(value);
@@ -97,6 +125,7 @@ function evidence(result: CallToolResult): ContextEvidence {
     const details = z
       .object({
         code: z.string().regex(/^[A-Z_]{1,80}$/),
+        domain: z.literal('gmail').optional(),
         recovery: z.object({
           retryable: z.boolean(),
           action: z.enum([
@@ -107,11 +136,41 @@ function evidence(result: CallToolResult): ContextEvidence {
             'check_engine_access',
             'retry_later',
             'investigate_source_response',
+            'connect_gmail',
+            'reconnect_gmail',
+            'finish_gmail_disconnect',
+            'check_gmail_connection',
+            'check_gmail_draft',
           ]),
         }),
       })
       .safeParse(failure.data.error);
     const recovery = details.success ? details.data.recovery : undefined;
+    const mailbox =
+      details.success && details.data.domain === 'gmail' && gmailReadTools.has(toolName ?? '')
+        ? gmailReadRecovery[details.data.code]
+        : undefined;
+    if (
+      mailbox &&
+      details.success &&
+      recovery?.action === mailbox.action &&
+      recovery.retryable === mailbox.retryable
+    ) {
+      const code =
+        details.data.code === 'GMAIL_RATE_LIMITED'
+          ? 'RATE_LIMITED'
+          : details.data.code === 'GMAIL_RESPONSE_TOO_LARGE'
+            ? 'RESPONSE_TOO_LARGE'
+            : mailbox.action === 'correct_query'
+              ? 'INVALID_ARGUMENTS'
+              : 'UNAVAILABLE';
+      throw new ContextEngineError(
+        code,
+        mailbox.retryable,
+        mailbox.retryable ? failure.data.retry_after_seconds : undefined,
+        { sourceCode: details.data.code, action: mailbox.action },
+      );
+    }
     throw recovery
       ? new ContextEngineError(
           error.code,
@@ -140,7 +199,11 @@ async function callDiscoveredTool(
       { method: 'tools/call', params: { name: tool.name, arguments: args } },
       request,
     );
-    if (!result.isError && tool.outputSchema && !schemaAccepts(tool.outputSchema, evidence(result)))
+    if (
+      !result.isError &&
+      tool.outputSchema &&
+      !schemaAccepts(tool.outputSchema, evidence(result, tool.name))
+    )
       throw new ContextEngineError('INVALID_RESPONSE');
     return result;
   } catch (error) {
@@ -365,7 +428,7 @@ export class ContextEngineMcpClient implements ContextToolGateway, ContextWriteG
         if (Object.keys(frozen).length) throw new ContextEngineError('INVALID_ARGUMENTS');
         return context;
       }
-      return evidence(await callDiscoveredTool(client, tool, frozen, request));
+      return evidence(await callDiscoveredTool(client, tool, frozen, request), name);
     });
   }
 
@@ -457,7 +520,7 @@ export class ContextEngineMcpClient implements ContextToolGateway, ContextWriteG
             await response.body?.cancel();
             throw statusError(
               response.status,
-              Number.isFinite(delay) && delay >= 0 && delay <= 3600 ? delay : undefined,
+              Number.isFinite(delay) && delay >= 0 && delay <= 86400 ? delay : undefined,
             );
           }
           const reader = response.body?.getReader();
@@ -495,7 +558,10 @@ export class ContextEngineMcpClient implements ContextToolGateway, ContextWriteG
           tool.annotations.destructiveHint !== true,
       );
       if (!contextTool) throw new ContextEngineError('TOOL_UNAVAILABLE');
-      const context = evidence(await callDiscoveredTool(client, contextTool, {}, request));
+      const context = evidence(
+        await callDiscoveredTool(client, contextTool, {}, request),
+        'get_context',
+      );
       const current = identity.safeParse(context.data);
       if (!current.success) throw new ContextEngineError('INVALID_RESPONSE');
       if (current.data.employee_id !== grant.employeeId)
