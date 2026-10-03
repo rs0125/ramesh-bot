@@ -16,12 +16,19 @@ import { combinedTurn } from '../../modules/messaging/debounce.js';
 import { MediaService, mediaOwner } from '../../modules/media/media.service.js';
 import { toInboxCandidate } from './message.mapper.js';
 import { encodeReply, decodeReply } from '../../modules/messaging/reply-payload.js';
-import { renderVoiceReply, type VoiceReplyReference } from '../../modules/media/voice-reply.js';
+import {
+  MAX_REPLY_CHARACTERS,
+  renderVoiceReply,
+  type VoiceReplyReference,
+} from '../../modules/media/voice-reply.js';
 import { currentUsageScope, withUsageScope } from '../../modules/usage/usage-scope.js';
 import { cancellable } from '../../lib/cancellable.js';
 import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
 import { reminderEvidenceMatches } from '../../modules/scheduling/scheduler.service.js';
-import { getPersonalDelivery } from '../../modules/messaging/delivery-evidence.js';
+import {
+  getPersonalDelivery,
+  getWriteDelivery,
+} from '../../modules/messaging/delivery-evidence.js';
 
 export interface DurableMessageOptions {
   encryptionKey: string;
@@ -637,7 +644,7 @@ export class DurableMessages {
           await this.repository.complete(job, 'EXPIRED', 'message_too_old');
           return;
         }
-        if (!prepared.text.trim() || prepared.text.length > 16000) {
+        if (!prepared.text.trim() || prepared.text.length > MAX_REPLY_CHARACTERS) {
           await this.repository.complete(job, 'FAILED', 'invalid_generated_reply');
           report('error');
           return;
@@ -670,6 +677,7 @@ export class DurableMessages {
             new Date(),
             businessEvidence,
             personalCommandId,
+            getWriteDelivery(prepared.businessEvidence),
           )
         ) {
           if (prepared.onSent)
@@ -720,7 +728,11 @@ export class DurableMessages {
             );
           } else if (job.mediaPayload) throw new Error('UNEXPECTED_AUTOMATION_MEDIA');
         }
-        if (typeof reply !== 'string' || (!reply.trim() && !outgoingMedia) || reply.length > 16000)
+        if (
+          typeof reply !== 'string' ||
+          (!reply.trim() && !outgoingMedia) ||
+          reply.length > MAX_REPLY_CHARACTERS
+        )
           throw new Error('Invalid saved reply');
       } catch {
         await this.repository.complete(
@@ -763,7 +775,10 @@ export class DurableMessages {
             await this.repository.releaseUnsent(job, true);
             return;
           }
-          if (getPersonalDelivery(evidence)?.commandId) {
+          if (
+            getPersonalDelivery(evidence)?.commandId ||
+            getWriteDelivery(evidence)?.operations.length
+          ) {
             // The change is committed. Retain its exact protected confirmation for bounded
             // reauthorization retries; a generic retry invitation can create duplicates.
             await this.repository.releaseUnsent(job);

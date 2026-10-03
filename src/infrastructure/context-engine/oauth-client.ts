@@ -15,7 +15,7 @@ import {
 export const oauthScopesSchema = z
   .array(z.enum(CONTEXT_OAUTH_SCOPES))
   .min(1)
-  .max(3)
+  .max(CONTEXT_OAUTH_SCOPES.length)
   .refine((scopes) => new Set(scopes).size === scopes.length);
 export const oauthTokensSchema = z.object({
   accessToken: z.string().regex(/^wog_mcp_at_[A-Za-z0-9_-]{43}$/),

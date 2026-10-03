@@ -25,6 +25,8 @@ Forwarded content cannot itself authorize writes. A direct, fully retained voice
 
 Condition checks inspect the complete trusted scheduling instruction, not just the model's quoted substring. A separate request such as “Also check if Acme has an open deal” does not block an ordinary time-based reminder. Conditions attached to reminder delivery, including a later “only if” sentence, remain unsupported. Ordinary reminder content such as “check if the owner replied” is allowed; hiding a dispatch condition inside the proposed reminder text does not authorize it.
 
+Read clauses that control an earlier action remain part of the condition check, including “check if the deal is open, and only then do it” and “otherwise skip it”. Punctuation or replacing “reminder” with “it” does not authorize an unconditional schedule. Literal personal records also retain the user's wording: “review leverage ratios” is legitimate task text. Conversational style checks apply to generated prose; the semantic verifier still checks all requested actions, exact personal text, dates and permissions.
+
 ## Time and lifecycle
 
 Use `Asia/Kolkata` for interpretation/display and UTC instants in storage. Relative durations anchor to the specific trusted command member's admitted time, including debounced turns. A task can have a date-only deadline; that alone does not schedule a notification. There is no 24-hour reminder horizon.

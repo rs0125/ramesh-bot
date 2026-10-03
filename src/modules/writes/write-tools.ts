@@ -10,6 +10,11 @@ import type {
 import { argumentsSha256, canonicalJson, schemaAccepts } from '../context-engine/read-contract.js';
 import { contextWriteDescriptor, writeContract } from '../context-engine/write-contract.js';
 import {
+  mailDraftProposalText,
+  mailDraftRecoveryText,
+  mailDraftResultText,
+} from './mail-draft-presentation.js';
+import {
   WriteStorageError,
   type WriteActor,
   type WriteCommandContext,
@@ -147,7 +152,10 @@ function proposalText(operation: WriteOperation) {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(new Date(operation.expiresAt));
-  return `*Review this change*\n${operation.payload.summary}\n${lines.join('\n')}${original}\n\nNothing has been changed yet. Reply with exactly:\nconfirm ${operation.confirmationCode}\n\nOr cancel ${operation.confirmationCode}. Confirm before ${expires} (IST).`;
+  const preview =
+    mailDraftProposalText(operation) ??
+    `*Review this change*\n${operation.payload.summary}\n${lines.join('\n')}${original}`;
+  return `${preview}\n\nNothing has been changed yet. Reply with exactly:\nconfirm ${operation.confirmationCode}\n\nOr cancel ${operation.confirmationCode}. Confirm before ${expires} (IST).`;
 }
 function resultText(operation: WriteOperation, now = Date.now()) {
   const label = operation.payload.summary;
@@ -159,7 +167,10 @@ function resultText(operation: WriteOperation, now = Date.now()) {
         ? 'That proposal has expired. Please ask me to prepare a fresh one.'
         : proposalText(operation);
     case 'SUCCEEDED':
-      return `${operation.result?.outcome === 'rolled_back' || operation.payload.parentOperationId ? 'Reversed' : 'Saved'}: ${label}. The audit trail has been retained.`;
+      return (
+        mailDraftResultText(operation) ??
+        `${operation.result?.outcome === 'rolled_back' || operation.payload.parentOperationId ? 'Reversed' : 'Saved'}: ${label}. The audit trail has been retained.`
+      );
     case 'CANCELLED':
       return 'Cancelled that proposal. No business change was dispatched.';
     case 'EXPIRED':
@@ -203,6 +214,8 @@ function recoverableText(
   definitions: readonly ContextToolDefinition[],
   now = Date.now(),
 ) {
+  const mailRecovery = mailDraftRecoveryText(operation);
+  if (mailRecovery) return mailRecovery;
   if (
     definitions.some(
       (t) =>
@@ -531,7 +544,7 @@ export class BusinessWriteRun {
     this.tools = [
       ...definitions.map((tool) => ({
         name: tool.name,
-        description: `${tool.description ?? tool.name}\nSTAGE ONLY: prepares a reviewable proposal. Does not execute the business change. The application generates its operation ID. A later exact direct confirmation authorizes dispatch.`,
+        description: `${tool.description ?? tool.name}\nSTAGE ONLY: prepares a reviewable proposal. Does not execute the business change. The application generates its operation ID. A later exact direct confirmation authorizes dispatch. The serialized arguments and summary must fit the 4,800-character WhatsApp proposal budget. Longer content is rejected, never truncated; ask the user to shorten it.`,
         inputSchema: safeSchema(tool),
         annotations: {
           readOnlyHint: false,

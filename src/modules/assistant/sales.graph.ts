@@ -512,8 +512,9 @@ export function buildSalesGraph(
     })
     .addNode('verifier', async (value, config) => {
       const started = Date.now();
-      // Exact application-owned proposal arguments are not conversational record cards.
-      const prose = writes?.preview() ? value.supplement : value.reply;
+      // Exact user-authored personal records and application-owned write previews are
+      // data, not generated prose. Review their semantics below without rewriting literals.
+      const prose = personal?.preview() || writes?.preview() ? value.supplement : value.reply;
       const issues = [
         ...dealDisplayIssues(prose, run?.evidence ?? [], run?.internalCrmIds),
         ...chatLayoutIssues(prose),

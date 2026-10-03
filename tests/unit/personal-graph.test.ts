@@ -354,6 +354,22 @@ test('mixed advice survives composition alongside the exact committed personal r
   assert.equal(getPersonalDelivery(h.reply.businessEvidence)?.kind, 'personal');
 });
 
+test('generated stock phrasing still requires repair alongside an application-owned personal result', async () => {
+  const h = await scenario({
+    workflow: 'general',
+    supplement: 'Certainly, I would leverage the available options.',
+  });
+  assert.equal(h.reply.trace.outcome, 'unavailable');
+  assert.equal(h.applied.length, 0);
+  const reviews = h.requests.filter((request) => request.stage === 'verifier');
+  assert.ok(reviews.length > 0);
+  for (const review of reviews) {
+    const input = JSON.parse(review.messages[0]!.content);
+    assert.match(input.presentation_issues.join(' '), /stock wording/);
+    assert.match(input.answer, /Pending personal changes/);
+  }
+});
+
 test('mixed business answer has both authorities and business recall reveals only its business segment', async () => {
   const h = await scenario({ workflow: 'general', business: true, supplement: businessText });
   assert.equal(h.reply.trace.outcome, 'completed');

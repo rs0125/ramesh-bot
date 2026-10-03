@@ -283,6 +283,87 @@ test('personal tools work without CRM; task and long-future reminder commit once
   }
 });
 
+test('literal task text is not rewritten or rejected as assistant stock phrasing', async () => {
+  for (const taskText of ['review leverage ratios', 'Read the Great Question briefing']) {
+    const h = harness();
+    const instruction = `Add a task to ${taskText}.`;
+    const fake = fakeModel([
+      {
+        name: 'personal_apply',
+        args: {
+          operations: [
+            {
+              kind: 'task_create',
+              text: taskText,
+              source: { messageId: 'member-1', quote: instruction },
+            },
+          ],
+        },
+      },
+    ]);
+    const reply = await h
+      .assistant(fake.model)
+      .prepare({ ...message, text: instruction }, signal(), {
+        ...trusted,
+        commandMessages: [
+          { id: 'member-1', text: instruction, receivedAtMs: now, forwarded: false },
+        ],
+      });
+    assert.equal(reply.trace.outcome, 'completed');
+    assert.ok(reply.text.includes(`Saved task: ${taskText}`));
+    assert.equal(h.applied.length, 1);
+    assert.equal((h.applied[0]![0] as { text: string }).text, taskText);
+    const reviews = fake.requests.filter((request) => request.stage === 'verifier');
+    assert.equal(reviews.length, 1);
+    const reviewed = JSON.parse(reviews[0]!.messages[0]!.content);
+    assert.deepEqual(reviewed.presentation_issues, []);
+    assert.equal(reviewed.personal_proposal[0].text, taskText);
+    assert.ok(
+      reviewed.answer.includes(taskText),
+      'semantic review still sees the full literal request',
+    );
+  }
+});
+
+test('retrieved personal task labels retain literal wording without bypassing semantic review', async () => {
+  const h = harness();
+  const text = 'review leverage ratios';
+  h.setList([
+    {
+      kind: 'task',
+      id: 'literal-record',
+      text,
+      state: 'open',
+      version: 1,
+      createdAt: new Date(now).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+    },
+  ]);
+  const instruction = 'Show my tasks.';
+  const context = {
+    ...trusted,
+    commandMessages: [{ id: 'member-1', text: instruction, receivedAtMs: now, forwarded: false }],
+  };
+  const fake = fakeModel([{ name: 'personal_list', args: { kind: 'task' } }]);
+  const reply = await h
+    .assistant(fake.model)
+    .prepare({ ...message, text: instruction }, signal(), context);
+  assert.equal(reply.trace.outcome, 'completed');
+  assert.ok(reply.text.includes(text));
+  const review = JSON.parse(
+    fake.requests.find((request) => request.stage === 'verifier')!.messages[0]!.content,
+  );
+  assert.deepEqual(review.presentation_issues, []);
+  assert.ok(review.answer.includes(text));
+  assert.deepEqual(h.finalized, [['saved-selection']]);
+  const rejected = harness();
+  const invalid = await rejected
+    .assistant(fakeModel([{ name: 'personal_apply', args: batch }], [], false).model)
+    .prepare(message, signal(), trusted);
+  assert.equal(invalid.trace.outcome, 'unavailable');
+  assert.equal(rejected.applied.length, 0);
+});
+
 test('committed recovery returns the durable receipt without any model invocation or another write', async () => {
   const h = harness();
   const before = await h
@@ -690,6 +771,10 @@ test('separate-sentence conditions, shortened source quotes, and conditions hidd
     'Remind me in 20 minutes to call Acme. Only if the deal is open.',
     'Remind me in 20 minutes to call Acme. Also check if the deal is open before sending the reminder.',
     'Remind me in 20 minutes to call Acme. Also check if the deal is open; only then send it.',
+    'Remind me in 20 minutes to call Acme. Also check if the deal is open, and only then do it.',
+    'Remind me in 20 minutes to call Acme. Also check if the deal is open and then do that.',
+    'Remind me in 20 minutes to call Acme. Also check if the deal is open, otherwise skip it.',
+    'Remind me in 20 minutes to call Acme. Also check if the deal is open before proceeding with it.',
   ]) {
     const h = harness();
     const run = (await h.service.open(

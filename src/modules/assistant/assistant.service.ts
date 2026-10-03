@@ -153,8 +153,8 @@ export class AssistantService {
     }
     let personal: PersonalToolRun | undefined;
     let writes: BusinessWriteRun | undefined;
+    let recoveredWrite: BusinessWriteReply | undefined;
     try {
-      let recoveredWrite: BusinessWriteReply | undefined;
       let writeSignal: AbortSignal | undefined;
       if (!message.isGroup && trusted?.key.remoteJid === message.chatId) {
         // Confirmation and receipt recovery are application commands, never model tool calls.
@@ -187,12 +187,26 @@ export class AssistantService {
         });
       if (recovered) return finish({ text: recovered.text, businessEvidence: recovered.delivery });
       if (writeSignal && trusted) {
-        writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
+        try {
+          writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
+        } catch (error) {
+          if (error instanceof CheckpointError) throw error;
+          signal?.throwIfAborted();
+          // Optional write discovery must not disable independent personal/read/chat work.
+          // Exact confirmation commands were already handled by recover above.
+        }
         if (writes) bindUsageEmployee(writes.employeeId);
       }
     } catch (error) {
       if (error instanceof CheckpointError) throw error;
       signal?.throwIfAborted();
+      // A remote write may already have committed before unrelated personal recovery fails.
+      // Keep its durable receipt; handoff still requires any committed personal receipt too.
+      if (recoveredWrite)
+        return finish({
+          text: recoveredWrite.text,
+          businessEvidence: writeDeliveryBundle(recoveredWrite.delivery),
+        });
       trace.outcome = 'unavailable';
       trace.failureCode = 'RUN_FAILED';
       return finish({ text: UNAVAILABLE_REPLY });

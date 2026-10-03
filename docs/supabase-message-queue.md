@@ -93,6 +93,13 @@ Outbound `available_at` is a durable due time and the sender never claims a futu
 
 The reviewed handoff also checks for a committed personal mutation receipt. Such a run can finalize only its exact protected command confirmation, including a composite personal/business reply. A generic fallback is rejected and the original run retries within existing attempt/expiry bounds, recovering the receipt without repeating the mutation. A temporary delivery-authorization failure retains that confirmation for bounded retry rather than replacing it with a generic “try again” message.
 
+The same handoff protection applies to this run's published, approved,
+dispatched, cancelled and terminal business-write transitions. Each operation
+must have its current version and actor/run binding in the protected receipt.
+Draft-only work creates no delivery obligation. Recovery and delivery never
+replace a recorded business outcome with a generic retry invitation. The
+additive `202610040001_write_delivery_lookup.sql` migration indexes these checks.
+
 Payloads larger than 256 KiB before encryption are rejected. Terminal transitions clear temporary transport payloads, retaining encrypted inbox content and metadata. Terminal records (including observed messages), jobs, and their event history expire after 30 days through application cleanup. Startup and minute-level maintenance expire stale ready work, recover abandoned leases and remove expired checkpoints. Checkpoints are deleted in the same transaction as inbound handoff or terminal failure. Their encrypted envelope is capped at 4 MiB, expires no later than message expiry or 24 hours from start, and contains at most 96 saved responses. It can include opaque provider-encrypted continuation, never plaintext model reasoning or credentials. See [the replay contract](agent-modules/47-durable-model-checkpoints.md).
 
 ## Inbox, context, and operator sends

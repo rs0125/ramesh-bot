@@ -1,5 +1,12 @@
 /** Transcripts are a delivery projection of expiring media, never model-generated text. */
 import { MAX_MEDIA_ITEMS, type MediaStore } from './media.types.js';
+
+/** Answer/storage limit. Delivery may add a separately bounded voice projection. */
+export const MAX_REPLY_CHARACTERS = 16000;
+export const MAX_VOICE_PREFIX_RESERVE = 2048;
+export const MAX_VOICE_REPLY_CHARACTERS = MAX_REPLY_CHARACTERS + MAX_VOICE_PREFIX_RESERVE;
+const VOICE_LABEL_ALLOWANCE = 120;
+const MIN_TRANSCRIPT_EXCERPT = 128;
 export interface VoiceReplyReference {
   owner: string;
   ids: string[];
@@ -34,15 +41,24 @@ export async function renderVoiceReply(
   reference?: VoiceReplyReference,
   store?: MediaStore,
 ): Promise<{ text: string; responseText: string; transcripts: VoiceTranscript[] }> {
+  if (typeof responseText !== 'string' || responseText.length > MAX_REPLY_CHARACTERS)
+    throw new Error('INVALID_REPLY_SIZE');
   if (!reference) return { text: responseText, responseText, transcripts: [] };
   if (!validVoiceReference(reference)) throw new Error('INVALID_VOICE_REFERENCE');
   const rows = store ? await store.get(reference.owner, reference.ids) : [];
-  // Leave room for numbered labels and explicit failure/excerpt notices within the transport bound.
-  const perNote = Math.max(
-    0,
-    Math.floor(
-      (16000 - responseText.length - 120 * reference.ids.length - 2) / reference.ids.length,
+  // Normally keep the complete projection within the existing answer limit. An exact
+  // receipt/proposal can already occupy that limit, so reserve a small independent
+  // envelope for labels and a useful excerpt. Never truncate the authoritative answer
+  // or retry an immutable answer that cannot fit its own transcript prefix.
+  const prefixBudget = Math.max(
+    MAX_REPLY_CHARACTERS - responseText.length,
+    Math.min(
+      MAX_VOICE_PREFIX_RESERVE,
+      (VOICE_LABEL_ALLOWANCE + MIN_TRANSCRIPT_EXCERPT) * reference.ids.length + 2,
     ),
+  );
+  const perNote = Math.floor(
+    (prefixBudget - VOICE_LABEL_ALLOWANCE * reference.ids.length - 2) / reference.ids.length,
   );
   const transcripts = reference.ids.map((id): VoiceTranscript => {
     const row = rows.find((r) => r.id === id);
@@ -53,6 +69,6 @@ export async function renderVoiceReply(
     return { text, ...(row.truncated || text.length < row.text.length ? { excerpt: true } : {}) };
   });
   const text = `${prefix(transcripts)}\n\n${responseText}`;
-  if (text.length > 16000) throw new Error('VOICE_REPLY_SIZE_LIMIT');
+  if (text.length > MAX_VOICE_REPLY_CHARACTERS) throw new Error('VOICE_REPLY_SIZE_LIMIT');
   return { text, responseText, transcripts };
 }

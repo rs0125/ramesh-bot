@@ -14,6 +14,7 @@ import {
 import type { BusinessReadService } from '../../src/modules/assistant/business-reads.js';
 import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.types.js';
 import type { AgentCheckpointStore } from '../../src/modules/assistant/checkpoint.types.js';
+import { CheckpointError } from '../../src/modules/assistant/checkpoint.types.js';
 import { buildSalesGraph } from '../../src/modules/assistant/sales.graph.js';
 import type {
   ModelRequest,
@@ -606,4 +607,122 @@ test('mixed crash recovery retains both authoritative receipts before checkpoint
   assert.deepEqual(getPersonalDelivery(reply.businessEvidence), personalDelivery);
   assert.deepEqual(calls, ['write-recover', 'personal-open', 'personal-recover']);
   assert.equal(reply.trace.stages.length, 0);
+});
+
+test('business recovery survives unrelated personal lookup failure without losing its receipt', async () => {
+  for (const failureAt of ['open', 'recover']) {
+    const assistant = new AssistantService(
+      { model: 'offline-write-fake', timeoutMs: 5000 },
+      {
+        async complete() {
+          assert.fail('Recovered writes must not call a model');
+        },
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        businessWrites: {
+          async recover() {
+            return { text: 'Saved: synthetic record.', delivery: receipt };
+          },
+          async open() {
+            assert.fail('No new proposal session after recovery');
+          },
+        } as unknown as BusinessWriteService,
+        personalTools: {
+          async open() {
+            if (failureAt === 'open') throw new Error('personal unavailable');
+            return {
+              employeeId: receipt.employeeId,
+              async recover() {
+                throw new Error('personal unavailable');
+              },
+            };
+          },
+        } as unknown as PersonalToolService,
+      },
+    );
+    const reply = await assistant.prepare(message, undefined, trusted);
+    assert.equal(reply.text, 'Saved: synthetic record.');
+    assert.deepEqual(getWriteDelivery(reply.businessEvidence), receipt);
+    assert.equal(reply.trace.stages.length, 0);
+  }
+});
+
+test('optional write discovery outage leaves independently authorized reads available', async () => {
+  const reads = readRun();
+  const fake = model([{ name: 'read_example_reference' }], {
+    supplement: 'The reference is available.',
+  });
+  const assistant = new AssistantService(
+    { model: 'offline-write-fake', timeoutMs: 5000 },
+    fake.fake,
+    undefined,
+    undefined,
+    undefined,
+    {
+      toolLoop: true,
+      async openTools() {
+        return { status: 'available', run: reads.run };
+      },
+    } as unknown as BusinessReadService,
+    {
+      businessWrites: {
+        async recover() {
+          return undefined;
+        },
+        async open() {
+          throw new Error('write catalogue unavailable');
+        },
+      } as unknown as BusinessWriteService,
+    },
+  );
+  const reply = await assistant.prepare(message, undefined, trusted);
+  assert.equal(reply.text, 'The reference is available.');
+  assert.deepEqual(reads.readCalls, ['read_example_reference']);
+  assert.equal(getWriteDelivery(reply.businessEvidence), undefined);
+});
+
+test('write recovery and discovery isolation preserve caller cancellation and checkpoint failures', async () => {
+  for (const stage of ['recover', 'open']) {
+    for (const failure of ['abort', 'checkpoint']) {
+      const controller = new AbortController();
+      const fail = () => {
+        if (failure === 'abort') {
+          controller.abort();
+          controller.signal.throwIfAborted();
+        }
+        throw new CheckpointError();
+      };
+      const assistant = new AssistantService(
+        { model: 'offline-write-fake', timeoutMs: 5000 },
+        {
+          async complete() {
+            assert.fail('No model after authority failure');
+          },
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          businessWrites: {
+            async recover() {
+              if (stage === 'recover') return fail();
+              return undefined;
+            },
+            async open() {
+              return fail();
+            },
+          } as unknown as BusinessWriteService,
+        },
+      );
+      await assert.rejects(
+        assistant.prepare(message, controller.signal, trusted),
+        failure === 'abort' ? { name: 'AbortError' } : CheckpointError,
+      );
+    }
+  }
 });

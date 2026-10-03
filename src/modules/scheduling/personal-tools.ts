@@ -731,6 +731,10 @@ function hasReminderCondition(message: string, reminderText?: string): boolean {
   );
   const scheduleReference =
     /\b(?:remind\w*|notification\w*|schedule\w*|reschedule\w*|snooz\w*|send|deliver|alert\w*|notify|ping)\b|याद|रिमाइंड/iu;
+  // A read can control an earlier action without naming it again: "check if X, and
+  // only then do it". Keep such clauses intact so the condition check below sees them.
+  const dependentAction =
+    /\bonly\s+(?:then|if|when|once)\b|\botherwise\b|\b(?:do(?:ing)?|skip(?:ping)?|cancel(?:ling)?|hold(?:ing)?|stop(?:ping)?|start(?:ing)?|perform(?:ing)?|proceed(?:ing)?\s+with|go(?:ing)?\s+ahead\s+with)\s+(?:it|that|this)\b/iu;
   const independentSchedule = clauses.some((clause) =>
     /^(?:also|and|separately)\s+(?:please\s+)?(?:remind|set|schedule|reschedule|snooze)\b/iu.test(
       clause.trim(),
@@ -743,7 +747,10 @@ function hasReminderCondition(message: string, reminderText?: string): boolean {
           clause.trim(),
         );
       return (
-        (index === 0 && !independentSchedule) || !separateRead || scheduleReference.test(clause)
+        (index === 0 && !independentSchedule) ||
+        !separateRead ||
+        scheduleReference.test(clause) ||
+        dependentAction.test(clause)
       );
     })
     .map((clause) => {

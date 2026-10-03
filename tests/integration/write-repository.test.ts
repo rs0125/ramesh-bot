@@ -11,10 +11,20 @@ import {
 } from '../../src/infrastructure/database/message-queue.repository.js';
 import { authCipher } from '../../src/infrastructure/database/auth-store.js';
 import { toInboxCandidate } from '../../src/infrastructure/whatsapp/message.mapper.js';
+import { DurableMessages } from '../../src/infrastructure/whatsapp/durable-messages.js';
+import { BusinessWriteService, type WriteDelivery } from '../../src/modules/writes/write-tools.js';
+import {
+  AssistantService,
+  UNAVAILABLE_REPLY,
+} from '../../src/modules/assistant/assistant.service.js';
+import { PersonalToolService } from '../../src/modules/scheduling/personal-tools.js';
+import { getWriteDelivery } from '../../src/modules/messaging/delivery-evidence.js';
 import type {
   WriteActor,
   WriteCommandContext,
   WriteProposalPayload,
+  WriteOperation,
+  WriteState,
 } from '../../src/modules/writes/write.types.js';
 import { temporaryMessageDatabase, postgresTestsEnabled } from '../fixtures/message-database.js';
 
@@ -138,6 +148,8 @@ test(
           cipher.seal('outbound-reply', job.id, reply),
           new Date(),
           receipt ? cipher.seal('business-delivery', job.id, receipt) : undefined,
+          undefined,
+          receipt?.write,
         ),
         true,
       );
@@ -156,7 +168,329 @@ test(
       await deliver(f, c.job);
       return op;
     }
+    const delivery = (op: WriteOperation, job: MessageJob): WriteDelivery => ({
+      kind: 'business_write',
+      version: 1,
+      ...actor,
+      runId: job.id,
+      operations: [{ id: op.operationId, version: op.version }],
+      tools: [op.payload.toolName],
+      expiresAt: new Date(Date.now() + 300000).toISOString(),
+    });
     try {
+      await t.test(
+        'every journal outcome requires a current owned receipt at handoff and cannot be replaced',
+        async () => {
+          const states: WriteState[] = [
+            'PROPOSED',
+            'APPROVED',
+            'DISPATCHING',
+            'SUCCEEDED',
+            'REJECTED',
+            'UNKNOWN',
+            'CANCELLED',
+            'EXPIRED',
+          ];
+          for (const state of states) {
+            const f = fixture();
+            let c: Awaited<ReturnType<typeof command>>;
+            let op: WriteOperation;
+            if (state === 'PROPOSED') {
+              c = await command(f, 'Create a point');
+              const draft = await f.repo.propose(c.ctx, payload());
+              op = await f.repo.publish(c.ctx, draft.operationId, draft.version);
+            } else {
+              op = await proposed(f);
+              c = await command(
+                f,
+                `${state === 'CANCELLED' ? 'cancel' : 'confirm'} ${op.confirmationCode}`,
+              );
+              if (state === 'CANCELLED')
+                op = await f.repo.cancel(c.ctx, op.operationId, op.version, op.confirmationCode);
+              else {
+                if (state === 'EXPIRED')
+                  await db.admin.query(
+                    'UPDATE public."ramesh-write-operations" SET expires_at=clock_timestamp()-interval \'1 second\' WHERE id=$1',
+                    [op.operationId],
+                  );
+                op = await f.repo.approve(c.ctx, op.operationId, op.version, op.confirmationCode);
+                if (['DISPATCHING', 'SUCCEEDED', 'REJECTED', 'UNKNOWN'].includes(state)) {
+                  const claim = await f.repo.claim(c.ctx, op.operationId, op.version);
+                  assert.ok(claim);
+                  op = claim.operation;
+                  if (state !== 'DISPATCHING')
+                    op = await f.repo.finish(c.ctx, op.operationId, claim.dispatchToken, {
+                      operation_id: op.operationId,
+                      outcome:
+                        state === 'SUCCEEDED'
+                          ? 'created'
+                          : state === 'REJECTED'
+                            ? 'rejected'
+                            : 'outcome_unknown',
+                      code: 'SYNTHETIC',
+                      message: state,
+                    });
+                }
+              }
+            }
+            assert.equal(op.state, state);
+            const proof = delivery(op, c.job);
+            const envelope = { kind: 'write_bundle', version: 1, write: proof };
+            const evidence = cipher.seal('business-delivery', c.job.id, envelope);
+            const reply = cipher.seal('outbound-reply', c.job.id, {
+              version: 1,
+              kind: 'business',
+              text: `Outcome: ${state}`,
+            });
+            assert.equal(await f.queue.handoff(c.job, 'generic-failure'), false, state);
+            assert.equal(await f.queue.handoff(c.job, reply, new Date(), evidence), false, state);
+            for (const invalid of [
+              { ...proof, runId: randomUUID() },
+              { ...proof, employeeId: actor.employeeId + 1 },
+              { ...proof, chatId: '919000000024@s.whatsapp.net' },
+              { ...proof, phoneE164: '+919000000024' },
+              { ...proof, operations: [{ id: randomUUID(), version: op.version }] },
+              ...[-1, 1].map((delta) => ({
+                ...proof,
+                operations: [{ id: op.operationId, version: op.version + delta }],
+              })),
+            ])
+              assert.equal(
+                await f.queue.handoff(c.job, reply, new Date(), evidence, undefined, invalid),
+                false,
+                state,
+              );
+            assert.equal(
+              await f.queue.handoff(c.job, reply, new Date(), evidence, undefined, proof),
+              true,
+              state,
+            );
+            const outbound = await f.queue.claimOutbound(120000);
+            assert.ok(outbound);
+            assert.equal(
+              await f.queue.replaceWithDeliveryNotice(outbound, 'generic-notice'),
+              false,
+              state,
+            );
+            assert.equal(await f.queue.beginSend(outbound), true);
+            assert.equal(await f.queue.complete(outbound, 'SENT'), true);
+            if (['SUCCEEDED', 'REJECTED', 'CANCELLED', 'EXPIRED'].includes(state)) {
+              // A later no-op command has no new effect and must not inherit the old run's obligation.
+              for (const action of ['confirm', 'retry']) {
+                const next = await command(f, `${action} ${op.confirmationCode}`);
+                assert.equal(await f.queue.handoff(next.job, 'no-new-effect'), true);
+                const outgoing = await f.queue.claimOutbound(120000);
+                assert.ok(outgoing);
+                await f.queue.complete(outgoing, 'FAILED');
+              }
+            }
+          }
+          const f = fixture(),
+            c = await command(f, 'Unfinished draft');
+          await f.repo.propose(c.ctx, payload());
+          assert.equal(await f.queue.handoff(c.job, 'No proposal was published.'), true);
+        },
+      );
+
+      await t.test(
+        'a real confirmed write keeps its receipt across personal recovery failure',
+        async () => {
+          const f = fixture(),
+            initial = await command(f, 'Create a point');
+          const content = payload();
+          (content.toolSchema.properties as Record<string, unknown>).operation_id = {
+            type: 'string',
+            format: 'uuid',
+          };
+          content.toolMeta = {
+            'wareongo/context-write-v1': {
+              requiredScopes: ['example:write'],
+              sourceFamily: 'example',
+              effect: 'create',
+              idempotencyArgument: 'operation_id',
+            },
+          };
+          const definition = {
+            name: content.toolName,
+            inputSchema: content.toolSchema,
+            _meta: content.toolMeta,
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+            outputSchema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                operation_id: { type: 'string' },
+                outcome: { type: 'string' },
+                code: { type: 'string' },
+                message: { type: 'string' },
+                meta: { type: 'object', additionalProperties: false, properties: {} },
+              },
+              required: ['operation_id', 'outcome', 'code', 'message', 'meta'],
+            },
+          };
+          const draft = await f.repo.propose(initial.ctx, content);
+          const op = await f.repo.publish(initial.ctx, draft.operationId, draft.version);
+          await deliver(f, initial.job);
+          const text = `confirm ${op.confirmationCode}`,
+            c = await command(f, text);
+          let dispatched = 0;
+          const writes = new BusinessWriteService(f.repo, async () => ({
+            actor,
+            writer: {
+              employeeId: actor.employeeId,
+              async describe() {
+                return { tools: [definition], resources: [], prompts: [], guidance: '' };
+              },
+              async discover() {
+                return [definition];
+              },
+              async call() {
+                dispatched++;
+                return {
+                  operation_id: op.operationId,
+                  outcome: 'created',
+                  code: 'CREATED',
+                  message: 'Saved',
+                };
+              },
+            },
+          }));
+          const original = f.personal.getReceipt;
+          f.personal.getReceipt = async () => {
+            throw new Error('unrelated personal lookup outage');
+          };
+          const assistant = new AssistantService(
+            { model: 'no-model', timeoutMs: 5000 },
+            {
+              async complete() {
+                assert.fail('Confirmation must not use a model');
+              },
+            },
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            {
+              businessWrites: writes,
+              personalTools: new PersonalToolService(f.personal, async () => actor),
+            },
+          );
+          const trusted = {
+            key: { remoteJid: actor.chatId },
+            runId: c.job.id,
+            checkpointLease: { leaseToken: c.job.token },
+            commandMessages: [{ id: c.job.id, text, receivedAtMs: Date.now(), forwarded: false }],
+          };
+          const reply = await assistant.prepare(
+            {
+              chatId: actor.chatId,
+              messageId: c.job.id,
+              text,
+              sentAtMs: Date.now(),
+              fromMe: false,
+              isGroup: false,
+              mentionsBot: false,
+            },
+            undefined,
+            trusted,
+          );
+          f.personal.getReceipt = original;
+          assert.equal(dispatched, 1);
+          assert.equal((await f.repo.receiptLookup(actor, op.operationId))?.state, 'SUCCEEDED');
+          assert.notEqual(reply.text, UNAVAILABLE_REPLY);
+          const proof = getWriteDelivery(reply.businessEvidence);
+          assert.ok(proof);
+          assert.equal(await f.queue.handoff(c.job, 'generic'), false);
+          assert.equal(
+            await f.queue.handoff(
+              c.job,
+              cipher.seal('outbound-reply', c.job.id, {
+                version: 1,
+                kind: 'business',
+                text: reply.text,
+              }),
+              new Date(),
+              cipher.seal('business-delivery', c.job.id, reply.businessEvidence),
+              undefined,
+              proof,
+            ),
+            true,
+          );
+          let authorized = false;
+          const sent: string[] = [];
+          const consumer = new DurableMessages(f.queue, {
+            encryptionKey: key,
+            maxAgeMs: 300000,
+            capacity: 10,
+            leaseMs: 30000,
+            pollMs: 5,
+            agentRuns: true,
+            waitBeforeReply: async () => true,
+            prepareReply: async () => {
+              assert.fail('Finalized write must not regenerate');
+            },
+            businessPreflight: async (message, evidence, signal) =>
+              authorized && writes.canDeliver(message.key, getWriteDelivery(evidence), signal),
+          });
+          const consumeOnce = async () => {
+            const stop = new AbortController();
+            const release = f.queue.releaseUnsent.bind(f.queue),
+              complete = f.queue.complete.bind(f.queue);
+            f.queue.releaseUnsent = async (...args) => {
+              await release(...args);
+              stop.abort();
+            };
+            f.queue.complete = async (...args) => {
+              const done = await complete(...args);
+              stop.abort();
+              return done;
+            };
+            try {
+              await consumer.consume(
+                {
+                  botJids: [],
+                  on: () => () => {},
+                  async close() {},
+                  async saveCredentials() {},
+                  async reply(_message, text) {
+                    sent.push(text);
+                  },
+                },
+                AbortSignal.any([stop.signal, AbortSignal.timeout(5000)]),
+                () => {},
+              );
+              assert.equal(stop.signal.aborted, true, 'consumer reached a durable outcome');
+            } finally {
+              f.queue.releaseUnsent = release;
+              f.queue.complete = complete;
+            }
+          };
+          const status = async () =>
+            (
+              await db.admin.query(
+                'SELECT state,reply_kind,business_evidence_encrypted FROM public."ramesh-messages" WHERE id=$1',
+                [c.job.id],
+              )
+            ).rows[0];
+          const before = await status();
+          await consumeOnce();
+          assert.equal((await status()).state, 'READY_TO_SEND');
+          assert.equal(
+            (await status()).business_evidence_encrypted,
+            before.business_evidence_encrypted,
+          );
+          assert.equal(sent.length, 0);
+          authorized = true;
+          await db.admin.query(
+            'UPDATE public."ramesh-outbound-queue" SET available_at=clock_timestamp() WHERE message_id=$1',
+            [c.job.id],
+          );
+          await consumeOnce();
+          assert.equal((await status()).state, 'SENT');
+          assert.deepEqual(sent, [reply.text]);
+          assert.equal(dispatched, 1);
+        },
+      );
       await t.test(
         'parallel proposal replay stores one frozen intent and immutable event, never plaintext',
         async () => {

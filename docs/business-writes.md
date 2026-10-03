@@ -37,6 +37,11 @@ delivery receipt that checks the cancelled operation's current state and version
 without requiring remote write permission. It cannot authorize confirmation,
 redisclose the proposal, cancel an uncertain dispatch, or undo a committed write.
 
+Write discovery is optional for independent conversation, reads and personal
+tasks. A catalogue outage omits the unavailable write tools rather than aborting
+those workflows. Exact confirmation commands still use the application-owned
+recovery path and cannot fall back to model-authorized execution.
+
 ## Storage and audit coverage
 
 Supabase migration `202610030009_write_journal.sql` adds:
@@ -52,7 +57,19 @@ Personal task/reminder mutations keep their existing request-driven behavior. Th
 
 Backend business state and Ramesh's journal cannot share one SQL transaction across HTTP. The domain handler must atomically commit its mutation and authoritative idempotency receipt. Ramesh persists intent before dispatch and the result afterwards. A crash between those steps leaves an explicit uncertain state, rather than pretending the remote transaction was rolled back.
 
+Migration `202610040001_write_delivery_lookup.sql` adds a run-scoped audit-event
+index for receipt checks. It changes no write permissions or table columns and
+is an additive performance migration; runtime readiness still accepts `009`.
+
 ## Recovery and undo
+
+A recovered business result survives an unrelated personal receipt lookup
+failure. Queue handoff checks this inbound run's non-draft business transitions
+and requires the current operation version, employee, phone, chat and run in the
+protected delivery receipt. A mixed turn must also carry its committed personal
+receipt. Missing or mismatched receipts retain the original run for bounded
+recovery. Delivery authorization outages retain saved confirmations for retry;
+they cannot replace an actual write outcome with a generic “try again” message.
 
 An operation uses one server-generated UUID for its lifetime. Unknown results retain their exact arguments and ID. `retry CODE` resumes that same approved operation; it cannot create a second operation or change the payload. Uncertain approved operations remain recoverable after the original proposal deadline. The durable approved transition preserves the verified delivery proof, so later inbox cleanup does not strand a pending outcome. A later permission failure does not establish that an earlier uncertain request never committed. There is no autonomous retry loop or LLM-controlled retry budget.
 

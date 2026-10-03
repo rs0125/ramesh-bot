@@ -22,13 +22,13 @@ const reserved = new Set([
 const contractSchema = z
   .object({
     requiredScopes: z
-      .array(z.string().regex(/^[a-z][a-z0-9_.-]{0,63}:(?:read|write)$/))
+      .array(z.string().regex(/^(?:[a-z][a-z0-9_.-]{0,63}:(?:read|write)|mail:drafts)$/))
       .min(1)
       .max(32)
       .refine(
         (scopes) =>
           new Set(scopes).size === scopes.length &&
-          scopes.some((scope) => scope.endsWith(':write')),
+          scopes.some((scope) => scope.endsWith(':write') || scope === 'mail:drafts'),
       ),
     sourceFamily: z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/),
     effect: z.enum(['create', 'update', 'delete', 'compensate']),

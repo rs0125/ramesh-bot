@@ -14,6 +14,7 @@ import {
 import type {
   BoundContextWriter,
   ContextToolDefinition,
+  ContextWriteResult,
 } from '../../src/modules/context-engine/context.types.js';
 import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.types.js';
 
@@ -91,15 +92,29 @@ const crm = tool('update_example_crm', 'update', {
   expected_version: { type: 'integer', minimum: 1 },
   stage: { type: 'string', enum: ['review', 'won'] },
 });
+const draft = tool(
+  'create_email_draft',
+  'create',
+  {
+    subject: { type: 'string', minLength: 1, maxLength: 200 },
+    body: { type: 'string', minLength: 1, maxLength: 12000 },
+    to: { type: 'array', items: { type: 'string', format: 'email' }, maxItems: 10 },
+    cc: { type: 'array', items: { type: 'string', format: 'email' }, maxItems: 10 },
+    connection_id: uuid,
+    connection_version: { type: 'integer', minimum: 1 },
+  },
+  { requiredScopes: ['mail:drafts'], sourceFamily: 'mail' },
+);
 const signal = () => AbortSignal.timeout(5000);
 
-function harness() {
+function harness(resultData?: Record<string, unknown>) {
   const operations = new Map<string, WriteOperation>();
   const sources = new Map<string, WriteSourceMessage>();
   const calls: Array<{ tool: string; args: Record<string, unknown>; operationId: string }> = [];
   const proposals: WriteOperation[] = [];
   let definitions = [create, rollback, crm].map((t) => structuredClone(t));
   let currentActor = { ...actor };
+  let resultOverride: Omit<ContextWriteResult, 'operation_id'> | undefined;
   let allowed = true,
     capture = false,
     unknown = false,
@@ -188,16 +203,18 @@ function harness() {
     async finish(_ctx, id, _token, result) {
       const op = operations.get(id)!;
       op.result = structuredClone(result);
-      op.hasUncertainAttempt ||= result.outcome === 'outcome_unknown';
+      const success = ['created', 'replayed', 'rolled_back'].includes(result.outcome);
+      op.hasUncertainAttempt =
+        !success && (op.hasUncertainAttempt || result.outcome === 'outcome_unknown');
       return transition(
         id,
-        result.outcome === 'outcome_unknown'
-          ? 'UNKNOWN'
-          : result.outcome === 'created' ||
-              result.outcome === 'replayed' ||
-              result.outcome === 'rolled_back'
-            ? 'SUCCEEDED'
-            : 'REJECTED',
+        success
+          ? 'SUCCEEDED'
+          : op.hasUncertainAttempt
+            ? 'UNKNOWN'
+            : result.outcome === 'not_dispatched'
+              ? 'APPROVED'
+              : 'REJECTED',
       );
     },
     async cancel(ctx, id, expectedVersion) {
@@ -240,11 +257,13 @@ function harness() {
     },
     async call(name, args, operationId) {
       calls.push({ tool: name, args: structuredClone(args), operationId });
+      if (resultOverride) return { ...structuredClone(resultOverride), operation_id: operationId };
       return {
         operation_id: operationId,
         outcome: unknown ? 'outcome_unknown' : name === rollback.name ? 'rolled_back' : 'created',
         code: unknown ? 'OUTCOME_UNKNOWN' : 'OK',
         message: 'Synthetic outcome.',
+        ...(resultData ? { data: structuredClone(resultData) } : {}),
       };
     },
   };
@@ -299,6 +318,9 @@ function harness() {
     useUnknown: (value: boolean) => {
       unknown = value;
     },
+    useResult: (value: Omit<ContextWriteResult, 'operation_id'>) => {
+      resultOverride = structuredClone(value);
+    },
     changeDefinitions: (next: ContextToolDefinition[]) => {
       definitions = structuredClone(next);
     },
@@ -339,6 +361,185 @@ test('a later exact direct text confirmation dispatches frozen arguments once', 
   assert.deepEqual(h.calls[0]!.args, operation.payload.arguments);
   await h.service.recover(confirmation, signal());
   assert.equal(h.calls.length, 1);
+});
+
+test('email drafts keep typed confirmation and deliver verified metadata without reopening private history', async () => {
+  const h = harness({
+    draft_ref: randomUUID(),
+    mailbox: 'employee@example.com',
+    subject: 'Warehouse options',
+    status: 'draft',
+    provider: 'gmail',
+  });
+  h.changeDefinitions([draft]);
+  const request = h.trusted('Prepare a warehouse options email draft.');
+  const run = (await h.service.open(request, signal()))!;
+  const args = {
+    subject: 'Warehouse options',
+    body: 'Hello,\nPlease review these options.\nThanks.',
+    to: ['recipient@example.com'],
+    cc: ['colleague@example.com'],
+    connection_id: randomUUID(),
+    connection_version: 1,
+  };
+  assert.equal(
+    ((await run.execute(draft.name, JSON.stringify(args), signal())) as { ok: boolean }).ok,
+    true,
+  );
+  const preview = (await run.finalize(signal()))!;
+  assert.match(
+    preview.text,
+    /Save a draft in your connected work Gmail; this does not send email\./,
+  );
+  for (const [label, key] of [
+    ['To', 'to'],
+    ['CC', 'cc'],
+    ['Subject', 'subject'],
+    ['Body', 'body'],
+  ] as const)
+    assert.ok(preview.text.includes(`${label}: ${JSON.stringify(args[key])}`));
+  assert.match(preview.text, /confirm ABCDEF12/);
+  assert.match(preview.text, /Or cancel ABCDEF12\. Confirm before .* \(IST\)\./);
+  assert.doesNotMatch(
+    preview.text,
+    /Email draft saved|mail\.google\.com|connection|operation_id|business change/,
+  );
+  assert.ok(!preview.text.includes(args.connection_id));
+  assert.equal(h.calls.length, 0);
+  const command = h.trusted('confirm ABCDEF12');
+  const reply = (await h.service.recover(command, signal()))!;
+  assert.match(reply.text, /Email draft saved\. This action did not send it\./);
+  assert.match(reply.text, /employee@example\.com/);
+  assert.match(reply.text, /https:\/\/mail\.google\.com\/mail\/#drafts/);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.connection_id, args.connection_id);
+  assert.equal(h.calls[0]!.args.connection_version, 1);
+  assert.deepEqual(h.calls[0]!.args, { ...args, operation_id: h.calls[0]!.operationId });
+  assert.equal(await h.service.canDeliver(command.key, reply.delivery, signal()), true);
+  const repeated = (await h.service.recover(command, signal()))!;
+  assert.match(repeated.text, /stored business details require current record authorization/);
+  assert.doesNotMatch(repeated.text, /employee@example|Warehouse options|mail\.google\.com/);
+  assert.equal(h.calls.length, 1);
+  h.revoke();
+  assert.equal(await h.service.canDeliver(command.key, reply.delivery, signal()), false);
+});
+
+test('WhatsApp rejects oversized email drafts before persistence without truncating their content', async () => {
+  const h = harness();
+  h.changeDefinitions([draft]);
+  const request = h.trusted('Prepare an email draft with this long body.');
+  const run = (await h.service.open(request, signal()))!;
+  assert.match(
+    run.tools.find((entry) => entry.name === draft.name)!.description!,
+    /4,800-character WhatsApp proposal budget/,
+  );
+  const result = await run.execute(
+    draft.name,
+    JSON.stringify({
+      subject: 'Long draft',
+      body: 'x'.repeat(5000),
+      to: [],
+      cc: [],
+      connection_id: randomUUID(),
+      connection_version: 1,
+    }),
+    signal(),
+  );
+  assert.match(JSON.stringify(result), /WRITE_PREVIEW_TOO_LARGE/);
+  assert.equal(h.proposals.length, 0);
+  assert.equal(h.calls.length, 0);
+  assert.equal(await run.finalize(signal()), undefined);
+});
+
+async function proposedMail() {
+  const h = harness();
+  h.changeDefinitions([draft]);
+  const run = (await h.service.open(h.trusted('Save my email draft.'), signal()))!;
+  assert.equal(
+    (
+      (await run.execute(
+        draft.name,
+        JSON.stringify({
+          subject: 'PRIVATE_SUBJECT',
+          body: 'PRIVATE_BODY',
+          to: ['private@example.com'],
+          cc: [],
+          connection_id: randomUUID(),
+          connection_version: 1,
+        }),
+        signal(),
+      )) as { ok: boolean }
+    ).ok,
+    true,
+  );
+  assert.ok(await run.finalize(signal()));
+  assert.equal(h.calls.length, 0);
+  return h;
+}
+
+test('a changed Gmail connection after confirmation gives safe cancel-and-reprepare guidance without history access', async () => {
+  const h = await proposedMail();
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'GMAIL_CONNECTION_CHANGED',
+    message: 'PRIVATE_PROVIDER_MESSAGE',
+  });
+  const command = h.trusted('confirm ABCDEF12');
+  const reply = (await h.service.recover(command, signal()))!;
+  assert.match(reply.text, /connection changed.*cancel ABCDEF12.*fresh draft proposal/s);
+  assert.doesNotMatch(reply.text, /retry ABCDEF12|PRIVATE_|private@example/);
+  assert.equal([...h.operations.values()][0]!.state, 'APPROVED');
+  assert.equal(await h.service.canDeliver(command.key, reply.delivery, signal()), true);
+  const cancelled = (await h.service.recover(h.trusted('cancel ABCDEF12'), signal()))!;
+  assert.match(cancelled.text, /cancelled/i);
+  assert.equal([...h.operations.values()][0]!.state, 'CANCELLED');
+  assert.equal(h.calls.length, 1);
+});
+
+test('definite Gmail rate limiting retains the same frozen operation for a later explicit retry', async () => {
+  const h = await proposedMail();
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'GMAIL_RATE_LIMITED',
+    message: 'PRIVATE_PROVIDER_MESSAGE',
+  });
+  const reply = (await h.service.recover(h.trusted('confirm ABCDEF12'), signal()))!;
+  assert.match(reply.text, /Wait before replying retry ABCDEF12.*same approved draft/);
+  assert.doesNotMatch(reply.text, /fresh draft|PRIVATE_|private@example/);
+  assert.equal(h.calls.length, 1);
+  assert.equal([...h.operations.values()][0]!.state, 'APPROVED');
+  await h.service.recover(h.trusted('retry ABCDEF12'), signal());
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[1]!.operationId, h.calls[0]!.operationId);
+  assert.deepEqual(h.calls[1]!.args, h.calls[0]!.args);
+  assert.equal(h.proposals.length, 1);
+});
+
+test('a Gmail connection failure after an uncertain attempt never invites replacement or rediscloses mail', async () => {
+  const h = await proposedMail();
+  h.useResult({
+    outcome: 'outcome_unknown',
+    code: 'GMAIL_OUTCOME_UNKNOWN',
+    message: 'PRIVATE_PROVIDER_MESSAGE',
+  });
+  const first = (await h.service.recover(h.trusted('confirm ABCDEF12'), signal()))!;
+  assert.match(first.text, /Do not create a replacement/);
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'GMAIL_CONNECTION_CHANGED',
+    message: 'PRIVATE_PROVIDER_MESSAGE',
+  });
+  const later = (await h.service.recover(h.trusted('retry ABCDEF12'), signal()))!;
+  assert.match(later.text, /retry ABCDEF12 to check the same operation/);
+  assert.match(later.text, /Do not create a replacement/);
+  assert.doesNotMatch(
+    later.text,
+    /did not create|cancel ABCDEF12|fresh draft|PRIVATE_|private@example/,
+  );
+  assert.equal([...h.operations.values()][0]!.state, 'UNKNOWN');
+  assert.equal(h.calls[1]!.operationId, h.calls[0]!.operationId);
+  assert.deepEqual(h.calls[1]!.args, h.calls[0]!.args);
+  assert.equal(h.proposals.length, 1);
 });
 
 for (const unavailable of ['empty catalogue', 'discovery outage'] as const) {

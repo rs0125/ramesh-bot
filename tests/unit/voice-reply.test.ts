@@ -1,9 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { generateWAMessageContent, proto } from '@whiskeysockets/baileys';
 import { loadAssistantConfig } from '../../src/config/assistant.js';
 import { OpenAIMediaProcessor } from '../../src/infrastructure/openai/media-processor.js';
-import { renderVoiceReply } from '../../src/modules/media/voice-reply.js';
+import {
+  MAX_REPLY_CHARACTERS,
+  MAX_VOICE_REPLY_CHARACTERS,
+  renderVoiceReply,
+} from '../../src/modules/media/voice-reply.js';
+import { plainTextMessage } from '../../src/infrastructure/whatsapp/baileys-session.js';
 import { decodeReply, encodeReply } from '../../src/modules/messaging/reply-payload.js';
 import { mediaOwner } from '../../src/modules/media/media.service.js';
 import type { MediaRecord, MediaStore } from '../../src/modules/media/media.types.js';
@@ -89,6 +95,62 @@ test('long transcripts are explicitly excerpts and preserve the delivery length 
   assert.ok(result.transcripts.every((t) => t.excerpt && !/[\uD800-\uDBFF]$/.test(t.text!)));
   assert.equal(result.responseText, 'Shared answer.');
   assert.match(result.text, /Transcript excerpt/);
+});
+test('a full-size exact answer retains ordered voice excerpts without exceeding the separate wire bound', async () => {
+  const answer =
+    'Synthetic exact receipt\n'.padEnd(MAX_REPLY_CHARACTERS - 18, 'x') + '\nconfirm ABCDEF12\n';
+  const audioIds = Array.from({ length: 8 }, () => randomUUID());
+  const audio = {
+    get: async () =>
+      audioIds.map((id, index) => ({
+        id,
+        kind: 'audio',
+        state: 'ready',
+        text: `Original note ${index + 1}. ` + '😊'.repeat(200),
+      })),
+  } as unknown as MediaStore;
+  for (const selected of [[audioIds[0]!], audioIds]) {
+    const result = await renderVoiceReply(answer, { owner, ids: selected }, audio);
+    assert.equal(result.responseText, answer);
+    assert.ok(result.text.endsWith(`\n\n${answer}`));
+    assert.ok(result.text.length > MAX_REPLY_CHARACTERS);
+    assert.ok(result.text.length <= MAX_VOICE_REPLY_CHARACTERS);
+    assert.equal(result.transcripts.length, selected.length);
+    assert.ok(result.transcripts.every((t) => t.excerpt && (t.text?.length ?? 0) >= 127));
+    assert.ok(result.transcripts.every((t) => !/[\uD800-\uDBFF]$/.test(t.text!)));
+    assert.match(result.text, /Transcript excerpt/);
+
+    // Actual installed SDK text builder/protobuf only; no socket or remote request.
+    const generated = await generateWAMessageContent(plainTextMessage(result.text), {
+      upload: async () => assert.fail('a voice projection must not upload media'),
+    });
+    const roundTrip = proto.Message.decode(proto.Message.encode(generated).finish());
+    assert.equal(roundTrip.extendedTextMessage?.text, result.text);
+  }
+});
+test('full-size answers still deliver with unavailable transcripts and oversized answers fail early', async () => {
+  const answer = 'x'.repeat(MAX_REPLY_CHARACTERS);
+  const result = await renderVoiceReply(answer, { owner, ids }, store([]));
+  assert.equal(result.responseText, answer);
+  assert.ok(result.text.endsWith(answer));
+  assert.ok(result.text.length <= MAX_VOICE_REPLY_CHARACTERS);
+  assert.equal((result.text.match(/Voice transcript unavailable or expired\./g) ?? []).length, 3);
+  assert.deepEqual(await renderVoiceReply(answer), {
+    text: answer,
+    responseText: answer,
+    transcripts: [],
+  });
+  const forbiddenStore = {
+    get: () => assert.fail('oversized answers must fail before media reads'),
+  } as unknown as MediaStore;
+  await assert.rejects(
+    renderVoiceReply(answer + 'x', { owner, ids }, forbiddenStore),
+    /INVALID_REPLY_SIZE/,
+  );
+  await assert.rejects(
+    renderVoiceReply(null as unknown as string, { owner, ids }, forbiddenStore),
+    /INVALID_REPLY_SIZE/,
+  );
 });
 test('voice payload persists references and response, decodes old records and rejects downgraded private replies', () => {
   const ref = { owner, ids };

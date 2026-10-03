@@ -39,6 +39,15 @@ interface OwnedRow {
   max_attempts: number;
 }
 
+/** Validated delivery identity supplied alongside the encrypted business receipt. */
+export interface WriteHandoffReceipt {
+  employeeId: number;
+  phoneE164: string;
+  chatId: string;
+  runId: string;
+  operations: Array<{ id: string; version: number }>;
+}
+
 export class MessageQueueRepository {
   constructor(
     private readonly pool: Pool,
@@ -747,6 +756,7 @@ export class MessageQueueRepository {
     availableAt = new Date(),
     businessEvidence?: string,
     personalCommandId?: string,
+    writeReceipt?: WriteHandoffReceipt,
   ): Promise<boolean> {
     if (job.direction !== 'inbound') return false;
     return this.transaction(async (db) => {
@@ -772,6 +782,35 @@ export class MessageQueueRepository {
       if (
         (command && (!businessEvidence || personalCommandId !== command.id)) ||
         (!command && personalCommandId)
+      )
+        return false;
+      // Any published/approved/dispatched/cancelled outcome for this run needs its
+      // current receipt. Draft-only work and no-op commands on old runs add no obligation.
+      const writes = await db.query<{
+        id: string;
+        version: number;
+        owner_employee_id: number;
+        phone_e164: string;
+        chat_id: string;
+      }>(
+        `SELECT DISTINCT o.id,o.version,o.owner_employee_id,o.phone_e164,o.chat_id
+         FROM public."ramesh-write-events" e
+         JOIN public."ramesh-write-operations" o ON o.account_id=e.account_id AND o.id=e.operation_id
+         WHERE e.account_id=$1 AND e.run_id=$2 AND e.operation_id IS NOT NULL
+           AND e.kind NOT IN ('drafted','draft_revised') AND o.state<>'DRAFT'`,
+        [this.accountId, job.id],
+      );
+      if (
+        writes.rows.some(
+          (op) =>
+            !businessEvidence ||
+            !writeReceipt ||
+            writeReceipt.runId !== job.id ||
+            writeReceipt.employeeId !== op.owner_employee_id ||
+            writeReceipt.phoneE164 !== op.phone_e164 ||
+            writeReceipt.chatId !== op.chat_id ||
+            !writeReceipt.operations.some((ref) => ref.id === op.id && ref.version === op.version),
+        )
       )
         return false;
       await db.query(
@@ -925,7 +964,10 @@ export class MessageQueueRepository {
          WHERE id=$1 AND account_id=$2 AND reply_kind='business' AND origin='whatsapp'
          AND expires_at>clock_timestamp()
          AND NOT EXISTS (SELECT 1 FROM public."ramesh-assistant-commands" c
-           WHERE c.account_id=$2 AND c.run_id=$1 AND c.kind='mutation') RETURNING id`,
+           WHERE c.account_id=$2 AND c.run_id=$1 AND c.kind='mutation')
+         AND NOT EXISTS (SELECT 1 FROM public."ramesh-write-events" e
+           WHERE e.account_id=$2 AND e.run_id=$1 AND e.operation_id IS NOT NULL
+             AND e.kind NOT IN ('drafted','draft_revised')) RETURNING id`,
         [job.id, this.accountId, replyPayload],
       );
       if (!changed.rowCount) return false;

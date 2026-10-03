@@ -13,7 +13,7 @@ import {
 import { cancellable } from '../../lib/cancellable.js';
 
 const scopes = z
-  .array(z.string().regex(/^[a-z][a-z0-9_.-]{0,63}:(?:read|write)$/))
+  .array(z.string().regex(/^(?:[a-z][a-z0-9_.-]{0,63}:(?:read|write)|mail:drafts)$/))
   .min(1)
   .max(32)
   .refine((v) => new Set(v).size === v.length);
