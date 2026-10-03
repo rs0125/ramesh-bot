@@ -54,7 +54,7 @@ function roundedMicros(numerator: bigint): number | null {
   return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
 }
 export function priceUsage(usage: ReportedUsage, price?: UsagePrice): number | null {
-  if (!price || !usage.valid || (usage.fields.cacheWriteTokens ?? 0) > 0) return null;
+  if (!price || !usage.valid) return null;
   const u = usage.fields;
   if (u.audioSeconds !== undefined) {
     if (price.durationMicrosPerSecond === undefined) return null;
@@ -63,9 +63,12 @@ export function priceUsage(usage: ReportedUsage, price?: UsagePrice): number | n
   }
   if (u.inputTokens === undefined || u.outputTokens === undefined) return null;
   const cached = u.cachedInputTokens ?? 0,
-    audio = u.audioInputTokens ?? 0;
-  if (cached + audio > u.inputTokens) return null;
+    audio = u.audioInputTokens ?? 0,
+    cacheWrite = u.cacheWriteTokens ?? 0;
+  // These are disjoint input subsets. Never add a write premium to regular input.
+  if (cached + audio + cacheWrite > u.inputTokens) return null;
   if (cached && price.cachedInputMicrosPerMillion === undefined) return null;
+  if (cacheWrite && price.cacheWriteInputMicrosPerMillion === undefined) return null;
   // Without a reported cache split, differing cached-input rates cannot be priced exactly.
   if (
     u.cachedInputTokens === undefined &&
@@ -76,8 +79,9 @@ export function priceUsage(usage: ReportedUsage, price?: UsagePrice): number | n
     return null;
   if (audio && price.audioInputMicrosPerMillion === undefined) return null;
   return roundedMicros(
-    BigInt(u.inputTokens - cached - audio) * BigInt(price.inputMicrosPerMillion) +
+    BigInt(u.inputTokens - cached - audio - cacheWrite) * BigInt(price.inputMicrosPerMillion) +
       BigInt(cached) * BigInt(price.cachedInputMicrosPerMillion ?? price.inputMicrosPerMillion) +
+      BigInt(cacheWrite) * BigInt(price.cacheWriteInputMicrosPerMillion ?? 0) +
       BigInt(audio) * BigInt(price.audioInputMicrosPerMillion ?? 0) +
       BigInt(u.outputTokens) * BigInt(price.outputMicrosPerMillion),
   );
@@ -101,6 +105,7 @@ export function reserveUsage(
         Math.max(
           price.inputMicrosPerMillion,
           price.cachedInputMicrosPerMillion ?? 0,
+          price.cacheWriteInputMicrosPerMillion ?? 0,
           price.audioInputMicrosPerMillion ?? 0,
         ),
       ) +

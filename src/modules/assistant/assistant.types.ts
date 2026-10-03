@@ -40,7 +40,17 @@ export interface TextModel {
 export interface ToolSessionRequest {
   instructions: string;
   messages: ChatMessage[];
-  tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>;
+  tools: Array<{
+    name: string;
+    description?: string;
+    inputSchema: Record<string, unknown>;
+    annotations?: {
+      readOnlyHint: boolean;
+      destructiveHint?: boolean;
+      idempotentHint?: boolean;
+      openWorldHint?: boolean;
+    };
+  }>;
 }
 export interface ModelToolCall {
   id: string;

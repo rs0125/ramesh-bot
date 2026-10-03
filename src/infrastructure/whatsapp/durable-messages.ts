@@ -19,6 +19,8 @@ import { encodeReply, decodeReply } from '../../modules/messaging/reply-payload.
 import { renderVoiceReply, type VoiceReplyReference } from '../../modules/media/voice-reply.js';
 import { currentUsageScope, withUsageScope } from '../../modules/usage/usage-scope.js';
 import { cancellable } from '../../lib/cancellable.js';
+import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
+import { reminderEvidenceMatches } from '../../modules/scheduling/scheduler.service.js';
 
 export interface DurableMessageOptions {
   encryptionKey: string;
@@ -40,6 +42,11 @@ export interface DurableMessageOptions {
     key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null },
     signal: AbortSignal,
   ) => Promise<number | undefined>;
+  reminderEmployee?: (
+    employeeId: number,
+    signal: AbortSignal,
+    chatId?: string,
+  ) => Promise<EmployeeIdentity | null>;
   businessPreflight?: (
     message: Pick<WAMessage, 'key'>,
     evidence: unknown,
@@ -68,6 +75,7 @@ type DurableRepository = Pick<
       | 'usageRunId'
       | 'claimNext'
       | 'renewLease'
+      | 'yieldReminderToHuman'
     >
   >;
 
@@ -442,7 +450,8 @@ export class DurableMessages {
       }
       let message: WAMessage | undefined;
       const automation = job.origin === 'automation';
-      const manual = job.origin === 'admin' || automation;
+      const reminder = job.origin === 'reminder';
+      const manual = job.origin === 'admin' || automation || reminder;
       try {
         if (!manual) {
           const wire = this.cipher.open('message', job.id, job.payload);
@@ -542,10 +551,42 @@ export class DurableMessages {
                 signal,
               )
             : '') + (failures.length ? `\n${failures.join('\n')}` : '');
+        const commandAudio =
+          this.options.media && mediaIds.length
+            ? await this.options.media.store.get(
+                mediaOwner(
+                  this.options.accountId ?? 'primary',
+                  candidate.chatId,
+                  candidate.senderId ?? candidate.chatId,
+                ),
+                mediaIds,
+              )
+            : [];
+        const commandMessages = originals.flatMap((item, index) => {
+          const receivedAtMs = item.receivedAt?.getTime();
+          if (receivedAtMs === undefined || !Number.isFinite(receivedAtMs)) return [];
+          const audio = commandAudio.find(
+            (record) =>
+              record.id === attachments[index]?.id &&
+              record.kind === 'audio' &&
+              record.state === 'ready' &&
+              !record.truncated &&
+              record.expiresAt.getTime() > Date.now(),
+          );
+          return [
+            {
+              id: item.id,
+              text: audio?.text ?? item.candidate.text ?? '',
+              receivedAtMs,
+              forwarded: item.candidate.forwarded === true,
+            },
+          ];
+        });
         const prepared = this.options.prepareReply
           ? await this.options.prepareReply(candidate, signal, {
               runId: job.id,
               checkpointLease: { leaseToken: job.token },
+              commandMessages,
               mediaContext,
               key: {
                 remoteJid: message.key.remoteJid,
@@ -622,6 +663,17 @@ export class DurableMessages {
         );
         reply = decoded.text;
         voice = decoded.voice;
+        if (
+          reminder &&
+          (job.replyKind !== 'business' ||
+            !job.reminder ||
+            !job.businessEvidence ||
+            !reminderEvidenceMatches(
+              this.cipher.open('business-delivery', job.id, job.businessEvidence),
+              job.reminder,
+            ))
+        )
+          throw new Error('INVALID_REMINDER_DELIVERY');
         if (automation !== !!decoded.automation || (!automation && job.mediaPayload))
           throw new Error('INVALID_REPLY_ORIGIN');
         if (automation) {
@@ -653,6 +705,7 @@ export class DurableMessages {
         report('error');
         return;
       }
+      if (reminder && (await this.repository.yieldReminderToHuman?.(job))) return;
       if (!(await this.options.waitBeforeReply(signal)) || signal.aborted) {
         await this.repository.releaseUnsent(job, true);
         return;
@@ -662,7 +715,7 @@ export class DurableMessages {
         this.sentCallbacks.delete(job.id);
         return;
       }
-      if (job.replyKind === 'business') {
+      if (job.replyKind === 'business' && !reminder) {
         const allowed =
           !manual &&
           message &&
@@ -711,7 +764,35 @@ export class DurableMessages {
         if (manual || voice.owner !== expectedOwner) throw new Error('VOICE_REPLY_OWNER_MISMATCH');
         reply = (await renderVoiceReply(reply as string, voice, this.options.media?.store)).text;
       }
-      if (!(await this.repository.beginSend(job))) {
+      let reminderPreflight: { employee: EmployeeIdentity; checkedAtMs: number } | undefined;
+      if (reminder) {
+        if (!this.options.reminderEmployee || !job.reminder || !job.chatId) {
+          await this.repository.complete(job, 'FAILED', 'reminder_delivery_unavailable');
+          report('error');
+          return;
+        }
+        const identitySignal = AbortSignal.any([signal, AbortSignal.timeout(10000)]);
+        const employee = await cancellable(
+          () =>
+            this.options.reminderEmployee!(
+              job.reminder!.ownerEmployeeId,
+              identitySignal,
+              job.chatId,
+            ),
+          identitySignal,
+        );
+        signal.throwIfAborted();
+        if (
+          !employee?.active ||
+          employee.employeeId !== job.reminder.ownerEmployeeId ||
+          employee.phoneE164 !== job.reminder.recipientPhoneE164
+        ) {
+          await this.repository.complete(job, 'EXPIRED', 'reminder_identity_unavailable');
+          return;
+        }
+        reminderPreflight = { employee, checkedAtMs: Date.now() };
+      }
+      if (!(await this.repository.beginSend(job, reminderPreflight))) {
         await this.repository.releaseUnsent(job);
         return;
       }

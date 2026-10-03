@@ -1,5 +1,7 @@
 # EC2 operations
 
+Scheduling rollout: message migration `202610030007` is applied and verified. Deploy the compatible queue code first, verify readiness, then explicitly enable personal tools and the due scheduler as described in [personal scheduling operations](personal-scheduling.md). Disabling new scheduling leaves existing reminder delivery checks active. Authenticated `/v1/status` exposes scheduler tick health separately from WhatsApp connectivity. The real-data capture role has no production scheduling access.
+
 Current implementation (2 October 2026): separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages and media use durable sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). The capture GUI accepts attachments and overlapping messages, with one response per batch. See [module specifications](agent-modules/README.md) for current contracts and deployment prerequisites. Real-data private outcome cases and transcripts remain only under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
 
 The optional business-read flag in this checkout now enables the full employee-permitted CRM, supply, knowledge and shortlist catalogue through the [sales loop](sales-manager-agent.md). Validate production migration `202610010004`, roster RLS, signed scopes and model limits before enabling it. Local Supabase capture tests do not change that production configuration.
@@ -66,7 +68,7 @@ Readiness checks validate the process, release, and configured databases without
 
 ## Runtime configuration
 
-The separate [outbound automation API](outbound-automation.md) uses `RAMESH_AUTOMATION_API_KEY` and `/v1/outbound-messages` plus its per-message status route. Supabase migration `202610030006` is applied; its dedicated key is installed in the protected host environment and SSM runtime version 11. The extended Caddy allowlist has been validated and reloaded. Code rollout is pending CI/CD. Normal app deployments do not replace the Caddyfile or these credentials.
+The separate [outbound automation API](outbound-automation.md) uses `RAMESH_AUTOMATION_API_KEY` and `/v1/outbound-messages` plus its per-message status route. Supabase migration `202610030006` is applied; its dedicated key is installed in the protected host environment and SSM runtime version 11. The extended Caddy allowlist has been validated and reloaded. Code is deployed in `3ad3408`; WhatsApp is connected and HTTPS authorization probes pass. Normal app deployments do not replace the Caddyfile or these credentials.
 
 `/etc/wareongo-sales-bot/worker.env` is root-owned mode `0600`. Parameter Store `/ramesh-bot/production/runtime` is a `SecureString` containing the encrypted JSON backup of runtime values. The process reads the host environment on startup; changing Parameter Store alone does not update or restart the worker. Bootstrap preserves an existing host environment, and ordinary releases do not replace it.
 

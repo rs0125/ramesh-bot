@@ -155,6 +155,86 @@ test('missing, inconsistent and unsupported billing dimensions remain explicitly
   assert.equal(priceUsage(reportedUsage({ usage }, 'responses')), null);
 });
 
+test('configured cache writes price disjoint input and increase the conservative reservation', () => {
+  const configured = { ...price, cacheWriteInputMicrosPerMillion: 4_000_000 };
+  const body = {
+    usage: {
+      ...usage,
+      input_tokens_details: { cached_tokens: 4, cache_write_tokens: 2 },
+      input_token_details: { audio_tokens: 1 },
+    },
+  };
+  assert.equal(priceUsage(reportedUsage(body, 'responses'), configured), 26);
+  assert.equal(priceUsage(reportedUsage(body, 'responses'), price), null);
+  assert.equal(reserveUsage(configured), 440);
+  assert.equal(
+    priceUsage(
+      reportedUsage({ usage: { ...body.usage, input_tokens: 6 } }, 'responses'),
+      configured,
+    ),
+    null,
+  );
+  assert.equal(
+    priceUsage(
+      reportedUsage(
+        {
+          usage: {
+            ...body.usage,
+            input_tokens_details: { cached_tokens: 4, cache_write_tokens: 7 },
+          },
+        },
+        'responses',
+      ),
+      configured,
+    ),
+    null,
+  );
+  for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () =>
+        loadUsagePolicy({
+          USAGE_PRICES_JSON: JSON.stringify({
+            version: 'fixture',
+            models: { fixture: { ...price, cacheWriteInputMicrosPerMillion: value } },
+          }),
+        }),
+      /INVALID_USAGE_PRICES/,
+    );
+  }
+  assert.equal(
+    loadUsagePolicy({
+      USAGE_PRICES_JSON: JSON.stringify({ version: 'fixture', models: { fixture: configured } }),
+    }).prices?.models.fixture?.cacheWriteInputMicrosPerMillion,
+    4_000_000,
+  );
+});
+
+test('recorded cache-write-heavy usage shapes settle without treating cached writes as regular input', () => {
+  // Only provider usage counts are retained; there is no prompt, response or business data here.
+  const reviewed: UsagePrice = {
+    inputMicrosPerMillion: 100_000,
+    cachedInputMicrosPerMillion: 10_000,
+    cacheWriteInputMicrosPerMillion: 125_000,
+    outputMicrosPerMillion: 500_000,
+  };
+  for (const [input, write, expected] of [
+    [3077, 3074, 385],
+    [6649, 6646, 832],
+  ]) {
+    const report = reportedUsage(
+      {
+        usage: {
+          input_tokens: input,
+          output_tokens: 0,
+          input_tokens_details: { cached_tokens: 0, cache_write_tokens: write },
+        },
+      },
+      'responses',
+    );
+    assert.equal(priceUsage(report, reviewed), expected);
+  }
+});
+
 test('transcription prices audio/text splits and duration but refuses an unbounded duration reservation', () => {
   const tokens = reportedUsage(
     {
@@ -343,7 +423,7 @@ test('transport failure retains a reservation rather than counting zero', async 
   assert.equal(summary.unknownRequests, 1);
 });
 
-test('unsupported cache-write counts are retained for diagnosis without guessing a price', async () => {
+test('unconfigured cache-write counts are retained for diagnosis without guessing a price', async () => {
   const { meter, events } = setup();
   const wrapped = meter.wrapFetch(async () =>
     Response.json({
@@ -359,6 +439,47 @@ test('unsupported cache-write counts are retained for diagnosis without guessing
   assert.equal(event.settlement.cacheWriteTokens, 2);
   assert.equal(event.settlement.actualMicros, null);
   assert.equal((await meter.summarize(scope.runId)).heldMicros, 340);
+});
+
+test('configured cache-write settlement releases unused reservations before the next request', async () => {
+  const events: UsageEvent[] = [];
+  const ledger = new MemoryUsageLedger('fixture-account', 'evaluation');
+  const meter = new UsageMeter(ledger, {
+    accountId: 'fixture-account',
+    purpose: 'evaluation',
+    policy: {
+      mode: 'enforce',
+      prices: {
+        version: 'fictional-cache-v1',
+        models: { 'fixture-model': { ...price, cacheWriteInputMicrosPerMillion: 4_000_000 } },
+      },
+      limits: { runMicros: 500 },
+    },
+    observe: (event) => {
+      events.push(event);
+    },
+  });
+  let calls = 0;
+  const wrapped = meter.wrapFetch(async () => {
+    calls++;
+    return Response.json({
+      usage: { ...usage, input_tokens_details: { cached_tokens: 4, cache_write_tokens: 2 } },
+    });
+  });
+  await meter.run(scope, async () => {
+    await wrapped(url, init);
+    await wrapped(url, init);
+  });
+  assert.equal(calls, 2);
+  const settlements = events.filter((event) => event.type === 'settled');
+  assert.equal(settlements.length, 2);
+  for (const event of settlements) {
+    assert.equal(event.settlement.actualMicros, 24);
+    assert.equal(event.settlement.cacheWriteTokens, 2);
+  }
+  const summary = await meter.summarize(scope.runId);
+  assert.equal(summary.heldMicros, 0);
+  assert.equal(summary.unknownRequests, 0);
 });
 
 test('real media SDK multipart and image requests share the same meter', async () => {

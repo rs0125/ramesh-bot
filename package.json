@@ -38,7 +38,8 @@
     "eval:private": "tsx evals/private-run.ts",
     "eval:judge": "tsx evals/judge-calibration-run.ts",
     "eval:regrade": "tsx evals/regrade-run.ts",
-    "eval:stt": "tsx evals/stt-run.ts"
+    "eval:stt": "tsx evals/stt-run.ts",
+    "eval:scheduling": "tsx evals/scheduling-run.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.4",

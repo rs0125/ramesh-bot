@@ -7,6 +7,8 @@ import type {
   OutboundAutomationStatus,
 } from '../../contracts/outbound-automation.js';
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
+import type { ReminderDeliveryRef } from '../../modules/scheduling/scheduling.types.js';
+import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
 
 export type TerminalState = 'SENT' | 'EXPIRED' | 'FAILED' | 'UNCERTAIN';
 export type QueueDirection = 'inbound' | 'outbound';
@@ -22,7 +24,8 @@ export interface MessageJob {
   receivedAt?: Date;
   direction: QueueDirection;
   replyPayload?: string;
-  origin?: 'whatsapp' | 'admin' | 'automation';
+  origin?: 'whatsapp' | 'admin' | 'automation' | 'reminder';
+  reminder?: ReminderDeliveryRef;
   mediaPayload?: string;
   chatId?: string;
   replyKind?: 'conversation' | 'business';
@@ -49,7 +52,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610030006'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610030007'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -338,6 +341,72 @@ export class MessageQueueRepository {
     });
   }
 
+  /** Internal only: caller owns the fenced occurrence transaction and the account admission lock. */
+  async enqueueReminder(
+    db: PoolClient,
+    id: string,
+    chatId: string,
+    content: string,
+    replyPayload: string,
+    businessEvidence: string,
+    capacity: number,
+    ref: ReminderDeliveryRef,
+  ): Promise<string | 'full'> {
+    if (
+      !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(id) ||
+      !/^\+[1-9]\d{7,14}$/.test(ref.recipientPhoneE164) ||
+      !/^(?:[1-9]\d{7,14}@s\.whatsapp\.net|\d{5,20}@lid)$/.test(chatId) ||
+      (chatId.endsWith('@s.whatsapp.net') &&
+        chatId !== `${ref.recipientPhoneE164.slice(1)}@s.whatsapp.net`) ||
+      !Number.isSafeInteger(capacity) ||
+      capacity < 1 ||
+      capacity > 1000 ||
+      !Number.isFinite(ref.notAfterMs) ||
+      ref.notAfterMs <= Date.now() ||
+      !content ||
+      !replyPayload ||
+      !businessEvidence
+    )
+      throw new Error('INVALID_REMINDER_ENQUEUE');
+    const existing = await db.query(
+      `SELECT m.id FROM public."ramesh-messages" m
+       JOIN public."ramesh-reminder-occurrences" o ON o.outbound_message_id=m.id
+       WHERE m.id=$1 AND m.account_id=$2 AND m.origin='reminder'
+       AND o.id=$3 AND o.schedule_version=$4 AND o.dispatch_generation=$5`,
+      [id, this.accountId, ref.occurrenceId, ref.scheduleVersion, ref.dispatchGeneration],
+    );
+    if (existing.rowCount) return id;
+    const count = await db.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM public."ramesh-messages" WHERE account_id=$1
+       AND state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')`,
+      [this.accountId],
+    );
+    if (count.rows[0]!.count >= capacity) return 'full';
+    await db.query(
+      `INSERT INTO public."ramesh-messages"
+       (id,account_id,chat_id,whatsapp_message_id,sent_at,expires_at,state,payload_encrypted,
+        origin,content_encrypted,reply_encrypted,reply_created_at,reply_kind,business_evidence_encrypted)
+       VALUES ($1,$2,$3,$4,clock_timestamp(),$5,'READY_TO_SEND',$6,'reminder',$7,$6,
+        clock_timestamp(),'business',$8)`,
+      [
+        id,
+        this.accountId,
+        chatId,
+        `reminder:${id}`,
+        new Date(ref.notAfterMs),
+        replyPayload,
+        content,
+        businessEvidence,
+      ],
+    );
+    await db.query(
+      `INSERT INTO public."ramesh-outbound-queue" (message_id,account_id,payload_encrypted)
+       VALUES ($1,$2,$3)`,
+      [id, this.accountId, replyPayload],
+    );
+    return id;
+  }
+
   /** Automation credentials must not disclose inbox/operator/inbound job metadata. */
   async automationStatus(id: string): Promise<OutboundAutomationStatus | null> {
     const row = (
@@ -510,16 +579,55 @@ export class MessageQueueRepository {
     return row?.wait == null ? maxMs : Math.min(maxMs, Math.max(25, Number(row.wait)));
   }
 
-  /** Batch members are part of their root's turn, not independent conversation heads. */
+  /** Include the human turn's pending reply, so a yielded reminder cannot overtake its answer. */
+  private pendingHuman(alias: string): string {
+    return `EXISTS (
+      SELECT 1 FROM public."ramesh-messages" human
+      JOIN public."ramesh-inbound-queue" turn ON turn.message_id=human.id
+      WHERE human.account_id=${alias}.account_id AND human.chat_id=${alias}.chat_id
+      AND human.origin='whatsapp' AND turn.batch_parent IS NULL
+      AND human.state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')
+    )`;
+  }
+
+  /** Human turns and their predecessors bypass only unsent scheduler notifications. */
   private conversationHead(alias: string): string {
-    return `NOT EXISTS (
+    return `(${alias}.origin<>'reminder' OR NOT ${this.pendingHuman(alias)}) AND NOT EXISTS (
       SELECT 1 FROM public."ramesh-messages" earlier
       LEFT JOIN public."ramesh-inbound-queue" child ON child.message_id=earlier.id
       WHERE earlier.account_id=${alias}.account_id AND earlier.chat_id=${alias}.chat_id
       AND earlier.queue_order<${alias}.queue_order
       AND earlier.state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')
       AND child.batch_parent IS NULL
+      AND NOT (earlier.origin='reminder' AND earlier.state='READY_TO_SEND'
+        AND ${this.pendingHuman(alias)})
     )`;
+  }
+
+  private async yieldReminder(db: PoolClient, job: MessageJob): Promise<boolean> {
+    if (job.origin !== 'reminder') return false;
+    const current = await this.owned(db, job);
+    if (!current || current.state !== 'READY_TO_SEND') return false;
+    const pending = await db.query(
+      `SELECT 1 FROM public."ramesh-messages" m WHERE m.id=$1 AND m.account_id=$2
+       AND m.origin='reminder' AND ${this.pendingHuman('m')}`,
+      [job.id, this.accountId],
+    );
+    if (!pending.rowCount) return false;
+    await db.query(
+      `UPDATE public."ramesh-outbound-queue" SET attempts=greatest(0,attempts-1)
+       WHERE message_id=$1 AND account_id=$2`,
+      [job.id, this.accountId],
+    );
+    await this.requeue(db, job, 'human_turn_pending', 0);
+    return true;
+  }
+
+  /** Pacing must not keep the only outbound lease while a human needs to cancel a reminder. */
+  async yieldReminderToHuman(job: MessageJob): Promise<boolean> {
+    return job.direction === 'outbound' && job.origin === 'reminder'
+      ? this.transaction((db) => this.yieldReminder(db, job))
+      : false;
   }
 
   claimInbound(leaseMs: number) {
@@ -554,6 +662,16 @@ export class MessageQueueRepository {
           m.reply_kind AS "replyKind",m.business_evidence_encrypted AS "businessEvidence",
           ${direction === 'outbound' ? 'j.payload_encrypted' : 'NULL::text'} AS "replyPayload",
           ${direction === 'outbound' ? 'j.media_payload_encrypted' : 'NULL::text'} AS "mediaPayload",
+          ${
+            direction === 'outbound'
+              ? `(SELECT jsonb_build_object(
+            'occurrenceId',o.id,'reminderId',o.reminder_id,'scheduleVersion',o.schedule_version,
+            'dispatchGeneration',o.dispatch_generation,'ownerEmployeeId',o.recipient_employee_id,
+            'recipientPhoneE164',o.recipient_phone_e164,
+            'notAfterMs',floor(extract(epoch FROM o.not_after)*1000))
+            FROM public."ramesh-reminder-occurrences" o WHERE o.outbound_message_id=m.id AND o.account_id=m.account_id)`
+              : 'NULL::jsonb'
+          } AS reminder,
           '${direction}'::text AS direction,m.queue_order
         FROM ${queueTable(direction)} j JOIN public."ramesh-messages" m ON m.id=j.message_id
         WHERE j.account_id=$1 AND j.state='READY' AND j.available_at<=clock_timestamp()
@@ -714,15 +832,67 @@ export class MessageQueueRepository {
     });
   }
 
-  async beginSend(job: MessageJob): Promise<boolean> {
+  async beginSend(
+    job: MessageJob,
+    preflight?: { employee: EmployeeIdentity; checkedAtMs: number },
+  ): Promise<boolean> {
     if (job.direction !== 'outbound') return false;
     return this.transaction(async (db) => {
+      if (await this.yieldReminder(db, job)) return false;
+      let reminderAuthorized = false;
+      if (job.origin === 'reminder') {
+        const ref = job.reminder;
+        const actor = preflight?.employee;
+        const proofAge = Date.now() - (preflight?.checkedAtMs ?? 0);
+        if (
+          !ref ||
+          !actor?.active ||
+          actor.employeeId !== ref.ownerEmployeeId ||
+          actor.phoneE164 !== ref.recipientPhoneE164 ||
+          proofAge < 0 ||
+          proofAge > 10000
+        )
+          return false;
+        const valid = await db.query(
+          `SELECT o.id FROM public."ramesh-reminder-occurrences" o
+           JOIN public."ramesh-reminders" r ON r.id=o.reminder_id AND r.account_id=o.account_id
+           LEFT JOIN public."ramesh-tasks" t ON t.id=r.task_id AND t.account_id=r.account_id
+           JOIN public."ramesh-messages" m ON m.id=o.outbound_message_id AND m.account_id=o.account_id
+           WHERE o.outbound_message_id=$1 AND o.account_id=$2 AND o.id=$3 AND o.reminder_id=$4
+           AND o.schedule_version=$5 AND o.dispatch_generation=$6 AND o.state='queued'
+           AND o.not_after>clock_timestamp() AND r.version=o.schedule_version AND r.state='scheduled'
+           AND r.owner_employee_id=$7 AND o.recipient_employee_id=$7
+           AND r.recipient_phone_e164=$8 AND o.recipient_phone_e164=$8
+           AND m.chat_id=o.recipient_chat_id AND r.recipient_chat_id=o.recipient_chat_id
+           AND (r.task_id IS NULL OR (t.state='open' AND t.owner_employee_id=r.owner_employee_id))
+           AND NOT ${this.pendingHuman('m')}
+           FOR UPDATE OF o,r`,
+          [
+            job.id,
+            this.accountId,
+            ref.occurrenceId,
+            ref.reminderId,
+            ref.scheduleVersion,
+            ref.dispatchGeneration,
+            actor.employeeId,
+            actor.phoneE164,
+          ],
+        );
+        if (!valid.rowCount) {
+          const owned = await this.owned(db, job);
+          if (owned?.state === 'READY_TO_SEND')
+            await this.finish(db, job, 'EXPIRED', 'reminder_no_longer_eligible');
+          return false;
+        }
+        reminderAuthorized = true;
+      }
       const result = await db.query(
         `UPDATE public."ramesh-messages" m SET state='SENDING',updated_at=clock_timestamp()
         FROM public."ramesh-outbound-queue" j WHERE m.id=$1 AND m.account_id=$2 AND m.state='READY_TO_SEND'
         AND j.message_id=m.id AND j.state='LEASED' AND j.lease_token=$3
-        AND j.lease_until>clock_timestamp() AND m.expires_at>clock_timestamp() RETURNING m.id`,
-        [job.id, this.accountId, job.token],
+        AND j.lease_until>clock_timestamp() AND m.expires_at>clock_timestamp()
+        AND (m.origin<>'reminder' OR $4::boolean) RETURNING m.id`,
+        [job.id, this.accountId, job.token, reminderAuthorized],
       );
       return result.rowCount === 1;
     });
@@ -839,7 +1009,10 @@ export class MessageQueueRepository {
       await this.recover(db);
       await db.query(
         `DELETE FROM public."ramesh-messages" WHERE account_id=$1
-        AND finished_at < clock_timestamp()-interval '30 days' AND state IN ('OBSERVED','SENT','EXPIRED','FAILED','UNCERTAIN')`,
+        AND finished_at < clock_timestamp()-interval '30 days' AND state IN ('OBSERVED','SENT','EXPIRED','FAILED','UNCERTAIN')
+        AND NOT EXISTS (SELECT 1 FROM public."ramesh-reminder-occurrences" o
+          WHERE o.outbound_message_id=public."ramesh-messages".id
+          AND o.state IN ('pending','preparing','waiting_source','queued'))`,
         [this.accountId],
       );
     });

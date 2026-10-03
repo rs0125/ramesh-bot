@@ -21,6 +21,11 @@ export interface AppConfig {
   readonly messageDatabase?: MessageDatabaseConfig;
   readonly assistant?: AssistantConfig;
   readonly businessReads?: BusinessReadConfig;
+  readonly scheduling?: {
+    readonly toolsEnabled: boolean;
+    readonly schedulerEnabled: boolean;
+    readonly pollMs: number;
+  };
   readonly whatsapp: {
     readonly debounce?: DebouncePolicy;
     readonly maxMessageAgeMs: number;
@@ -92,6 +97,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (api.automationKey && !messageDatabase)
     throw new Error('RAMESH_AUTOMATION_API_KEY requires Supabase message storage');
   const assistant = loadAssistantConfig(env);
+  const toolsEnabled = booleanValue(env, 'PERSONAL_SCHEDULING_ENABLED', false);
+  const schedulerEnabled = booleanValue(env, 'REMINDER_SCHEDULER_ENABLED', toolsEnabled);
+  const schedulingPollMs = positiveInteger(env, 'REMINDER_SCHEDULER_POLL_MS', 30000);
+  if (schedulingPollMs < 1000 || schedulingPollMs > 60000)
+    throw new Error('REMINDER_SCHEDULER_POLL_MS must be between 1000 and 60000');
+  if ((toolsEnabled || schedulerEnabled) && !messageDatabase)
+    throw new Error('Personal scheduling requires Supabase message storage');
+  if (toolsEnabled && !assistant)
+    throw new Error('Personal scheduling tools require a configured assistant');
   const businessReads = loadBusinessReadConfig(env);
   if (businessReads && (!messageDatabase || !assistant))
     throw new Error('Business reads require Supabase message storage and the configured assistant');
@@ -104,6 +118,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     messageDatabase,
     assistant,
     businessReads,
+    scheduling:
+      toolsEnabled || schedulerEnabled
+        ? { toolsEnabled, schedulerEnabled, pollMs: schedulingPollMs }
+        : undefined,
     whatsapp: {
       debounce: loadDebounce(env),
       maxMessageAgeMs: maxAgeSeconds * 1000,

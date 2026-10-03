@@ -12,6 +12,45 @@ const base = {
   WORKER_API_TOKEN: 'x'.repeat(32),
 };
 
+test('scheduling requires durable storage, permits delivery pause, and needs no CRM grant', () => {
+  const configured = {
+    ...base,
+    MESSAGE_DATABASE_URL: 'postgresql://ramesh_worker:fake@127.0.0.1/test',
+    OPENAI_API_KEY: 'fake-unused',
+    PERSONAL_SCHEDULING_ENABLED: 'true',
+  };
+  assert.equal(loadConfig(base).scheduling, undefined);
+  assert.throws(() => loadConfig({ ...base, PERSONAL_SCHEDULING_ENABLED: 'true' }), /Supabase/);
+  assert.throws(() => loadConfig({ ...configured, OPENAI_API_KEY: '' }), /assistant/);
+  assert.deepEqual(loadConfig(configured).scheduling, {
+    toolsEnabled: true,
+    schedulerEnabled: true,
+    pollMs: 30000,
+  });
+  assert.equal(loadConfig(configured).businessReads, undefined);
+  assert.deepEqual(loadConfig({ ...configured, REMINDER_SCHEDULER_ENABLED: 'false' }).scheduling, {
+    toolsEnabled: true,
+    schedulerEnabled: false,
+    pollMs: 30000,
+  });
+  assert.deepEqual(
+    loadConfig({
+      ...configured,
+      PERSONAL_SCHEDULING_ENABLED: 'false',
+      REMINDER_SCHEDULER_ENABLED: 'true',
+      OPENAI_API_KEY: '',
+    }).scheduling,
+    {
+      toolsEnabled: false,
+      schedulerEnabled: true,
+      pollMs: 30000,
+    },
+  );
+  for (const value of ['999', '60001', '0', '2.5']) {
+    assert.throws(() => loadConfig({ ...configured, REMINDER_SCHEDULER_POLL_MS: value }));
+  }
+});
+
 test('message database config requires a scoped login and bounded polling', () => {
   assert.equal(loadConfig(base).messageDatabase, undefined);
   assert.throws(

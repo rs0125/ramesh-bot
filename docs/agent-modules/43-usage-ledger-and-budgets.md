@@ -52,15 +52,16 @@ with `USAGE_METER_REQUIRED`; use the live Supabase playground for persistent cap
 model ID. Version and model IDs use letters, numbers, dots, underscores and
 hyphens. Each model entry has these fields:
 
-| Field                         | Unit and responsibility                                                                                     |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `inputMicrosPerMillion`       | Integer USD micros per million uncached text input tokens; required                                         |
-| `outputMicrosPerMillion`      | Integer USD micros per million output tokens; required                                                      |
-| `cachedInputMicrosPerMillion` | Explicit rate for reported cached input tokens, when applicable                                             |
-| `audioInputMicrosPerMillion`  | Explicit rate for reported audio input tokens, when applicable                                              |
-| `durationMicrosPerSecond`     | Explicit rate for reported transcription seconds; see the enforcement limitation below                      |
-| `maxInputTokens`              | Reviewed upper bound for billable input of this model/request path; needed for a safe reservation           |
-| `maxOutputTokens`             | Reviewed upper bound used when a request has no explicit output limit, including token-billed transcription |
+| Field                             | Unit and responsibility                                                                                     |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `inputMicrosPerMillion`           | Integer USD micros per million uncached text input tokens; required                                         |
+| `outputMicrosPerMillion`          | Integer USD micros per million output tokens; required                                                      |
+| `cachedInputMicrosPerMillion`     | Explicit rate for reported cached input tokens, when applicable                                             |
+| `cacheWriteInputMicrosPerMillion` | Explicit rate for reported cache-write input tokens, when applicable                                        |
+| `audioInputMicrosPerMillion`      | Explicit rate for reported audio input tokens, when applicable                                              |
+| `durationMicrosPerSecond`         | Explicit rate for reported transcription seconds; see the enforcement limitation below                      |
+| `maxInputTokens`                  | Reviewed upper bound for billable input of this model/request path; needed for a safe reservation           |
+| `maxOutputTokens`                 | Reviewed upper bound used when a request has no explicit output limit, including token-billed transcription |
 
 Rates must match the actual provider, requested model, service tier and billing
 categories used by this application. Check current provider documentation and
@@ -87,9 +88,12 @@ require separate operational accounting.
 Reasoning tokens are part of reported output usage, so they are not added to
 output tokens a second time. Incomplete responses can still incur usage before
 producing visible text. See the official [OpenAI reasoning documentation](https://developers.openai.com/api/docs/guides/reasoning).
-Cached and audio input counts are likewise treated as input subsets. Missing
-rates or inconsistent usage produce an unknown amount. Unsupported positive
-cache-write usage is not priced as ordinary input.
+Cached reads, cache writes and audio counts are disjoint subsets of total input.
+Each is charged at its explicitly configured rate; the remaining input uses the
+ordinary input rate. Their sum cannot exceed reported input. Missing rates or
+inconsistent usage produce an unknown amount, so positive cache-write usage
+without `cacheWriteInputMicrosPerMillion` retains the reservation. Configuring this
+optional rate also includes it in the maximum input rate used for admission.
 
 The transcription adapter reads the returned usage structure, including its
 reported text/audio split; see the official [Create transcription reference](https://developers.openai.com/api/reference/cli/resources/audio/subresources/transcriptions/methods/create).

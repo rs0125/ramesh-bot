@@ -29,6 +29,9 @@ import { PostgresEmployeeRoster } from '../infrastructure/database/employee-rost
 import { UsageMeter } from '../modules/usage/usage-meter.js';
 import { UsageLedgerRepository } from '../infrastructure/database/usage-ledger.repository.js';
 import { AutomationOutboundService } from '../modules/messaging/outbound-automation.js';
+import { PersonalRepository } from '../infrastructure/database/personal.repository.js';
+import { PersonalToolService } from '../modules/scheduling/personal-tools.js';
+import { PersonalSchedulerService } from '../modules/scheduling/scheduler.service.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -71,6 +74,46 @@ export function createApplication(
   const businessReads =
     config.businessReads && messagePool
       ? createBusinessReads(config.businessReads, db, messagePool, config.encryptionKey)
+      : undefined;
+  // Existing queued reminders still need their delivery fence when new scheduling is disabled.
+  const schedulingIdentity = messagePool
+    ? new EmployeeIdentityResolver(new PostgresEmployeeRoster(messagePool))
+    : undefined;
+  const schedulingSender = schedulingIdentity
+    ? new WhatsAppEmployeeResolver(db, config.encryptionKey, schedulingIdentity)
+    : undefined;
+  const resolveReminderEmployee =
+    schedulingIdentity && schedulingSender
+      ? async (id: number, signal: AbortSignal, chatId?: string) => {
+          const employee = await schedulingIdentity.resolveEmployee(id, signal);
+          if (!employee || !chatId) return employee;
+          const current = await schedulingSender.resolve(
+            { key: { remoteJid: chatId, fromMe: false } },
+            signal,
+          );
+          return current?.sender.audience === 'dm' &&
+            current.employee.employeeId === id &&
+            current.employee.phoneE164 === employee.phoneE164
+            ? employee
+            : null;
+        }
+      : undefined;
+  const personalRepository =
+    messagePool && config.messageDatabase
+      ? new PersonalRepository(messagePool, config.messageDatabase.accountId, config.encryptionKey)
+      : undefined;
+  const personalTools =
+    config.scheduling && personalRepository && schedulingSender
+      ? new PersonalToolService(personalRepository, async (key, signal) => {
+          const resolved = await schedulingSender.resolve({ key }, signal);
+          return resolved?.sender.audience === 'dm' && key.remoteJid
+            ? {
+                employeeId: resolved.employee.employeeId,
+                phoneE164: resolved.employee.phoneE164,
+                chatId: key.remoteJid,
+              }
+            : null;
+        })
       : undefined;
   const usagePolicy = config.assistant?.usagePolicy;
   if (usagePolicy && usagePolicy.mode !== 'off' && !messagePool)
@@ -117,7 +160,11 @@ export function createApplication(
         (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
         inboxRepository ? (message) => inboxRepository.context(message) : undefined,
         businessReads,
-        { usageMeter, checkpoints },
+        {
+          usageMeter,
+          checkpoints,
+          personalTools: config.scheduling?.toolsEnabled ? personalTools : undefined,
+        },
       )
     : undefined;
   const prepareReply = assistant ? assistant.prepare.bind(assistant) : undefined;
@@ -133,28 +180,54 @@ export function createApplication(
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
           prepareReply,
-          agentRuns: !!businessReads,
+          agentRuns: !!businessReads || !!personalTools,
           media,
           accountId: config.messageDatabase.accountId,
           usageMode: usagePolicy?.mode ?? 'off',
+          reminderEmployee: resolveReminderEmployee,
           usageEmployee: usageIdentity
             ? async (key, signal) =>
                 (await usageIdentity.resolve({ key }, signal))?.employee.employeeId
             : undefined,
           onUsageAttributionFailure: (reason) =>
             logger.warn({ reason }, 'Usage attribution unavailable'),
-          businessPreflight: businessReads
-            ? (message, evidence, signal) =>
-                businessReads.canDeliver(
-                  message.key,
-                  evidence,
-                  AbortSignal.any([
+          businessPreflight:
+            businessReads || personalTools
+              ? async (message, evidence, signal) => {
+                  const bounded = AbortSignal.any([
                     signal,
-                    AbortSignal.timeout(config.businessReads!.context.timeoutMs),
-                  ]),
-                  (reason, tool) => logger.warn({ reason, tool }, 'Business delivery check failed'),
-                )
-            : undefined,
+                    AbortSignal.timeout(config.businessReads?.context.timeoutMs ?? 10000),
+                  ]);
+                  if (
+                    evidence &&
+                    typeof evidence === 'object' &&
+                    'kind' in evidence &&
+                    evidence.kind === 'personal'
+                  )
+                    return personalTools
+                      ? personalTools.canDeliver(message.key, evidence, bounded)
+                      : false;
+                  return businessReads
+                    ? businessReads.canDeliver(message.key, evidence, bounded, (reason, tool) =>
+                        logger.warn({ reason, tool }, 'Business delivery check failed'),
+                      )
+                    : false;
+                }
+              : undefined,
+        })
+      : undefined;
+  const scheduler =
+    config.scheduling?.schedulerEnabled &&
+    personalRepository &&
+    messageRepository &&
+    resolveReminderEmployee
+      ? new PersonalSchedulerService(personalRepository, messageRepository, {
+          encryptionKey: config.encryptionKey,
+          capacity: config.whatsapp.maxPendingMessages,
+          resolveEmployee: resolveReminderEmployee,
+          onQueued: () => durableMessages?.notifyOutbound(),
+          pollMs: config.scheduling.pollMs,
+          onError: () => logger.error('Personal reminder scheduler operation failed'),
         })
       : undefined;
   const greetings = new GreetingService(
@@ -197,7 +270,18 @@ export function createApplication(
     });
   const api = createAdminServer(
     {
-      getStatus: () => whatsapp.getStatus(),
+      getStatus: () => ({
+        ...whatsapp.getStatus(),
+        ...(config.scheduling
+          ? {
+              scheduling: {
+                toolsEnabled: config.scheduling.toolsEnabled,
+                schedulerEnabled: config.scheduling.schedulerEnabled,
+                scheduler: scheduler?.getStatus() ?? null,
+              },
+            }
+          : {}),
+      }),
       start: async () => {
         await remember(true);
         await whatsapp.start();
@@ -257,6 +341,7 @@ export function createApplication(
           await messageRepository.clean();
           await checkpoints?.clean();
           await media?.clean();
+          await personalRepository?.clean();
           await db.botSetting.upsert({
             where: { key: 'message-storage' },
             create: { key: 'message-storage', value: 'postgres' },
@@ -274,6 +359,7 @@ export function createApplication(
             .then(() => messageRepository?.clean())
             .then(() => checkpoints?.clean())
             .then(() => media?.clean())
+            .then(() => personalRepository?.clean())
             .catch((error) => logger.error({ err: error }, 'State cleanup failed'));
         }, 60_000);
         maintenance.unref();
@@ -281,6 +367,7 @@ export function createApplication(
         if ((preference ? preference.value === 'true' : config.autoConnect) && !stopped)
           await whatsapp.start();
         ready = !stopped;
+        if (ready) scheduler?.start();
       })());
     },
     stop() {
@@ -291,6 +378,7 @@ export function createApplication(
         await starting?.catch(() => undefined);
         if (maintenance) clearInterval(maintenance);
         try {
+          await scheduler?.stop();
           await api.stop();
         } finally {
           durableMessages?.stopMediaIngress();

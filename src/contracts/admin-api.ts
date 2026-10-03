@@ -14,6 +14,16 @@ export interface BotEvent {
   message: string;
 }
 export interface BotStatus {
+  scheduling?: {
+    toolsEnabled: boolean;
+    schedulerEnabled: boolean;
+    scheduler: {
+      running: boolean;
+      lastTickAt: string | null;
+      lastSuccessAt: string | null;
+      lastError: boolean;
+    } | null;
+  };
   state: BotState;
   qr: string | null;
   updatedAt: string;

@@ -1,5 +1,7 @@
 # WareOnGo WhatsApp worker
 
+The [reminders and tasks design](docs/reminders-and-tasks-design.md) proposes durable personal tasks, IST schedules beyond 24 hours, recurrence, cancellation and legacy migration. It is a documentation draft; those tools and the scheduler are not implemented.
+
 Production status (3 October 2026): Sol at medium reasoning runs separate converser → planner → worker/tool-executor → formatter → verifier roles; ordinary chat skips planning. CRM, supply and knowledge reads are enabled for active employees within their Context Engine permissions. Images, PDFs and voice notes use encrypted owner-scoped media records with 24-hour expiry. Forwarded messages/media use sliding inbound batching (1-second ordinary text, 3-second burst window, 8-second cap). See the [capability review](docs/capability-review-2026-10-02.md) and [module specifications](docs/agent-modules/README.md). Real-data cases and transcripts remain under gitignored `.local/private-evals/`; `npm run eval:private` refuses CI.
 
 Standalone TypeScript service for Ramesh, a personal chief of staff for anyone messaging it. OpenAI Responses and LangGraph handle DMs and real group @mentions. Business reads are private to verified employees in DMs. Without business configuration, a two-node converser/formatter flow remains available; without an API key, the original `hello` behavior remains available. Supabase stores the encrypted inbox, recent conversational context, message state, and separate `ramesh-inbound-queue` and `ramesh-outbound-queue` tables. Prisma/SQLite retains encrypted WhatsApp auth and admin state. Operators can read conversations and send messages as Ramesh to existing chats from the admin.
@@ -17,7 +19,7 @@ Detailed [agent module specifications](docs/agent-modules/README.md) define the 
 
 The deployed concurrency/replay release has production migrations `202610020006` (usage ledger), `202610030004` (per-chat queue) and `202610030005` (checkpoints) applied, plus independent capture migrations `202610020003` (usage ledger) and `202610030005` (checkpoints). Fresh installations need the full migration history; runtime readiness rejects an older schema. See the [first-read runbook](docs/first-crm-read.md) for activation and rollback, and [inbox operations](docs/supabase-message-queue.md#inbox-context-and-operator-sends).
 
-The [outbound automation API](docs/agent-modules/48-outbound-automation-api.md) is implemented in the current checkout, with rollout pending. It accepts authenticated text, JPEG/PNG images and PDFs into the outbound queue without invoking the agent. Production migration `202610030006` is applied and verified with the restricted runtime role. The API key is installed on the host and in SSM runtime version 11, and the proxy configuration is validated. Code deployment awaits the push and CI/CD; this capability is separate from the deployed concurrency/replay release. See the [outbound automation integration guide](docs/outbound-automation.md).
+The [outbound automation API](docs/agent-modules/48-outbound-automation-api.md) is deployed in `3ad3408`. It accepts authenticated text, JPEG/PNG images and PDFs into the outbound queue without invoking the agent. Production migration `202610030006` is applied and verified with the restricted runtime role. The API key is installed on the host and in SSM runtime version 11, and the proxy configuration is validated. CI and CD passed. Production health, WhatsApp connectivity and non-mutating HTTPS authorization probes passed; no test notifications were sent. See the [outbound automation integration guide](docs/outbound-automation.md).
 
 This checkout adds [currency accounting and admission caps](docs/agent-modules/43-usage-ledger-and-budgets.md), disabled by default, and a [model-free capability readiness probe](docs/agent-modules/44-capability-readiness.md). Runtime monetary caps and automatic capability gating need explicit configuration; deploying the code alone does not enable them. The probe verifies a configured employee's current source access; ordinary `/healthz` remains process liveness. See the [3 October adversarial audit](docs/adversarial-audit-2026-10-03.md) for confirmed fixes, remaining gaps and architecture recommendations.
 
@@ -121,6 +123,7 @@ src/
   modules/assistant/       LangGraph, prompts, bounded memory and style guard
   modules/context-engine/  Read-tool contract, credential port and domain services
   modules/identity/        Live employee roster resolution and canonical phone binding
+  modules/scheduling/      Owned task/reminder tools, IST recurrence and due delivery
   infrastructure/
     whatsapp/              SDK adapter, mapping, connection/retry management
     database/              SQLite auth/admin and PostgreSQL queue repositories
@@ -198,7 +201,7 @@ Read the [detailed current implementation and architecture](docs/current-impleme
 | [Deployment guide](docs/deployment-vercel-ec2.md)                             | Independent release automation, production HTTPS, and Vercel setup                          |
 | [Usage ledger and budgets](docs/agent-modules/43-usage-ledger-and-budgets.md) | Runtime modes, reviewed pricing, atomic reservations, capture isolation and eval allowances |
 | [Capability readiness](docs/agent-modules/44-capability-readiness.md)         | Bounded employee-scoped source verification without a model or WhatsApp session             |
-| [Outbound automation API](docs/agent-modules/48-outbound-automation-api.md)   | Implemented text/media producer API, idempotency, encrypted delivery and pending rollout    |
+| [Outbound automation API](docs/agent-modules/48-outbound-automation-api.md)   | Deployed text/media producer API, idempotency and encrypted delivery                        |
 | [Product context](CONTEXT.md)                                                 | Confirmed decisions, organisational sources, and earlier options                            |
 
 The fake chat GUI uses local port **3012**; the documented SSM tunnel uses **3013**. The pairing admin at **3010** is an operations surface and is separate from the fake chat GUI.
@@ -214,3 +217,7 @@ Latest local validation: [evaluation, graph and voice refinements](evals/results
 Voice transcripts are quoted in italics before one common answer for a batch. The delivery layer reads the exact STT text from expiring media, while durable history stores only references and the answer. Configure `OPENAI_STT_API_KEY` independently of the assistant key and `OPENAI_TRANSCRIBE_MODEL` independently of the assistant model. See [voice delivery](docs/agent-modules/35-voice-transcripts.md) and [current model comparison](evals/results/2026-10-02-stt-comparison.md).
 
 The [production evaluation review](docs/agent-modules/37-production-evaluation.md) maps current primary-source guidance to this harness. Human-labelled holdouts, a required release gate and sampled production quality monitoring remain proposed; the current manual-only paid evaluation workflow does not block every deployment.
+
+## Personal scheduling
+
+Personal tasks and reminders are implemented behind explicit activation flags. They use Supabase migration `202610030007`, with one-off and daily/weekly/monthly schedules, cancellation and snooze. See [capabilities, limits and activation](docs/personal-scheduling.md). Production migration `202610030007` has been applied and verified. Activation uses the documented runtime flags after the compatible release is healthy.

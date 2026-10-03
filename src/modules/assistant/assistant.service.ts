@@ -19,6 +19,7 @@ import type { UsageMeter } from '../usage/usage-meter.js';
 import { UtilityToolRun } from './utility-tools.js';
 import { CheckpointError, type AgentCheckpointStore } from './checkpoint.types.js';
 import { withModelReplay, replayedModelSteps } from './model-replay.js';
+import type { PersonalToolRun, PersonalToolService } from '../scheduling/personal-tools.js';
 
 export interface AssistantReply extends PreparedReply {
   trace: AgentTrace;
@@ -44,6 +45,7 @@ export class AssistantService {
       usageMeter?: UsageMeter;
       utilityFetch?: typeof fetch;
       checkpoints?: AgentCheckpointStore;
+      personalTools?: PersonalToolService;
     } = {},
   ) {
     this.graph = buildAssistantGraph(model);
@@ -108,11 +110,12 @@ export class AssistantService {
     const trace: AgentTrace = {
       runId,
       model: this.modelConfig.model,
-      promptVersion: this.businessReads?.toolLoop
-        ? SALES_PROMPT_VERSION
-        : this.businessReads
-          ? READ_PROMPT_VERSION
-          : PROMPT_VERSION,
+      promptVersion:
+        this.businessReads?.toolLoop || this.runtime.personalTools
+          ? SALES_PROMPT_VERSION
+          : this.businessReads
+            ? READ_PROMPT_VERSION
+            : PROMPT_VERSION,
       durationMs: 0,
       stages: [],
       outcome: 'completed',
@@ -140,6 +143,28 @@ export class AssistantService {
           ? 'That message is a bit long. Can you split it into smaller parts?'
           : 'Could you send that as text?',
       });
+    }
+    let personal: PersonalToolRun | undefined;
+    try {
+      // A committed mutation is authoritative even if the old model deadline or journal expired.
+      // Receipt lookup still requires a current inbound lease and freshly resolved owner identity.
+      const recoveryDeadline = AbortSignal.timeout(Math.min(5000, this.modelConfig.timeoutMs));
+      const recoverySignal = signal
+        ? AbortSignal.any([signal, recoveryDeadline])
+        : recoveryDeadline;
+      personal =
+        !message.isGroup && trusted?.key.remoteJid === message.chatId
+          ? await this.runtime.personalTools?.open(trusted, recoverySignal)
+          : undefined;
+      if (personal) bindUsageEmployee(personal.employeeId);
+      const recovered = await personal?.recover(recoverySignal);
+      if (recovered) return finish({ text: recovered.text, businessEvidence: recovered.delivery });
+    } catch (error) {
+      if (error instanceof CheckpointError) throw error;
+      signal?.throwIfAborted();
+      trace.outcome = 'unavailable';
+      trace.failureCode = 'RUN_FAILED';
+      return finish({ text: UNAVAILABLE_REPLY });
     }
     const checkpoint =
       trusted?.checkpointLease && this.runtime.checkpoints
@@ -191,55 +216,67 @@ export class AssistantService {
           audience: message.isGroup ? ('group' as const) : ('dm' as const),
         };
         const graphConfig = { signal: combined, recursionLimit: 6 };
-        const result = this.businessReads?.toolLoop
-          ? await buildSalesGraph(
-              this.model,
-              async (readSignal) => {
-                const tools = await this.businessReads!.openTools(
-                  trusted?.key.remoteJid === message.chatId ? trusted : undefined,
-                  readSignal,
-                );
-                if (tools.run) bindUsageEmployee(tools.run.employeeId);
-                return tools;
-              },
-              {
-                now: checkpoint ? () => checkpoint.metadata.requestTimeMs : this.runtime.now,
-                researchDeadlineMs: deadlineAtMs - Math.min(60000, this.modelConfig.timeoutMs / 4),
-                onStage: (stage) => trace.stages.push(stage),
-                onContext: this.runtime.observeContext,
-                utilities: new UtilityToolRun(
-                  this.modelConfig.tavilyApiKey,
-                  this.runtime.utilityFetch,
-                  this.runtime.now,
-                ),
-              },
-            ).invoke(inputState, { signal: combined, recursionLimit: 76 })
-          : this.businessReads
-            ? await buildBusinessGraph(this.model, (readSignal) =>
-                this.businessReads!.read(
-                  trusted?.key.remoteJid === message.chatId ? trusted : undefined,
-                  readSignal,
-                ),
-              ).invoke(inputState, graphConfig)
-            : await this.graph.invoke(inputState, graphConfig);
+        const result =
+          this.businessReads?.toolLoop || personal
+            ? await buildSalesGraph(
+                this.model,
+                async (readSignal) => {
+                  const tools = this.businessReads?.toolLoop
+                    ? await this.businessReads.openTools(
+                        trusted?.key.remoteJid === message.chatId ? trusted : undefined,
+                        readSignal,
+                      )
+                    : { status: 'denied' as const };
+                  if (tools.run) bindUsageEmployee(tools.run.employeeId);
+                  return tools;
+                },
+                {
+                  now: checkpoint ? () => checkpoint.metadata.requestTimeMs : this.runtime.now,
+                  researchDeadlineMs:
+                    deadlineAtMs - Math.min(60000, this.modelConfig.timeoutMs / 4),
+                  onStage: (stage) => trace.stages.push(stage),
+                  onContext: this.runtime.observeContext,
+                  utilities: new UtilityToolRun(
+                    this.modelConfig.tavilyApiKey,
+                    this.runtime.utilityFetch,
+                    this.runtime.now,
+                  ),
+                  personal,
+                },
+              ).invoke(inputState, { signal: combined, recursionLimit: 76 })
+            : this.businessReads
+              ? await buildBusinessGraph(this.model, (readSignal) =>
+                  this.businessReads!.read(
+                    trusted?.key.remoteJid === message.chatId ? trusted : undefined,
+                    readSignal,
+                  ),
+                ).invoke(inputState, graphConfig)
+              : await this.graph.invoke(inputState, graphConfig);
         combined.throwIfAborted();
         trace.stages = result.stages;
         if ('researchExhausted' in result && result.researchExhausted)
           trace.limitedBy = 'research_deadline';
         const business = 'business' in result ? result.business : undefined;
+        const personalReply = 'personal' in result ? result.personal : undefined;
         if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
         if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
         let remembered = false;
         return finish({
           text: result.reply,
           draft: result.draft,
-          ...(business?.outcome === 'verified' ? { businessEvidence: business.delivery } : {}),
+          ...(personalReply
+            ? { businessEvidence: personalReply.delivery }
+            : business?.outcome === 'verified'
+              ? { businessEvidence: business.delivery }
+              : {}),
           onSent: () => {
             if (!remembered && key) {
               this.memory.remember(
                 key,
                 this.input(message),
-                business?.outcome === 'verified' ? PRIVATE_HISTORY_REPLY : result.reply,
+                personalReply || business?.outcome === 'verified'
+                  ? PRIVATE_HISTORY_REPLY
+                  : result.reply,
                 business?.outcome === 'verified'
                   ? { text: result.reply, receipt: business.delivery }
                   : undefined,
@@ -249,8 +286,8 @@ export class AssistantService {
           },
         });
       } catch (error) {
-        signal?.throwIfAborted();
         if (error instanceof CheckpointError) throw error;
+        signal?.throwIfAborted();
         trace.outcome = 'unavailable';
         trace.failureCode = deadline.signal.aborted ? 'DEADLINE_EXCEEDED' : 'RUN_FAILED';
         return finish({ text: UNAVAILABLE_REPLY });

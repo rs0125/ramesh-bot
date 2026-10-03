@@ -33,6 +33,13 @@ export interface TrustedReplyContext {
   readonly runId: string;
   /** Transport-owned lease; never accepted from chat input or a model argument. */
   readonly checkpointLease?: { readonly leaseToken: string };
+  /** Immutable original message members; only their own text/direct voice may authorize commands. */
+  readonly commandMessages?: readonly {
+    readonly id: string;
+    readonly text: string;
+    readonly receivedAtMs: number;
+    readonly forwarded: boolean;
+  }[];
   readonly mediaContext?: string;
   readonly key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null };
   readonly record?: (

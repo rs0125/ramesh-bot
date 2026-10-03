@@ -22,7 +22,7 @@ export interface InboxContent {
 interface InboxRow {
   id: string;
   chat_id: string;
-  origin: 'whatsapp' | 'admin' | 'automation';
+  origin: 'whatsapp' | 'admin' | 'automation' | 'reminder';
   mentions_bot: boolean;
   content_encrypted: string;
   reply_encrypted: string | null;
@@ -131,7 +131,9 @@ export class InboxRepository {
         senderId: null,
         senderName: 'Ramesh',
         direction: 'outbound',
-        source: row.origin === 'whatsapp' ? 'assistant' : row.origin,
+        // Keep the existing v1 admin client's source enum compatible. Storage still records
+        // the distinct reminder origin for leases, priority and delivery audit.
+        source: row.origin === 'whatsapp' || row.origin === 'reminder' ? 'assistant' : row.origin,
         mentionsBot: false,
         at: (
           (row.state === 'SENT' ? row.finished_at : null) ??

@@ -1,6 +1,6 @@
 # Outbound automation API
 
-Implementation and focused deterministic tests are complete. Migration `202610030006` is applied and the restricted runtime schema checks pass. The separate service key is provisioned in SSM runtime version 11 and the protected host environment; the HTTPS routes are validated. Code deployment remains pending CI/CD. See the [integration guide](../outbound-automation.md).
+Implementation and focused deterministic tests are complete. Migration `202610030006` is applied and the restricted runtime schema checks pass. The separate service key is provisioned in SSM runtime version 11 and the protected host environment; the HTTPS routes are validated. Code is deployed in `3ad3408`; CI and CD passed, WhatsApp is connected and non-mutating HTTPS authorization probes pass. See the [integration guide](../outbound-automation.md).
 
 ## Purpose and boundary
 

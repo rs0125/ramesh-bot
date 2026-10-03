@@ -28,6 +28,7 @@ import { isUtilityTool, type UtilityToolName, type UtilityToolRun } from './util
 import { bindReplayAuthority } from './model-replay.js';
 import { CheckpointError } from './checkpoint.types.js';
 import { presentEvidence, presentToolOutput, presentOrientation } from './evidence-presentation.js';
+import type { PersonalToolRun, PersonalReply } from '../scheduling/personal-tools.js';
 
 const verdict = z
   .object({
@@ -55,6 +56,7 @@ const state = new StateSchema({
   unavailable: z.boolean().default(false),
   researchExhausted: z.boolean().default(false),
   business: z.custom<{ outcome: 'verified'; delivery: ToolDelivery }>().optional(),
+  personal: z.custom<PersonalReply>().optional(),
 });
 
 export interface GraphContextObservation {
@@ -67,6 +69,7 @@ export interface SalesGraphOptions {
   onStage?: (stage: StageMetric) => void;
   onContext?: (context: GraphContextObservation) => void;
   utilities?: UtilityToolRun;
+  personal?: PersonalToolRun;
 }
 
 export function buildSalesGraph(
@@ -86,6 +89,8 @@ export function buildSalesGraph(
   let toolSteps = 0;
   const recalled: unknown[] = [];
   let utilities: UtilityToolRun | undefined;
+  const personal = options.personal;
+  const remainingTools = () => Math.max(run?.remaining ?? 0, personal?.remaining ?? 0);
   const currentRecalls = () => {
     const active = new Set(run?.evidence.map((entry) => entry.id) ?? []);
     return recalled.filter((value) => {
@@ -146,7 +151,7 @@ export function buildSalesGraph(
   const applicationContext = () => ({
     assistant: 'Ramesh',
     organization: 'WareOnGo',
-    sender_is_verified_employee: accessStatus === 'available',
+    sender_is_verified_employee: accessStatus === 'available' || !!personal,
     crm_identifiers: 'Internal tool references only; use client names in replies, never CRM UUIDs.',
   });
   return new StateGraph(state)
@@ -155,8 +160,12 @@ export function buildSalesGraph(
       const access = await open(config.signal ?? new AbortController().signal);
       run = access.run;
       accessStatus = access.status;
+      if (personal && run && personal.employeeId !== run.employeeId)
+        throw new Error('PERSONAL_IDENTITY_CHANGED');
       bindReplayAuthority({
         employeeId: run?.employeeId ?? null,
+        personalEmployeeId: personal?.employeeId ?? null,
+        personalTools: personal?.tools ?? [],
         status: accessStatus,
         tools: run?.tools ?? [],
         guidance: run?.guidance ?? '',
@@ -176,9 +185,10 @@ export function buildSalesGraph(
         })) ?? []),
         ...(recall.available ? [recallDefinition] : []),
         ...(utilities?.tools ?? []),
+        ...(personal?.tools ?? []),
       ];
       options.onContext?.({ access: accessStatus, tools: structuredClone(tools) });
-      runtime = `Runtime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available, utilities?.tools))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Tool access: ${accessStatus}. ${value.audience === 'group' ? 'No business tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private business data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The tool service is temporarily unavailable. Do not treat that as missing records.' : ''}`;
+      runtime = `Runtime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available, utilities?.tools, personal?.tools))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Business tool access: ${accessStatus}. ${value.audience === 'group' ? 'No private tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The business tool service is temporarily unavailable. Do not treat that as missing records.' : ''}\n${personal ? personal.context : 'Personal persistence tools are unavailable; do not claim a task or reminder was saved.'}`;
       return {};
     })
     .addNode('converser', async (value, config) => {
@@ -243,8 +253,7 @@ export function buildSalesGraph(
     .addNode('worker', async (value, config) => {
       const started = Date.now();
       const attempt = await research(
-        (signal) =>
-          session!.next(Math.min(run?.remaining ?? 0, Math.max(0, 28 - toolSteps)), signal),
+        (signal) => session!.next(Math.min(remainingTools(), Math.max(0, 28 - toolSteps)), signal),
         config.signal,
       );
       if (attempt.limited) return { calls: [], researchExhausted: true };
@@ -267,26 +276,30 @@ export function buildSalesGraph(
     })
     .addNode('executor', async (value, config) => {
       const started = Date.now();
-      if (value.calls.length !== 1 || !run || run.remaining <= 0)
+      if (value.calls.length !== 1 || remainingTools() <= 0 || toolSteps >= 28)
         throw new Error('Invalid model tool proposal');
       const call = value.calls[0]!;
       toolSteps++;
       const attempt = await research(
         (signal) =>
-          call.name === RECALL_TOOL
-            ? recall.execute(call.arguments, signal)
-            : isUtilityTool(call.name) && utilities
-              ? run!.executeUtility(
-                  (authorizeResult) =>
-                    utilities!.execute(
-                      call.name as UtilityToolName,
-                      call.arguments,
-                      signal,
-                      authorizeResult,
-                    ),
-                  signal,
-                )
-              : run!.execute(call.name, call.arguments, signal),
+          personal?.hasTool(call.name)
+            ? personal.execute(call.name, call.arguments, signal)
+            : call.name === RECALL_TOOL && run && run.remaining > 0
+              ? recall.execute(call.arguments, signal)
+              : isUtilityTool(call.name) && utilities && run && run.remaining > 0
+                ? run!.executeUtility(
+                    (authorizeResult) =>
+                      utilities!.execute(
+                        call.name as UtilityToolName,
+                        call.arguments,
+                        signal,
+                        authorizeResult,
+                      ),
+                    signal,
+                  )
+                : run && run.remaining > 0
+                  ? run.execute(call.name, call.arguments, signal)
+                  : Promise.reject(new Error('UNAVAILABLE_TOOL')),
         config.signal,
       );
       if (attempt.limited) return { calls: [], researchExhausted: true };
@@ -295,7 +308,7 @@ export function buildSalesGraph(
       session!.accept(call.id, presentToolOutput(output, call.name));
       return {
         calls: [],
-        blocked: run.blocked,
+        blocked: !!run?.blocked || !!personal?.blocked,
         stages: [
           ...value.stages,
           recordMetric({
@@ -335,6 +348,8 @@ export function buildSalesGraph(
                 evidence: presentEvidence(run?.evidence ?? []),
                 utility_evidence: utilities?.evidence ?? [],
                 utility_failures: utilities?.failures ?? [],
+                personal_evidence: personal?.evidence ?? [],
+                personal_failures: personal?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
@@ -400,6 +415,8 @@ export function buildSalesGraph(
                 evidence: presentEvidence(run?.evidence ?? []),
                 utility_evidence: utilities?.evidence ?? [],
                 utility_failures: utilities?.failures ?? [],
+                personal_evidence: personal?.evidence ?? [],
+                personal_failures: personal?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
@@ -442,7 +459,7 @@ export function buildSalesGraph(
       session!.revise!(JSON.stringify({ answer: value.reply, feedback: value.feedback }));
       return {};
     })
-    .addNode('finish', async (value) => {
+    .addNode('finish', async (value, config) => {
       if (value.blocked) return { reply: deniedReply, unavailable: true };
       if (!value.approved)
         return {
@@ -450,6 +467,9 @@ export function buildSalesGraph(
             "I couldn't verify a reliable answer for that request. Please try narrowing it down.",
           unavailable: true,
         };
+      const personalReply = await personal?.finish(config.signal ?? new AbortController().signal);
+      if (personalReply)
+        return { reply: personalReply.text, personal: personalReply, unavailable: false };
       const delivery = run?.delivery();
       if (delivery && utilities?.usedWeb) delivery.publicWebUsed = true;
       return {
@@ -473,8 +493,7 @@ export function buildSalesGraph(
         : !value.researchExhausted &&
             Date.now() < (options.researchDeadlineMs ?? Infinity) &&
             value.repairKind !== 'format' &&
-            run &&
-            run.remaining > 0 &&
+            remainingTools() > 0 &&
             toolSteps < 28
           ? session?.revise
             ? 'revise'

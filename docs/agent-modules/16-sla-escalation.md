@@ -2,6 +2,8 @@
 
 Status: **Proposed bot integration with CRM-Automations.** Depends on [reminders](15-reminders.md), [delivery](14-outbound-delivery.md) and the CRM domain's existing rules. The selected recipient order is **lead assignee(s), then existing CRM admins**.
 
+The [reminders/tasks draft](../reminders-and-tasks-design.md) now separates personal intent from delivery occurrences. Use its [scheduler contract](50-reminder-scheduler.md) and [migration/evaluation plan](51-reminder-migration-and-evaluation.md) for transport integration; neither the deployed immediate outbound API nor that draft activates SLA notifications.
+
 ## Responsibility and domain ownership
 
 CRM-Automations owns source synchronization, meaningful-activity clocks, stage clocks, rule evaluation and alert episodes. Ramesh owns authorized notification preparation and WhatsApp delivery. A planner or model does not decide whether an SLA was breached, and the bot should not add an independent Twenty polling loop.
@@ -30,6 +32,8 @@ An email fallback recipient list is not a verified WhatsApp identity. Ambiguous/
 ## Decisions needed before activation
 
 The CRM owner must settle threshold boundaries, missing-clock behavior, grace periods, repeat cadence, quiet hours, volume caps and unassigned-lead behavior. Existing email schedules do not define these WhatsApp policies. No new SLA should be inferred for stages that lack one.
+
+The inspected `CRM-Automations/src/lib/sla.js` floors elapsed 24-hour days and marks RED only when that count exceeds `yellowMax`; its deadline label uses a different apparent boundary, and a missing stage clock currently renders GREEN. Resolve these domain semantics in CRM-Automations before enabling WhatsApp escalation. Ramesh must not silently reinterpret “two days” as an exact 48-hour breach or treat a missing clock as verified healthy evidence.
 
 Automation needs its own authenticated invocation and authorized read/projection contract. The implemented interactive signed MCP path is not blanket organization-wide automation authority. Service identity and recipient permission checks remain separate concerns.
 

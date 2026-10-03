@@ -8,6 +8,7 @@ export const usagePriceSchema = z
     inputMicrosPerMillion: micros,
     outputMicrosPerMillion: micros,
     cachedInputMicrosPerMillion: micros.optional(),
+    cacheWriteInputMicrosPerMillion: micros.optional(),
     audioInputMicrosPerMillion: micros.optional(),
     durationMicrosPerSecond: micros.optional(),
     /** Reviewed provider ceilings, not a token estimate from characters or compressed audio bytes. */

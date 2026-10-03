@@ -4,7 +4,7 @@ Status: **Message tables and the minimal run/event journal are established. Per-
 
 The run ID equals its inbound message UUID. Current run state is running/finalized/failed, fenced by the inbound lease and retry attempt. Encrypted tool receipts are append-only; run finalization shares the outbound handoff transaction. Finalized means saved, not sent. Message cleanup cascades to run/event history after 30 days.
 
-The deployed release requires production migrations [202610030004_per_chat_queue.sql](../../supabase/migrations/202610030004_per_chat_queue.sql) and [202610030005_agent_checkpoints.sql](../../supabase/migrations/202610030005_agent_checkpoints.sql), following the earlier inbox/media/ledger migrations. The real-data playground independently requires [capture 202610030005](../../supabase/playground/202610030005_agent_checkpoints.sql). Runtime health checks reject an older schema. These production and capture migrations are applied, including the previously pending production `202610020006` and capture `202610020003` usage ledgers. The separate [outbound automation implementation](48-outbound-automation-api.md) additionally requires production migration `202610030006`, which is applied and verified with the restricted runtime role. Automation code deployment remains pending; see the [integration guide](../outbound-automation.md).
+The deployed release requires production migrations [202610030004_per_chat_queue.sql](../../supabase/migrations/202610030004_per_chat_queue.sql) and [202610030005_agent_checkpoints.sql](../../supabase/migrations/202610030005_agent_checkpoints.sql), following the earlier inbox/media/ledger migrations. The real-data playground independently requires [capture 202610030005](../../supabase/playground/202610030005_agent_checkpoints.sql). Runtime health checks reject an older schema. These production and capture migrations are applied, including the previously pending production `202610020006` and capture `202610020003` usage ledgers. The separate [outbound automation implementation](48-outbound-automation-api.md) additionally requires production migration `202610030006`, which is applied and verified with the restricted runtime role. Automation is deployed in `3ad3408`; see the [integration guide](../outbound-automation.md).
 
 ## Implemented stores and ownership
 
@@ -30,7 +30,7 @@ Every begin/read/save/budget/policy operation checks the live inbound lease and 
 
 ## Proposed richer task schema
 
-The following contracts describe future task epochs, waiting states and effect reconciliation. They are not additional columns or guarantees in the current minimal journal. A future native LangGraph Postgres adapter would require separately reviewed private checkpoint tables, serialization, encryption and transaction semantics. `ramesh-reminders` and `ramesh-action-proposals` also remain proposed.
+The following contracts describe future task epochs, waiting states and effect reconciliation. They are not additional columns or guarantees in the current minimal journal. A future native LangGraph Postgres adapter would require separately reviewed private checkpoint tables, serialization, encryption and transaction semantics. Personal scheduling tables are implemented in migration `202610030007` (applied and verified; activation uses runtime flags); `ramesh-action-proposals` remains proposed. See [scheduling operations](../personal-scheduling.md).
 
 ### Run and event columns
 
