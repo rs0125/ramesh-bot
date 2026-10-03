@@ -871,7 +871,11 @@ test(
             { kind: 'reminder_create', text: 'Bad content', schedule: future() },
             { kind: 'reminder_create', text: 'Valid content', schedule: future() },
           ]);
-          for (const r of result.records) await dueNow(r.id);
+          // Equal millisecond deadlines fall back to random occurrence UUID order.
+          // Put both poison rows strictly before the valid row to test traversal.
+          await dueNow(result.records[0]!.id, 180);
+          await dueNow(result.records[1]!.id, 120);
+          await dueNow(result.records[2]!.id, 60);
           await db.admin.query(`UPDATE public."ramesh-reminders" SET schedule='{}' WHERE id=$1`, [
             result.records[0]!.id,
           ]);
