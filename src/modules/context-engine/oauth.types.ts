@@ -1,5 +1,10 @@
 /** Encrypted credential payloads stay behind the resolver and never enter graph state or prompts. */
-export const CONTEXT_OAUTH_SCOPES = ['crm:read', 'warehouses:read', 'knowledge:read'] as const;
+export const CONTEXT_OAUTH_SCOPES = [
+  'crm:read',
+  'warehouses:read',
+  'knowledge:read',
+  'crm.rfq:write',
+] as const;
 export type ContextOAuthScope = (typeof CONTEXT_OAUTH_SCOPES)[number];
 export interface OAuthTokens {
   accessToken: string;

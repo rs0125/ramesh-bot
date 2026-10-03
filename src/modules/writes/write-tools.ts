@@ -659,6 +659,17 @@ export class BusinessWriteRun {
       const sources = ids?.length ? await this.repository.readSources(this.command, ids) : [source];
       if (ids?.some((id) => !sources.some((s) => s.id === id)))
         throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
+      if (contract.sourceTextArgument) {
+        // Model paraphrases must never replace the original RFQ. The caller
+        // chooses source IDs, but can only use complete stored source text.
+        const selected = ids?.length ? ids.map((id) => sources.find((s) => s.id === id)!) : sources;
+        if (
+          !selected.length ||
+          selected.some((s) => !s.text.trim()) ||
+          args[contract.sourceTextArgument] !== selected.map((s) => s.text).join('\n\n')
+        )
+          throw new WriteStorageError('WRITE_SOURCE_TEXT_MISMATCH');
+      }
       let parent: WriteOperation | null = null;
       if (contract.effect === 'compensate') {
         const id = args[contract.originalOperationArgument!] as string;

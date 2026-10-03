@@ -70,6 +70,19 @@ test('refresh is one form POST to the fixed origin, with no bearer header, cooki
   assert.equal(result.accessExpiresAtMs, 901000);
 });
 
+test('RFQ scope can be explicitly refreshed but cannot be added to a read-only grant', async () => {
+  const scopes = ['crm:read', 'warehouses:read', 'knowledge:read', 'crm.rfq:write'] as const;
+  const client = new ContextOAuthClient(
+    config,
+    async () => Response.json({ ...valid, scope: scopes.join(' ') }),
+    () => 1000,
+  );
+  assert.deepEqual((await client.refresh({ ...grant, scopes: [...scopes] }, signal())).scopes, [
+    ...scopes,
+  ]);
+  await assert.rejects(client.refresh(grant, signal()));
+});
+
 test('resource substitution, widened scopes, missing rotation, invalid tokens and excessive expiry are rejected', async () => {
   for (const response of [
     { ...valid, resource: 'https://other.example/mcp' },

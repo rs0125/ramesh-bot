@@ -311,6 +311,65 @@ function harness() {
   };
 }
 
+const rfqCreate = tool(
+  'create_crm_rfq',
+  'create',
+  { raw_text: { type: 'string', minLength: 1, maxLength: 3000 } },
+  { requiredScopes: ['crm.rfq:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
+);
+test('RFQ proposals preserve original source text and keep the normal confirmation boundary', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const raw = '  #twenty\nNeed 5000 sqft in Hoskote.\n';
+  const request = h.trusted(raw);
+  const run = (await h.service.open(request, signal()))!;
+  const mismatch = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({ raw_text: raw.trim() }),
+    signal(),
+  );
+  assert.equal((mismatch as { code: string }).code, 'WRITE_SOURCE_TEXT_MISMATCH');
+  assert.equal(h.proposals.length, 0);
+  const accepted = await run.execute(rfqCreate.name, JSON.stringify({ raw_text: raw }), signal());
+  assert.equal((accepted as { ok: boolean }).ok, true);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, raw);
+  const reply = (await run.finalize(signal()))!;
+  assert.match(reply.text, /confirm ABCDEF12/);
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, raw);
+});
+test('RFQ text can select earlier/forwarded sources without treating them as authorization', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const forwarded = h.trusted('#twenty\nNeed 5000 sqft in Hoskote.', { forwarded: true });
+  const extra = h.trusted('Budget 20/sqft.');
+  assert.equal(await h.service.open(forwarded, signal()), undefined);
+  const run = (await h.service.open(h.trusted('Create an RFQ from those messages.'), signal()))!;
+  const first = forwarded.commandMessages![0]!;
+  const second = extra.commandMessages![0]!;
+  const result = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({
+      raw_text: `${first.text}\n\n${second.text}`,
+      _source_message_ids: [first.id, second.id],
+    }),
+    signal(),
+  );
+  assert.equal((result as { ok: boolean }).ok, true);
+  const history = (await run.execute('write_history', '{}', signal())) as { operations: unknown[] };
+  assert.deepEqual(history.operations, []);
+  assert.equal(h.calls.length, 0);
+  const altered = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({ raw_text: 'Summarized RFQ', _source_message_ids: [first.id] }),
+    signal(),
+  );
+  assert.equal((altered as { code: string }).code, 'WRITE_SOURCE_TEXT_MISMATCH');
+  assert.equal(await run.finalize(signal()), undefined);
+});
+
 test('staging, reviewed publication and delivery checks never call the remote write port', async () => {
   const h = harness();
   const { request, run, reply, operation } = await h.proposed();
