@@ -103,7 +103,7 @@ test(
         FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
         WHERE n.nspname='public' AND c.relkind='r' AND c.relname LIKE 'ramesh-%'`)
         ).rows;
-        assert.equal(rights.length, 15);
+        assert.equal(rights.length, 17);
         for (const name of [
           'ramesh-usage-requests',
           'ramesh-usage-buckets',
@@ -112,6 +112,8 @@ test(
           'ramesh-reminders',
           'ramesh-reminder-occurrences',
           'ramesh-assistant-commands',
+          'ramesh-write-operations',
+          'ramesh-write-events',
         ])
           assert.ok(rights.some((row) => row.relname === name));
         for (const row of rights) {
