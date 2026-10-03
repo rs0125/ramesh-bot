@@ -37,6 +37,21 @@ export const toolDeliverySchema = z
     expiresAt: instant,
     /** Recall refreshes private reads, not public web research used in the same answer. */
     publicWebUsed: z.literal(true).optional(),
+    /** Identifiers actually displayed, in presentation order; never cached record facts. */
+    displayedRecords: z
+      .array(
+        z
+          .object({
+            kind: z.literal('warehouse'),
+            id: z.number().int().positive().safe(),
+            position: z.number().int().min(1).max(100).optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(100)
+      .refine((records) => new Set(records.map((record) => record.id)).size === records.length)
+      .optional(),
     checks: z
       .array(
         z

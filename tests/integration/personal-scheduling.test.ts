@@ -2,6 +2,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
+import type { Pool } from 'pg';
+import {
+  PERSONAL_LIST_MAX_CHARACTERS,
+  renderList,
+} from '../../src/modules/scheduling/personal-presentation.js';
 import { PersonalRepository } from '../../src/infrastructure/database/personal.repository.js';
 import {
   MessageQueueRepository,
@@ -28,6 +33,28 @@ const future = () => ({
 });
 const code = (expected: string) => (error: unknown) =>
   !!error && typeof error === 'object' && 'code' in error && error.code === expected;
+
+test('failed rollback destroys the connection instead of returning an unknown transaction to the pool', async () => {
+  const original = new Error('synthetic query failed');
+  let destroyed: boolean | undefined;
+  const pool = {
+    async connect() {
+      return {
+        async query(sql: string) {
+          if (sql === 'ROLLBACK') throw new Error('synthetic rollback failed');
+          if (sql.startsWith('UPDATE')) throw original;
+          return { rows: [], rowCount: 0 };
+        },
+        release(destroy: boolean) {
+          destroyed = destroy;
+        },
+      };
+    },
+  } as unknown as Pool;
+  const repo = new PersonalRepository(pool, 'synthetic', randomBytes(32).toString('base64url'));
+  await assert.rejects(repo.reconcile(), (error) => error === original);
+  assert.equal(destroyed, true);
+});
 
 test(
   'personal intent and delivery persist safely through retries, edits and cleanup',
@@ -132,6 +159,268 @@ test(
       assert.equal(await f.queue.complete(outbound, 'SENT'), true);
     }
     try {
+      await t.test(
+        'delivered trusted context stays bound to owner, chat, phone and its short retention',
+        async () => {
+          const f = fixture();
+          const c = await command(f);
+          const member = {
+            id: c.ctx.runId,
+            text: 'Remind me to review the synthetic proposal',
+            receivedAtMs: c.ctx.requestTimeMs,
+          };
+          await f.repo.saveContext(c.ctx, [member]);
+          assert.deepEqual(await f.repo.recall(actor, 'instructions'), {
+            kind: 'instructions',
+            members: [],
+          });
+          await delivered(f, c.job);
+          assert.deepEqual(await f.repo.recall(actor, 'instructions'), {
+            kind: 'instructions',
+            members: [{ ...member, runId: c.ctx.runId }],
+          });
+          assert.deepEqual(
+            await f.repo.recall({ ...actor, phoneE164: '+919000000099' }, 'instructions'),
+            { kind: 'instructions', members: [] },
+          );
+          assert.deepEqual(
+            await f.repo.recall({ ...actor, chatId: '123456789012345@lid' }, 'instructions'),
+            { kind: 'instructions', members: [] },
+          );
+          assert.deepEqual(await f.repo.recall({ ...actor, employeeId: 24 }, 'instructions'), {
+            kind: 'instructions',
+            members: [],
+          });
+          const large = await command(f);
+          await f.repo.saveContext(large.ctx, [
+            {
+              id: large.ctx.runId,
+              text: '界'.repeat(11000),
+              receivedAtMs: large.ctx.requestTimeMs,
+            },
+            {
+              id: randomUUID(),
+              text: 'Expired original source',
+              receivedAtMs: Date.now() - 25 * 3600000,
+            },
+          ]);
+          await delivered(f, large.job);
+          const bounded = await f.repo.recall(actor, 'instructions');
+          assert.deepEqual(bounded, {
+            kind: 'instructions',
+            members: [{ ...member, runId: c.ctx.runId }],
+            truncated: true,
+          });
+          assert.ok(Buffer.byteLength(JSON.stringify(bounded)) < 32000);
+          await db.admin.query(
+            `UPDATE public."ramesh-assistant-commands" SET expires_at=clock_timestamp()-interval '1 second' WHERE account_id=$1 AND kind='context'`,
+            [f.account],
+          );
+          assert.deepEqual(await f.repo.recall(actor, 'instructions'), {
+            kind: 'instructions',
+            members: [],
+          });
+          await f.repo.clean();
+          assert.equal(
+            (
+              await db.admin.query(
+                `SELECT count(*)::int n FROM public."ramesh-assistant-commands" WHERE account_id=$1 AND kind='context'`,
+                [f.account],
+              )
+            ).rows[0].n,
+            0,
+          );
+        },
+      );
+      await t.test(
+        'combined pages preserve order and delivered continuation inherits the original filter',
+        async () => {
+          const f = fixture();
+          const created = await apply(
+            f,
+            Array.from({ length: 12 }, (_, i) => ({
+              kind: 'task_create' as const,
+              text: `Synthetic page task ${i + 1}`,
+            })),
+          );
+          const c = await command(f);
+          const first = await f.repo.list(actor, 'task', c.ctx.runId, { limit: 5, state: 'all' });
+          assert.ok(first.nextCursor);
+          const combined = await f.repo.list(actor, 'task', c.ctx.runId, {
+            limit: 5,
+            cursor: first.nextCursor,
+            appendSelectionId: first.selectionId,
+          });
+          assert.deepEqual(
+            combined.records.map((r) => r.id),
+            created.records.slice(0, 10).map((r) => r.id),
+          );
+          await f.repo.finalizeSelections(c.ctx, [combined.selectionId]);
+          await delivered(f, c.job);
+          assert.equal(
+            (await f.repo.resolveSelection(actor, 'task', 'latest', 8)).id,
+            created.records[7]!.id,
+          );
+          const next = await command(f);
+          const continued = await f.repo.list(actor, 'task', next.ctx.runId, {
+            continuation: 'latest',
+          });
+          assert.deepEqual(
+            continued.records.map((r) => r.id),
+            created.records.slice(10).map((r) => r.id),
+          );
+          assert.equal(continued.nextCursor, null);
+          await f.queue.complete(next.job, 'FAILED');
+          const recalled = await f.repo.recall(actor, 'task');
+          assert.equal(recalled.kind, 'task');
+          assert.equal(recalled.records.length, 10);
+        },
+      );
+      await t.test(
+        'reactivation obeys the reminder quota while active edits remain possible',
+        async () => {
+          const f = fixture();
+          const base = await apply(f, [
+            { kind: 'reminder_create', text: 'Cancelled synthetic source', schedule: future() },
+            { kind: 'reminder_create', text: 'Delivered synthetic source', schedule: future() },
+          ]);
+          const cancelled = base.records[0]!,
+            completed = base.records[1]!;
+          await apply(f, [{ kind: 'reminder_cancel', id: cancelled.id, expectedVersion: 1 }]);
+          await dueNow(completed.id);
+          const due = await f.repo.claimDue(30000);
+          assert.ok(due);
+          const out = await queued(f, due);
+          await db.admin.query(
+            `UPDATE public."ramesh-messages" SET state='SENT',finished_at=clock_timestamp() WHERE id=$1`,
+            [out.id],
+          );
+          const recall = await f.repo.recall(actor, 'reminder');
+          assert.equal(recall.kind, 'reminder');
+          assert.equal(recall.records[0]?.occurrenceId, due.id);
+          assert.equal(recall.records[0]?.id, completed.id);
+          let active = '';
+          for (let n = 0; n < 100; n += 12) {
+            const receipt = await apply(
+              f,
+              Array.from({ length: Math.min(12, 100 - n) }, (_, i) => ({
+                kind: 'reminder_create' as const,
+                text: `Synthetic active ${n + i}`,
+                schedule: future(),
+              })),
+            );
+            active = receipt.records[0]!.id;
+          }
+          for (const op of [
+            {
+              kind: 'reminder_reschedule' as const,
+              id: cancelled.id,
+              expectedVersion: 2,
+              schedule: future(),
+            },
+            {
+              kind: 'reminder_snooze' as const,
+              id: completed.id,
+              expectedVersion: 1,
+              occurrenceId: due.id,
+              dueAt: future().dueAt,
+            },
+          ]) {
+            const c = await command(f);
+            await assert.rejects(f.repo.applyBatch(c.ctx, [op]), code('PERSONAL_CAPACITY'));
+            await f.queue.complete(c.job, 'FAILED');
+          }
+          await apply(f, [
+            { kind: 'reminder_reschedule', id: active, expectedVersion: 1, schedule: future() },
+          ]);
+          assert.equal(
+            (
+              await db.admin.query(
+                `SELECT count(*)::int n FROM public."ramesh-reminders" WHERE account_id=$1 AND state='scheduled'`,
+                [f.account],
+              )
+            ).rows[0].n,
+            100,
+          );
+        },
+      );
+      await t.test(
+        'list snapshots fit the presentation budget without advancing past undisplayed records',
+        async () => {
+          const f = fixture();
+          const expected: string[] = [];
+          for (let batch = 0; batch < 2; batch++) {
+            const result = await apply(
+              f,
+              Array.from({ length: 12 }, (_, i) => ({
+                kind: 'task_create' as const,
+                text: `Synthetic long task ${batch * 12 + i + 1}: ${'content '.repeat(65)}`,
+              })),
+            );
+            expected.push(...result.records.map((r) => r.id));
+          }
+          const c = await command(f);
+          const first = await f.repo.list(actor, 'task', c.ctx.runId, { limit: 50 });
+          assert.ok(first.records.length > 0 && first.records.length < expected.length);
+          assert.ok(renderList('task', first).length <= PERSONAL_LIST_MAX_CHARACTERS);
+          assert.ok(first.nextCursor);
+          assert.deepEqual(
+            first.records.map((r) => r.id),
+            expected.slice(0, first.records.length),
+          );
+          await assert.rejects(
+            f.repo.list(actor, 'task', c.ctx.runId, {
+              limit: 50,
+              cursor: first.nextCursor,
+              appendSelectionId: first.selectionId,
+            }),
+            code('PERSONAL_LIST_LIMIT'),
+          );
+          await f.repo.finalizeSelections(c.ctx, [first.selectionId]);
+          await delivered(f, c.job);
+          const next = await command(f);
+          const second = await f.repo.list(actor, 'task', next.ctx.runId, {
+            limit: 50,
+            continuation: 'latest',
+          });
+          assert.deepEqual(
+            second.records.map((r) => r.id),
+            expected.slice(first.records.length),
+          );
+          await f.queue.complete(next.job, 'FAILED');
+        },
+      );
+      await t.test('graceful pauses refund only the unfinished preparation attempt', async () => {
+        const f = fixture();
+        const r = (
+          await apply(f, [
+            { kind: 'reminder_create', text: 'Survive scheduler pauses', schedule: future() },
+          ])
+        ).records[0]!;
+        await dueNow(r.id);
+        for (let n = 0; n < 6; n++) {
+          const due = await f.repo.claimDue(30000);
+          assert.ok(due);
+          await f.repo.releaseDue(due, 'scheduler_paused');
+          const row = (
+            await db.admin.query(
+              `SELECT attempts,state FROM public."ramesh-reminder-occurrences" WHERE id=$1`,
+              [due.id],
+            )
+          ).rows[0];
+          assert.deepEqual(row, { attempts: 0, state: 'pending' });
+        }
+        const due = await f.repo.claimDue(30000);
+        assert.ok(due);
+        await f.repo.releaseDue(due, 'preparation_retry');
+        const row = (
+          await db.admin.query(
+            `SELECT attempts,state FROM public."ramesh-reminder-occurrences" WHERE id=$1`,
+            [due.id],
+          )
+        ).rows[0];
+        assert.deepEqual(row, { attempts: 1, state: 'waiting_source' });
+      });
       await t.test(
         'atomic linked intent, encrypted receipt replay, argument conflict and lost lease',
         async () => {
@@ -645,6 +934,11 @@ test(
           );
           await f.repo.clean();
           assert.equal(await f.repo.claimDue(30000), null);
+          const retained = (
+            await f.repo.list(actor, 'reminder', randomUUID(), { state: 'completed' })
+          ).records.find((record) => record.id === r.id);
+          assert.equal(retained?.lastOutcome, 'failed');
+          assert.equal(retained?.occurrenceState, undefined);
           assert.equal(
             (
               await db.admin.query(

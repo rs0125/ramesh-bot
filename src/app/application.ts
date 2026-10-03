@@ -32,6 +32,10 @@ import { AutomationOutboundService } from '../modules/messaging/outbound-automat
 import { PersonalRepository } from '../infrastructure/database/personal.repository.js';
 import { PersonalToolService } from '../modules/scheduling/personal-tools.js';
 import { PersonalSchedulerService } from '../modules/scheduling/scheduler.service.js';
+import {
+  compositeDeliverySchema,
+  getPersonalDelivery,
+} from '../modules/messaging/delivery-evidence.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -198,15 +202,17 @@ export function createApplication(
                     signal,
                     AbortSignal.timeout(config.businessReads?.context.timeoutMs ?? 10000),
                   ]);
-                  if (
-                    evidence &&
-                    typeof evidence === 'object' &&
-                    'kind' in evidence &&
-                    evidence.kind === 'personal'
-                  )
-                    return personalTools
-                      ? personalTools.canDeliver(message.key, evidence, bounded)
-                      : false;
+                  const personal = getPersonalDelivery(evidence);
+                  if (personal) {
+                    if (
+                      !personalTools ||
+                      !(await personalTools.canDeliver(message.key, personal, bounded))
+                    )
+                      return false;
+                    const composite = compositeDeliverySchema.safeParse(evidence);
+                    if (!composite.success) return true;
+                    evidence = composite.data.business;
+                  }
                   return businessReads
                     ? businessReads.canDeliver(message.key, evidence, bounded, (reason, tool) =>
                         logger.warn({ reason, tool }, 'Business delivery check failed'),

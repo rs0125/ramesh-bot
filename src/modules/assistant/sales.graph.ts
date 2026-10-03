@@ -29,34 +29,44 @@ import { bindReplayAuthority } from './model-replay.js';
 import { CheckpointError } from './checkpoint.types.js';
 import { presentEvidence, presentToolOutput, presentOrientation } from './evidence-presentation.js';
 import type { PersonalToolRun, PersonalReply } from '../scheduling/personal-tools.js';
+import { compositeDeliverySchema } from '../messaging/delivery-evidence.js';
+import { displayedWarehouseRecords } from './displayed-records.js';
+import { currentRecall } from './recall-evidence.js';
+import { reviewFailure, reviewMetric, reviewFailureReply } from './review-diagnostics.js';
 
 const verdict = z
   .object({
     supported: z.boolean(),
     feedback: z.string().max(1200),
     repair: z.enum(['none', 'format', 'tools']).default('tools'),
+    reason: reviewFailure.default('other'),
   })
   .strict();
+const supplementSchema = z.object({ additional_reply: z.string().max(4000) }).strict();
 const state = new StateSchema({
   input: z.string(),
   history: z.array(z.custom<ChatMessage>()),
   audience: z.enum(['dm', 'group']),
   route: z.enum(['direct', 'work']).default('direct'),
   objective: z.string().default(''),
+  personalOnly: z.boolean().default(false),
   plan: taskPlanSchema.optional(),
   draft: z.string().default(''),
   reply: z.string().default(''),
+  supplement: z.string().default(''),
   calls: z.array(z.custom<ModelToolCall>()).default([]),
   stages: z.array(z.custom<StageMetric>()).default([]),
   approved: z.boolean().default(false),
   feedback: z.string().default(''),
   repairKind: z.enum(['none', 'format', 'tools']).default('none'),
+  reviewReason: reviewFailure.default('none'),
   repairs: z.number().default(0),
   blocked: z.boolean().default(false),
   unavailable: z.boolean().default(false),
   researchExhausted: z.boolean().default(false),
   business: z.custom<{ outcome: 'verified'; delivery: ToolDelivery }>().optional(),
   personal: z.custom<PersonalReply>().optional(),
+  composite: z.custom<z.infer<typeof compositeDeliverySchema>>().optional(),
 });
 
 export interface GraphContextObservation {
@@ -87,22 +97,18 @@ export function buildSalesGraph(
   let recall: ReturnType<typeof businessRecall>;
   let modelHistory: ChatMessage[] = [];
   let toolSteps = 0;
-  const recalled: unknown[] = [];
+  let sessionTools: typeof tools = [];
+  const recalled: Array<{
+    value: Record<string, unknown>;
+    sources: import('./tool-evidence.js').ToolEvidence[];
+  }> = [];
   let utilities: UtilityToolRun | undefined;
   const personal = options.personal;
   const remainingTools = () => Math.max(run?.remaining ?? 0, personal?.remaining ?? 0);
   const currentRecalls = () => {
-    const active = new Set(run?.evidence.map((entry) => entry.id) ?? []);
-    return recalled.filter((value) => {
-      if (!value || typeof value !== 'object') return false;
-      const recalled = value as {
-        ok?: boolean;
-        source_record_checks?: Array<{ evidence_id: string }>;
-      };
-      // A recalled answer is supported jointly by all of its checks. Never preserve its
-      // old prose by removing only a stale check or treating an unknown ID as still valid.
-      if (recalled.ok !== true) return true;
-      return recalled.source_record_checks?.every((check) => active.has(check.evidence_id));
+    return recalled.flatMap(({ value, sources }) => {
+      const current = currentRecall(value, sources, run?.evidence ?? []);
+      return current ? [current] : [];
     });
   };
   const requestTime = (options.now ?? Date.now)();
@@ -154,6 +160,18 @@ export function buildSalesGraph(
     sender_is_verified_employee: accessStatus === 'available' || !!personal,
     crm_identifiers: 'Internal tool references only; use client names in replies, never CRM UUIDs.',
   });
+  const startSession = (
+    plan: z.infer<typeof taskPlanSchema>,
+    input: string,
+    personalOnly: boolean,
+  ) => {
+    sessionTools = personalOnly ? [...(personal?.tools ?? [])] : tools;
+    session = model.startToolSession!({
+      instructions: `${WORKER_PROMPT}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}\nValidated task_plan: ${JSON.stringify(plan)}`,
+      messages: [...modelHistory, { role: 'user', content: input }],
+      tools: sessionTools,
+    });
+  };
   return new StateGraph(state)
     .addNode('context', async (value, config) => {
       if (!model.startToolSession) throw new Error('A tool-capable model is required');
@@ -207,9 +225,31 @@ export function buildSalesGraph(
       return {
         route: route.route,
         objective: route.objective,
+        personalOnly: route.route === 'work' && route.workflow === 'personal' && !!personal,
         draft: route.reply,
         stages: [...value.stages, recordMetric(metric('converser', started, result))],
       };
+    })
+    .addNode('personal_plan', async (value) => {
+      const plan = validateTaskPlan(
+        {
+          objective: value.objective,
+          successCriteria: [
+            'Satisfy the complete explicit personal request with the correct owner, target, and IST time; clarify missing details before saving.',
+          ],
+          steps: [
+            {
+              id: 'personal',
+              goal: value.objective,
+              dependsOn: [],
+              toolNames: personal!.tools.map((tool) => tool.name),
+            },
+          ],
+        },
+        personal!.tools,
+      );
+      startSession(plan, value.input, true);
+      return { plan };
     })
     .addNode('planner', async (value, config) => {
       const started = Date.now();
@@ -243,11 +283,7 @@ export function buildSalesGraph(
       if (attempt.limited) return { researchExhausted: true };
       const result = attempt.result;
       const plan = validateTaskPlan(JSON.parse(result.text), tools);
-      session = model.startToolSession!({
-        instructions: `${WORKER_PROMPT}\n${runtime}\n${engineOrientation()}\nValidated task_plan: ${JSON.stringify(plan)}`,
-        messages: [...modelHistory, { role: 'user', content: value.input }],
-        tools,
-      });
+      startSession(plan, value.input, false);
       return { plan, stages: [...value.stages, recordMetric(metric('planner', started, result))] };
     })
     .addNode('worker', async (value, config) => {
@@ -279,6 +315,8 @@ export function buildSalesGraph(
       if (value.calls.length !== 1 || remainingTools() <= 0 || toolSteps >= 28)
         throw new Error('Invalid model tool proposal');
       const call = value.calls[0]!;
+      if (!sessionTools.some((tool) => tool.name === call.name))
+        throw new Error('UNAVAILABLE_TOOL');
       toolSteps++;
       const attempt = await research(
         (signal) =>
@@ -304,7 +342,17 @@ export function buildSalesGraph(
       );
       if (attempt.limited) return { calls: [], researchExhausted: true };
       const output = attempt.result;
-      if (call.name === RECALL_TOOL) recalled.push(output);
+      if (call.name === RECALL_TOOL) {
+        const snapshot = { value: output, sources: structuredClone(run?.evidence ?? []) };
+        const prior =
+          output.ok === true
+            ? recalled.findIndex(
+                (entry) => entry.value.ok === true && entry.value.turn === output.turn,
+              )
+            : -1;
+        if (prior >= 0) recalled.splice(prior, 1, snapshot);
+        else recalled.push(snapshot);
+      }
       session!.accept(call.id, presentToolOutput(output, call.name));
       return {
         calls: [],
@@ -321,13 +369,16 @@ export function buildSalesGraph(
       };
     })
     .addNode('formatter', async (value, config) => {
+      const preview = personal?.preview();
+      if (value.personalOnly && preview) return { reply: preview, supplement: '' };
       const started = Date.now();
+      const composed = !!preview;
       const result = await model.complete(
         {
           stage: 'formatter',
           reasoningEffort:
             run?.evidence.length || utilities?.evidence.length || value.feedback ? 'low' : 'none',
-          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${engineOrientation()}\n${value.feedback ? 'A source reviewer found a problem. Correct every identified issue without inventing replacements, and independently check every candidate against its actual fields; clearly state any unresolved limitation.' : ''}`,
+          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies the separate personal_result shown in the input, and appends its committed receipt or exact list. Do not repeat, paraphrase, promise, or claim completion of those personal actions. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Correct every identified issue without inventing replacements, and independently check every candidate against its actual fields; clearly state any unresolved limitation.' : ''}`,
           messages: [
             {
               role: 'user',
@@ -349,6 +400,7 @@ export function buildSalesGraph(
                 utility_evidence: utilities?.evidence ?? [],
                 utility_failures: utilities?.failures ?? [],
                 personal_evidence: personal?.evidence ?? [],
+                personal_result: preview,
                 personal_failures: personal?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
@@ -360,13 +412,29 @@ export function buildSalesGraph(
               }),
             },
           ],
+          ...(composed
+            ? {
+                jsonSchema: {
+                  name: 'ramesh_personal_supplement',
+                  schema: z.toJSONSchema(supplementSchema),
+                },
+              }
+            : {}),
         },
         config.signal,
       );
-      const reply = withDealDates(finishReply(result.text), run?.evidence ?? []);
-      if (!reply || reply.length > 12000) throw new Error('Invalid sales reply');
+      const additional = composed
+        ? supplementSchema.parse(JSON.parse(result.text)).additional_reply
+        : result.text;
+      const supplement = additional.trim()
+        ? withDealDates(finishReply(additional), run?.evidence ?? [])
+        : '';
+      const reply = composed ? [supplement, preview].filter(Boolean).join('\n\n') : supplement;
+      if (!reply || reply.length > (composed ? 16000 : 12000))
+        throw new Error('Invalid sales reply');
       return {
         reply,
+        supplement: composed ? supplement : '',
         stages: [
           ...value.stages,
           recordMetric({
@@ -416,6 +484,9 @@ export function buildSalesGraph(
                 utility_evidence: utilities?.evidence ?? [],
                 utility_failures: utilities?.failures ?? [],
                 personal_evidence: personal?.evidence ?? [],
+                personal_proposal: personal?.pendingOperations ?? [],
+                personal_result: personal?.preview(),
+                additional_reply: value.supplement,
                 personal_failures: personal?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
@@ -437,10 +508,12 @@ export function buildSalesGraph(
         review.supported = false;
         review.feedback = `${issues.join(' ')} ${review.feedback}`;
       }
+      const diagnostic = reviewMetric({ ...review, supported: modelApproved }, issues.length);
       return {
         approved: review.supported,
         repairKind: issues.length && modelApproved ? ('format' as const) : review.repair,
         feedback: review.feedback,
+        reviewReason: diagnostic.reason,
         repairs: value.repairs + (review.supported ? 0 : 1),
         stages: [
           ...value.stages,
@@ -451,6 +524,7 @@ export function buildSalesGraph(
             outputTokens: result.outputTokens,
             reasoningTokens: result.reasoningTokens ?? 0,
             cachedInputTokens: result.cachedInputTokens ?? 0,
+            review: diagnostic,
           }),
         ],
       };
@@ -463,15 +537,55 @@ export function buildSalesGraph(
       if (value.blocked) return { reply: deniedReply, unavailable: true };
       if (!value.approved)
         return {
-          reply:
-            "I couldn't verify a reliable answer for that request. Please try narrowing it down.",
+          reply: reviewFailureReply({
+            hasEvidence: !!(
+              run?.evidence.length ||
+              utilities?.evidence.length ||
+              personal?.evidence.length
+            ),
+            reason: value.reviewReason,
+            researchExhausted: value.researchExhausted,
+          }),
           unavailable: true,
         };
-      const personalReply = await personal?.finish(config.signal ?? new AbortController().signal);
-      if (personalReply)
-        return { reply: personalReply.text, personal: personalReply, unavailable: false };
+      const signal = config.signal ?? new AbortController().signal;
+      // Save only server-owned user provenance. It becomes recallable only once this reply is sent.
+      await personal?.saveContext(signal);
+      const personalResult = await personal?.finish(signal);
+      const personalReply =
+        personalResult ??
+        (personal?.usedPrivateData
+          ? { text: value.reply, delivery: personal.deliveryReference }
+          : undefined);
       const delivery = run?.delivery();
       if (delivery && utilities?.usedWeb) delivery.publicWebUsed = true;
+      if (delivery && !personal?.usedPrivateReads) {
+        const displayed = displayedWarehouseRecords(
+          personalReply ? value.supplement : value.reply,
+          run?.evidence ?? [],
+        );
+        if (displayed.length) delivery.displayedRecords = displayed;
+      }
+      if (personalReply) {
+        const reply = [value.supplement, personalReply.text].filter(Boolean).join('\n\n');
+        const composite =
+          delivery && (value.supplement || !personalResult)
+            ? compositeDeliverySchema.parse({
+                kind: 'composite',
+                version: 1,
+                personal: personalReply.delivery,
+                business: delivery,
+                businessText: value.supplement || value.reply,
+                ...(personal?.usedPrivateReads ? { businessRecallAllowed: false } : {}),
+              })
+            : undefined;
+        return {
+          reply,
+          personal: personalReply,
+          ...(composite ? { composite } : {}),
+          unavailable: false,
+        };
+      }
       return {
         ...(delivery ? { business: { outcome: 'verified' as const, delivery } } : {}),
         unavailable:
@@ -480,11 +594,18 @@ export function buildSalesGraph(
     })
     .addEdge(START, 'context')
     .addEdge('context', 'converser')
-    .addConditionalEdges('converser', (value) => (value.route === 'work' ? 'planner' : 'formatter'))
+    .addConditionalEdges('converser', (value) =>
+      value.route === 'work' ? (value.personalOnly ? 'personal_plan' : 'planner') : 'formatter',
+    )
+    .addEdge('personal_plan', 'worker')
     .addConditionalEdges('planner', (value) => (value.researchExhausted ? 'formatter' : 'worker'))
     .addConditionalEdges('worker', (value) => (value.calls.length ? 'executor' : 'formatter'))
     .addConditionalEdges('executor', (value) =>
-      value.blocked ? 'finish' : value.researchExhausted ? 'formatter' : 'worker',
+      value.blocked
+        ? 'finish'
+        : value.researchExhausted || (value.personalOnly && !!personal?.pendingOperations.length)
+          ? 'formatter'
+          : 'worker',
     )
     .addEdge('formatter', 'verifier')
     .addConditionalEdges('verifier', (value) =>

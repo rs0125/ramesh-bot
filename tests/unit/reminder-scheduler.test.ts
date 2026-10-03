@@ -68,6 +68,10 @@ function schedulerFixture(options?: {
   const releases: Array<{ reason: string; terminal?: string }> = [];
   let encrypted: Parameters<MessageQueueRepository['enqueueReminder']> | undefined;
   const repository: ReminderSchedulerRepository = {
+    async prepareDue() {},
+    async claimPrepared() {
+      return this.claimDue(1000);
+    },
     async claimDue() {
       claims++;
       if (claimed) return null;
@@ -218,6 +222,70 @@ test('stop aborts active preparation and drains it without dropping schedule int
   assert.equal(f.enqueues, 0);
   assert.equal(f.releases[0]?.reason, 'scheduler_paused');
   assert.equal(f.scheduler.getStatus().running, false);
+  assert.equal(f.scheduler.getStatus().lastError, false);
+});
+
+test('one tick prepares once and limits each owner while admitting another owner', async () => {
+  const pending = Array.from({ length: 8 }, () => makeDue());
+  pending.push({
+    ...makeDue(),
+    employeeId: 24,
+    phoneE164: '+919000000024',
+    chatId: '919000000024@s.whatsapp.net',
+  });
+  const admitted: number[] = [];
+  let preparations = 0;
+  const repository: ReminderSchedulerRepository = {
+    async prepareDue() {
+      preparations++;
+    },
+    async claimDue() {
+      throw new Error('Per-claim materialization must not run in the scheduler');
+    },
+    async claimPrepared(_lease, excluded = []) {
+      const index = pending.findIndex((due) => !excluded.includes(due.employeeId));
+      return index < 0 ? null : pending.splice(index, 1)[0]!;
+    },
+    async renewDue() {
+      return true;
+    },
+    async releaseDue() {
+      throw new Error('No retry expected');
+    },
+    async enqueueDue(due) {
+      admitted.push(due.employeeId);
+      return 'queued';
+    },
+    async reconcile() {
+      throw new Error('Reconciliation belongs to the single prepare step');
+    },
+  };
+  const scheduler = new PersonalSchedulerService(
+    repository,
+    {
+      accountId: 'synthetic',
+      async enqueueReminder() {
+        throw new Error('Repository mock never invokes transport');
+      },
+    },
+    {
+      encryptionKey: randomBytes(32).toString('base64url'),
+      capacity: 100,
+      concurrency: 4,
+      resolveEmployee: async (id) => ({
+        ...employee,
+        employeeId: id,
+        phoneE164: id === 23 ? employee.phoneE164 : '+919000000024',
+      }),
+    },
+  );
+  await scheduler.tick();
+  assert.equal(preparations, 1);
+  assert.deepEqual(admitted, [23, 23, 23, 24]);
+  assert.equal(pending.length, 5);
+  await scheduler.tick();
+  assert.equal(preparations, 2);
+  assert.equal(admitted.filter((id) => id === 23).length, 6);
 });
 
 async function deliver(options?: {

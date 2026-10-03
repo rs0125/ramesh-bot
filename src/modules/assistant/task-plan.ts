@@ -5,6 +5,7 @@ export const routeSchema = z
     route: z.enum(['direct', 'work']),
     objective: z.string().min(1).max(2000),
     reply: z.string().max(12000),
+    workflow: z.enum(['general', 'personal']).default('general'),
   })
   .strict();
 export const taskPlanSchema = z

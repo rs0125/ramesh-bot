@@ -14,6 +14,7 @@ import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
 import type { BusinessReadService } from './business-reads.js';
 import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js';
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
+import { getBusinessReply } from '../messaging/delivery-evidence.js';
 import { bindUsageEmployee, currentUsageScope, withUsageScope } from '../usage/usage-scope.js';
 import type { UsageMeter } from '../usage/usage-meter.js';
 import { UtilityToolRun } from './utility-tools.js';
@@ -258,6 +259,7 @@ export class AssistantService {
           trace.limitedBy = 'research_deadline';
         const business = 'business' in result ? result.business : undefined;
         const personalReply = 'personal' in result ? result.personal : undefined;
+        const composite = 'composite' in result ? result.composite : undefined;
         if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
         if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
         let remembered = false;
@@ -265,7 +267,7 @@ export class AssistantService {
           text: result.reply,
           draft: result.draft,
           ...(personalReply
-            ? { businessEvidence: personalReply.delivery }
+            ? { businessEvidence: composite ?? personalReply.delivery }
             : business?.outcome === 'verified'
               ? { businessEvidence: business.delivery }
               : {}),
@@ -277,9 +279,11 @@ export class AssistantService {
                 personalReply || business?.outcome === 'verified'
                   ? PRIVATE_HISTORY_REPLY
                   : result.reply,
-                business?.outcome === 'verified'
-                  ? { text: result.reply, receipt: business.delivery }
-                  : undefined,
+                composite
+                  ? getBusinessReply({ text: result.reply, receipt: composite })
+                  : business?.outcome === 'verified'
+                    ? { text: result.reply, receipt: business.delivery }
+                    : undefined,
               );
               remembered = true;
             }

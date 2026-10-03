@@ -1,21 +1,25 @@
 # Personal tasks and scheduling
 
-Implementation status, 3 October 2026: personal scheduling is implemented and production migration `202610030007` is applied. Runtime flags control activation after a compatible release passes readiness checks. This page describes current implementation; the [design overview](reminders-and-tasks-design.md) and modules 15/49/50/51 also include future policies.
+Release status, 3 October 2026: this release includes the adversarial-review fixes described below. Production migration `202610030008` is **applied and verified**; personal tools and the scheduler remain enabled, with existing worker credentials unchanged. Worker rollout uses CI/CD after pushing `main`; confirm its exact release, schema readiness, scheduler ticks and WhatsApp connection before declaring completion. The [design overview](reminders-and-tasks-design.md) and modules 15/49/50/51 also include future policies.
 
 ## What an employee can ask
 
 - “Add a task to compare the offers.” Saves a personal task without inventing a notification.
 - “Remind me on 15 November 2026 at 10 am to call the owner.” Confirms the complete date and time in IST.
 - “Every Monday at 9 am, remind me to review my pipeline.” Creates a weekly schedule. Daily and monthly rules are also supported.
-- “Show my tasks/reminders.” Returns a numbered page. “Complete the second task” resolves the actual last delivered selection with its recorded version.
+- “Show my tasks/reminders”, then “show more”. Continues the last delivered selection with its original filter. Pages fetched in one turn accumulate in their displayed order, within the response limits. “Complete the second task” resolves the actual delivered selection with its recorded version.
 - “Move that reminder to tomorrow at 11 am”, “cancel it”, or “snooze it for 30 minutes”. Changes owned schedules; snooze replaces one occurrence while retaining the recurring rule.
 - “Add a task to review the lease and remind me on 15 November at 10 am.” Creates the task and linked reminder atomically. Completing/cancelling the task cancels its unsent linked reminders.
 
 Access requires an active, unambiguous VerifiedNumber employee in their own DM. Unknown users can still chat. Personal tools do not require a Context Engine OAuth grant and do not expand CRM write access. Phone/LID mappings are rechecked when using tools and before delivery. A changed or disabled identity suppresses delivery; ownership never transfers to the next holder of the number.
 
-Personal tools are dynamically added as `personal_list` and `personal_apply`. The latter stages one atomic batch of at most eight operations. Code validates ownership, input schema, exact user-authored text spans, versions and dates; the verifier reviews intent; then the application commits and renders its own receipt. It never reports a model's draft as a successful write. Restart recovery reads committed receipts before generating another response.
+Personal tools are dynamically added as `personal_list`, `personal_recall` and `personal_apply`. The latter stages one atomic batch of at most eight operations. Before commit, a verifier-driven correction can replace that entire staged proposal; it cannot add another committed batch. Code validates ownership, input schema, user-authored text provenance, versions and dates; the verifier reviews intent; then the application commits and renders its own receipt. It never reports a model's draft as a successful write. Restart recovery reads committed receipts before generating another response.
 
-For a mixed personal/business request, the committed personal receipt takes priority in this first slice; business prose may need a follow-up. A mutation receipt lists its affected records rather than a stale pre-mutation list. Paginated lists render the latest requested page per kind and say “this page”; only that delivered order becomes the ordinal selection.
+The router can explicitly choose a personal-only workflow. That path uses a deterministic plan, one native tool worker and the independent verifier; it skips planner and formatter model calls when a deterministic personal result is available. General and mixed requests retain the full graph. Their formatter returns a structured `additional_reply`, preserving requested advice or business findings alongside the application's exact committed receipt. Mixed private replies carry both authorization receipts, and delivery requires both checks. A creation receipt from the current user instruction can retain a separately verified business segment for business recall. Whenever a personal list/history/occurrence read informed the answer, including read-plus-mutation requests, `businessRecallAllowed: false` blocks business-only recall of the combined prose; historical personal data must not inherit business authority.
+
+`personal_recall` can recover the latest actually delivered personal result and its original record/occurrence references, including a completed one-off for “snooze that”. It can also retrieve encrypted direct, non-forwarded instructions from delivered turns in the same owner's chat for up to 24 hours. This lets “tomorrow at 10” complete an earlier clarification. Old text supplies provenance, never fresh authorization: the current direct message must authorize the change and supplies its relative-time clock. Recalled targets are reauthorized and read in their current state.
+
+Mutation receipts list their affected records rather than a stale pre-mutation list. Lists accumulate up to 50 rows and 5,000 rendered characters per kind within a turn; excess data retains a continuation cursor. A later “show more” resumes the last delivered page with the saved filter. Only the exact delivered order becomes the ordinal selection; an unsent or withheld reply cannot replace it.
 
 Forwarded content cannot itself authorize writes. A direct, fully retained voice transcript can supply the owner's instruction. Saved instruction text does not retain the audio beyond its existing 24-hour lifecycle. Retrieved business facts cannot be copied into an unprotected schedule by the model. Conditional CRM reminders, delegation, group reminders, SLA escalation and arbitrary scheduled tool execution are not implemented. Requests needing them must be explained or clarified, never silently simplified.
 
@@ -27,7 +31,7 @@ Recurrence supports daily, selected ISO weekdays and monthly dates. Day 31 skips
 
 The scheduler ticks every 30 seconds by default. An occurrence keeps a fixed deadline one hour after its scheduled time. Restart, pacing, queue capacity and retry do not extend that deadline. Missed historical recurring slots are coalesced by advancing the cursor directly; the worker does not send a backlog flood. Delivery is subject to connection state and queue pacing, not an exact-second promise.
 
-Defaults: 50 open tasks and 100 scheduled reminders per owner; ten entries per tool list page; 25 due candidates per tick; two concurrent preparations; 30-second renewable preparation leases; a 20-second preparation timeout and at most five failed preparation attempts. Queue saturation defers work without spending a failed-preparation attempt. Future intent survives message cleanup. Terminal occurrence details and command/list receipts have 30-day cleanup; active tasks and schedules are retained, along with durable cursor/consumed state.
+Defaults: 50 open tasks and 100 scheduled reminders per owner; ten entries per tool list page; 25 due claims per tick; at most three claims per owner per scheduler tick; two concurrent preparations; 30-second renewable preparation leases; a 20-second preparation timeout and at most five failed preparation attempts. Rescheduling or snoozing a terminal reminder must satisfy the same active-reminder quota as creation. Due materialization and reconciliation run once per tick before individual claims. The per-owner allowance is local to one scheduler tick, not a distributed rate limit across workers. Queue saturation and deliberate scheduler shutdown defer work without spending a failed-preparation attempt. Future intent survives message cleanup. Terminal occurrence details and command/list receipts have 30-day cleanup; trusted clarification context has a separate 24-hour expiry. Active tasks and schedules retain their cursor/consumed state and last delivery outcome, so list output can still distinguish a missed or uncertain notification after occurrence cleanup.
 
 Reminder text and command/selection payloads are encrypted. Replies use the existing private delivery envelope and redacted inbox/history behavior. Ordinary logs do not contain reminder text or phone numbers.
 
@@ -41,20 +45,24 @@ Unsent reminders yield to a pending human turn and its response in the same chat
 
 The final database transaction verifies the occurrence, schedule version, dispatch generation, owner, recipient binding, linked task and deadline. A cancellation that commits first prevents sending. If sending already started, the receipt says the notification may still arrive. `UNCERTAIN` sends are never automatically retried or converted into snoozes.
 
+Confirmation is also fenced. If a mutation receipt exists, inbound-to-outbound handoff requires that exact command ID in the protected reply. A late model/identity failure cannot finalize a generic “try again” response after the change committed. The original run retries within its existing attempt and expiry limits, recovering the durable receipt without another write. If confirmation authorization temporarily fails after handoff, the protected reply is retained for bounded retry; it is not replaced with a generic retry invitation. Permanently unavailable authority can leave confirmation failed without undoing the saved intent.
+
 ## Storage and activation
 
 Migration `supabase/migrations/202610030007_personal_scheduling.sql` adds:
 
-| Table                         | Purpose                                                |
-| ----------------------------- | ------------------------------------------------------ |
-| `ramesh-tasks`                | Owned commitments and optional deadlines               |
-| `ramesh-reminders`            | Schedule intent, recurrence cursor and revision        |
-| `ramesh-reminder-occurrences` | Due slots, generations, leases and delivery outcomes   |
-| `ramesh-assistant-commands`   | Atomic mutation receipts and delivered list selections |
+| Table                         | Purpose                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `ramesh-tasks`                | Owned commitments and optional deadlines                                       |
+| `ramesh-reminders`            | Schedule intent, recurrence cursor and revision                                |
+| `ramesh-reminder-occurrences` | Due slots, generations, leases and delivery outcomes                           |
+| `ramesh-assistant-commands`   | Atomic mutation receipts, delivered selections and short-lived trusted context |
 
 Only the dedicated worker receives table privileges. The capture role is explicitly denied. Existing `public.task` and `public.reminder` are untouched because the legacy Twilio poller did not isolate application ownership. No legacy import is included.
 
-Production migration `202610030007` was applied and verified on 3 October 2026: the checksum matches, the terminal trigger is enabled, all four tables have RLS and worker-only CRUD, and capture/API/public grants are absent. For a new environment, apply the ordered, checksum-verified production migrations through the existing message-database provisioning workflow. Preserve the deployed `ramesh_worker` password and TLS settings; never point SQLite Prisma migrations at Supabase. Schema health now requires `202610030007`, even while scheduling is disabled, because queue queries reference occurrence state. The independent capture schema is unchanged.
+Production migration `202610030007` was applied and verified on 3 October 2026: the checksum matches, the terminal trigger is enabled, all four tables have RLS and worker-only CRUD, and capture/API/public grants are absent. Migration `202610030008_personal_context.sql` extends the command kind constraint with `context` and adds its uniqueness/owner indexes; it creates no new table and does not widen role grants. This worker requires schema `202610030008` even with scheduling disabled. Migration `202610030008` was applied in production on 3 October 2026, with its checksum, restricted-worker schema health, role grants and RLS verified. Runtime credentials and enabled flags were preserved. Fresh environments must apply it before deploying this worker.
+
+For a new environment, apply the ordered, checksum-verified production migrations through the existing message-database provisioning workflow. Preserve the deployed `ramesh_worker` password and TLS settings; never point SQLite Prisma migrations at Supabase. The independent capture schema is unchanged.
 
 ```dotenv
 PERSONAL_SCHEDULING_ENABLED=true
@@ -62,7 +70,7 @@ REMINDER_SCHEDULER_ENABLED=true
 REMINDER_SCHEDULER_POLL_MS=30000
 ```
 
-Both features default off. Deploy the compatible binary and verify its release/readiness before enabling the flags, then restart that same binary to load them. Tools require configured OpenAI inference and Supabase message storage. Delivery can run without an inference provider. The poll setting accepts 1000–60000 ms. Keep production and SSM runtime settings consistent when deploying.
+Both features default off in a fresh installation; production has both enabled since the initial scheduling release `2bf91be`. A fresh rollout deploys a compatible binary and verifies readiness before enabling the flags. Tools require configured OpenAI inference and Supabase message storage. Delivery can run without an inference provider. The poll setting accepts 1000–60000 ms. Keep production and SSM runtime settings consistent when deploying.
 
 Authenticated `GET /v1/status` includes scheduling enablement, running state, last tick, last successful tick and a sanitized error flag. It does not expose personal records. To pause due processing, set `REMINDER_SCHEDULER_ENABLED=false`; already queued notifications still follow their stored delivery fences. Disable both flags to remove new tool access as well. A pause does not cancel existing intent. Use an intentional transport stop for an immediate delivery halt; normal outbound jobs otherwise remain active.
 
@@ -78,7 +86,11 @@ The three bounded scenarios cover casual relative-date phrasing, a corrected dur
 
 The [official Luna model reference](https://developers.openai.com/api/docs/models/gpt-6-luna) documents Responses API function calling and supported reasoning effort. Production model configuration does not select the evaluation model.
 
-## Validation recorded on 3 October 2026
+## Validation record
+
+The scheduling review passed **546 model-free tests with no skips**, using local PostgreSQL for integration coverage. Schema validation, TypeScript checks and the build also passed; documentation formatting is checked separately. These results do not claim a production rollout. Coverage includes graph composition, command revisions, personal recall, pagination, due processing and actual durable-consumer confirmation recovery. The confirmation tests exercise one committed change, rejection of generic fallback, recovery of the original receipt and bounded delivery reauthorization, including permanent denial. No paid model evaluation or production mutation was performed by those tests. The subsequent authorized rollout applied migration `202610030008` separately. The existing optional Luna runner is retained.
+
+### Previous deployed release, 3 October 2026
 
 The full deterministic check passed 518 tests with local PostgreSQL, followed by successful focused personal-tool and accounting checks after the final changes. TypeScript, build, formatting and migration/permission checks passed. Those tests performed no production database changes or WhatsApp sends. The subsequent authorized rollout applied production migration `202610030007` and verified it without adding test records.
 

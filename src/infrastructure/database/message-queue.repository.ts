@@ -52,7 +52,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610030007'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610030008'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -746,6 +746,7 @@ export class MessageQueueRepository {
     replyPayload: string,
     availableAt = new Date(),
     businessEvidence?: string,
+    personalCommandId?: string,
   ): Promise<boolean> {
     if (job.direction !== 'inbound') return false;
     return this.transaction(async (db) => {
@@ -759,6 +760,20 @@ export class MessageQueueRepository {
         await this.finish(db, job, 'EXPIRED', 'message_too_old');
         return false;
       }
+      // A successful/ambiguous commit must never be finalized as a generic failure reply.
+      // Returning false retains the original run for bounded retry and receipt recovery.
+      const command = (
+        await db.query<{ id: string }>(
+          `SELECT id FROM public."ramesh-assistant-commands"
+           WHERE account_id=$1 AND run_id=$2 AND kind='mutation'`,
+          [this.accountId, job.id],
+        )
+      ).rows[0];
+      if (
+        (command && (!businessEvidence || personalCommandId !== command.id)) ||
+        (!command && personalCommandId)
+      )
+        return false;
       await db.query(
         `INSERT INTO public."ramesh-outbound-queue" (message_id,account_id,payload_encrypted,available_at) VALUES ($1,$2,$3,$4)`,
         [job.id, this.accountId, replyPayload, availableAt],
@@ -908,7 +923,9 @@ export class MessageQueueRepository {
         `UPDATE public."ramesh-messages" SET reply_encrypted=$3,reply_kind='conversation',
          business_evidence_encrypted=NULL,reason='business_delivery_check_failed',updated_at=clock_timestamp()
          WHERE id=$1 AND account_id=$2 AND reply_kind='business' AND origin='whatsapp'
-         AND expires_at>clock_timestamp() RETURNING id`,
+         AND expires_at>clock_timestamp()
+         AND NOT EXISTS (SELECT 1 FROM public."ramesh-assistant-commands" c
+           WHERE c.account_id=$2 AND c.run_id=$1 AND c.kind='mutation') RETURNING id`,
         [job.id, this.accountId, replyPayload],
       );
       if (!changed.rowCount) return false;

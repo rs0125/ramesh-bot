@@ -1,4 +1,6 @@
 /** Small model port: the graph knows nothing about OpenAI credentials or WhatsApp sends. */
+import type { ReviewMetric } from './review-diagnostics.js';
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -75,6 +77,8 @@ export interface StageMetric {
   outputTokens: number;
   reasoningTokens?: number;
   cachedInputTokens?: number;
+  /** Allowlisted verdict metadata only; no reviewer feedback, answer text, or source values. */
+  review?: ReviewMetric;
 }
 
 export interface AgentTrace {

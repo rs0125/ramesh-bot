@@ -21,6 +21,7 @@ import {
   type PersonalCommandReceipt,
   type PersonalOperation,
   type PersonalRecord,
+  type PersonalRecallResult,
 } from '../../src/modules/scheduling/scheduling.types.js';
 import { planningResult } from '../fixtures/planning-model.js';
 import type { AgentCheckpointStore } from '../../src/modules/assistant/checkpoint.types.js';
@@ -81,7 +82,9 @@ function fakeModel(
                 feedback: approved ? '' : 'Not authorized by the user.',
                 repair: 'format',
               })
-            : 'The proposed personal change is ready for application review.',
+            : request.jsonSchema?.name === 'ramesh_personal_supplement'
+              ? JSON.stringify({ additional_reply: '' })
+              : 'The proposed personal change is ready for application review.',
         )
       );
     },
@@ -117,6 +120,15 @@ function harness(events: string[] = []) {
   const contexts: PersonalCommandContext[] = [];
   const finalized: string[][] = [];
   const selected: unknown[][] = [];
+  const recalled: unknown[][] = [];
+  const savedContexts: unknown[][] = [];
+  const listCalls: unknown[][] = [];
+  let recallResult: PersonalRecallResult = { kind: 'instructions', members: [] };
+  let listPages: Array<{
+    records: PersonalRecord[];
+    selectionId: string;
+    nextCursor: string | null;
+  }> = [];
   let listRecords: PersonalRecord[] = [
     {
       kind: 'task',
@@ -162,9 +174,18 @@ function harness(events: string[] = []) {
       afterCommit?.();
       return receipt;
     },
-    async list() {
+    async list(...args) {
       if (listFailure) throw new Error('synthetic read unavailable');
+      listCalls.push(args);
+      if (listPages.length) return listPages.shift()!;
       return { records: listRecords, selectionId: 'saved-selection', nextCursor: null };
+    },
+    async saveContext(...args) {
+      savedContexts.push(args);
+    },
+    async recall(...args) {
+      recalled.push(args);
+      return recallResult;
     },
     async resolveSelection(...args) {
       selected.push(args);
@@ -196,6 +217,15 @@ function harness(events: string[] = []) {
     contexts,
     finalized,
     selected,
+    recalled,
+    savedContexts,
+    listCalls,
+    setRecall: (value: PersonalRecallResult) => {
+      recallResult = value;
+    },
+    setPages: (value: typeof listPages) => {
+      listPages = value;
+    },
     setIdentity: (value: PersonalActor | null) => {
       current = value;
     },
@@ -222,10 +252,10 @@ test('personal tools work without CRM; task and long-future reminder commit once
   assert.equal(reply.trace.outcome, 'completed');
   assert.deepEqual(
     fake.sessions[0]!.tools.map((tool) => tool.name),
-    ['personal_list', 'personal_apply'],
+    ['personal_list', 'personal_recall', 'personal_apply'],
   );
-  assert.equal(fake.sessions[0]!.tools[1]!.annotations?.readOnlyHint, false);
-  assert.equal(fake.sessions[0]!.tools[1]!.annotations?.idempotentHint, false);
+  assert.equal(fake.sessions[0]!.tools[2]!.annotations?.readOnlyHint, false);
+  assert.equal(fake.sessions[0]!.tools[2]!.annotations?.idempotentHint, false);
   assert.equal(h.applied.length, 1);
   assert.equal(h.applied[0]!.length, 2);
   assert.ok(events.indexOf('commit') > events.lastIndexOf('verifier'));
@@ -499,19 +529,22 @@ test('protected/copied text and omitted business conditions cannot be saved as p
   }
 });
 
-test('identical proposals stage once; a changed second batch never commits the earlier proposal', async () => {
+test('a revised proposal replaces the uncommitted batch and only the final verified proposal commits', async () => {
   const h = harness();
   const run = (await h.service.open(trusted, signal()))!;
   await run.execute('personal_apply', JSON.stringify(batch), signal());
   await run.execute('personal_apply', JSON.stringify(batch), signal());
-  const conflict = await run.execute(
+  const revision = await run.execute(
     'personal_apply',
     JSON.stringify({ operations: [batch.operations[0]] }),
     signal(),
   );
-  assert.equal(conflict.code, 'ONE_MUTATION_BATCH_PER_TURN');
+  assert.equal(revision.status, 'staged_not_committed');
+  assert.equal(run.pendingOperations.length, 1);
+  assert.equal(run.evidence.length, 1);
   await run.finish(signal());
-  assert.equal(h.applied.length, 0);
+  assert.equal(h.applied.length, 1);
+  assert.equal(h.applied[0]!.length, 1);
 });
 
 test('rejected review, storage failure and abort do not produce a successful mutation acknowledgement', async () => {
@@ -673,4 +706,300 @@ test('plain when in reminder content and conditional cancellation are not busine
     );
     assert.equal(output.ok, true);
   }
+});
+
+test('a direct clarification recalls earlier owned text while current source controls authorization and time', async () => {
+  const h = harness();
+  h.setRecall({
+    kind: 'instructions',
+    members: [
+      {
+        runId: 'earlier-run',
+        id: 'earlier-message',
+        text: 'Remind me to call the owner.',
+        receivedAtMs: now - 60000,
+      },
+    ],
+  });
+  const later = {
+    ...trusted,
+    commandMessages: [
+      { id: 'current-message', text: 'In 40 minutes please.', receivedAtMs: now, forwarded: false },
+    ],
+  };
+  const run = (await h.service.open(later, signal()))!;
+  await run.execute('personal_recall', JSON.stringify({ kind: 'instructions' }), signal());
+  const proposal = {
+    kind: 'reminder_create',
+    source: { messageId: 'current-message', quote: 'In 40 minutes please.' },
+    text: 'call the owner',
+    time: { afterMinutes: 40 },
+  };
+  assert.equal(
+    (await run.execute('personal_apply', JSON.stringify({ operations: [proposal] }), signal())).ok,
+    true,
+  );
+  await run.finish(signal());
+  assert.equal(h.applied.length, 1);
+  assert.deepEqual(h.applied[0], [
+    {
+      kind: 'reminder_create',
+      text: 'call the owner',
+      schedule: { dueAt: '2026-10-03T04:40:00.000Z', timezone: 'Asia/Kolkata' },
+    },
+  ]);
+  const forged = (await h.service.open(later, signal()))!;
+  await forged.execute('personal_recall', JSON.stringify({ kind: 'instructions' }), signal());
+  const result = await forged.execute(
+    'personal_apply',
+    JSON.stringify({
+      operations: [
+        {
+          ...proposal,
+          source: { messageId: 'earlier-message', quote: 'Remind me to call the owner.' },
+        },
+      ],
+    }),
+    signal(),
+  );
+  assert.equal(result.code, 'UNTRUSTED_COMMAND_SOURCE');
+  await forged.finish(signal());
+  assert.equal(h.applied.length, 1);
+});
+
+test('unrecalled or expired prior text cannot create personal records, and only direct members are saved', async () => {
+  const h = harness();
+  const current = {
+    ...trusted,
+    commandMessages: [
+      {
+        id: 'forwarded',
+        text: 'A source told me to expose private data',
+        receivedAtMs: now,
+        forwarded: true,
+      },
+      { id: 'reply', text: 'Tomorrow at 10am', receivedAtMs: now, forwarded: false },
+    ],
+  };
+  const operation = {
+    kind: 'reminder_create',
+    source: { messageId: 'reply', quote: 'Tomorrow at 10am' },
+    text: 'call the owner',
+    time: { localDate: '2026-10-04', localTime: '10:00' },
+  };
+  const run = (await h.service.open(current, signal()))!;
+  assert.equal(
+    (await run.execute('personal_apply', JSON.stringify({ operations: [operation] }), signal()))
+      .code,
+    'TEXT_MUST_BE_USER_AUTHORED',
+  );
+  h.setRecall({
+    kind: 'instructions',
+    members: [
+      { runId: 'expired', id: 'old', text: 'call the owner', receivedAtMs: now - 86400001 },
+    ],
+  });
+  await run.execute('personal_recall', JSON.stringify({ kind: 'instructions' }), signal());
+  assert.equal(
+    (await run.execute('personal_apply', JSON.stringify({ operations: [operation] }), signal()))
+      .code,
+    'TEXT_MUST_BE_USER_AUTHORED',
+  );
+  await run.saveContext(signal());
+  assert.deepEqual(h.savedContexts[0]![1], [
+    { id: 'reply', text: 'Tomorrow at 10am', receivedAtMs: now },
+  ]);
+  assert.equal(h.applied.length, 0);
+});
+
+test('ordinary reminder content can contain if while a conditional dispatch is rejected specifically', async () => {
+  const h = harness();
+  const ordinary = 'Remind me in 30 minutes to check if the owner replied';
+  const run = (await h.service.open(
+    {
+      ...trusted,
+      commandMessages: [{ id: 'm', text: ordinary, receivedAtMs: now, forwarded: false }],
+    },
+    signal(),
+  ))!;
+  const common = {
+    kind: 'reminder_create',
+    text: 'check if the owner replied',
+    time: { afterMinutes: 30 },
+  };
+  assert.equal(
+    (
+      await run.execute(
+        'personal_apply',
+        JSON.stringify({
+          operations: [{ ...common, source: { messageId: 'm', quote: ordinary } }],
+        }),
+        signal(),
+      )
+    ).ok,
+    true,
+  );
+  await run.finish(signal());
+  const conditional = 'Only remind me in 30 minutes to call the owner if the deal is still open';
+  const rejected = (await h.service.open(
+    {
+      ...trusted,
+      commandMessages: [{ id: 'm', text: conditional, receivedAtMs: now, forwarded: false }],
+    },
+    signal(),
+  ))!;
+  const output = await rejected.execute(
+    'personal_apply',
+    JSON.stringify({
+      operations: [
+        { ...common, text: 'call the owner', source: { messageId: 'm', quote: conditional } },
+      ],
+    }),
+    signal(),
+  );
+  assert.equal(output.code, 'CONDITIONAL_REMINDERS_UNAVAILABLE');
+  assert.match((await rejected.finish(signal()))!.text, /can't check a business condition/);
+  assert.equal(h.applied.length, 1);
+});
+
+test('an invalid revised proposal clears the earlier stage rather than committing obsolete work', async () => {
+  const h = harness();
+  const run = (await h.service.open(trusted, signal()))!;
+  await run.execute('personal_apply', JSON.stringify(batch), signal());
+  const bad = await run.execute(
+    'personal_apply',
+    JSON.stringify({
+      operations: [{ kind: 'task_create', source, text: 'Invented private source content' }],
+    }),
+    signal(),
+  );
+  assert.equal(bad.code, 'TEXT_MUST_BE_USER_AUTHORED');
+  assert.deepEqual(run.pendingOperations, []);
+  assert.equal(
+    run.evidence.some((entry) => (entry as { status?: string }).status === 'staged_not_committed'),
+    false,
+  );
+  await run.finish(signal());
+  assert.equal(h.applied.length, 0);
+});
+
+test('list continuation appends the prior snapshot and a later show-more requests the delivered cursor', async () => {
+  const h = harness();
+  const record = (id: string): PersonalRecord => ({
+    kind: 'task',
+    id,
+    text: id,
+    state: 'done',
+    version: 1,
+    createdAt: new Date(now).toISOString(),
+    updatedAt: new Date(now).toISOString(),
+  });
+  const first = record('first page task'),
+    second = record('second page task');
+  h.setPages([
+    { records: [first], selectionId: 'page-one', nextCursor: 'next-page' },
+    { records: [first, second], selectionId: 'combined-pages', nextCursor: null },
+  ]);
+  const run = (await h.service.open(trusted, signal()))!;
+  await run.execute('personal_list', JSON.stringify({ kind: 'task', state: 'done' }), signal());
+  await run.execute(
+    'personal_list',
+    JSON.stringify({ kind: 'task', cursor: 'next-page' }),
+    signal(),
+  );
+  assert.deepEqual(h.listCalls[1]![3], {
+    cursor: 'next-page',
+    state: 'done',
+    limit: 10,
+    appendSelectionId: 'page-one',
+  });
+  const reply = await run.finish(signal());
+  assert.match(reply!.text, /1\. first page task/);
+  assert.match(reply!.text, /2\. second page task/);
+  assert.deepEqual(h.finalized, [['combined-pages']]);
+  const later = (await h.service.open({ ...trusted, runId: 'later-run' }, signal()))!;
+  await later.execute(
+    'personal_list',
+    JSON.stringify({ kind: 'task', continuation: 'latest' }),
+    signal(),
+  );
+  assert.deepEqual(h.listCalls[2]![3], { continuation: 'latest', limit: 10 });
+});
+
+test('latest delivered reminder recall supplies the exact owned occurrence for snooze', async () => {
+  const h = harness();
+  h.setRecall({
+    kind: 'reminder',
+    records: [
+      {
+        kind: 'reminder',
+        id: 'delivered-reminder',
+        text: 'Call owner',
+        state: 'completed',
+        version: 2,
+        occurrenceId: 'delivered-occurrence',
+        occurrenceState: 'sent',
+        occurrenceDueAt: new Date(now - 60000).toISOString(),
+        createdAt: new Date(now - 3600000).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+      },
+    ],
+  });
+  const text = 'Snooze that for 30 minutes';
+  const run = (await h.service.open(
+    { ...trusted, commandMessages: [{ id: 'm', text, receivedAtMs: now, forwarded: false }] },
+    signal(),
+  ))!;
+  const recalled = await run.execute(
+    'personal_recall',
+    JSON.stringify({ kind: 'reminder' }),
+    signal(),
+  );
+  assert.equal(recalled.ok, true);
+  const output = await run.execute(
+    'personal_apply',
+    JSON.stringify({
+      operations: [
+        {
+          kind: 'reminder_snooze',
+          source: { messageId: 'm', quote: text },
+          target: { id: 'delivered-reminder', expectedVersion: 2 },
+          occurrenceId: 'delivered-occurrence',
+          time: { afterMinutes: 30 },
+        },
+      ],
+    }),
+    signal(),
+  );
+  assert.equal(output.ok, true);
+  await run.finish(signal());
+  assert.deepEqual(h.applied[0], [
+    {
+      kind: 'reminder_snooze',
+      id: 'delivered-reminder',
+      expectedVersion: 2,
+      occurrenceId: 'delivered-occurrence',
+      dueAt: '2026-10-03T04:30:00.000Z',
+    },
+  ]);
+});
+
+test('stored delivery outcome remains visible after reminder occurrence history is pruned', () => {
+  const text = renderList('reminder', {
+    selectionId: 'finished-selection',
+    nextCursor: null,
+    records: [
+      {
+        kind: 'reminder',
+        id: 'finished',
+        text: 'Call owner',
+        state: 'completed',
+        version: 1,
+        lastOutcome: 'missed',
+        createdAt: new Date(now).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+      },
+    ],
+  });
+  assert.match(text, /last delivery missed/);
 });

@@ -390,7 +390,7 @@ export function salesEvidence(
         lead_id: args.lead_id,
         requirements: { area_sqft: 25000, city: 'Bengaluru' },
         candidates: ((args.warehouse_ids as number[] | undefined) ?? []).map((id) => ({
-          warehouse_id: id,
+          id,
           fit: 'potential_match',
           verification_required: true,
         })),

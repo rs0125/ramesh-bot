@@ -61,6 +61,8 @@ export interface PersonalRecord {
   schedule?: ScheduleSpec;
   /** Current recurring cursor, separate from the last occurrence. Null means no future slot. */
   nextDueAt?: string | null;
+  /** Durable delivery outcome retained after individual occurrence history expires. */
+  lastOutcome?: string;
   taskId?: string;
   occurrenceId?: string;
   occurrenceState?: string;
@@ -79,6 +81,18 @@ export interface PersonalListResult {
   selectionId: string;
   nextCursor: string | null;
 }
+export interface PersonalCommandMember {
+  id: string;
+  text: string;
+  receivedAtMs: number;
+}
+export type PersonalRecallResult =
+  | {
+      kind: 'instructions';
+      members: Array<PersonalCommandMember & { runId: string }>;
+      truncated?: boolean;
+    }
+  | { kind: 'task' | 'reminder'; records: PersonalRecord[]; selectionId?: string };
 export interface DueReminder {
   id: string;
   reminderId: string;

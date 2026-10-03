@@ -2,6 +2,8 @@
 
 Status: **Code source checks and independent model answer review implemented.**
 
+This release's follow-up revision: verdicts include a fixed diagnostic reason, and stage traces retain only approval, repair category, reason and presentation-issue count. Rejected prose and reviewer feedback remain excluded from logs. Current-task instructions distinguish contextual explanations from a preceding shortlist request and permit useful supported partial answers with specific limitations. The fallback no longer instructs users to narrow an otherwise valid question. See [follow-up recovery](../followup-recovery.md), including its limits and deterministic validation.
+
 **Implemented subset:** tool-evidence.ts validates source path/query, response/source clocks, explicit scope, page counts, totals and consistency metadata. sales.graph.ts reviews the formatted answer against current registered evidence in a fresh model context. One repair is allowed, routed directly to formatting for wording issues or back to the tool loop for missing evidence; a second failure returns a limitation. Model review cannot override code authorization and is probabilistic. See the [personal-assistant runbook](../sales-manager-agent.md) and [module 22](22-sales-manager-tool-loop.md) for the current contract. Production enablement remains separate. The richer role/task contracts below remain target design unless explicitly identified as implemented.
 
 ## Responsibility

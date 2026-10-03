@@ -3,6 +3,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { authCipher } from './auth-store.js';
 import {
+  PERSONAL_LIST_MAX_CHARACTERS,
+  renderList,
+} from '../../modules/scheduling/personal-presentation.js';
+import {
   nextOccurrence,
   validateSchedule,
   validateTaskDeadline,
@@ -19,6 +23,8 @@ import {
   type ScheduleSpec,
   type DueReminder,
   type ReminderDeliveryRef,
+  type PersonalCommandMember,
+  type PersonalRecallResult,
 } from '../../modules/scheduling/scheduling.types.js';
 
 type Row = Record<string, any>;
@@ -54,6 +60,7 @@ export class PersonalRepository {
   }
   private async tx<T>(work: (db: PoolClient) => Promise<T>): Promise<T> {
     const db = await this.pool.connect();
+    let destroy = false;
     try {
       await db.query('BEGIN');
       await db.query("SET LOCAL lock_timeout='1000ms'");
@@ -65,10 +72,14 @@ export class PersonalRepository {
       await db.query('COMMIT');
       return value;
     } catch (error) {
-      await db.query('ROLLBACK').catch(() => {});
+      try {
+        await db.query('ROLLBACK');
+      } catch {
+        destroy = true;
+      }
       throw error;
     } finally {
-      db.release();
+      db.release(destroy);
     }
   }
   private async fence(db: PoolClient, ctx: PersonalCommandContext) {
@@ -103,6 +114,7 @@ export class PersonalRepository {
         ? { schedule: row.schedule, nextDueAt: row.next_due_at?.toISOString() ?? null }
         : {}),
       ...(row.task_id ? { taskId: row.task_id } : {}),
+      ...(row.last_outcome ? { lastOutcome: row.last_outcome } : {}),
       ...(row.occurrence_id
         ? {
             occurrenceId: row.occurrence_id,
@@ -132,6 +144,138 @@ export class PersonalRepository {
       if (row.owner_employee_id !== ctx.employeeId)
         throw new SchedulingError('PERSONAL_ACCESS_DENIED');
       return { ...this.receipt(row), replayed: true };
+    });
+  }
+  /** Application supplies admitted, non-forwarded members, never model-generated history. */
+  async saveContext(ctx: PersonalCommandContext, members: PersonalCommandMember[]): Promise<void> {
+    if (!members.length) return;
+    if (
+      members.length > 32 ||
+      members.some(
+        (m) =>
+          !uuid(m.id) ||
+          typeof m.text !== 'string' ||
+          !m.text.trim() ||
+          !Number.isFinite(m.receivedAtMs),
+      ) ||
+      Buffer.byteLength(JSON.stringify(members)) > 180000
+    )
+      throw new SchedulingError('PERSONAL_CONTEXT_INVALID');
+    await this.tx(async (db) => {
+      await this.fence(db, ctx);
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO public."ramesh-assistant-commands"(id,account_id,owner_employee_id,run_id,kind,payload_encrypted,finished_at,expires_at)
+         VALUES($1,$2,$3,$4,'context',$5,clock_timestamp(),clock_timestamp()+interval '24 hours')
+         ON CONFLICT(account_id,run_id) WHERE kind='context' DO NOTHING`,
+        [
+          id,
+          this.accountId,
+          ctx.employeeId,
+          ctx.runId,
+          this.cipher.seal(`personal-context:${ctx.employeeId}`, id, {
+            phoneE164: ctx.phoneE164,
+            chatId: ctx.chatId,
+            members,
+          }),
+        ],
+      );
+    });
+  }
+  async recall(
+    actor: PersonalActor,
+    kind: 'instructions' | 'task' | 'reminder',
+  ): Promise<PersonalRecallResult> {
+    this.actor(actor);
+    if (kind === 'instructions') {
+      const rows = (
+        await this.pool.query(
+          `SELECT c.* FROM public."ramesh-assistant-commands" c JOIN public."ramesh-messages" m ON m.id=c.run_id AND m.account_id=c.account_id
+         WHERE c.account_id=$1 AND c.owner_employee_id=$2 AND c.kind='context' AND c.expires_at>clock_timestamp()
+         AND c.created_at>clock_timestamp()-interval '24 hours' AND m.origin='whatsapp' AND m.chat_id=$3 AND m.state='SENT'
+         ORDER BY m.finished_at DESC,c.created_at DESC LIMIT 32`,
+          [this.accountId, actor.employeeId, actor.chatId],
+        )
+      ).rows;
+      const members: Array<PersonalCommandMember & { runId: string }> = [];
+      const cutoff = Date.now() - 86400000;
+      let bytes = 0,
+        truncated = false;
+      for (const row of rows) {
+        const payload = this.cipher.open(
+          `personal-context:${actor.employeeId}`,
+          row.id,
+          row.payload_encrypted,
+        ) as { phoneE164: string; chatId: string; members: PersonalCommandMember[] };
+        if (payload.phoneE164 !== actor.phoneE164 || payload.chatId !== actor.chatId) continue;
+        for (const member of [...payload.members].reverse()) {
+          if (member.receivedAtMs < cutoff) continue;
+          const recalled = { ...member, runId: row.run_id };
+          const size = Buffer.byteLength(JSON.stringify(recalled));
+          if (members.length >= 32 || bytes + size > 32000) {
+            truncated = true;
+            continue;
+          }
+          members.push(recalled);
+          bytes += size;
+        }
+      }
+      return { kind, members: members.reverse(), ...(truncated ? { truncated: true } : {}) };
+    }
+    return this.tx(async (db) => {
+      const rows = (
+        await db.query(
+          `SELECT c.*,m.finished_at AS delivered_at FROM public."ramesh-assistant-commands" c JOIN public."ramesh-messages" m ON m.id=c.run_id AND m.account_id=c.account_id
+         WHERE c.account_id=$1 AND c.owner_employee_id=$2 AND c.kind IN('mutation','selection') AND c.expires_at>clock_timestamp()
+         AND (c.kind='mutation' OR c.presented) AND m.origin='whatsapp' AND m.chat_id=$3 AND m.reply_kind='business' AND m.state='SENT'
+         ORDER BY m.finished_at DESC,c.created_at DESC LIMIT 50`,
+          [this.accountId, actor.employeeId, actor.chatId],
+        )
+      ).rows;
+      let selected: Row | undefined;
+      let targets: VersionedTarget[] = [];
+      for (const row of rows) {
+        if (row.kind === 'mutation') {
+          targets = this.receipt(row)
+            .records.filter((r) => r.kind === kind)
+            .map((r) => ({ id: r.id, expectedVersion: r.version }));
+        } else {
+          const payload = this.cipher.open(
+            `personal-selection:${actor.employeeId}`,
+            row.id,
+            row.payload_encrypted,
+          ) as { kind: string; records: VersionedTarget[] };
+          if (payload.kind !== kind) continue;
+          targets = payload.records;
+        }
+        if (targets.length) {
+          selected = row;
+          break;
+        }
+      }
+      if (kind === 'reminder') {
+        const latest = (
+          await db.query(
+            `SELECT r.*,o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,m.finished_at AS delivered_at
+           FROM public."ramesh-reminder-occurrences" o JOIN public."ramesh-reminders" r ON r.id=o.reminder_id AND r.account_id=o.account_id
+           JOIN public."ramesh-messages" m ON m.id=o.outbound_message_id AND m.account_id=o.account_id
+           WHERE r.account_id=$1 AND r.owner_employee_id=$2 AND o.recipient_employee_id=$2 AND o.recipient_phone_e164=$3 AND o.recipient_chat_id=$4
+           AND o.state='sent' AND m.state='SENT' AND m.chat_id=$4 AND o.schedule_version=r.version
+           ORDER BY m.finished_at DESC,o.id DESC LIMIT 1`,
+            [this.accountId, actor.employeeId, actor.phoneE164, actor.chatId],
+          )
+        ).rows[0];
+        if (latest && (!selected || latest.delivered_at > selected.delivered_at))
+          return { kind, records: [this.record(kind, latest)] };
+      }
+      const records: PersonalRecord[] = [];
+      for (const target of targets.slice(0, 50))
+        records.push(this.record(kind, await this.target(db, actor, kind, target.id)));
+      return {
+        kind,
+        records,
+        ...(selected?.kind === 'selection' ? { selectionId: selected.id } : {}),
+      };
     });
   }
   async applyBatch(
@@ -203,7 +347,10 @@ export class PersonalRepository {
     if (!uuid(id)) throw new SchedulingError('PERSONAL_NOT_FOUND');
     const row = (
       await db.query(
-        `SELECT * FROM public."ramesh-${kind === 'task' ? 'tasks' : 'reminders'}" WHERE id=$1 AND account_id=$2 AND owner_employee_id=$3 FOR UPDATE`,
+        `SELECT t.* ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at' : ''}
+         FROM public."ramesh-${kind === 'task' ? 'tasks' : 'reminders'}" t
+         ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
+         WHERE t.id=$1 AND t.account_id=$2 AND t.owner_employee_id=$3 FOR UPDATE OF t`,
         [id, this.accountId, ctx.employeeId],
       )
     ).rows[0];
@@ -344,6 +491,7 @@ export class PersonalRepository {
       return { ...this.record('reminder', row), alreadySending };
     }
     if (op.kind === 'reminder_reschedule') {
+      if (old.state !== 'scheduled') await this.quota(db, ctx, 'reminder');
       const schedule = validateSchedule(op.schedule);
       if (Date.parse(schedule.dueAt) < ctx.requestTimeMs)
         throw new SchedulingError('PERSONAL_PAST_TIME');
@@ -384,6 +532,7 @@ export class PersonalRepository {
       if (newer.rowCount) throw new SchedulingError('PERSONAL_OCCURRENCE_CONFLICT');
       if (old.task_id && (await this.target(db, ctx, 'task', old.task_id)).state !== 'open')
         throw new SchedulingError('PERSONAL_TASK_CLOSED');
+      if (old.state !== 'scheduled') await this.quota(db, ctx, 'reminder');
       if (await this.cancelOccurrences(db, op.id, op.occurrenceId))
         throw new SchedulingError('PERSONAL_ALREADY_SENDING');
       const updated = (
@@ -451,14 +600,20 @@ export class PersonalRepository {
     actor: PersonalActor,
     kind: 'task' | 'reminder',
     runId: string,
-    options: { state?: string; limit?: number; cursor?: string } = {},
+    options: {
+      state?: string;
+      limit?: number;
+      cursor?: string;
+      continuation?: 'latest';
+      appendSelectionId?: string;
+    } = {},
   ): Promise<PersonalListResult> {
     this.actor(actor);
     if (!uuid(runId)) throw new SchedulingError('PERSONAL_INVALID_RUN');
     const limit = options.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 50)
       throw new SchedulingError('PERSONAL_LIST_LIMIT');
-    const state = options.state ?? (kind === 'task' ? 'open' : 'scheduled');
+    let state = options.state ?? (kind === 'task' ? 'open' : 'scheduled');
     if (
       !(
         kind === 'task'
@@ -484,6 +639,58 @@ export class PersonalRepository {
       }
     }
     return this.tx(async (db) => {
+      let previous: VersionedTarget[] = [];
+      if (options.continuation && (options.cursor || options.appendSelectionId))
+        throw new SchedulingError('PERSONAL_INVALID_CURSOR');
+      if (options.continuation || options.appendSelectionId) {
+        if (options.appendSelectionId && !uuid(options.appendSelectionId))
+          throw new SchedulingError('PERSONAL_SELECTION_INVALID');
+        const selections = (
+          await db.query(
+            `SELECT c.* FROM public."ramesh-assistant-commands" c JOIN public."ramesh-messages" m ON m.id=c.run_id AND m.account_id=c.account_id
+           WHERE c.account_id=$1 AND c.owner_employee_id=$2 AND c.kind='selection' AND c.expires_at>clock_timestamp() AND m.chat_id=$3
+           AND (($4::uuid IS NOT NULL AND c.id=$4 AND c.run_id=$5) OR ($4::uuid IS NULL AND c.presented AND m.reply_kind='business' AND m.state='SENT'))
+           ORDER BY m.finished_at DESC NULLS LAST,c.created_at DESC,c.id DESC LIMIT 50`,
+            [
+              this.accountId,
+              actor.employeeId,
+              actor.chatId,
+              options.appendSelectionId ?? null,
+              runId,
+            ],
+          )
+        ).rows;
+        let found = false;
+        for (const row of selections) {
+          const payload = this.cipher.open(
+            `personal-selection:${actor.employeeId}`,
+            row.id,
+            row.payload_encrypted,
+          ) as {
+            kind: string;
+            records: VersionedTarget[];
+            state: string;
+            nextCursor?: string | null;
+          };
+          if (payload.kind !== kind) continue;
+          if (options.state !== undefined && options.state !== payload.state)
+            throw new SchedulingError('PERSONAL_INVALID_STATE');
+          state = payload.state;
+          if (!payload.nextCursor) throw new SchedulingError('PERSONAL_LIST_COMPLETE');
+          const savedCursor = JSON.parse(
+            Buffer.from(payload.nextCursor, 'base64url').toString('utf8'),
+          ) as [string, string];
+          if (options.cursor && (cursor?.[0] !== savedCursor[0] || cursor?.[1] !== savedCursor[1]))
+            throw new SchedulingError('PERSONAL_INVALID_CURSOR');
+          cursor = savedCursor;
+          if (options.appendSelectionId) previous = payload.records;
+          found = true;
+          break;
+        }
+        if (!found) throw new SchedulingError('PERSONAL_SELECTION_NOT_FOUND');
+      }
+      const pageLimit = Math.min(limit, 50 - previous.length);
+      if (pageLimit < 1) throw new SchedulingError('PERSONAL_LIST_LIMIT');
       const table = kind === 'task' ? 'ramesh-tasks' : 'ramesh-reminders';
       const rows = (
         await db.query(
@@ -498,11 +705,36 @@ export class PersonalRepository {
             state,
             cursor?.[0] ?? null,
             cursor?.[1] ?? null,
-            limit + 1,
+            pageLimit + 1,
           ],
         )
       ).rows;
-      const records = rows.slice(0, limit).map((row) => this.record(kind, row));
+      const records: PersonalRecord[] = [];
+      for (const target of previous)
+        records.push(
+          this.record(kind, await this.target(db, actor, kind, target.id, target.expectedVersion)),
+        );
+      let included = 0;
+      for (const row of rows.slice(0, pageLimit)) {
+        const candidate = this.record(kind, row);
+        // Reserve the continuation footer while fitting the actual rendered presentation.
+        if (
+          renderList(kind, {
+            records: [...records, candidate],
+            selectionId: '',
+            nextCursor: 'more',
+          }).length > PERSONAL_LIST_MAX_CHARACTERS
+        )
+          break;
+        records.push(candidate);
+        included++;
+      }
+      if (!included && rows.length) throw new SchedulingError('PERSONAL_LIST_LIMIT');
+      const last = rows[included - 1];
+      const nextCursor =
+        rows.length > included && last
+          ? Buffer.from(JSON.stringify([last.cursor_time, last.id])).toString('base64url')
+          : null;
       const id = randomUUID();
       await db.query(
         `INSERT INTO public."ramesh-assistant-commands"(id,account_id,owner_employee_id,run_id,kind,payload_encrypted,finished_at,expires_at)
@@ -516,17 +748,14 @@ export class PersonalRepository {
             kind,
             records: records.map((r) => ({ id: r.id, expectedVersion: r.version })),
             state,
+            nextCursor,
           }),
         ],
       );
-      const last = rows[limit - 1];
       return {
         records,
         selectionId: id,
-        nextCursor:
-          rows.length > limit && last
-            ? Buffer.from(JSON.stringify([last.cursor_time, last.id])).toString('base64url')
-            : null,
+        nextCursor,
       };
     });
   }
@@ -654,64 +883,110 @@ export class PersonalRepository {
   async reconcile() {
     await this.tx((db) => this.reconcileIn(db));
   }
-  async claimDue(leaseMs: number): Promise<DueReminder | null> {
-    if (!Number.isSafeInteger(leaseMs) || leaseMs < 100 || leaseMs > 120000)
-      throw new SchedulingError('PERSONAL_INVALID_LEASE');
-    return this.tx(async (db) => {
-      await this.reconcileIn(db);
-      const now = (await db.query('SELECT clock_timestamp() AS now')).rows[0].now as Date;
-      const ready = (
-        await db.query(
-          `SELECT r.* FROM public."ramesh-reminders" r WHERE r.account_id=$1 AND r.state='scheduled' AND r.next_due_at<=clock_timestamp() ORDER BY r.next_due_at,r.id LIMIT 25 FOR UPDATE SKIP LOCKED`,
-          [this.accountId],
-        )
-      ).rows;
-      for (const r of ready) {
-        if (r.task_id) {
-          const task = (
-            await db.query(
-              `SELECT state FROM public."ramesh-tasks" WHERE id=$1 AND account_id=$2`,
-              [r.task_id, this.accountId],
-            )
-          ).rows[0];
-          if (task?.state !== 'open') {
-            await this.cancel(db, r.id);
-            continue;
-          }
-        }
-        let schedule: ScheduleSpec;
-        try {
-          schedule = validateSchedule(r.schedule as ScheduleSpec);
-        } catch {
-          // A corrupt definition must not roll back progress for every other owner.
+  private async materializeDue(db: PoolClient): Promise<void> {
+    const now = (await db.query('SELECT clock_timestamp() AS now')).rows[0].now as Date;
+    const ready = (
+      await db.query(
+        `WITH ranked AS (SELECT id,row_number() OVER(PARTITION BY owner_employee_id ORDER BY next_due_at,id) AS owner_rank
+          FROM public."ramesh-reminders" WHERE account_id=$1 AND state='scheduled' AND next_due_at<=clock_timestamp())
+          SELECT r.*,t.state AS task_state FROM ranked JOIN public."ramesh-reminders" r ON r.id=ranked.id
+          LEFT JOIN public."ramesh-tasks" t ON t.id=r.task_id AND t.account_id=r.account_id AND t.owner_employee_id=r.owner_employee_id
+          ORDER BY ranked.owner_rank,r.next_due_at,r.id LIMIT 25 FOR UPDATE OF r SKIP LOCKED`,
+        [this.accountId],
+      )
+    ).rows;
+    const slots: Array<{
+      id: string;
+      occurrence_id: string;
+      due: string;
+      next_due: string | null;
+    }> = [];
+    for (const r of ready) {
+      if (r.task_id) {
+        if (r.task_state !== 'open') {
           await this.cancel(db, r.id);
-          await db.query(
-            `UPDATE public."ramesh-reminders" SET state='completed',consumed=true,last_outcome='invalid_schedule' WHERE id=$1 AND account_id=$2`,
-            [r.id, this.accountId],
-          );
           continue;
         }
-        let due = new Date(r.next_due_at);
-        if (schedule.recurrence && due.getTime() <= now.getTime() - 3600000) {
-          const recent = nextOccurrence(schedule, new Date(now.getTime() - 3600000));
-          if (recent && recent <= now) due = recent;
-        }
-        await this.insertOccurrence(db, r, due, due);
-        const next = schedule.recurrence ? nextOccurrence(schedule, now) : null;
-        await db.query(
-          `UPDATE public."ramesh-reminders" SET next_due_at=$3,consumed=true,updated_at=clock_timestamp() WHERE id=$1 AND account_id=$2`,
-          [r.id, this.accountId, next],
-        );
       }
+      let schedule: ScheduleSpec;
+      try {
+        schedule = validateSchedule(r.schedule as ScheduleSpec);
+      } catch {
+        // A corrupt definition must not roll back progress for every other owner.
+        await this.cancel(db, r.id);
+        await db.query(
+          `UPDATE public."ramesh-reminders" SET state='completed',consumed=true,last_outcome='invalid_schedule' WHERE id=$1 AND account_id=$2`,
+          [r.id, this.accountId],
+        );
+        continue;
+      }
+      let due = new Date(r.next_due_at);
+      if (schedule.recurrence && due.getTime() <= now.getTime() - 3600000) {
+        const recent = nextOccurrence(schedule, new Date(now.getTime() - 3600000));
+        if (recent && recent <= now) due = recent;
+      }
+      const next = schedule.recurrence ? nextOccurrence(schedule, now) : null;
+      slots.push({
+        id: r.id,
+        occurrence_id: randomUUID(),
+        due: due.toISOString(),
+        next_due: next?.toISOString() ?? null,
+      });
+    }
+    if (slots.length)
+      await db.query(
+        `WITH slots AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS s(id uuid,occurrence_id uuid,due timestamptz,next_due timestamptz)),
+         inserted AS (
+           INSERT INTO public."ramesh-reminder-occurrences"(id,account_id,reminder_id,schedule_version,slot_key,scheduled_for,eligible_at,not_after,next_attempt_at,recipient_employee_id,recipient_phone_e164,recipient_chat_id)
+           SELECT s.occurrence_id,r.account_id,r.id,r.version,s.due,s.due,s.due,s.due+interval '1 hour',s.due,r.owner_employee_id,r.recipient_phone_e164,r.recipient_chat_id
+           FROM slots s JOIN public."ramesh-reminders" r ON r.id=s.id AND r.account_id=$1
+           ON CONFLICT(account_id,reminder_id,schedule_version,slot_key,dispatch_generation) DO NOTHING
+         )
+         UPDATE public."ramesh-reminders" r SET next_due_at=s.next_due,consumed=true,updated_at=clock_timestamp() FROM slots s WHERE r.id=s.id AND r.account_id=$1`,
+        [this.accountId, JSON.stringify(slots)],
+      );
+  }
+  /** Materialize and reconcile once per scheduler tick, outside its per-occurrence claim loop. */
+  async prepareDue(): Promise<void> {
+    await this.tx(async (db) => {
+      await this.materializeDue(db);
       await this.reconcileIn(db);
+    });
+  }
+  async claimDue(leaseMs: number): Promise<DueReminder | null> {
+    return this.claim(leaseMs, [], true);
+  }
+  async claimPrepared(
+    leaseMs: number,
+    excludedEmployeeIds: number[] = [],
+  ): Promise<DueReminder | null> {
+    return this.claim(leaseMs, excludedEmployeeIds, false);
+  }
+  private async claim(
+    leaseMs: number,
+    excludedEmployeeIds: number[],
+    prepare: boolean,
+  ): Promise<DueReminder | null> {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 100 || leaseMs > 120000)
+      throw new SchedulingError('PERSONAL_INVALID_LEASE');
+    if (
+      excludedEmployeeIds.length > 100 ||
+      excludedEmployeeIds.some((id) => !Number.isSafeInteger(id) || id < 1)
+    )
+      throw new SchedulingError('PERSONAL_INVALID_OWNER');
+    return this.tx(async (db) => {
+      if (prepare) {
+        await this.materializeDue(db);
+        await this.reconcileIn(db);
+      }
       const candidates = (
         await db.query(
           `SELECT o.*,r.text_encrypted,r.owner_employee_id FROM public."ramesh-reminder-occurrences" o JOIN public."ramesh-reminders" r ON r.id=o.reminder_id AND r.account_id=o.account_id
         WHERE o.account_id=$1 AND o.state IN('pending','waiting_source') AND o.next_attempt_at<=clock_timestamp() AND o.eligible_at<=clock_timestamp() AND o.not_after>clock_timestamp()
-        AND r.state='scheduled' AND r.version=o.schedule_version AND o.attempts<5
+        AND r.state='scheduled' AND r.version=o.schedule_version AND o.attempts<5 AND NOT (o.recipient_employee_id=ANY($2::integer[]))
         AND NOT EXISTS(SELECT 1 FROM public."ramesh-reminder-occurrences" busy WHERE busy.account_id=o.account_id AND busy.recipient_employee_id=o.recipient_employee_id AND busy.state='preparing')
         ORDER BY o.eligible_at,o.id LIMIT 25 FOR UPDATE OF o SKIP LOCKED`,
-          [this.accountId],
+          [this.accountId, excludedEmployeeIds],
         )
       ).rows;
       for (const row of candidates) {
@@ -785,10 +1060,12 @@ export class PersonalRepository {
     await this.tx(async (db) => {
       const row = await this.ownDue(db, due);
       if (!row) return;
-      const state = terminal ?? (row.attempts >= 5 ? 'failed' : 'waiting_source');
+      const paused = reason === 'scheduler_paused' && terminal === undefined;
+      const state =
+        terminal ?? (paused ? 'pending' : row.attempts >= 5 ? 'failed' : 'waiting_source');
       await db.query(
-        `UPDATE public."ramesh-reminder-occurrences" SET state=$3,reason_code=$4,lease_token=NULL,lease_until=NULL,next_attempt_at=least(not_after,clock_timestamp()+interval '30 seconds'),finished_at=CASE WHEN $3 IN('failed','suppressed') THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp() WHERE id=$1 AND account_id=$2`,
-        [due.id, this.accountId, state, reason],
+        `UPDATE public."ramesh-reminder-occurrences" SET state=$3,reason_code=$4,lease_token=NULL,lease_until=NULL,attempts=greatest(0,attempts-CASE WHEN $5 THEN 1 ELSE 0 END),next_attempt_at=least(not_after,clock_timestamp()+CASE WHEN $5 THEN interval '0 seconds' ELSE interval '30 seconds' END),finished_at=CASE WHEN $3 IN('failed','suppressed') THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp() WHERE id=$1 AND account_id=$2`,
+        [due.id, this.accountId, state, reason, paused],
       );
       await this.reconcileIn(db);
     });

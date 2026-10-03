@@ -22,6 +22,7 @@ import {
 import { AgentCheckpointRepository } from '../src/infrastructure/database/agent-checkpoint.repository.js';
 import { authCipher } from '../src/infrastructure/database/auth-store.js';
 import { encodeReply } from '../src/modules/messaging/reply-payload.js';
+import { getPersonalDelivery } from '../src/modules/messaging/delivery-evidence.js';
 import { combinedTurn } from '../src/modules/messaging/debounce.js';
 import { styleViolations } from '../src/modules/assistant/style.js';
 import { promptManifest } from '../src/modules/assistant/prompt-files.js';
@@ -412,6 +413,7 @@ export async function runSchedulingEvaluation() {
                 protectedReply
                   ? cipher.seal('business-delivery', job.id, reply.businessEvidence)
                   : undefined,
+                getPersonalDelivery(reply.businessEvidence)?.commandId,
               ))
             )
               throw new Error('SCHEDULING_EVAL_CAPTURE_HANDOFF_FAILED');

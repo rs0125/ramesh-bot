@@ -21,6 +21,7 @@ import { currentUsageScope, withUsageScope } from '../../modules/usage/usage-sco
 import { cancellable } from '../../lib/cancellable.js';
 import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
 import { reminderEvidenceMatches } from '../../modules/scheduling/scheduler.service.js';
+import { getPersonalDelivery } from '../../modules/messaging/delivery-evidence.js';
 
 export interface DurableMessageOptions {
   encryptionKey: string;
@@ -639,7 +640,16 @@ export class DurableMessages {
         const businessEvidence = protectedReply
           ? this.cipher.seal('business-delivery', job.id, prepared.businessEvidence)
           : undefined;
-        if (await this.repository.handoff(job, payload, new Date(), businessEvidence)) {
+        const personalCommandId = getPersonalDelivery(prepared.businessEvidence)?.commandId;
+        if (
+          await this.repository.handoff(
+            job,
+            payload,
+            new Date(),
+            businessEvidence,
+            personalCommandId,
+          )
+        ) {
           if (prepared.onSent)
             this.sentCallbacks.set(job.id, {
               expiresAt: candidate.sentAtMs + this.options.maxAgeMs,
@@ -716,20 +726,26 @@ export class DurableMessages {
         return;
       }
       if (job.replyKind === 'business' && !reminder) {
+        const evidence = job.businessEvidence
+          ? this.cipher.open('business-delivery', job.id, job.businessEvidence)
+          : undefined;
         const allowed =
           !manual &&
           message &&
           this.options.businessPreflight &&
-          job.businessEvidence &&
-          (await this.options.businessPreflight(
-            message,
-            this.cipher.open('business-delivery', job.id, job.businessEvidence),
-            signal,
-          ));
+          evidence &&
+          (await this.options.businessPreflight(message, evidence, signal));
         if (!allowed) {
           this.sentCallbacks.delete(job.id);
           if (signal.aborted) {
             await this.repository.releaseUnsent(job, true);
+            return;
+          }
+          if (getPersonalDelivery(evidence)?.commandId) {
+            // The change is committed. Retain its exact protected confirmation for bounded
+            // reauthorization retries; a generic retry invitation can create duplicates.
+            await this.repository.releaseUnsent(job);
+            report('error');
             return;
           }
           const notice =

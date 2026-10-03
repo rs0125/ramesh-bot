@@ -12,6 +12,7 @@ import type {
   TextModel,
   ToolSessionRequest,
 } from '../../src/modules/assistant/assistant.types.js';
+import { displayedWarehouseRecords } from '../../src/modules/assistant/displayed-records.js';
 const trusted = { key: { remoteJid: FIXTURE_JID }, runId: 'test' };
 const signal = () => AbortSignal.timeout(5000);
 
@@ -33,6 +34,153 @@ async function setup() {
   const run = (await fixture.service.openTools(trusted, signal())).run!;
   return { fixture, history, run, original };
 }
+
+async function warehouseHistory(legacy = false) {
+  const fixture = createSalesFixture();
+  const original = (await fixture.service.openTools(trusted, signal())).run!;
+  await original.execute('search_warehouses', '{"limit":5}', signal());
+  await original.execute('get_context', '{}', signal());
+  const text = '1. *ID 105* · OLD PRIVATE PRO\n2. ID:103 · OLD PRIVATE CON\n3. ID 101 · old size';
+  const receipt = original.delivery()!;
+  if (!legacy) receipt.displayedRecords = displayedWarehouseRecords(text, original.evidence);
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Give three suitable warehouses' },
+    { role: 'assistant', content: PRIVATE_HISTORY_REPLY, protectedReply: { text, receipt } },
+  ];
+  fixture.state.calls.length = 0;
+  const run = (await fixture.service.openTools(trusted, signal())).run!;
+  return { fixture, history, run };
+}
+
+test('ranked displayed IDs refresh directly despite changed search ordering and unrelated source failure', async () => {
+  const { fixture, history, run } = await warehouseHistory();
+  fixture.state.failures.set('search_warehouses', new ContextEngineError('UNAVAILABLE'));
+  fixture.state.failures.set('get_context', new ContextEngineError('UNAVAILABLE'));
+  fixture.state.mutate = (result, tool, args) => {
+    if (tool === 'read_warehouse') result.data.area_sqft = 50000 + Number(args.id);
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.selection_status, 'complete');
+  assert.equal(output.previous_reply_verified, false);
+  assert.equal(output.previous_reply, undefined);
+  assert.ok(!JSON.stringify(output).includes('OLD PRIVATE'));
+  assert.deepEqual(
+    (output.displayed_selection as any[]).map(({ id, position }) => ({ id, position })),
+    [
+      { id: 105, position: 1 },
+      { id: 103, position: 2 },
+      { id: 101, position: 3 },
+    ],
+  );
+  assert.deepEqual(
+    fixture.state.calls.map(({ tool, args }) => [tool, args.id]),
+    [
+      ['read_warehouse', 105],
+      ['read_warehouse', 103],
+      ['read_warehouse', 101],
+    ],
+  );
+  assert.deepEqual(
+    (output.fresh_evidence as any[]).map((entry) => entry.data.area_sqft),
+    [50105, 50103, 50101],
+  );
+});
+
+test('legacy explicit display labels avoid old pool replay and restore authorized IDs without old prose', async () => {
+  const { fixture, history, run } = await warehouseHistory(true);
+  fixture.state.failures.set('search_warehouses', new ContextEngineError('UNAVAILABLE'));
+  fixture.state.mutate = (result, tool) => {
+    if (tool === 'read_warehouse') result.data.source_updated_at = '2026-10-03T00:00:00Z';
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.selection_source, 'legacy_explicit_labels');
+  assert.equal(output.selection_status, 'complete');
+  assert.equal(output.selection_count, 3);
+  assert.deepEqual(
+    (output.displayed_selection as any[]).map((entry) => entry.id),
+    [105, 103, 101],
+  );
+  assert.equal(fixture.state.calls.length, 3);
+  assert.ok(!JSON.stringify(output).includes('OLD PRIVATE'));
+});
+
+test('unavailable displayed warehouse is hidden without replacing or renumbering the survivors', async () => {
+  const { fixture, history, run } = await warehouseHistory();
+  fixture.state.mutate = (_result, tool, args) => {
+    if (tool === 'read_warehouse' && args.id === 103)
+      throw new ContextEngineError('TOOL_UNAVAILABLE');
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.selection_status, 'partial');
+  assert.equal(output.retry_available, true);
+  assert.deepEqual(
+    (output.displayed_selection as any[]).map(({ id, position }) => ({ id, position })),
+    [
+      { id: 105, position: 1 },
+      { id: 101, position: 3 },
+    ],
+  );
+  assert.ok(!JSON.stringify(output).includes('"id":103'));
+  assert.deepEqual(output.unavailable_checks, [
+    { tool: 'read_warehouse', code: 'TOOL_UNAVAILABLE' },
+  ]);
+  assert.equal(output.previous_reply, undefined);
+});
+
+test('stored display positions survive omitted references rather than collapsing ordinals', async () => {
+  const { history, run } = await warehouseHistory();
+  const receipt = history[1]!.protectedReply!.receipt as any;
+  receipt.displayedRecords = [
+    { kind: 'warehouse', id: 103, position: 2 },
+    { kind: 'warehouse', id: 101, position: 4 },
+  ];
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.equal(output.selection_count, 4);
+  assert.equal(output.selection_status, 'partial');
+  assert.deepEqual(
+    (output.displayed_selection as any[]).map(({ id, position }) => ({ id, position })),
+    [
+      { id: 103, position: 2 },
+      { id: 101, position: 4 },
+    ],
+  );
+});
+
+test('partial exact selection permits one bounded retry and reuses successful fresh reads', async () => {
+  const { fixture, history, run } = await warehouseHistory();
+  let failed = false;
+  fixture.state.mutate = (_result, tool, args) => {
+    if (tool === 'read_warehouse' && args.id === 103 && !failed) {
+      failed = true;
+      throw new ContextEngineError('UNAVAILABLE', true);
+    }
+  };
+  const recall = businessRecall(history, run);
+  const first = await recall.execute('{}', signal());
+  assert.equal(first.selection_status, 'partial');
+  assert.equal(first.retry_available, true);
+  const second = await recall.execute('{}', signal());
+  assert.equal(second.selection_status, 'complete');
+  assert.equal(second.retry_available, false);
+  assert.deepEqual(
+    (second.displayed_selection as any[]).map((entry) => entry.id),
+    [105, 103, 101],
+  );
+  assert.deepEqual(
+    fixture.state.calls.map(({ args }) => args.id),
+    [105, 103, 101, 103],
+  );
+  assert.equal((await recall.execute('{}', signal())).code, 'ALREADY_RECALLED');
+});
+
+test('revoked identity cannot reveal displayed ID metadata or successful earlier reads', async () => {
+  const { fixture, history, run } = await warehouseHistory();
+  fixture.state.mutate = () => {
+    fixture.state.active = false;
+  };
+  const output = await businessRecall(history, run).execute('{}', signal());
+  assert.deepEqual(output, { ok: false, code: 'ACCESS_DENIED' });
+});
 
 test('recall restores selection/order only after fresh registered reads; metadata never enters messages', async () => {
   const { fixture, history, run } = await setup();

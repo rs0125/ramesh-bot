@@ -1,6 +1,6 @@
 # Personal reminders
 
-Status: **Implemented; production schema `202610030007` applied. Runtime flags control activation.** Personal reminder tools and recurrence are implemented; conditional business reminders and delegated recipients remain future work. See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
+Status, 3 October 2026: **This release includes the scheduling review fixes. Production migration `202610030008` is applied and verified; both scheduling flags remain enabled and worker credentials are unchanged. Worker rollout uses CI/CD after pushing `main`; verify the exact release and runtime health.** Conditional business reminders and delegated recipients remain future work. See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
 
 ## Product contract
 
@@ -19,20 +19,25 @@ Add application-owned tools to the dynamically discovered catalogue only when th
 | Tool                  | Model-visible proposal                                                | Application-enforced behavior                                                         |
 | --------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `reminder_create`     | Text, explicit time/rule, optional selected task reference            | Normalize time, authorize ownership/linkage and stage creation.                       |
-| `reminder_list`       | Bounded state/date filters and pagination                             | Return only the owner's records, exact IST range and an ordered selection reference.  |
+| `personal_list`       | Reminder kind, state and bounded continuation                         | Return only the owner's records and an ordered selection reference.                   |
+| `personal_recall`     | Prior direct instructions or latest delivered reminder result         | Reauthorize source text or original delivered occurrence/record references.           |
 | `reminder_reschedule` | Stable or selected reference, expected version, replacement time/rule | Compare revision and invalidate eligible unsent occurrences of the replaced revision. |
 | `reminder_snooze`     | Selected occurrence, expected version, explicit new time              | Move that notification opportunity without silently rewriting the recurring rule.     |
 | `reminder_cancel`     | Selected reference, expected version, explicit scope                  | Cancel the authorized schedule/occurrence and invalidate eligible unsent delivery.    |
 
 The runtime supplies account, employee, recipient, admission timestamp, command identity, leases and authority. The model cannot choose these fields. Schemas reject extra authority fields and invalid times; instructions embedded in reminder text remain inert content.
 
-`reminder_list` is read-only. Mutation tools advertise `readOnlyHint: false`; create is not generally idempotent across separate user requests. Cancellation is not append-only. The server's replay protection is a separate guarantee from tool annotations. An explicit user request authorizes the scoped action; do not add a redundant confirmation unless selection, time or scope is materially ambiguous.
+`personal_list` and `personal_recall` are read-only. Mutation tools advertise `readOnlyHint: false`; create is not generally idempotent across separate user requests. Cancellation is not append-only. The server's replay protection is a separate guarantee from tool annotations. An explicit user request authorizes the scoped action; do not add a redundant confirmation unless selection, time or scope is materially ambiguous.
 
 For the first implementation, tools stage proposals into **one bounded, server-validated atomic mutation batch per inbound turn**. One batch can create a task and its reminder together, or contain several explicitly requested additions. It must not commit a task and then independently attempt its requested reminder. Do not permit arbitrary successive write batches in the same turn.
 
-Persist admitted operation slots and normalized intent in `ramesh-assistant-commands`, then commit the mutations and their result receipt atomically. Bind the receipt to trusted account/owner, admitted inbound identity, accepted slots and normalized argument fingerprints. A replay loads the accepted batch and committed result; changed arguments for an occupied slot fail reconciliation rather than cause another write. Model tool-call IDs alone are not stable business idempotency keys.
+Commit the normalized mutations and their result receipt atomically in `ramesh-assistant-commands`. Bind the receipt to trusted account/owner, admitted inbound identity and normalized argument fingerprints. A replay loads the committed result; changed arguments after commit fail reconciliation rather than cause another write. Before commit, a reviewed correction can replace the staged proposal. Model tool-call IDs alone are not stable business idempotency keys.
 
-Success prose comes from the committed receipt, including exact saved time, affected count, version and send-boundary outcome. A storage error means no success acknowledgement. A crash during formatting or WhatsApp acknowledgement does not repeat an already committed mutation. The current graph therefore needs an explicit staging, application-commit and receipt-verification path before these tools are enabled.
+Success prose comes from the committed receipt, including exact saved time, affected count and send-boundary outcome. The verifier reviews a deterministic pending preview before application commit. It can revise the entire uncommitted proposal; only the final approved batch commits once. A storage error means no success acknowledgement. Queue handoff requires the exact stored command receipt if a mutation committed, so a late failure cannot become a generic retry invitation. Receipt and delivery reauthorization retries remain bounded.
+
+The implemented tools are `personal_list`, `personal_recall` and `personal_apply`; reminder mutations are operation kinds in the latter. The personal-only route skips planner/formatter inference when it has a deterministic personal result, retaining the router, tool worker and verifier. Mixed requests keep the general graph and preserve their additional answer alongside the receipt, with both personal and business authorization when required.
+
+`personal_recall` can resolve a delivered reminder occurrence for “snooze that”, even after its one-off schedule completed. It also exposes owner-authorized direct instructions from delivered own-chat turns for 24 hours to complete a clarification. Those instructions provide text provenance only; the current direct message still authorizes a change and supplies its time anchor. Forwarded text and retrieved business content do not acquire instruction authority through recall.
 
 ## Time interpretation in IST
 
@@ -85,7 +90,7 @@ flowchart LR
     F --> O[Record sent, failed, missed or uncertain]
 ```
 
-Keep long-future intent in the schedule table, not the messages queue. Materialize only the next needed occurrence. The proposed starting scheduler cadence is 30 seconds with a fixed one-hour lateness allowance; these are product defaults to validate before activation, not deployed behavior. Retries cannot reset the deadline. A reminder too late becomes visibly missed. Recurring downtime must not send a burst for every skipped slot; module 50 defines bounded catch-up.
+Keep long-future intent in the schedule table, not the messages queue. Materialize only the next needed occurrence. The deployed scheduler cadence is 30 seconds with a fixed one-hour lateness allowance. Retries cannot reset the deadline. A reminder too late becomes missed. The reviewed list rendering also retains the schedule's last outcome after terminal occurrence cleanup. Recurring downtime must not send a burst for every skipped slot; module 50 defines bounded catch-up.
 
 Explicit nighttime requests keep their requested time. Personal quiet hours require an opt-in policy. Organization-generated notifications need their own approved timing rules. A fixed delivery grace is separate from how far into the future a user may schedule.
 
@@ -95,11 +100,13 @@ Retain active intent until it ends, independently of 30-day conversation cleanup
 
 Every edit is owner-scoped and compares an expected definition version. A conflict refreshes the current record and resolves changed intent; it must not silently overwrite another edit. Reminder changes, linked task completion and queue invalidation share the transaction/lock order in module 50.
 
+The 100-active-reminder limit applies when rescheduling or snoozing a terminal reminder back into scheduled state, as well as on creation. A benign pause refunds its preparation attempt; genuine failures keep the five-attempt bound and original deadline. Due preparation allows at most three claims per owner in one scheduler tick, with 25 total claims and one materialization/reconciliation pass per tick.
+
 The proposed `origin='reminder'` queue path must yield unsent notifications to pending human inbound turns in that chat. This includes releasing a claimed or pacing reminder before `SENDING` under the account lock. Human turns keep FIFO order. This priority applies to all pending human turns, without trying to recognize cancellation phrases, so “cancel”, “done” or “snooze” can reach normal authorized tools before the reminder sends. Fixed expiry bounds the delay.
 
 If the mutation wins before the final `SENDING` transition, the old eligible delivery cannot invoke the SDK. If sending has already begun, report that the current notification may still arrive while confirming cancellation of future ones. Do not promise recall. Completing or cancelling a linked task atomically cancels its active linked schedules and eligible unsent occurrences; sent and uncertain history remains intact.
 
-The generic outbound API does not currently provide this schedule/version fence or cancellation. Posting an immediate outbound job alone therefore cannot fulfill these guarantees. The internal scheduler needs the shared transactional queue adapter. External producers retain their own durable outbox, fixed request identity and status reconciliation; a repeated `POST` or `202` response is not proof of delivery.
+The generic outbound API does not provide this schedule/version fence or cancellation. Posting an immediate outbound job alone therefore cannot fulfill these guarantees. The internal scheduler uses the shared transactional queue adapter. External producers retain their own durable outbox, fixed request identity and status reconciliation; a repeated `POST` or `202` response is not proof of delivery.
 
 `SENT` means transport acceptance, not delivery/read or task completion. An `UNCERTAIN` send must never be automatically recreated with a new job key. Separate future slots of an authorized recurring schedule may continue; the uncertain slot remains uncertain.
 

@@ -226,7 +226,7 @@ test('general graph can present a supplied non-CRM UUID without a deterministic 
   assert.equal(reviews, 1);
 });
 
-test('retiring one source invalidates a whole multi-source recall, while unrelated supported recall survives', async () => {
+test('an identical refreshed source preserves joint recall under its new evidence ID', async () => {
   const { fixture, run, advance, now } = await setup();
   await run.execute('read_warehouse', JSON.stringify({ id: 101 }), signal());
   const receipt = run.delivery()!;
@@ -277,12 +277,19 @@ test('retiring one source invalidates a whole multi-source recall, while unrelat
       const plan = planningResult(request);
       if (plan) return plan;
       const data = JSON.parse(request.messages[0]!.content);
-      assert.equal(data.recalled.length, 1);
-      assert.equal(data.recalled[0].previous_reply, 'CURRENT_UNRELATED_PROSE');
-      assert.equal(data.recalled[0].source_record_checks.length, 1);
+      assert.equal(data.recalled.length, 2);
+      assert.equal(data.recalled[0].previous_reply, 'PRIVATE_OLD_RECALL_PROSE');
+      assert.equal(data.recalled[0].source_record_checks.length, 2);
+      assert.ok(
+        data.recalled[0].source_record_checks.every(
+          (check: { evidence_id: string }) =>
+            !data.retired_evidence_ids.includes(check.evidence_id),
+        ),
+      );
+      assert.equal(data.recalled[1].previous_reply, 'CURRENT_UNRELATED_PROSE');
+      assert.equal(data.recalled[1].source_record_checks.length, 1);
       assert.equal(data.retired_evidence_ids.length, 1);
       assert.equal(data.evidence.length, 2);
-      assert.ok(!JSON.stringify(data).includes('PRIVATE_OLD_RECALL_PROSE'));
       return {
         text:
           request.stage === 'verifier'

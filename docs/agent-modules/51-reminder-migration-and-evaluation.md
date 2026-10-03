@@ -1,6 +1,6 @@
 # Reminder and task migration, evaluation and rollout
 
-Status: **Implemented; production schema `202610030007` applied. Runtime flags control activation.** New namespaced schema and deterministic tests are implemented. Legacy import, capture scheduling and production activation remain separate work. See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
+Status, 3 October 2026: **This release includes the scheduling review fixes. Production migration `202610030008` is applied and verified; both scheduling flags remain enabled and worker credentials are unchanged. Worker rollout uses CI/CD after pushing `main`; verify the exact release and runtime health.** Legacy import and capture scheduling remain separate work. See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
 
 This contract complements the [design overview](../reminders-and-tasks-design.md), [personal tasks](49-personal-tasks.md), [scheduler](50-reminder-scheduler.md), [personal reminders](15-reminders.md), [SLA escalation](16-sla-escalation.md), [outbound delivery](14-outbound-delivery.md), [per-chat concurrency](46-per-chat-concurrency.md), [restart checkpoints](47-durable-model-checkpoints.md), and [outbound automation](48-outbound-automation-api.md).
 
@@ -32,7 +32,7 @@ Use new, explicitly named Supabase tables. Do not repurpose the shared legacy ta
 
 The initial mutation contract commits one atomic batch per inbound turn. Creating a task together with its linked reminder is one transaction and one shared command receipt, not two separately acknowledged writes. Replay identity is tied to the trusted turn/batch, not a provider-generated tool call ID. A different regenerated proposal conflicts with the already committed batch and must be reconciled explicitly.
 
-These are proposed names and responsibilities, not applied migrations. Detailed fields, indexes, state transitions and role grants belong to the implementation migration review. Initial application access must use the restricted worker role and explicit employee ownership checks; public/API roles and capture credentials must not gain production write rights.
+These four tables are created by production migration `202610030007`. Access uses the restricted worker role and explicit employee ownership checks; public/API roles and capture credentials have no production scheduling privileges. Migration `202610030008_personal_context.sql` extends `ramesh-assistant-commands.kind` with `context` and adds indexes for one context receipt per run and owner retrieval. It creates no additional table or broader grant. Context payloads are encrypted, expire after 24 hours and can be recalled only from actually delivered turns in the same owner's chat. That migration was applied in production on 3 October 2026; checksum, restricted-worker schema health, role grants and RLS were verified, with existing credentials and runtime flags preserved.
 
 Reuse the current queue, outbound pacing, encryption, account transaction lock and send uncertainty handling. The reminder scheduler creates a short-lived delivery only when an occurrence is due. It does not put a three-month timer in the current outbound queue or keep a model invocation running until that time.
 
@@ -84,9 +84,9 @@ An imported record needs an immutable origin mapping such as `(source_system, so
 5. Verify destination counts, owner bindings, due instants, terminal classifications and origin uniqueness without activating delivery.
 6. Enable only the reviewed destination cohort. Monitor for any continued legacy writes. Newly appearing legacy pending work is an ownership violation to investigate, not an automatic invitation to import continuously.
 
-## Proposed clock and delivery policy
+## Clock and delivery policy
 
-These are initial design defaults to implement and verify, not current production behavior:
+The initial personal slice implements the following baseline policies; conditional business behavior remains deferred:
 
 - Scheduler tick: 30 seconds, plus a catch-up pass on startup. Tick cadence is not a promise of delivery within exactly 30 seconds; queue backlog and transport pacing also matter.
 - Timezone: `Asia/Kolkata`. Store and compare UTC instants; interpret and display local intent in IST. Acknowledgements include an unambiguous date, time and timezone for future reminders, including those beyond the next day.
@@ -104,7 +104,7 @@ Long-lived schedules and command receipts must not depend on a foreign-key casca
 
 ## Outcome-based acceptance matrix
 
-Use public synthetic names and abstract task/reminder text. Assert user-visible outcomes and persisted invariants, not a particular model tool name, chain of thought or prompt wording. Every case below is a proposed acceptance test; none has been executed for this documentation task.
+Use public synthetic names and abstract task/reminder text. Assert user-visible outcomes and persisted invariants, not a particular model tool name, chain of thought or prompt wording. The matrix includes both implemented personal checks and future business/import/capture cases. It is not a claim that every future capability below exists or has been tested.
 
 | Area         | Scenario                                                                                             | Required outcome                                                                                                   |
 | ------------ | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -167,6 +167,10 @@ Use public synthetic names and abstract task/reminder text. Assert user-visible 
 
 ### Deterministic checks first
 
+The review adds regressions for post-commit fallback rejection and same-run receipt recovery through the actual durable consumer, retained confirmation on authorization failure, bounded permanent-denial retries, personal-context ownership/expiry, ordered pagination continuation, quota enforcement on reactivation, pause attempt refunds, retained delivery outcomes and per-owner due fairness. Graph tests use fake models to verify the personal-only route avoids planner/formatter inference without skipping semantic verification, and that mixed answers keep both the useful additional answer and deterministic receipt. Composite evidence rejects mismatched owners. When a personal list/history/occurrence read informs an answer, `businessRecallAllowed: false` blocks business-only recall of that prose; receipt-only creation can retain its separately verified business segment.
+
+The scheduling review passed 546 model-free tests with no skips, including local PostgreSQL integration, plus schema validation, TypeScript checks and the build. Documentation formatting is checked separately. The subsequent authorized rollout applied production migration `202610030008`; worker deployment uses CI/CD and requires exact-release/runtime verification. No new paid model tests were run for this review; the opt-in Luna runner remains available, and the previous release's paid reports are retained rather than rerun.
+
 Use a fake clock for scheduling logic and explicit UTC/IST fixtures. Test calendar conversion as pure functions. In integration tests, use disposable local PostgreSQL databases and restricted roles; inject controlled database time or explicit timestamps at well-defined seams rather than depending on long sleeps. Do not change production clocks or write production schedules to validate date math.
 
 Exercise the actual transaction code with two independent repository/scheduler instances. Force lease expiry, process interruption boundaries and concurrent cancellation/`beginSend`. Synchronize those races with test barriers so the assertions prove both possible orderings. Cancellation and send admission must use the existing account advisory lock and a consistent row-lock order. A race test must verify the stored occurrence, schedule version and outbound state together, not just that a callback ran once.
@@ -191,6 +195,8 @@ Record commit/schema versions, fixture timezone, policy versions, test scenario 
 
 ## Phased implementation and rollout
 
+The table below remains the broader implementation plan. The initial personal slice is already active in production as `2bf91be` with migration `202610030007`; legacy import, conditional CRM/SLA integration and capture scheduling are not active. For this review release, the additive `202610030008` migration has been applied in production and verified against its checksum, restricted-worker schema health, role grants and RLS. Existing worker credentials and enabled runtime flags are unchanged. Deploy the compatible worker through CI/CD after pushing `main`, then check its exact release, schema health, scheduler ticks and connection status without sending a test notification. Applied migration state alone is not proof that the new worker is running.
+
 | Phase                         | Work                                                                                      | Exit condition                                                                              |
 | ----------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | 0. Design and inventory       | Agree owner/time/recurrence/late policy; inspect legacy writers only if import is desired | No unresolved double-owner assumption; no production activation                             |
@@ -209,4 +215,4 @@ Pause new schedule admission and due processing for the affected scope. Preserve
 
 Do not automatically re-enable the old Twilio poller as rollback. It does not understand Ramesh's versions, import ownership or future horizons and can duplicate already prepared/sent work. Returning a cohort to the old application would require a separate reconciled transfer with terminal/uncertain outcomes excluded. It must not rely on copying Ramesh rows back as `pending`.
 
-The safe rollback state is durable intent with delivery visibly paused, not deleted schedules or two active owners. After correcting the issue, resume with the original due instants and fixed catch-up deadlines. Schedules outside that window are missed, not replayed as a fresh batch. No production scheduler or legacy import is enabled by this plan.
+The safe rollback state is durable intent with delivery visibly paused, not deleted schedules or two active owners. After correcting the issue, resume with the original due instants and fixed catch-up deadlines. Schedules outside that window are missed, not replayed as a fresh batch. The review does not change current production enablement or perform a legacy import.

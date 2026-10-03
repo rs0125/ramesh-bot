@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { PoolClient } from 'pg';
 
-export const MESSAGE_SCHEMA_VERSION = '202610030007';
+export const MESSAGE_SCHEMA_VERSION = '202610030008';
 const migrations = [
   '202610010001_message_queue.sql',
   '202610010002_split_queues.sql',
@@ -15,6 +15,7 @@ const migrations = [
   '202610030005_agent_checkpoints.sql',
   '202610030006_outbound_automation.sql',
   '202610030007_personal_scheduling.sql',
+  '202610030008_personal_context.sql',
 ];
 
 /** dotenv expands \n itself; normalize an already-escaped CA before quoting it again. */

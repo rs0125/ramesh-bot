@@ -1,6 +1,6 @@
 # Reminder scheduler and delivery
 
-Status: **Implemented; production schema `202610030007` applied. Runtime flags control activation.** Deterministic due processing, leases, queue admission, cancellation priority and final delivery fences are implemented. See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
+Status, 3 October 2026: **This release includes the scheduling review fixes. Production migration `202610030008` is applied and verified; both scheduling flags remain enabled and worker credentials are unchanged. Worker rollout uses CI/CD after pushing `main`; verify the exact release and runtime health.** See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
 
 ## Ownership and runtime
 
@@ -8,7 +8,7 @@ The schedule is durable intent. An occurrence is a due notification opportunity.
 
 Initially run one small scheduler service inside the worker process, started after database readiness and stopped before application shutdown drains resources. Multiple accidental or future scheduler processes must still be safe: use database leases and uniqueness, not a process-local singleton as correctness protection. The scheduler and Baileys consumer have separate enable switches. Capture mode must use separate tables/queue adapters and must have no production sender capability.
 
-Suggested starting limits: tick every 30 seconds, up to 25 due candidates per tick, two simultaneous preparation tasks, 30-second leases renewed every 10 seconds, and a finite preparation deadline. Make them deployment settings within bounded ranges. A full queue defers preparation; it never deletes reminder intent. Preserve the existing one active outbound send per account and shared queue capacity. Add a per-owner dispatch allowance so one overdue backlog cannot monopolize that queue; exact volume policy belongs to rollout configuration.
+Current defaults: tick every 30 seconds, up to 25 claims per tick, two simultaneous preparation tasks, 30-second leases renewed every 10 seconds, and a 20-second preparation deadline. The reviewed scheduler materializes/reconciles once per tick before individual claims and admits at most three claims per owner per tick. This avoids repeatedly scanning/materializing schedules under the shared queue lock and prevents one owner's ready backlog consuming the whole batch. The per-owner allowance is local to a scheduler tick, not a cluster-wide rate limiter. A full queue defers preparation without spending a failed attempt; deliberate shutdown also refunds its attempt. The one active outbound send per account and shared capacity remain unchanged.
 
 ## Data contract
 
@@ -38,7 +38,7 @@ A one-off schedule also retains its consumed slot/version independently of the o
 
 ## Due processing
 
-1. Using the database clock, select a bounded due batch with `FOR UPDATE SKIP LOCKED` in a short transaction. Ignore paused/cancelled schedules, future slots and already queued/terminal occurrences. Acquire a random lease token and deadline.
+1. Using the database clock, materialize and reconcile a bounded due batch once per scheduler tick. Then claim prepared occurrences in short transactions, excluding owners that used their tick allowance. Ignore cancelled schedules, future slots and already queued/terminal occurrences. Acquire a random lease token and deadline.
 2. Release the transaction before any identity or Context Engine call. Renew ownership during bounded preparation. A stale process must not enqueue after its lease expires.
 3. Resolve the owner and intended recipient from stable active employee IDs. Require an unambiguous current phone/LID binding and the appropriate schedule permission. A changed phone binding must be deliberately re-resolved; it cannot transfer ownership of someone else's reminder.
 4. For a linked task, verify it is still open. For a conditional business reminder, read the authoritative current record/condition using explicit scheduler authority and a recipient-scoped projection. Unknown or stale source health means `waiting_source`, not an assertion that the condition is true. An obsolete condition becomes `suppressed` or resolves the schedule as its policy specifies.
@@ -69,7 +69,7 @@ The existing strict conversation FIFO presents an extra race: a reminder enqueue
 
 Change both the conversation-head claim predicate and the final pre-send check. A reminder must not be claimed ahead of a pending human turn. If a human turn arrives after its lease was claimed, release the unsent reminder lease after pacing/before `beginSend` under the same account lock; the claim predicate must then allow the human turn past that reminder. Do not infer cancellation by matching message text. Any pending human turn gets the opportunity to change its tasks/schedules through normal authorized tools.
 
-Reclaiming the reminder requires a fresh lease and current identity/source preflight. Its fixed `not_after` bounds starvation: repeated human work may cause a missed reminder rather than forcing the reminder ahead of the user. Once `SENDING` has won the atomic boundary, communicate that cancellation cannot guarantee recall. This exception is a proposed scheduler prerequisite; it does not change the deployed queue behavior yet.
+Reclaiming the reminder requires a fresh lease and current identity/source preflight. Its fixed `not_after` bounds starvation: repeated human work may cause a missed reminder rather than forcing the reminder ahead of the user. Once `SENDING` has won the atomic boundary, communicate that cancellation cannot guarantee recall. Human-turn priority is already deployed with the initial scheduling release.
 
 ### Crash and send outcomes
 
@@ -106,11 +106,11 @@ Anchor a relative time to the trusted admission timestamp of the actual command-
 
 Generate command identities in application code. A fresh model tool-call ID after graph recovery is not a safe business idempotency key. Before resuming a write-capable turn, load its already committed commands and feed the receipts back into the graph; do not ask the model to recreate them. Use the existing native model checkpoint to recover the intended tool-call mapping when available, but the database receipt is authoritative even if a checkpoint write failed.
 
-The command coordinator persists the admitted operation slot and normalized intent before execution. If recovery proposes different arguments for an occupied slot, stop for reconciliation rather than performing a second mutation. Identical separate operations explicitly requested in one turn use separate persisted slots; ordinary duplicate tool proposals reuse the accepted slot. Limit allowed mutations per turn and do not deduplicate unrelated later user requests merely because their text matches.
+The command coordinator binds normalized intent and its result to one durable batch per inbound run. If recovery proposes different arguments after commit, stop for reconciliation rather than performing a second mutation. Before commit, a correction replaces the staged batch in full. Identical separate operations explicitly requested in one turn retain distinct operation positions. Limit allowed mutations per turn and do not deduplicate unrelated later user requests merely because their text matches.
 
-For the first implementation, collect those operation proposals into **one bounded atomic mutation batch per inbound turn**, with one durable receipt. This supports “create a task and remind me Friday” without committing an orphan task first. The tool adapter stages typed proposals; the application validates and commits the batch once, then supplies its receipt to the formatter/verifier. A recovered turn reconciles that same batch. It cannot start an additional write batch after one has committed. Multiple independent commit cycles in one conversation turn are a later capability, not a prerequisite.
+Collect proposals into **one bounded atomic mutation batch per inbound turn**, with one durable receipt. This supports “create a task and remind me Friday” without committing an orphan task first. The tool adapter can replace an uncommitted proposal during verifier correction. The verifier reviews its deterministic pending preview; the application commits the final batch once and renders the receipt. A recovered turn reconciles that same receipt. It cannot start an additional write batch after one has committed. Multiple independent commit cycles in one conversation turn remain a later capability.
 
-Store command payload/result encrypted with owner-bound references. The graph's formatter/verifier reads the committed receipt: exact saved date, affected count, current version and whether a send had already started. It must not infer success from proposed arguments or from an empty error-shaped tool result. Command retention must outlast every allowed inbound replay; expired inbound work cannot recreate a command after its receipt is purged.
+Store command payload/result encrypted with owner-bound references. The deterministic confirmation reads the committed receipt: exact saved date, affected count and whether a send had already started. It must not infer success from proposed arguments or an error-shaped tool result. The queue handoff verifies the stored command ID before finalizing any reply from a run that committed a mutation. A late error leaves that run eligible for bounded receipt recovery rather than finalizing “try again”. Delivery reauthorization failure preserves a protected confirmation for bounded retry rather than replacing it with generic failure prose. Command retention must outlast every allowed inbound replay; expired inbound work cannot recreate a command after its receipt is purged.
 
 ## Operations and observability
 
@@ -118,4 +118,4 @@ Expose scheduler health separately from WhatsApp connection: last successful tic
 
 Provide an operator pause for due admission that does not discard schedules. Maintain bounded reconciliation/cleanup even while Baileys is disconnected. Ensure cleanup cannot erase a leased/queued occurrence whose delivery state is unresolved. Graceful shutdown aborts preparation and releases/reclaims leases; it does not mark a not-yet-invoked send as delivered.
 
-See module 51 for fake-clock failure cases and activation gates. No schedule is activated, legacy table repurposed, WhatsApp message sent, or model evaluation run by this design draft.
+See module 51 for failure cases and rollout gates. Production scheduling remains enabled and migration `202610030008` was applied and verified on 3 October 2026. This release includes the review fixes; deploy the compatible worker through CI/CD and verify its exact release and runtime health. No legacy table is repurposed, and this review does not send test WhatsApp messages or run paid evaluations.

@@ -1,6 +1,6 @@
 # Reminders and tasks for Ramesh
 
-Updated 3 October 2026. **The personal scheduling slice is implemented; production migration `202610030007` is applied and verified.** See the [implemented behavior and operations](personal-scheduling.md) for the exact shipped scope. The conditional CRM, delegation, import and SLA sections below remain a design contract. The prerequisite outbound API is deployed in `3ad340828ace5519d5f53eac95ee2a3260405b61`; see the [integration guide](outbound-automation.md).
+Updated 3 October 2026. **This release includes the adversarial-review scheduling fixes. Production migration `202610030008` is applied and verified; both feature flags remain enabled and existing worker credentials are unchanged. Worker rollout uses CI/CD after pushing `main`, followed by exact-release and runtime-health verification.** See the [implemented behavior and operations](personal-scheduling.md) for the implementation scope and rollout checks. The conditional CRM, delegation, import and SLA sections below remain a design contract. The prerequisite outbound API is deployed in `3ad340828ace5519d5f53eac95ee2a3260405b61`; see the [integration guide](outbound-automation.md).
 
 ## Intended experience
 
@@ -85,7 +85,7 @@ The unconditional path must preserve provenance. Its content comes from the user
 
 Already available: trusted phone/LID identity resolution, employee-scoped Context Engine tools, encrypted Supabase storage, per-chat queue ordering, outbound leases/uncertain-send recovery, dynamic catalogues, capture isolation, and a separately authenticated immediate outbound API.
 
-The implementation now provides typed local tools, atomic task/reminder batches and receipts, persisted list selections, daily/weekly/monthly recurrence, a due scheduler, occurrence leases, atomic outbound admission, private delivery and final cancellation/identity fences. Migration `202610030007` is applied; explicit environment activation follows deployment of a compatible worker. The detailed [operations guide](personal-scheduling.md) distinguishes implemented policies from future extensions.
+The deployed implementation provides typed local tools, atomic task/reminder batches and receipts, persisted list selections, daily/weekly/monthly recurrence, a due scheduler, occurrence leases, atomic outbound admission, private delivery and final cancellation/identity fences. Migration `202610030007` is applied and scheduling is enabled. This release adds 24-hour trusted personal context/recall, ordered continuation, corrections before one commit, mixed-answer composition, confirmation handoff fencing and fairer due processing. Migration `202610030008` was applied and verified in production on 3 October 2026. Deploy the matching worker through CI/CD and verify its exact release. The detailed [operations guide](personal-scheduling.md) distinguishes this release from future extensions.
 
 Still deferred: conditional CRM/SLA reminders, delegated/group recipients, legacy import, capture GUI scheduling, arbitrary custom recurrence and richer scheduling dashboards. The existing real-data capture role has no production scheduling access.
 

@@ -10,6 +10,8 @@ import { cancellable } from '../../lib/cancellable.js';
 
 export interface ReminderSchedulerRepository {
   claimDue(leaseMs: number): Promise<DueReminder | null>;
+  prepareDue(): Promise<void>;
+  claimPrepared(leaseMs: number, excludedEmployeeIds?: number[]): Promise<DueReminder | null>;
   renewDue(due: DueReminder, leaseMs: number): Promise<boolean>;
   releaseDue(due: DueReminder, reason: string, terminal?: 'suppressed' | 'failed'): Promise<void>;
   enqueueDue(
@@ -34,6 +36,7 @@ export interface PersonalSchedulerOptions {
   preparationTimeoutMs?: number;
   batchSize?: number;
   concurrency?: number;
+  perOwnerLimit?: number;
 }
 
 export function reminderMessageId(accountId: string, ref: ReminderDeliveryRef): string {
@@ -88,6 +91,7 @@ export class PersonalSchedulerService {
   private readonly timeoutMs;
   private readonly batchSize;
   private readonly concurrency;
+  private readonly perOwnerLimit;
   private controller?: AbortController;
   private running?: Promise<void>;
   private ticking?: Promise<void>;
@@ -114,12 +118,14 @@ export class PersonalSchedulerService {
     this.timeoutMs = options.preparationTimeoutMs ?? 20000;
     this.batchSize = options.batchSize ?? 25;
     this.concurrency = options.concurrency ?? 2;
+    this.perOwnerLimit = options.perOwnerLimit ?? 3;
     if (
       !validBound(this.pollMs, 100, 300000) ||
       !validBound(this.leaseMs, 1000, 120000) ||
       !validBound(this.timeoutMs, 100, 120000) ||
       !validBound(this.batchSize, 1, 100) ||
       !validBound(this.concurrency, 1, 4) ||
+      !validBound(this.perOwnerLimit, 1, 25) ||
       !validBound(options.capacity, 1, 1000)
     )
       throw new Error('INVALID_REMINDER_SCHEDULER_CONFIG');
@@ -184,11 +190,28 @@ export class PersonalSchedulerService {
     signal.throwIfAborted();
     this.lastTickAt = new Date().toISOString();
     this.lastError = false;
-    await this.repository.reconcile();
+    await this.repository.prepareDue();
     let remaining = this.batchSize;
+    const ownerClaims = new Map<number, number>();
+    // Claims already serialize on the database queue lock. Keep the local allowance
+    // in that same order so concurrent preparation cannot overshoot an owner's cap.
+    let claiming: Promise<unknown> = Promise.resolve();
+    const claimNext = () => {
+      const claimed = claiming.then(async () => {
+        if (signal.aborted) return null;
+        const excluded = [...ownerClaims]
+          .filter(([, count]) => count >= this.perOwnerLimit)
+          .map(([id]) => id);
+        const due = await this.repository.claimPrepared(this.leaseMs, excluded);
+        if (due) ownerClaims.set(due.employeeId, (ownerClaims.get(due.employeeId) ?? 0) + 1);
+        return due;
+      });
+      claiming = claimed.catch(() => {});
+      return claimed;
+    };
     const work = async () => {
       while (!signal.aborted && remaining-- > 0) {
-        const due = await this.repository.claimDue(this.leaseMs);
+        const due = await claimNext();
         if (!due) break;
         await this.prepare(due, signal);
       }
@@ -287,7 +310,7 @@ export class PersonalSchedulerService {
         }
       }
     } catch {
-      this.report('REMINDER_PREPARATION_FAILED');
+      if (!outer.aborted) this.report('REMINDER_PREPARATION_FAILED');
       // An invalid lease makes release a no-op; an already committed enqueue stays committed.
       await this.repository.releaseDue(
         due,

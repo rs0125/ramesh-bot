@@ -1,6 +1,6 @@
 # Personal tasks
 
-Status: **Implemented; production schema `202610030007` applied. Runtime flags control activation.** Owned tasks, atomic mutation receipts and persisted selection references are implemented. See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
+Status, 3 October 2026: **This release includes the scheduling review fixes. Production migration `202610030008` is applied and verified; both scheduling flags remain enabled and worker credentials are unchanged. Worker rollout uses CI/CD after pushing `main`; verify the exact release and runtime health.** See [current scope and operations](../personal-scheduling.md). Remaining sections retain the broader design contract; features outside that implementation summary are not promises of current behavior.
 
 ## Product contract and examples
 
@@ -24,17 +24,20 @@ Conversational statements are not automatically task commands. Use the user's in
 
 Advertise local task tools dynamically only when the feature is enabled and the requester satisfies the identity policy. Introduce an explicit application-owned mutation path; do not weaken the existing read-only Context Engine filter or rely on a model prompt as the write guard.
 
-| Tool            | Proposed arguments                                                            | Trusted behavior                                                               |
-| --------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `task_create`   | Task text/notes, optional explicit deadline and explicitly requested reminder | Stage owned creation; validate all requested linked records together.          |
-| `task_list`     | Bounded state/date filters and pagination                                     | Read only authorized owner records and return an ordered selection reference.  |
-| `task_update`   | Stable/selected reference, expected version, changed text/deadline            | Apply only explicit fields through an owner-scoped version check.              |
-| `task_complete` | Stable/selected reference and expected version                                | Mark done and cancel eligible unsent linked reminders in the same transaction. |
-| `task_cancel`   | Stable/selected reference and expected version                                | Cancel the task and eligible unsent linked reminders atomically.               |
+The implemented public tools are `personal_list`, `personal_recall` and `personal_apply`. The mutation names below are operation kinds inside one `personal_apply` batch, not separately advertised endpoints. The personal-only route uses a deterministic plan plus router, tool worker and verifier inference; general/mixed work keeps the full graph. Mixed answers retain requested advice or business findings alongside the deterministic receipt, with both authorization checks for mixed private content.
+
+| Tool              | Proposed arguments                                                            | Trusted behavior                                                               |
+| ----------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `task_create`     | Task text/notes, optional explicit deadline and explicitly requested reminder | Stage owned creation; validate all requested linked records together.          |
+| `personal_list`   | Task/reminder kind, state and bounded continuation                            | Read only authorized owner records and return an ordered selection reference.  |
+| `personal_recall` | Instructions or latest delivered task/reminder result                         | Reauthorize saved direct context or original personal record references.       |
+| `task_update`     | Stable/selected reference, expected version, changed text/deadline            | Apply only explicit fields through an owner-scoped version check.              |
+| `task_complete`   | Stable/selected reference and expected version                                | Mark done and cancel eligible unsent linked reminders in the same transaction. |
+| `task_cancel`     | Stable/selected reference and expected version                                | Cancel the task and eligible unsent linked reminders atomically.               |
 
 The runtime supplies account, owner, admission timestamp, command identity and authorization. A model cannot select an owner or recipient, mint an authoritative version, or grant itself a broader write capability. Reject authority-shaped extra fields. Text and notes are data, not instructions to execute tools.
 
-`task_list` advertises `readOnlyHint: true`. Mutations advertise `readOnlyHint: false`; creates are not generally idempotent across independent explicit requests, while command replay is deduplicated by application code. Complete/cancel operations must accurately describe state-changing behavior rather than claiming append-only safety.
+`personal_list` and `personal_recall` advertise `readOnlyHint: true`. Mutations advertise `readOnlyHint: false`; creates are not generally idempotent across independent explicit requests, while command replay is deduplicated by application code. Complete/cancel operations must accurately describe state-changing behavior rather than claiming append-only safety.
 
 Return typed failures for inactive identity, absent/unauthorized target, stale version, ambiguous selection, invalid date, capacity and storage failure. An unavailable list is not an empty task list. A proposed write or an error-shaped result is never evidence that persistence succeeded.
 
@@ -63,9 +66,11 @@ Use `ramesh-reminders` for optional linked schedules, `ramesh-reminder-occurrenc
 
 The first implementation accepts **one bounded atomic mutation batch per admitted inbound turn**. Tools stage typed proposals; application code validates ownership, exact selection, expected versions, limits and normalized arguments, then commits once. A batch can include several explicitly requested tasks or a task with its requested reminder. It cannot commit one part and report another part as successful after failure.
 
-Persist the admitted operation slots and normalized batch before execution. The durable receipt binds account, trusted employee, original inbound identity and fingerprints of normalized arguments. Mutation and committed result share a database transaction. Feed the receipt to formatting and verification so the assistant states the actual saved text, deadlines, versions and counts.
+Stage and review the normalized batch before execution. The durable receipt binds account, trusted employee, original inbound identity and fingerprints of normalized arguments. Mutation and committed result share a database transaction. The verifier reviews a deterministic pending preview; after commit the application renders the exact saved text, deadlines and counts without another model deciding whether the write succeeded.
 
-On graph recovery, load accepted/committed command state before allowing writes. Reuse the same batch; do not reconstruct new operations solely from a regenerated model response or tool-call ID. A changed proposal for an occupied slot is a reconciliation conflict, not permission for a second task. No additional write batch can start after one has committed in that turn. Independently requested later tasks with the same words remain distinct user intentions.
+On graph recovery, load committed command state before allowing writes. An uncommitted proposal can be replaced in full to correct a verifier finding; a different proposal after commit conflicts with the stored fingerprint and cannot create a second task. No additional write batch can start after one has committed in that turn. Independently requested later tasks with the same words remain distinct user intentions.
+
+Inbound handoff checks the committed command ID under the queue transaction lock. A post-commit error cannot finalize an ordinary “try again” message. The original run receives bounded retries and returns its receipt without repeating writes or model work. Delivery authorization failures retain that protected confirmation for bounded retries instead of substituting a generic failure invitation.
 
 Resolve relative dates using the server-captured admission timestamp of the command-bearing inbound member and persist that member identity, clock and normalized date/instant. A grouped/debounced turn must not use an earlier unrelated member's timestamp. A restart across midnight must not shift “Friday”, “tomorrow” or a duration. Native model checkpoints may help recover tool-call mapping, but the database receipt remains authoritative if checkpoint saving or acknowledgement delivery failed.
 
@@ -78,6 +83,8 @@ Concurrent edits use compare-and-swap against the expected version. A losing edi
 “The second task” refers to the list actually presented, not whichever row is now second in a fresh query. Persist a bounded encrypted list receipt in `ramesh-assistant-commands` containing account/owner, selection reference, filters/page and the exact ordered task IDs with observed versions. This reuses the fourth table rather than adding a general conversation-memory table.
 
 Bind the snapshot to the finalized outbound presentation. If formatting changes or omits entries, the final recorded order must still match the numbered list the user saw. Task/reminder lists should use deterministic rendering or verified references so the formatter cannot silently reorder the IDs. An unsent/failed newer list cannot replace the last presented selection; an uncertain presentation requires explicit disambiguation. An acknowledgement between listing and selection must not erase a valid reference.
+
+Within one turn, cursor pages append to the ordered result, capped at 50 records and 5,000 rendered characters per kind. A later `continuation="latest"` resumes the last delivered page with its stored state filter. Earlier hidden pages cannot become a new ordinal list. `personal_recall` separately resolves original delivered task/reminder references against current owned records. For clarifications, it can read encrypted direct instructions from delivered own-chat turns for 24 hours; current direct input still supplies authorization and its relative-time clock.
 
 A mutation accepts either a stable task ID with expected version or an owner-bound selection reference plus ordinal. Resolve that ID, recheck current authorization and compare version within the transaction. New tasks, sorting changes and pagination cannot change the selected identity. A stale, expired, deleted or ambiguous reference prompts a fresh list or clarification; never substitute a neighboring task.
 
@@ -96,7 +103,7 @@ Completing or cancelling a task must, in one transaction and the lock order from
 3. Cancel active linked reminder definitions and invalidate their eligible unsent occurrences/jobs.
 4. Commit a receipt describing the task change, affected reminders and any delivery already past the send boundary.
 
-The planned scheduler-origin queue must let unsent reminders yield to pending human inbound turns, including when already leased or pacing. This gives a later “done” or “cancel” turn a chance to commit before `SENDING` while retaining FIFO among human turns. It is a prerequisite to the new feature, not current deployed automation behavior.
+The deployed scheduler-origin queue lets unsent reminders yield to pending human inbound turns, including when already leased or pacing. This gives a later “done” or “cancel” turn a chance to commit before `SENDING` while retaining FIFO among human turns.
 
 If completion wins the final transaction fence, linked unsent reminders cannot call the sender. If a send has begun, say the current notification may still arrive; cancel future ones. Preserve sent/uncertain history and never automatically resend an uncertain occurrence. Completing a task after its notification was accepted is still an ordinary task mutation, not a transport recall.
 
