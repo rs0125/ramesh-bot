@@ -137,3 +137,41 @@ export const disconnectedContextCredentials: ContextCredentialResolver = {
     return null;
   },
 };
+
+/** Separate action port. Reads, evidence replay and delivery verification never call this port. */
+export interface ContextWriteResult {
+  operation_id: string;
+  outcome:
+    | 'created'
+    | 'replayed'
+    | 'rolled_back'
+    | 'not_dispatched'
+    | 'rejected'
+    | 'outcome_unknown';
+  code: string;
+  message: string;
+  data?: Record<string, unknown>;
+  meta?: { toolName: string; argumentsSha256: string; employeeId: number };
+}
+export interface ContextWriteGateway {
+  discoverWrites(sender: ContextSender, signal?: AbortSignal): Promise<ContextToolDefinition[]>;
+  describeWrites(sender: ContextSender, signal?: AbortSignal): Promise<ContextCatalogue>;
+  callWrite(
+    sender: ContextSender,
+    name: string,
+    args: Record<string, unknown>,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<ContextWriteResult>;
+}
+export interface BoundContextWriter {
+  employeeId: number;
+  discover(signal: AbortSignal): Promise<ContextToolDefinition[]>;
+  describe(signal: AbortSignal): Promise<ContextCatalogue>;
+  call(
+    name: string,
+    args: Record<string, unknown>,
+    operationId: string,
+    signal: AbortSignal,
+  ): Promise<ContextWriteResult>;
+}

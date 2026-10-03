@@ -22,7 +22,7 @@ import { InboxRepository } from '../infrastructure/database/inbox.repository.js'
 import { MediaRepository } from '../infrastructure/database/media.repository.js';
 import { MediaService } from '../modules/media/media.service.js';
 import { OpenAIMediaProcessor } from '../infrastructure/openai/media-processor.js';
-import { createBusinessReads } from './business-reads.js';
+import { createBusinessReads, createBusinessAccessResolver } from './business-reads.js';
 import { WhatsAppEmployeeResolver } from '../infrastructure/whatsapp/employee-sender.js';
 import { EmployeeIdentityResolver } from '../modules/identity/employee-identity.js';
 import { PostgresEmployeeRoster } from '../infrastructure/database/employee-roster.js';
@@ -32,9 +32,13 @@ import { AutomationOutboundService } from '../modules/messaging/outbound-automat
 import { PersonalRepository } from '../infrastructure/database/personal.repository.js';
 import { PersonalToolService } from '../modules/scheduling/personal-tools.js';
 import { PersonalSchedulerService } from '../modules/scheduling/scheduler.service.js';
+import { WriteRepository } from '../infrastructure/database/write.repository.js';
+import { BusinessWriteService } from '../modules/writes/write-tools.js';
 import {
   compositeDeliverySchema,
   getPersonalDelivery,
+  getWriteDelivery,
+  withoutWriteDelivery,
 } from '../modules/messaging/delivery-evidence.js';
 
 export interface Application {
@@ -119,6 +123,33 @@ export function createApplication(
             : null;
         })
       : undefined;
+  // Keep the delivery fence for existing receipts even when new proposals are disabled.
+  const writeAccess =
+    config.businessReads && messagePool
+      ? createBusinessAccessResolver(config.businessReads, db, messagePool, config.encryptionKey)
+      : undefined;
+  const businessWrites =
+    writeAccess && schedulingSender && messagePool && config.messageDatabase
+      ? new BusinessWriteService(
+          new WriteRepository(messagePool, config.messageDatabase.accountId, config.encryptionKey),
+          async (key, signal) => {
+            const resolved = await schedulingSender.resolve({ key }, signal);
+            if (!resolved || resolved.sender.audience !== 'dm' || !key.remoteJid) return null;
+            const access = await writeAccess(key, signal);
+            if (!access?.writes || access.employeeId !== resolved.employee.employeeId) return null;
+            const pilot = config.businessReads!.employeeIds;
+            if (pilot !== 'all' && !pilot.includes(access.employeeId)) return null;
+            return {
+              actor: {
+                employeeId: access.employeeId,
+                phoneE164: resolved.employee.phoneE164,
+                chatId: key.remoteJid,
+              },
+              writer: access.writes,
+            };
+          },
+        )
+      : undefined;
   const usagePolicy = config.assistant?.usagePolicy;
   if (usagePolicy && usagePolicy.mode !== 'off' && !messagePool)
     throw new Error('USAGE_DURABLE_DATABASE_REQUIRED');
@@ -168,6 +199,7 @@ export function createApplication(
           usageMeter,
           checkpoints,
           personalTools: config.scheduling?.toolsEnabled ? personalTools : undefined,
+          businessWrites: config.businessWrites ? businessWrites : undefined,
         },
       )
     : undefined;
@@ -184,7 +216,7 @@ export function createApplication(
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
           prepareReply,
-          agentRuns: !!businessReads || !!personalTools,
+          agentRuns: !!businessReads || !!personalTools || !!businessWrites,
           media,
           accountId: config.messageDatabase.accountId,
           usageMode: usagePolicy?.mode ?? 'off',
@@ -196,12 +228,22 @@ export function createApplication(
           onUsageAttributionFailure: (reason) =>
             logger.warn({ reason }, 'Usage attribution unavailable'),
           businessPreflight:
-            businessReads || personalTools
+            businessReads || personalTools || businessWrites
               ? async (message, evidence, signal) => {
                   const bounded = AbortSignal.any([
                     signal,
                     AbortSignal.timeout(config.businessReads?.context.timeoutMs ?? 10000),
                   ]);
+                  const write = getWriteDelivery(evidence);
+                  if (write) {
+                    if (
+                      !businessWrites ||
+                      !(await businessWrites.canDeliver(message.key, write, bounded))
+                    )
+                      return false;
+                    evidence = withoutWriteDelivery(evidence);
+                    if (!evidence) return true;
+                  }
                   const personal = getPersonalDelivery(evidence);
                   if (personal) {
                     if (

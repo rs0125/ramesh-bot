@@ -70,6 +70,8 @@ async function main() {
           'ramesh-message-events',
           'ramesh-agent-runs',
           'ramesh-agent-events',
+          'ramesh-write-operations',
+          'ramesh-write-events',
           'ramesh-schema-migrations',
         ],
         runtimeRole: 'ramesh_worker',

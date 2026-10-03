@@ -1,6 +1,10 @@
 /** Bounded read executor. Authority comes from the trusted message, never from model arguments. */
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
-import { ContextEngineError, type ContextEvidence } from '../context-engine/context.types.js';
+import {
+  ContextEngineError,
+  type ContextEvidence,
+  type BoundContextWriter,
+} from '../context-engine/context.types.js';
 import {
   FOLLOWUPS_QUERY,
   verifyFollowups,
@@ -22,6 +26,7 @@ export interface BoundCrmReader {
   employeeId: number;
   search(args: typeof FOLLOWUPS_QUERY, signal: AbortSignal): Promise<ContextEvidence>;
   tools?: BoundContextReader;
+  writes?: BoundContextWriter;
 }
 export type BusinessAccessResolver = (
   key: TrustedReplyContext['key'],

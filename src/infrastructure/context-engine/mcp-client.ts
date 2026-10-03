@@ -17,10 +17,13 @@ import {
   type ContextSender,
   type ContextToolDefinition,
   type ContextToolGateway,
+  type ContextWriteGateway,
+  type ContextWriteResult,
   type EmployeeContextGrant,
 } from '../../modules/context-engine/context.types.js';
 import {
   admittedReadTool,
+  argumentsSha256,
   MAX_CATALOGUE_BYTES,
   MAX_CATALOGUE_TOOLS,
   MAX_GUIDANCE_BYTES,
@@ -28,6 +31,12 @@ import {
   schemaAccepts,
   TOOL_NAME,
 } from '../../modules/context-engine/read-contract.js';
+
+import {
+  admittedWriteTool,
+  writeContract,
+  writeResultSchema,
+} from '../../modules/context-engine/write-contract.js';
 
 const envelope = z
   .object({
@@ -40,7 +49,8 @@ const envelope = z
 const identity = z.object({
   employee_id: z.number().int().positive(),
   scopes: z.array(z.string()),
-  read_only: z.literal(true),
+  read_only: z.boolean(),
+  write_capabilities: z.array(z.string().regex(TOOL_NAME)).max(32).optional(),
 });
 
 async function abortable<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
@@ -184,7 +194,7 @@ async function listCurrentTools(
   throw new ContextEngineError('RESPONSE_TOO_LARGE');
 }
 
-export class ContextEngineMcpClient implements ContextToolGateway {
+export class ContextEngineMcpClient implements ContextToolGateway, ContextWriteGateway {
   private readonly config: ContextEngineConfig;
   constructor(
     config: ContextEngineConfig,
@@ -216,6 +226,119 @@ export class ContextEngineMcpClient implements ContextToolGateway {
         ...(tool._meta ? { _meta: tool._meta } : {}),
       })),
     }));
+  }
+
+  async discoverWrites(
+    sender: ContextSender,
+    signal?: AbortSignal,
+  ): Promise<ContextToolDefinition[]> {
+    return (await this.describeWrites(sender, signal)).tools;
+  }
+
+  describeWrites(sender: ContextSender, signal?: AbortSignal) {
+    return this.withConnection(
+      sender,
+      signal,
+      async (client, _reads, context, _request, writes) => ({
+        guidance: client.getInstructions(),
+        context: modelContext(context.data),
+        tools: writes.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          outputSchema: tool.outputSchema,
+          annotations: tool.annotations,
+          _meta: tool._meta,
+        })),
+      }),
+    );
+  }
+
+  /** One dispatch only. The caller owns durable intent, authorization and same-operation recovery. */
+  async callWrite(
+    sender: ContextSender,
+    name: string,
+    args: Record<string, unknown>,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<ContextWriteResult> {
+    if (!z.string().uuid().safeParse(operationId).success)
+      throw new ContextEngineError('INVALID_ARGUMENTS');
+    const id = operationId.toLowerCase();
+    let dispatched = false;
+    const failed = (code: string): ContextWriteResult => ({
+      operation_id: id,
+      outcome: dispatched ? 'outcome_unknown' : 'not_dispatched',
+      code,
+      message: dispatched
+        ? 'The outcome could not be confirmed. Recover only with the same operation ID and unchanged arguments.'
+        : 'The action was not dispatched. Refresh access or correct the request before proceeding.',
+    });
+    try {
+      if (!TOOL_NAME.test(name)) throw new ContextEngineError('TOOL_UNAVAILABLE');
+      const serialized = JSON.stringify(args);
+      if (!serialized || Buffer.byteLength(serialized) > 16384)
+        throw new ContextEngineError('INVALID_ARGUMENTS');
+      const frozen = JSON.parse(serialized) as Record<string, unknown>;
+      if (!frozen || typeof frozen !== 'object' || Array.isArray(frozen))
+        throw new ContextEngineError('INVALID_ARGUMENTS');
+      return await this.withConnection(
+        sender,
+        signal,
+        async (client, _reads, context, request, writes) => {
+          const tool = writes.find((tool) => tool.name === name),
+            contract = tool && writeContract(tool);
+          if (!tool || !contract) throw new ContextEngineError('TOOL_UNAVAILABLE');
+          if (
+            frozen[contract.idempotencyArgument] !== operationId ||
+            !schemaAccepts(tool.inputSchema, frozen)
+          )
+            throw new ContextEngineError('INVALID_ARGUMENTS');
+          const result = await client.request(
+            { method: 'tools/call', params: { name, arguments: frozen } },
+            request,
+          );
+          let raw: unknown = result.structuredContent;
+          if (!raw) {
+            const content = result.content?.find((part) => part.type === 'text');
+            raw = content?.type === 'text' ? JSON.parse(content.text) : undefined;
+          }
+          if (Buffer.byteLength(JSON.stringify(raw) ?? '') > 64_000)
+            throw new ContextEngineError('RESPONSE_TOO_LARGE');
+          const checked = writeResultSchema.safeParse(raw);
+          if (!checked.success || !schemaAccepts(tool.outputSchema!, raw))
+            throw new ContextEngineError('INVALID_RESPONSE');
+          const receipt = checked.data,
+            success = ['created', 'replayed', 'rolled_back'].includes(receipt.outcome);
+          if (
+            receipt.operation_id.toLowerCase() !== id ||
+            receipt.meta?.toolName !== name ||
+            receipt.meta.argumentsSha256 !== argumentsSha256(frozen) ||
+            receipt.meta.employeeId !== context.data.employee_id ||
+            Boolean(result.isError) === success
+          )
+            throw new ContextEngineError('INVALID_RESPONSE');
+          if (!success && receipt.data !== undefined)
+            throw new ContextEngineError('INVALID_RESPONSE');
+          return receipt;
+        },
+        {
+          name,
+          dispatch: () => {
+            if (dispatched) throw new ContextEngineError('INVALID_RESPONSE');
+            dispatched = true;
+          },
+        },
+      );
+    } catch (error) {
+      return failed(
+        dispatched
+          ? 'WRITE_OUTCOME_UNKNOWN'
+          : error instanceof ContextEngineError
+            ? `WRITE_${error.code}`
+            : 'WRITE_UNAVAILABLE',
+      );
+    }
   }
 
   async call(
@@ -254,7 +377,9 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       tools: Tool[],
       context: ContextEvidence,
       request: { signal: AbortSignal; timeout: number },
+      writes: Tool[],
     ) => Promise<T>,
+    writeAttempt?: { name: string; dispatch: () => void },
   ): Promise<T> {
     if (sender.audience !== 'dm' || !/^\+[1-9]\d{7,14}$/.test(sender.phoneE164))
       throw new ContextEngineError('ACCESS_DENIED');
@@ -315,6 +440,14 @@ export class ContextEngineMcpClient implements ContextToolGateway {
           if (outgoing.url !== this.config.endpoint) throw new ContextEngineError('ACCESS_DENIED');
           if (signed && outgoing.method === 'POST')
             outgoing = await signed.authorize(outgoing, signal);
+          if (writeAttempt && outgoing.method === 'POST') {
+            const rpc = (await outgoing.clone().json()) as {
+              method?: string;
+              params?: { name?: string };
+            };
+            if (rpc.method === 'tools/call' && rpc.params?.name === writeAttempt.name)
+              writeAttempt.dispatch();
+          }
           const response = await this.fetcher(outgoing, {
             redirect: 'error',
             signal: AbortSignal.any([signal, outgoing.signal]),
@@ -371,7 +504,22 @@ export class ContextEngineMcpClient implements ContextToolGateway {
       if (instructions && Buffer.byteLength(instructions) > MAX_GUIDANCE_BYTES)
         throw new ContextEngineError('RESPONSE_TOO_LARGE');
       const tools = catalogue.filter((tool) => admittedReadTool(tool, current.data.scopes));
-      return await work(client, tools, context, request);
+      const possibleWrites = catalogue.filter((tool) =>
+        admittedWriteTool(tool, current.data.scopes),
+      );
+      const advertised = current.data.write_capabilities ?? [];
+      if (
+        new Set(advertised).size !== advertised.length ||
+        (current.data.read_only
+          ? advertised.length > 0
+          : !advertised.length ||
+            advertised.some((name) => !possibleWrites.some((tool) => tool.name === name)))
+      )
+        throw new ContextEngineError('INVALID_RESPONSE');
+      const writes = current.data.read_only
+        ? []
+        : possibleWrites.filter((tool) => advertised.includes(tool.name));
+      return await work(client, tools, context, request, writes);
     } catch (error) {
       if (
         error instanceof ContextEngineError &&

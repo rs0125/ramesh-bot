@@ -26,6 +26,7 @@ export function scopedCrmReader(
   return {
     employeeId: employee.employeeId,
     search: (args, signal) => services.crm.search(args, signal),
+    ...(services.writes ? { writes: { employeeId: employee.employeeId, ...services.writes } } : {}),
     tools: {
       employeeId: employee.employeeId,
       discover: (signal) => services.discover(signal),

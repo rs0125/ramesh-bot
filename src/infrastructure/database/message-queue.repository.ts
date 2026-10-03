@@ -52,7 +52,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610030008'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610030009'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }

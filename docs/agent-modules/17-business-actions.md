@@ -1,6 +1,6 @@
-# Future business actions
+# Business actions
 
-Status: **Deferred write milestone.** Current Context Engine tools remain read-only. Depends on [identity](02-identity-resolver.md), [executor](08-tool-executor.md), [persistence](13-supabase-persistence.md) and source-system command handlers.
+Status: **Generic write execution and audit implemented; CRM domain commands remain deferred.** The [implemented write contract](../business-writes.md) supersedes the proposed table/state names below. Context Engine advertises scoped GIS creation and compensation; read tools stay separate. Depends on [identity](02-identity-resolver.md), [executor](08-tool-executor.md), [persistence](13-supabase-persistence.md) and source-system command handlers.
 
 ## Responsibility
 
@@ -34,4 +34,4 @@ Attribute requesting employee, application service, run and source command separ
 
 Test duplicate inputs, replayed confirmation, changed actor, stale revision, payload edits, scope removal, source rejection, timeout after commit, mirror lag, reconciliation after restart and cancellation racing dispatch. Verification must compare actual source state with the authorized payload.
 
-No command is enabled until its source API semantics, authorization, idempotency behavior, conflict policy, audit and confirmation requirements are implemented and tested. This spec is a design boundary for later work; the first CRM-read implementation must not expose these commands.
+No command is enabled until its source API semantics, authorization, idempotency behavior, conflict policy, audit and confirmation requirements are implemented and tested. These requirements remain the admission gate for each new CRM command; the generic writer does not itself grant CRM mutations.

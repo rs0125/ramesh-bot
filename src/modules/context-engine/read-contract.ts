@@ -14,7 +14,14 @@ export const TOOL_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
 export const MAX_CATALOGUE_TOOLS = 64;
 export const MAX_CATALOGUE_BYTES = 512_000;
 export const MAX_GUIDANCE_BYTES = 64_000;
-const reserved = new Set(['recall_business_context', 'calculate', 'web_search', 'read_webpage']);
+const reserved = new Set([
+  'recall_business_context',
+  'calculate',
+  'web_search',
+  'read_webpage',
+  'write_history',
+  'write_sources',
+]);
 const contract = z
   .object({
     requiredScopes: z.array(z.string().regex(/^[a-z][a-z0-9_.-]*:[a-z][a-z0-9_.-]*$/)).max(32),
@@ -42,6 +49,7 @@ export function contextReadDescriptor(tool: ContextToolDefinition) {
     !TOOL_NAME.test(tool.name) ||
     reserved.has(tool.name) ||
     tool.annotations?.readOnlyHint !== true ||
+    tool._meta?.['wareongo/context-write-v1'] !== undefined ||
     tool.annotations.destructiveHint === true
   )
     return false;
@@ -96,6 +104,7 @@ export function modelContext(data: Record<string, unknown>): Record<string, unkn
   const allowed = [
     'scopes',
     'read_only',
+    'write_capabilities',
     'knowledge_discovery',
     'server_clock',
     'query_guidance',

@@ -147,7 +147,7 @@ function fixture() {
 const sourceCalls = (calls: Rpc[]) =>
   calls.filter((rpc) => rpc.method === 'tools/call' && rpc.params?.name === name);
 
-test('operator scope ceilings accept future read namespaces without allowing write scopes', () => {
+test('operator scope ceilings accept explicit read/write namespaces without wildcards', () => {
   const signing = {
     kid: 'fixture',
     privateKey: { kty: 'OKP', crv: 'Ed25519', x: 'a'.repeat(43), d: 'b'.repeat(43) },
@@ -157,7 +157,13 @@ test('operator scope ceilings accept future read namespaces without allowing wri
     loadContextSigningConfig({ CONTEXT_RAMESH_SIGNING_KEY_JSON: JSON.stringify(signing) })?.scopes,
     ['documents:read'],
   );
-  for (const scopes of [['documents:write'], ['*'], ['documents:read', 'documents:read']])
+  assert.deepEqual(
+    loadContextSigningConfig({
+      CONTEXT_RAMESH_SIGNING_KEY_JSON: JSON.stringify({ ...signing, scopes: ['documents:write'] }),
+    })?.scopes,
+    ['documents:write'],
+  );
+  for (const scopes of [['documents:admin'], ['*'], ['documents:read', 'documents:read']])
     assert.throws(() =>
       loadContextSigningConfig({
         CONTEXT_RAMESH_SIGNING_KEY_JSON: JSON.stringify({ ...signing, scopes }),

@@ -1,5 +1,10 @@
 /** Employee-bound domain methods and a generic read port for the personal-assistant tool loop. */
-import type { ContextReadTool, ContextSender, ContextToolGateway } from './context.types.js';
+import type {
+  ContextReadTool,
+  ContextSender,
+  ContextToolGateway,
+  ContextWriteGateway,
+} from './context.types.js';
 
 export type ReadFilters = Record<
   string,
@@ -8,7 +13,7 @@ export type ReadFilters = Record<
 export type LeadContextSection = 'notes' | 'tasks' | 'company' | 'stage_history';
 
 export class ContextEngineServices {
-  constructor(private readonly gateway: ContextToolGateway) {}
+  constructor(private readonly gateway: ContextToolGateway & Partial<ContextWriteGateway>) {}
 
   forSender(sender: ContextSender) {
     const identity = Object.freeze({ ...sender });
@@ -19,6 +24,20 @@ export class ContextEngineServices {
     ) => this.gateway.call(identity, tool, input, signal);
     return {
       call: read,
+      ...(this.gateway.callWrite && this.gateway.describeWrites && this.gateway.discoverWrites
+        ? {
+            writes: {
+              discover: (signal?: AbortSignal) => this.gateway.discoverWrites!(identity, signal),
+              describe: (signal?: AbortSignal) => this.gateway.describeWrites!(identity, signal),
+              call: (
+                name: string,
+                args: Record<string, unknown>,
+                operationId: string,
+                signal?: AbortSignal,
+              ) => this.gateway.callWrite!(identity, name, args, operationId, signal),
+            },
+          }
+        : {}),
       discover: (signal?: AbortSignal) => this.gateway.discover(identity, signal),
       describe: async (signal?: AbortSignal) =>
         this.gateway.describe

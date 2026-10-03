@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { authCipher } from './auth-store.js';
+import { appendWriteAudit } from './write.repository.js';
 import {
   PERSONAL_LIST_MAX_CHARACTERS,
   renderList,
@@ -304,6 +305,13 @@ export class PersonalRepository {
         if (old.fingerprint !== fingerprint) throw new SchedulingError('PERSONAL_COMMAND_CONFLICT');
         return { ...this.receipt(old), replayed: true };
       }
+      const targetIds = operations.flatMap((operation) =>
+        'id' in operation ? [operation.id] : [],
+      );
+      const occurrenceIds = operations.flatMap((operation) =>
+        'occurrenceId' in operation ? [operation.occurrenceId] : [],
+      );
+      const before = await this.auditSnapshot(db, ctx, targetIds, occurrenceIds);
       const id = randomUUID();
       await db.query(
         `INSERT INTO public."ramesh-assistant-commands"(id,account_id,owner_employee_id,run_id,kind,fingerprint,payload_encrypted,expires_at)
@@ -329,8 +337,65 @@ export class PersonalRepository {
         `UPDATE public."ramesh-assistant-commands" SET result_encrypted=$2,finished_at=clock_timestamp() WHERE id=$1`,
         [id, this.cipher.seal(`personal-result:${ctx.employeeId}`, id, receipt)],
       );
+      const after = await this.auditSnapshot(
+        db,
+        ctx,
+        [
+          ...targetIds,
+          ...records.map((record) => record.id),
+          ...before.reminders.map((record) => record.id),
+        ],
+        [...occurrenceIds, ...before.occurrences.map((row) => row.id)],
+      );
+      await appendWriteAudit(db, this.cipher, this.accountId, ctx, {
+        personalCommandId: id,
+        sourceFamily: 'personal',
+        kind: 'personal_batch_applied',
+        runId: ctx.runId,
+        before,
+        after: { ...after, operations, receipt },
+      });
       return receipt;
     });
+  }
+  /** Includes linked reminder cancellation and snooze occurrences, not only direct return records. */
+  private async auditSnapshot(
+    db: PoolClient,
+    actor: PersonalActor,
+    ids: string[],
+    occurrenceIds: string[] = [],
+  ) {
+    const validIds = [...new Set(ids.filter(uuid))];
+    const tasks = (
+      await db.query(
+        `SELECT * FROM public."ramesh-tasks" WHERE account_id=$1 AND owner_employee_id=$2 AND id=ANY($3::uuid[]) ORDER BY id`,
+        [this.accountId, actor.employeeId, validIds],
+      )
+    ).rows;
+    const reminders = (
+      await db.query(
+        `SELECT * FROM public."ramesh-reminders" WHERE account_id=$1 AND owner_employee_id=$2 AND (id=ANY($3::uuid[]) OR (task_id=ANY($3::uuid[]) AND state='scheduled')) ORDER BY id`,
+        [this.accountId, actor.employeeId, validIds],
+      )
+    ).rows;
+    const occurrences = (
+      await db.query(
+        `SELECT id,reminder_id,schedule_version,slot_key,dispatch_generation,scheduled_for,eligible_at,not_after,state,reason_code,outbound_message_id,created_at,finished_at
+      FROM public."ramesh-reminder-occurrences" WHERE account_id=$1 AND reminder_id=ANY($2::uuid[]) AND (state=ANY($3::text[]) OR id=ANY($4::uuid[])) ORDER BY reminder_id,created_at,id LIMIT 1001`,
+        [
+          this.accountId,
+          reminders.map((row) => row.id),
+          activeOccurrences,
+          occurrenceIds.filter(uuid),
+        ],
+      )
+    ).rows;
+    if (occurrences.length > 1000) throw new SchedulingError('PERSONAL_AUDIT_LIMIT');
+    return {
+      tasks: tasks.map((row) => this.record('task', row)),
+      reminders: reminders.map((row) => this.record('reminder', row)),
+      occurrences,
+    };
   }
   private text(text: string) {
     if (typeof text !== 'string' || !text.trim() || text.length > 2000)

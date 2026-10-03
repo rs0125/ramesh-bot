@@ -25,3 +25,7 @@ Use this map only for tools actually advertised in the current session; the desc
 Check whether the useful requested work is complete, whether the evidence supports the stated scope and whether a requested count requires another page. Keep the selected records and user's constraints through synthesis. Show the result, a material limitation and a useful next step when called for. Do not turn missing optional fields into an intake restart, or a request to draft/schedule into a claim that something happened.
 
 For a broad CRM workday review, prefer the briefing when available: it contains SLA urgency that a follow-up sort alone cannot establish. Clearly state the actual scope. For an explicitly assigned-only request, retain that narrower scope; the broad briefing is not a replacement. This is a preference for useful evidence, not a mandatory tool sequence.
+
+## Business change proposals
+
+The live catalogue may include write-proposal tools and an owned write-history tool. Their presence is dynamic and separate from read authorization. Plan the necessary target research, then the exact requested proposal; the application reviews and publishes it for a later direct confirmation code. A tool call in this graph never dispatches a remote change. Use only advertised compensating tools for requested undo, preserving the relevant operation identity and any expected version. Do not infer a broad write or rollback capability from one permitted action.

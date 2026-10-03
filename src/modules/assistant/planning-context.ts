@@ -9,11 +9,13 @@ export function planningContext(
   recallAvailable: boolean,
   utilityTools: readonly { name: string }[] = [],
   personalTools: readonly { name: string }[] = [],
+  writeTools: readonly { name: string }[] = [],
 ) {
   const tools = audience === 'dm' && access === 'available' ? (run?.tools ?? []) : [];
   const utilities = audience === 'dm' && access === 'available' && run ? utilityTools : [];
   const personal = audience === 'dm' ? personalTools : [];
-  const names = [...tools, ...utilities, ...personal].map((tool) => tool.name);
+  const writes = audience === 'dm' ? writeTools : [];
+  const names = [...tools, ...utilities, ...personal, ...writes].map((tool) => tool.name);
   return {
     audience,
     access,
@@ -22,13 +24,14 @@ export function planningContext(
       ...(names.includes('calculate') ? ['calculation'] : []),
       ...(names.includes('web_search') ? ['public_web'] : []),
       ...(personal.length ? ['personal_tasks_and_reminders'] : []),
+      ...(writes.length ? ['business_write_proposals'] : []),
       ...new Set(tools.map((tool) => readContract(tool)?.sourceFamily).filter(Boolean)),
     ],
     private_selection_recall_available: tools.length > 0 && recallAvailable,
     function_schema_reference:
       'Use the live function definitions and Context Engine guidance in this session; omit unset fields and preserve actual returned identifiers/cursors.',
     remaining_source_proposals: names.length
-      ? Math.max(run?.remaining ?? 0, personal.length ? 24 : 0)
+      ? Math.max(run?.remaining ?? 0, personal.length || writes.length ? 24 : 0)
       : 0,
     ...(personal.length
       ? {
@@ -40,6 +43,6 @@ export function planningContext(
           },
         }
       : {}),
-    actions: `${personal.length ? 'Only advertised personal tools can stage one owned task/reminder mutation batch. The application commits after review and supplies the only authoritative success receipt. CRM tools remain read-only. Checking a business condition when a reminder is due is not implemented, even with full CRM access. Login, grants, account changes, or confirming the current status cannot enable it. Offer a plain time-based reminder only as an alternative; wait for explicit user acceptance before creating it.' : 'Current catalogue is read-only. Drafting is text; sending, scheduling and changing records are unavailable.'} Attachments are readable only through ready, unexpired extraction data supplied by the application in this request. A label alone does not provide file contents.`,
+    actions: `${personal.length ? 'Advertised personal tools can stage one owned task/reminder mutation batch. The application commits after review and supplies the only authoritative success receipt. Checking a business condition when a reminder is due is not implemented, even with full CRM access. Login, grants, account changes, or confirming the current status cannot enable it. Offer a plain time-based reminder only as an alternative; wait for explicit user acceptance before creating it.' : 'Personal task and reminder persistence is unavailable.'} ${writes.length ? 'Advertised business write tools only stage exact proposed changes. After independent review the application publishes the exact arguments and a confirmation code. A later direct, nonforwarded confirm CODE message authorizes dispatch after fresh authorization. Do not claim a proposal has executed, invent codes, or call a read/evidence replay as a write. An advertised history tool can recall owned proposal outcomes. Undo requires an explicitly advertised compensating tool and the same proposal/confirmation flow; do not infer rollback, raw SQL access, or unsupported capabilities.' : 'Business write proposals are unavailable. Drafting is text; do not claim business records changed.'} Attachments are readable only through ready, unexpired extraction data supplied by the application in this request. A label alone does not provide file contents.`,
   };
 }

@@ -14,13 +14,18 @@ import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
 import type { BusinessReadService } from './business-reads.js';
 import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js';
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
-import { getBusinessReply } from '../messaging/delivery-evidence.js';
+import { getBusinessReply, writeDeliveryBundle } from '../messaging/delivery-evidence.js';
 import { bindUsageEmployee, currentUsageScope, withUsageScope } from '../usage/usage-scope.js';
 import type { UsageMeter } from '../usage/usage-meter.js';
 import { UtilityToolRun } from './utility-tools.js';
 import { CheckpointError, type AgentCheckpointStore } from './checkpoint.types.js';
 import { withModelReplay, replayedModelSteps } from './model-replay.js';
 import type { PersonalToolRun, PersonalToolService } from '../scheduling/personal-tools.js';
+import type {
+  BusinessWriteReply,
+  BusinessWriteRun,
+  BusinessWriteService,
+} from '../writes/write-tools.js';
 
 export interface AssistantReply extends PreparedReply {
   trace: AgentTrace;
@@ -47,6 +52,7 @@ export class AssistantService {
       utilityFetch?: typeof fetch;
       checkpoints?: AgentCheckpointStore;
       personalTools?: PersonalToolService;
+      businessWrites?: BusinessWriteService;
     } = {},
   ) {
     this.graph = buildAssistantGraph(model);
@@ -112,7 +118,7 @@ export class AssistantService {
       runId,
       model: this.modelConfig.model,
       promptVersion:
-        this.businessReads?.toolLoop || this.runtime.personalTools
+        this.businessReads?.toolLoop || this.runtime.personalTools || this.runtime.businessWrites
           ? SALES_PROMPT_VERSION
           : this.businessReads
             ? READ_PROMPT_VERSION
@@ -146,7 +152,16 @@ export class AssistantService {
       });
     }
     let personal: PersonalToolRun | undefined;
+    let writes: BusinessWriteRun | undefined;
     try {
+      let recoveredWrite: BusinessWriteReply | undefined;
+      let writeSignal: AbortSignal | undefined;
+      if (!message.isGroup && trusted?.key.remoteJid === message.chatId) {
+        // Confirmation and receipt recovery are application commands, never model tool calls.
+        const writeDeadline = AbortSignal.timeout(this.modelConfig.timeoutMs);
+        writeSignal = signal ? AbortSignal.any([signal, writeDeadline]) : writeDeadline;
+        recoveredWrite = await this.runtime.businessWrites?.recover(trusted, writeSignal);
+      }
       // A committed mutation is authoritative even if the old model deadline or journal expired.
       // Receipt lookup still requires a current inbound lease and freshly resolved owner identity.
       const recoveryDeadline = AbortSignal.timeout(Math.min(5000, this.modelConfig.timeoutMs));
@@ -159,7 +174,22 @@ export class AssistantService {
           : undefined;
       if (personal) bindUsageEmployee(personal.employeeId);
       const recovered = await personal?.recover(recoverySignal);
+      // A mixed turn can commit a personal batch and publish a business proposal before
+      // handoff crashes. Preserve both receipts so delivery retains both authorization fences.
+      if (recoveredWrite)
+        return finish({
+          text: [recovered?.text, recoveredWrite.text].filter(Boolean).join('\n\n'),
+          businessEvidence: writeDeliveryBundle(
+            recoveredWrite.delivery,
+            recovered?.delivery,
+            recovered?.text,
+          ),
+        });
       if (recovered) return finish({ text: recovered.text, businessEvidence: recovered.delivery });
+      if (writeSignal && trusted) {
+        writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
+        if (writes) bindUsageEmployee(writes.employeeId);
+      }
     } catch (error) {
       if (error instanceof CheckpointError) throw error;
       signal?.throwIfAborted();
@@ -218,7 +248,7 @@ export class AssistantService {
         };
         const graphConfig = { signal: combined, recursionLimit: 6 };
         const result =
-          this.businessReads?.toolLoop || personal
+          this.businessReads?.toolLoop || personal || writes
             ? await buildSalesGraph(
                 this.model,
                 async (readSignal) => {
@@ -243,6 +273,7 @@ export class AssistantService {
                     this.runtime.now,
                   ),
                   personal,
+                  writes,
                 },
               ).invoke(inputState, { signal: combined, recursionLimit: 76 })
             : this.businessReads
@@ -260,30 +291,33 @@ export class AssistantService {
         const business = 'business' in result ? result.business : undefined;
         const personalReply = 'personal' in result ? result.personal : undefined;
         const composite = 'composite' in result ? result.composite : undefined;
+        const writeReply = 'write' in result ? result.write : undefined;
+        const otherEvidence = personalReply
+          ? (composite ?? personalReply.delivery)
+          : business?.outcome === 'verified'
+            ? business.delivery
+            : undefined;
+        const evidence = writeReply
+          ? writeDeliveryBundle(
+              writeReply.delivery,
+              otherEvidence,
+              'writeOtherText' in result ? result.writeOtherText : undefined,
+            )
+          : otherEvidence;
         if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
         if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
         let remembered = false;
         return finish({
           text: result.reply,
           draft: result.draft,
-          ...(personalReply
-            ? { businessEvidence: composite ?? personalReply.delivery }
-            : business?.outcome === 'verified'
-              ? { businessEvidence: business.delivery }
-              : {}),
+          ...(evidence ? { businessEvidence: evidence } : {}),
           onSent: () => {
             if (!remembered && key) {
               this.memory.remember(
                 key,
                 this.input(message),
-                personalReply || business?.outcome === 'verified'
-                  ? PRIVATE_HISTORY_REPLY
-                  : result.reply,
-                composite
-                  ? getBusinessReply({ text: result.reply, receipt: composite })
-                  : business?.outcome === 'verified'
-                    ? { text: result.reply, receipt: business.delivery }
-                    : undefined,
+                evidence ? PRIVATE_HISTORY_REPLY : result.reply,
+                evidence ? getBusinessReply({ text: result.reply, receipt: evidence }) : undefined,
               );
               remembered = true;
             }

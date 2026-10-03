@@ -1,6 +1,6 @@
 # Native locations and the first GIS write
 
-Status: implemented locally, 3 October 2026. Native WhatsApp location capture belongs in this repository. The `create_gis_poi` MCP tool and dashboard adapter belong in Context Engine, with mutation in the dashboard backend. No GIS-specific executor or dashboard credential is added to Ramesh. Production migration/deployment and a generic bot write executor remain pending; the deployed bot baseline remains `dd4c10b`.
+Status: native capture deployed in `a48daa5` on 3 October 2026. GIS create is deployed in Context Engine and the dashboard. The [generic audited writer and compensation](../business-writes.md) now implement the remaining integration described below; release evidence and activation are tracked separately. CRM mutations remain deferred.
 
 ## The observed gap
 
@@ -42,11 +42,11 @@ Context Engine exposes `create_gis_poi` only with an explicit `gis:write` grant 
 
 Creation and the idempotency receipt commit together. A fresh signed retry with the same employee, operation ID and payload returns the original creation result; changing the payload under that ID conflicts. A lost HTTP response must never force the caller to invent another operation ID. See the dashboard integration documentation for exact headers, validation, migration and environment configuration.
 
-## Generic agent integration still required
+## Generic agent integration
 
 Do not insert creation into `ContextToolRun`, a Context Engine read descriptor or business-read delivery checks. Those paths re-read evidence for authorization and freshness. Replaying a write there would be an unsafe side effect.
 
-Implement one general write execution path for MCP write contracts, following these steps. Keep GIS schemas, categories, validation and the dashboard HTTP client in Context Engine; do not add a local GIS tool or duplicate them in Ramesh:
+The shared writer implements the following MCP write boundary. Keep GIS schemas, categories, validation and the dashboard HTTP client in Context Engine; do not add a local GIS tool or duplicate them in Ramesh:
 
 1. Resolve the messaging employee from the transport key and discover permitted write tools from Context Engine. Preserve their explicit scope and separate write-contract metadata.
 2. Let the model propose a name/category/notes and select a native location source reference. Resolve the actual coordinates in application code. The model cannot supply an employee, auth header or replacement coordinates.
@@ -59,9 +59,9 @@ Implement one general write execution path for MCP write contracts, following th
 
 Separate dynamically discovered write contracts from reads and reserved local utilities. Keep tool definitions and employee authorization dynamic. Do not relax read-only contracts to enable this one mutation. Context Engine's `docs/gis-write-tool.md` documents the implemented tool, explicit scope, signing configuration and rollout prerequisites.
 
-Keep Ramesh's current signing configuration read-only during this rollout. Its `CONTEXT_RAMESH_SIGNING_KEY_JSON` schema currently accepts only `:read` scopes; adding `gis:write` before the generic write path is implemented fails worker configuration validation. Context Engine and the dashboard can enable the separately granted tool for compatible clients without changing this bot credential.
+Write activation requires `BUSINESS_WRITES_ENABLED=true`, the journal migration and matching explicit `gis:write` grants in both worker signing configuration and Context Engine. The signing schema accepts read/write scopes; employee permissions still narrow the live tool list.
 
-`TrustedReplyContext.locationMessages` initially contains only the current inbound batch. Conversation history can explain an earlier pin, but history text is not a trusted write reference. Before enabling the writer, add bounded retrieval of the encrypted structured pin by its source-message reference, restricted to the same account/chat/sender and retention window. This covers the normal case where a user sends the instruction after the debounce window has closed. Multiple possible pins require clarification; never silently use the newest coordinates.
+`write_sources` retrieves structured location sources from the encrypted inbox in the same private conversation, bounded to 24 hours and 32 messages. Forwarded and historical data cannot authorize execution. The current direct instruction stages a proposal; an independently reviewed, actually delivered preview and a later exact typed confirmation authorize dispatch. Multiple candidate pins must be clarified or explicitly selected. The current graph never sends the HTTP mutation itself.
 
 ## Focused acceptance checks
 

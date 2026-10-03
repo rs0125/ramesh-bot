@@ -21,6 +21,7 @@ export interface AppConfig {
   readonly messageDatabase?: MessageDatabaseConfig;
   readonly assistant?: AssistantConfig;
   readonly businessReads?: BusinessReadConfig;
+  readonly businessWrites?: boolean;
   readonly scheduling?: {
     readonly toolsEnabled: boolean;
     readonly schedulerEnabled: boolean;
@@ -109,6 +110,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const businessReads = loadBusinessReadConfig(env);
   if (businessReads && (!messageDatabase || !assistant))
     throw new Error('Business reads require Supabase message storage and the configured assistant');
+  const businessWrites = booleanValue(env, 'BUSINESS_WRITES_ENABLED', false);
+  if (businessWrites && !businessReads)
+    throw new Error(
+      'Business writes require configured signed business access and Supabase storage',
+    );
   return {
     databaseUrl,
     logLevel: logLevel as LevelWithSilent,
@@ -118,6 +124,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     messageDatabase,
     assistant,
     businessReads,
+    businessWrites,
     scheduling:
       toolsEnabled || schedulerEnabled
         ? { toolsEnabled, schedulerEnabled, pollMs: schedulingPollMs }
