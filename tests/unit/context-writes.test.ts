@@ -70,6 +70,20 @@ function descriptor(): ContextToolDefinition {
     },
   };
 }
+
+test('source-text metadata must point to a required string distinct from operation identity', () => {
+  const tool = descriptor();
+  const contract = tool._meta![WRITE_CONTRACT_KEY] as Record<string, unknown>;
+  contract.sourceTextArgument = 'title';
+  contract.requiredScopes = ['crm.rfq:write'];
+  assert.equal(contextWriteDescriptor(tool), true);
+  assert.equal(admittedWriteTool(tool, ['crm:read']), false);
+  assert.equal(admittedWriteTool(tool, ['crm.rfq:write']), true);
+  for (const field of ['missing', 'operation_id', '_source_message_ids']) {
+    contract.sourceTextArgument = field;
+    assert.equal(contextWriteDescriptor(tool), false);
+  }
+});
 function fixture() {
   const state = {
     tool: descriptor(),

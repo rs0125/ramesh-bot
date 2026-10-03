@@ -112,9 +112,10 @@ function directContext(
 }
 function safeSchema(tool: ContextToolDefinition): Record<string, unknown> {
   const schema = structuredClone(tool.inputSchema);
-  const id = writeContract(tool)!.idempotencyArgument;
+  const contract = writeContract(tool)!;
+  const suppliedByApp = [contract.idempotencyArgument, contract.sourceTextArgument];
   const properties = schema.properties as Record<string, unknown>;
-  delete properties[id];
+  for (const name of suppliedByApp) if (name) delete properties[name];
   properties._source_message_ids = {
     type: 'array',
     items: { type: 'string', minLength: 1, maxLength: 200 },
@@ -123,7 +124,7 @@ function safeSchema(tool: ContextToolDefinition): Record<string, unknown> {
     description:
       'Original message IDs supplying source data, from current trusted context or write_sources. Never an authorization claim.',
   };
-  schema.required = (schema.required as string[]).filter((name) => name !== id);
+  schema.required = (schema.required as string[]).filter((name) => !suppliedByApp.includes(name));
   return schema;
 }
 function visibleArguments(operation: WriteOperation) {
@@ -158,6 +159,13 @@ function proposalText(operation: WriteOperation) {
     `*Review this change*\n${operation.payload.summary}\n${lines.join('\n')}${original}`;
   return `${preview}\n\nNothing has been changed yet. Reply with exactly:\nconfirm ${operation.confirmationCode}\n\nOr cancel ${operation.confirmationCode}. Confirm before ${expires} (IST).`;
 }
+function unsentText(operation: WriteOperation): string | undefined {
+  if (operation.result?.outcome !== 'not_dispatched' || operation.hasUncertainAttempt)
+    return undefined;
+  // Only the public error code is shown; the stored business arguments and
+  // upstream message still require the tool's history-disclosure permission.
+  return `That attempt was not sent (${operation.result.code}). To change the reviewed details, reply cancel ${operation.confirmationCode} and ask for a corrected proposal. For a temporary access or service problem, reply retry ${operation.confirmationCode} to retry the same approved change.`;
+}
 function resultText(operation: WriteOperation, now = Date.now()) {
   const label = operation.payload.summary;
   switch (operation.state) {
@@ -179,9 +187,10 @@ function resultText(operation: WriteOperation, now = Date.now()) {
     case 'REJECTED':
       return `That change was not completed (${operation.result?.code ?? 'REJECTED'}). Please review the target or your access before preparing it again.`;
     case 'APPROVED':
-      if (operation.result?.outcome === 'not_dispatched' && !operation.hasUncertainAttempt)
-        return `That attempt was not sent (${operation.result.code}). Reply retry ${operation.confirmationCode} to retry the same approved change after access or service availability is restored.`;
-      return `The change is approved but has no confirmed outcome yet. Reply retry ${operation.confirmationCode} to resume the same operation safely.`;
+      return (
+        unsentText(operation) ??
+        `The change is approved but has no confirmed outcome yet. Reply retry ${operation.confirmationCode} to resume the same operation safely.`
+      );
     default:
       return `I cannot yet confirm the outcome of: ${label}. It may already have completed. Reply retry ${operation.confirmationCode} to check or retry this same operation safely. Do not create a replacement yet.`;
   }
@@ -240,8 +249,13 @@ function recoverableText(
       return Date.parse(operation.expiresAt) <= now
         ? 'That proposal has expired. Please ask me to prepare a fresh one.'
         : 'That proposal is awaiting confirmation. Please refer to the original reviewed preview; its stored business details cannot be redisplayed without current record authorization.';
+    case 'APPROVED':
+      return (
+        unsentText(operation) ??
+        `The audit has no confirmed completion for that operation. Use retry ${operation.confirmationCode} to recover the same approved operation safely.`
+      );
     default:
-      return `The audit has no confirmed completion for that operation. Use retry ${operation.confirmationCode} to recover the same approved operation safely.`;
+      return `The operation may already have completed. Use retry ${operation.confirmationCode} to recover the same approved operation safely. If it remains unresolved, ask an administrator to reconcile it before requesting a replacement.`;
   }
 }
 function sourceProjection(source: WriteSourceMessage) {
@@ -556,16 +570,22 @@ export class BusinessWriteRun {
     private readonly now: () => number,
   ) {
     this.tools = [
-      ...definitions.map((tool) => ({
-        name: tool.name,
-        description: `${tool.description ?? tool.name}\nSTAGE ONLY: prepares a reviewable proposal. Does not execute the business change. The application generates its operation ID. A later exact direct confirmation authorizes dispatch. The serialized arguments and summary must fit the 4,800-character WhatsApp proposal budget. Longer content is rejected, never truncated; ask the user to shorten it.`,
-        inputSchema: safeSchema(tool),
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: tool.annotations?.destructiveHint ?? false,
-          idempotentHint: true,
-        },
-      })),
+      ...definitions.map((tool) => {
+        const sourceText = writeContract(tool)!.sourceTextArgument;
+        const sourceInstruction = sourceText
+          ? ` The application fills ${sourceText} from complete stored messages; do not supply it. Select source message IDs through _source_message_ids, using write_sources for earlier messages. Without a selection, the current direct request supplies the text.`
+          : '';
+        return {
+          name: tool.name,
+          description: `${tool.description ?? tool.name}\nSTAGE ONLY: prepares a reviewable proposal. Does not execute the business change. The application generates its operation ID. A later exact direct confirmation authorizes dispatch. The serialized arguments and summary must fit the 4,800-character WhatsApp proposal budget. Longer content is rejected, never truncated; ask the user to shorten it.${sourceInstruction}`,
+          inputSchema: safeSchema(tool),
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: tool.annotations?.destructiveHint ?? false,
+            idempotentHint: true,
+          },
+        };
+      }),
       ...structuredClone(localTools),
     ];
   }
@@ -687,6 +707,18 @@ export class BusinessWriteRun {
       const sources = ids?.length ? await this.repository.readSources(this.command, ids) : [source];
       if (ids?.some((id) => !sources.some((s) => s.id === id)))
         throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
+      if (contract.sourceTextArgument) {
+        // Copy from the trusted store, never from model-transcribed text. Bind
+        // before hashing, persistence, review and confirmation.
+        const selected = ids?.length ? ids.map((id) => sources.find((s) => s.id === id)!) : sources;
+        if (!selected.length || selected.some((s) => !s.text.trim()))
+          throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
+        const text = selected.map((s) => s.text).join('\n\n');
+        const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
+        if (!schemaAccepts(properties[contract.sourceTextArgument]!, text))
+          throw new WriteStorageError('WRITE_SOURCE_TEXT_INVALID');
+        args[contract.sourceTextArgument] = text;
+      }
       let parent: WriteOperation | null = null;
       if (contract.effect === 'compensate') {
         const id = args[contract.originalOperationArgument!] as string;

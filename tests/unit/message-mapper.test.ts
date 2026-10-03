@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { WAMessage } from '@whiskeysockets/baileys';
-import { toGreetingCandidate } from '../../src/infrastructure/whatsapp/message.mapper.js';
+import {
+  toGreetingCandidate,
+  toInboxCandidate,
+} from '../../src/infrastructure/whatsapp/message.mapper.js';
 import { selectGreetingTarget } from '../../src/modules/greetings/greeting.policy.js';
 
 // Exercise real SDK normalization and domain policy together with synthetic messages.
@@ -19,6 +22,20 @@ const dm = (patch: Partial<WAMessage> = {}): WAMessage => ({
   messageTimestamp: now / 1000,
   message: { conversation: 'hi' },
   ...patch,
+});
+
+test('inbox RFQ source text retains whitespace for conversations, extended text and captions', () => {
+  const raw = '  #twenty\nNeed 5000 sqft in Hoskote.\n';
+  for (const message of [
+    { conversation: raw },
+    { extendedTextMessage: { text: raw } },
+    { imageMessage: { caption: raw } },
+    { documentMessage: { caption: raw } },
+  ]) {
+    assert.equal(toInboxCandidate(dm({ message }), [])?.text, raw);
+    assert.equal(toGreetingCandidate(dm({ message }), [])?.text, raw.trim());
+  }
+  assert.equal(toInboxCandidate(dm({ message: { conversation: ' \n ' } }), []), null);
 });
 
 test('replies to text DMs using phone and LID addressing', () => {

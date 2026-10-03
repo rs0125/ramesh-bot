@@ -4,6 +4,7 @@ export const CONTEXT_OAUTH_SCOPES = [
   'warehouses:read',
   'knowledge:read',
   'mail:drafts',
+  'crm.rfq:write',
 ] as const;
 export type ContextOAuthScope = (typeof CONTEXT_OAUTH_SCOPES)[number];
 export interface OAuthTokens {
