@@ -34,6 +34,7 @@ import { displayedWarehouseRecords } from './displayed-records.js';
 import { currentRecall } from './recall-evidence.js';
 import { reviewFailure, reviewMetric, reviewFailureReply } from './review-diagnostics.js';
 import type { BusinessWriteRun, BusinessWriteReply } from '../writes/write-tools.js';
+import { notifyToolActivity } from './tool-activity.js';
 
 const verdict = z
   .object({
@@ -81,6 +82,8 @@ export interface SalesGraphOptions {
   researchDeadlineMs?: number;
   onStage?: (stage: StageMetric) => void;
   onContext?: (context: GraphContextObservation) => void;
+  /** Best-effort progress when substantial planning or tool execution starts. */
+  onToolActivity?: () => void;
   utilities?: UtilityToolRun;
   personal?: PersonalToolRun;
   writes?: BusinessWriteRun;
@@ -272,7 +275,9 @@ export function buildSalesGraph(
         stages: [...value.stages, recordMetric(metric('converser', started, result))],
       };
     })
-    .addNode('personal_plan', async (value) => {
+    .addNode('personal_plan', async (value, config) => {
+      config.signal?.throwIfAborted();
+      notifyToolActivity(options.onToolActivity);
       const plan = validateTaskPlan(
         {
           objective: value.objective,
@@ -295,33 +300,32 @@ export function buildSalesGraph(
     })
     .addNode('planner', async (value, config) => {
       const started = Date.now();
-      const attempt = await research(
-        (signal) =>
-          model.complete(
-            {
-              stage: 'planner',
-              reasoningEffort: 'medium',
-              instructions: `${PLANNER_PROMPT}\n${runtime}\n${engineOrientation()}`,
-              messages: [
-                {
-                  role: 'user',
-                  content: JSON.stringify({
-                    request: value.input,
-                    objective: value.objective,
-                    history: modelHistory,
-                    tool_definitions: tools,
-                    ...(value.feedback
-                      ? { review_feedback: value.feedback, previous_reply: value.reply }
-                      : {}),
-                  }),
-                },
-              ],
-              jsonSchema: { name: 'ramesh_task_plan', schema: z.toJSONSchema(taskPlanSchema) },
-            },
-            signal,
-          ),
-        config.signal,
-      );
+      const attempt = await research((signal) => {
+        notifyToolActivity(options.onToolActivity);
+        return model.complete(
+          {
+            stage: 'planner',
+            reasoningEffort: 'medium',
+            instructions: `${PLANNER_PROMPT}\n${runtime}\n${engineOrientation()}`,
+            messages: [
+              {
+                role: 'user',
+                content: JSON.stringify({
+                  request: value.input,
+                  objective: value.objective,
+                  history: modelHistory,
+                  tool_definitions: tools,
+                  ...(value.feedback
+                    ? { review_feedback: value.feedback, previous_reply: value.reply }
+                    : {}),
+                }),
+              },
+            ],
+            jsonSchema: { name: 'ramesh_task_plan', schema: z.toJSONSchema(taskPlanSchema) },
+          },
+          signal,
+        );
+      }, config.signal);
       if (attempt.limited) return { researchExhausted: true };
       const result = attempt.result;
       const plan = validateTaskPlan(JSON.parse(result.text), tools);
@@ -359,39 +363,39 @@ export function buildSalesGraph(
       if (!sessionTools.some((tool) => tool.name === call.name))
         throw new Error('UNAVAILABLE_TOOL');
       toolSteps++;
-      const attempt = await research(
-        (signal) =>
-          toolSteps > 28 || familyBudgets()[toolFamily(call.name)] <= 0
-            ? Promise.resolve({
-                ok: false,
-                code: 'TOOL_BUDGET_EXHAUSTED',
-                family: toolFamily(call.name),
-                remaining: toolBudget(),
-                message:
-                  'This tool family has no remaining calls. Preserve the evidence already gathered, complete other requested work with callable tools, and state any unfinished coverage.',
-              })
-            : personal?.hasTool(call.name)
-              ? personal.execute(call.name, call.arguments, signal)
-              : writes?.hasTool(call.name)
-                ? writes.execute(call.name, call.arguments, signal)
-                : call.name === RECALL_TOOL && run
-                  ? recall.execute(call.arguments, signal)
-                  : isUtilityTool(call.name) && utilities && run
-                    ? run!.executeUtility(
-                        (authorizeResult) =>
-                          utilities!.execute(
-                            call.name as UtilityToolName,
-                            call.arguments,
-                            signal,
-                            authorizeResult,
-                          ),
+      const attempt = await research((signal) => {
+        if (toolSteps > 28 || familyBudgets()[toolFamily(call.name)] <= 0)
+          return Promise.resolve({
+            ok: false,
+            code: 'TOOL_BUDGET_EXHAUSTED',
+            family: toolFamily(call.name),
+            remaining: toolBudget(),
+            message:
+              'This tool family has no remaining calls. Preserve the evidence already gathered, complete other requested work with callable tools, and state any unfinished coverage.',
+          });
+        signal.throwIfAborted();
+        notifyToolActivity(options.onToolActivity);
+        return personal?.hasTool(call.name)
+          ? personal.execute(call.name, call.arguments, signal)
+          : writes?.hasTool(call.name)
+            ? writes.execute(call.name, call.arguments, signal)
+            : call.name === RECALL_TOOL && run
+              ? recall.execute(call.arguments, signal)
+              : isUtilityTool(call.name) && utilities && run
+                ? run!.executeUtility(
+                    (authorizeResult) =>
+                      utilities!.execute(
+                        call.name as UtilityToolName,
+                        call.arguments,
                         signal,
-                      )
-                    : run
-                      ? run.execute(call.name, call.arguments, signal)
-                      : Promise.reject(new Error('UNAVAILABLE_TOOL')),
-        config.signal,
-      );
+                        authorizeResult,
+                      ),
+                    signal,
+                  )
+                : run
+                  ? run.execute(call.name, call.arguments, signal)
+                  : Promise.reject(new Error('UNAVAILABLE_TOOL'));
+      }, config.signal);
       if (attempt.limited) return { calls: [], researchExhausted: true };
       if (!attempt.result || typeof attempt.result !== 'object' || Array.isArray(attempt.result))
         throw new Error('INVALID_TOOL_OUTPUT');

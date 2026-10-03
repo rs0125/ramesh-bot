@@ -18,7 +18,7 @@ Deliver saved, authorized content through the one active Baileys account. The se
 
 ## Input contract
 
-`PreparedDelivery` includes server-bound chat/employee references, encrypted finalized text, purpose/classification, run epoch or reminder version, evidence/effect references, availability, expiry and an idempotent response/occurrence key. Existing automatic replies retain their original quote reference. New reminder jobs will require their own explicit unquoted delivery shape.
+`PreparedDelivery` includes server-bound chat/employee references, encrypted finalized text, purpose/classification, run epoch or reminder version, evidence/effect references, availability, expiry and an idempotent response/occurrence key. Existing automatic replies retain their original quote reference. Reminder payload version 4 carries an optional minimal original-command quote, validated against the current destination; reminders without stored provenance stay unquoted. All reminder text starts with `⏰`.
 
 Operator messages remain separately attributable. The operational admin credential does not grant CRM reads or authorize an agent to populate a message with private business data. Preserve existing manual-send constraints to received conversations.
 
@@ -30,6 +30,12 @@ Operator messages remain separately attributable. The operational admin credenti
 4. If time-sensitive evidence has expired, suspend the prepared output and request a bounded refresh; do not send stale claims. If access is denied, suppress sensitive content.
 5. Apply existing pacing and recheck lease/expiry/cancellation immediately before the send boundary.
 6. Commit `SENDING`, invoke the bound Baileys send once, and record SDK acceptance or an uncertain outcome.
+
+For a reminder, supply a stable native WhatsApp message ID derived from its durable
+dispatch and persist it on the exact occurrence in the `SENT` completion transaction.
+Quoted `done`/`snooze` commands resolve this ID with current owner and generation
+checks. A lost send response remains uncertain and is neither automatically resent
+nor treated as a confirmed quick-reply target.
 
 The business preflight interface must be implemented for the first enabled preset. If no appropriate current-access check can be performed, that business message cannot be sent. A fresh scoped reread may establish access for a small result set; it also consumes a bounded delivery-preflight budget and must preserve the answer's stated freshness.
 

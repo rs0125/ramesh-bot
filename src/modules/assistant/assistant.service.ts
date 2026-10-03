@@ -113,6 +113,8 @@ export class AssistantService {
     runId: string,
   ): Promise<AssistantReply> {
     signal?.throwIfAborted();
+    const onToolActivity =
+      trusted?.key.remoteJid === message.chatId ? trusted.onToolActivity : undefined;
     const started = Date.now();
     const trace: AgentTrace = {
       runId,
@@ -186,6 +188,9 @@ export class AssistantService {
           ),
         });
       if (recovered) return finish({ text: recovered.text, businessEvidence: recovered.delivery });
+      const quickReply = await personal?.quickReply(recoverySignal);
+      if (quickReply)
+        return finish({ text: quickReply.text, businessEvidence: quickReply.delivery });
       if (writeSignal && trusted) {
         try {
           writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
@@ -281,6 +286,7 @@ export class AssistantService {
                     deadlineAtMs - Math.min(60000, this.modelConfig.timeoutMs / 4),
                   onStage: (stage) => trace.stages.push(stage),
                   onContext: this.runtime.observeContext,
+                  onToolActivity,
                   utilities: new UtilityToolRun(
                     this.modelConfig.tavilyApiKey,
                     this.runtime.utilityFetch,
@@ -291,11 +297,14 @@ export class AssistantService {
                 },
               ).invoke(inputState, { signal: combined, recursionLimit: 76 })
             : this.businessReads
-              ? await buildBusinessGraph(this.model, (readSignal) =>
-                  this.businessReads!.read(
-                    trusted?.key.remoteJid === message.chatId ? trusted : undefined,
-                    readSignal,
-                  ),
+              ? await buildBusinessGraph(
+                  this.model,
+                  (readSignal) =>
+                    this.businessReads!.read(
+                      trusted?.key.remoteJid === message.chatId ? trusted : undefined,
+                      readSignal,
+                    ),
+                  onToolActivity,
                 ).invoke(inputState, graphConfig)
               : await this.graph.invoke(inputState, graphConfig);
         combined.throwIfAborted();

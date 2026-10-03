@@ -819,9 +819,20 @@ Failed business checks atomically replace the withheld answer with a neutral
 retry notice and retain unexpired same-owner voice references. The original
 business answer is not marked sent or remembered as delivered.
 
-After durable inbound archival, Baileys sends an explicit normal delivery receipt.
-Offline presence remains enabled; these are not read/played receipts. A bounded
-best-effort dispatcher prevents receipt writes from delaying forwarded bursts.
-See [module 40](agent-modules/40-delivery-acknowledgements.md).
+After durable inbound archival, Baileys sends normal delivery and explicit read
+receipts (blue ticks), while offline presence stays enabled. Audio is never marked
+played. Planning/tool work sends one `Sure, just a sec.` reply and `✏️` reaction;
+a durable lease-fenced marker prevents repetition after restart. A bounded
+best-effort dispatcher prevents feedback from delaying forwarded bursts or answers.
+Reminders start with `⏰` and quote the original command when its minimal encrypted
+source snapshot exists. Typing presence covers active preparation, with bounded
+refresh and cleanup. Direct `stop` bypasses the busy chat worker to cancel eligible
+unsent investigations, preserving committed effects and published confirmations.
+Native quoted `done` and `snooze 30m` target the exact reminder occurrence without
+model inference; done leaves linked tasks and recurring schedules unchanged.
+The ordered QoL migrations through `202610040004` were applied and verified in
+production on 4 October 2026; matching code rolls out separately through CI/CD.
+See [WhatsApp QoL](whatsapp-qol.md) and
+[module 40](agent-modules/40-delivery-acknowledgements.md).
 
 `OPENAI_STT_API_KEY` optionally separates audio credentials from `OPENAI_API_KEY`; `OPENAI_TRANSCRIBE_MODEL` defaults to `gpt-4o-transcribe`. Both the current model and newer `gpt-transcribe` were exercised through the real adapter with the authorized legacy key. See [module 35](agent-modules/35-voice-transcripts.md), [model evaluation](agent-modules/36-transcription-evaluation.md) and the [retained result](../evals/results/2026-10-02-stt-comparison.md).

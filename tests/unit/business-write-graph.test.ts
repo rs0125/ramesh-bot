@@ -251,10 +251,29 @@ test('dynamic writes can follow reads but publish exact proposals only after ind
   const result = await buildSalesGraph(
     fake.fake,
     async () => ({ status: 'available', run: reads.run }),
-    { writes: writes.run, now: () => now },
+    {
+      writes: writes.run,
+      now: () => now,
+      onToolActivity: () => {
+        events.push('tool_activity');
+      },
+    },
   ).invoke(input);
   assert.deepEqual(reads.readCalls, ['read_example_reference']);
   assert.deepEqual(writes.invocations, [{ name: writeDefinition.name, args: exact }]);
+  assert.deepEqual(
+    events.filter(
+      (event) =>
+        event === 'tool_activity' || event.startsWith('read:') || event.startsWith('stage:'),
+    ),
+    [
+      'tool_activity',
+      'tool_activity',
+      'read:read_example_reference',
+      'tool_activity',
+      `stage:${writeDefinition.name}`,
+    ],
+  );
   assert.equal(writes.finalized(), 1);
   assert.ok(events.indexOf('verifier') < events.indexOf('publish'));
   assert.equal(

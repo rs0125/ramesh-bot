@@ -1,7 +1,14 @@
 /** Owner-scoped personal intent, command receipts and occurrence leases in the message database. */
 import { createHash, randomUUID } from 'node:crypto';
+import { proto, type WAMessage } from '@whiskeysockets/baileys';
 import type { Pool, PoolClient } from 'pg';
 import { authCipher } from './auth-store.js';
+import { toInboxCandidate } from '../whatsapp/message.mapper.js';
+import { persistableMessageContent } from '../whatsapp/media-privacy.js';
+import {
+  validReminderSourceQuote,
+  type ReminderSourceQuote,
+} from '../../contracts/reminder-quote.js';
 import { appendWriteAudit } from './write.repository.js';
 import {
   PERSONAL_LIST_MAX_CHARACTERS,
@@ -121,6 +128,9 @@ export class PersonalRepository {
             occurrenceId: row.occurrence_id,
             occurrenceState: row.occurrence_state,
             occurrenceDueAt: row.occurrence_due_at.toISOString(),
+            ...(row.occurrence_acknowledged_at
+              ? { occurrenceAcknowledgedAt: row.occurrence_acknowledged_at.toISOString() }
+              : {}),
           }
         : {}),
     };
@@ -146,6 +156,42 @@ export class PersonalRepository {
         throw new SchedulingError('PERSONAL_ACCESS_DENIED');
       return { ...this.receipt(row), replayed: true };
     });
+  }
+  /** Only a confirmed native outbound ID in this owner's chat can select a quick-reply target. */
+  async resolveReminderQuote(
+    ctx: PersonalCommandContext,
+    quotedMessageId: string,
+  ): Promise<PersonalRecord | null> {
+    return this.tx(async (db) => {
+      await this.fence(db, ctx);
+      const row = await this.quotedReminder(db, ctx, quotedMessageId);
+      return row ? this.record('reminder', row) : null;
+    });
+  }
+  private async quotedReminder(
+    db: PoolClient,
+    actor: PersonalActor,
+    quotedMessageId: string,
+  ): Promise<Row | undefined> {
+    if (
+      typeof quotedMessageId !== 'string' ||
+      !quotedMessageId ||
+      quotedMessageId.length > 256 ||
+      /[\x00-\x1f\x7f]/.test(quotedMessageId)
+    )
+      return undefined;
+    return (
+      await db.query(
+        `SELECT r.*,o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,o.acknowledged_at AS occurrence_acknowledged_at
+       FROM public."ramesh-reminders" r JOIN public."ramesh-reminder-occurrences" o ON o.reminder_id=r.id AND o.account_id=r.account_id
+       WHERE r.account_id=$1 AND r.owner_employee_id=$2 AND o.recipient_employee_id=$2 AND o.recipient_phone_e164=$3 AND o.recipient_chat_id=$4
+       AND o.whatsapp_message_id=$5 AND o.state='sent'
+       AND o.schedule_version=r.version AND r.state<>'cancelled'
+       AND NOT EXISTS(SELECT 1 FROM public."ramesh-reminder-occurrences" newer WHERE newer.account_id=o.account_id AND newer.reminder_id=o.reminder_id AND newer.schedule_version=o.schedule_version AND newer.slot_key=o.slot_key AND newer.dispatch_generation>o.dispatch_generation)
+       FOR UPDATE OF r,o`,
+        [this.accountId, actor.employeeId, actor.phoneE164, actor.chatId, quotedMessageId],
+      )
+    ).rows[0];
   }
   /** Application supplies admitted, non-forwarded members, never model-generated history. */
   async saveContext(ctx: PersonalCommandContext, members: PersonalCommandMember[]): Promise<void> {
@@ -260,7 +306,7 @@ export class PersonalRepository {
       if (kind === 'reminder') {
         const latest = (
           await db.query(
-            `SELECT r.*,o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,m.finished_at AS delivered_at
+            `SELECT r.*,o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,o.acknowledged_at AS occurrence_acknowledged_at,m.finished_at AS delivered_at
            FROM public."ramesh-reminder-occurrences" o JOIN public."ramesh-reminders" r ON r.id=o.reminder_id AND r.account_id=o.account_id
            JOIN public."ramesh-messages" m ON m.id=o.outbound_message_id AND m.account_id=o.account_id
            WHERE r.account_id=$1 AND r.owner_employee_id=$2 AND o.recipient_employee_id=$2 AND o.recipient_phone_e164=$3 AND o.recipient_chat_id=$4
@@ -428,9 +474,9 @@ export class PersonalRepository {
       const kind = payload.kind;
       const rows = (
         await db.query(
-          `SELECT t.*,t.created_at::text AS cursor_time ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at' : ''}
+          `SELECT t.*,t.created_at::text AS cursor_time ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,o.acknowledged_at AS occurrence_acknowledged_at' : ''}
          FROM public."ramesh-${kind === 'task' ? 'tasks' : 'reminders'}" t
-         ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
+         ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at,acknowledged_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
          WHERE t.account_id=$1 AND t.owner_employee_id=$2 AND t.id=ANY($3::uuid[]) AND ($4='all' OR t.state=$4)
          ORDER BY t.created_at,t.id FOR UPDATE OF t`,
           [this.accountId, ctx.employeeId, recordIds, payload.state],
@@ -493,7 +539,7 @@ export class PersonalRepository {
     ).rows;
     const occurrences = (
       await db.query(
-        `SELECT id,reminder_id,schedule_version,slot_key,dispatch_generation,scheduled_for,eligible_at,not_after,state,reason_code,outbound_message_id,created_at,finished_at
+        `SELECT id,reminder_id,schedule_version,slot_key,dispatch_generation,scheduled_for,eligible_at,not_after,state,reason_code,outbound_message_id,acknowledged_at,created_at,finished_at
       FROM public."ramesh-reminder-occurrences" WHERE account_id=$1 AND reminder_id=ANY($2::uuid[]) AND (state=ANY($3::text[]) OR id=ANY($4::uuid[])) ORDER BY reminder_id,created_at,id LIMIT 1001`,
         [
           this.accountId,
@@ -525,9 +571,9 @@ export class PersonalRepository {
     if (!uuid(id)) throw new SchedulingError('PERSONAL_NOT_FOUND');
     const row = (
       await db.query(
-        `SELECT t.* ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at' : ''}
+        `SELECT t.* ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,o.acknowledged_at AS occurrence_acknowledged_at' : ''}
          FROM public."ramesh-${kind === 'task' ? 'tasks' : 'reminders'}" t
-         ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
+         ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at,acknowledged_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
          WHERE t.id=$1 AND t.account_id=$2 AND t.owner_employee_id=$3 FOR UPDATE OF t`,
         [id, this.accountId, ctx.employeeId],
       )
@@ -545,6 +591,72 @@ export class PersonalRepository {
       )
     ).rows[0];
     if (row.n >= (kind === 'task' ? 50 : 100)) throw new SchedulingError('PERSONAL_CAPACITY');
+  }
+
+  /** Re-read the admitted original; model text and recalled instructions cannot fabricate a quote. */
+  private async reminderSource(
+    db: PoolClient,
+    ctx: PersonalCommandContext,
+    sourceId?: string,
+  ): Promise<ReminderSourceQuote | undefined> {
+    if (sourceId === undefined) return undefined; // Legacy/internal callers have no quote provenance.
+    if (!uuid(sourceId)) throw new SchedulingError('PERSONAL_SOURCE_INVALID');
+    const row = (
+      await db.query(
+        `SELECT m.id,m.whatsapp_message_id,m.payload_encrypted FROM public."ramesh-messages" m
+         JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
+         WHERE m.id=$1 AND m.account_id=$2 AND m.chat_id=$3 AND m.origin='whatsapp'
+         AND m.expires_at>clock_timestamp() AND (m.id=$4 OR q.batch_parent=$4)`,
+        [sourceId, this.accountId, ctx.chatId, ctx.runId],
+      )
+    ).rows[0];
+    if (!row?.payload_encrypted) throw new SchedulingError('PERSONAL_SOURCE_INVALID');
+    let message: WAMessage;
+    try {
+      const payload = this.cipher.open('message', row.id, row.payload_encrypted);
+      if (!Buffer.isBuffer(payload)) throw new Error('Invalid source');
+      message = proto.WebMessageInfo.decode(payload) as WAMessage;
+    } catch {
+      throw new SchedulingError('PERSONAL_SOURCE_INVALID');
+    }
+    const candidate = toInboxCandidate(message, []);
+    if (
+      !candidate ||
+      candidate.fromMe ||
+      candidate.isGroup ||
+      candidate.forwarded ||
+      candidate.chatId !== ctx.chatId ||
+      candidate.senderId !== ctx.chatId ||
+      candidate.messageId !== row.whatsapp_message_id
+    )
+      throw new SchedulingError('PERSONAL_SOURCE_INVALID');
+    const base = { chatId: ctx.chatId, messageId: candidate.messageId };
+    const content = persistableMessageContent(message.message);
+    let quote: ReminderSourceQuote;
+    if (candidate.kind === 'audio') quote = { ...base, kind: 'audio' };
+    else if (candidate.kind === 'text') {
+      const text = content?.conversation ?? content?.extendedTextMessage?.text;
+      if (typeof text !== 'string') throw new SchedulingError('PERSONAL_SOURCE_INVALID');
+      quote = { ...base, kind: 'text', text };
+    } else if (
+      candidate.kind === 'image' ||
+      candidate.kind === 'video' ||
+      candidate.kind === 'document'
+    ) {
+      const text =
+        candidate.kind === 'image'
+          ? content?.imageMessage?.caption
+          : candidate.kind === 'video'
+            ? content?.videoMessage?.caption
+            : content?.documentMessage?.caption;
+      quote = {
+        ...base,
+        kind: candidate.kind,
+        ...(typeof text === 'string' && text.length ? { text } : {}),
+      };
+    } else return undefined;
+    if (!validReminderSourceQuote(quote)) throw new SchedulingError('PERSONAL_SOURCE_INVALID');
+    return quote;
   }
   private async apply(
     db: PoolClient,
@@ -586,10 +698,11 @@ export class PersonalRepository {
       if (taskId && (await this.target(db, ctx, 'task', taskId)).state !== 'open')
         throw new SchedulingError('PERSONAL_TASK_CLOSED');
       const id = randomUUID();
+      const sourceQuote = await this.reminderSource(db, ctx, op.sourceMessageId);
       const row = (
         await db.query(
-          `INSERT INTO public."ramesh-reminders"(id,account_id,owner_employee_id,recipient_phone_e164,recipient_chat_id,text_encrypted,task_id,schedule,next_due_at,creation_command_key)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          `INSERT INTO public."ramesh-reminders"(id,account_id,owner_employee_id,recipient_phone_e164,recipient_chat_id,text_encrypted,task_id,schedule,next_due_at,creation_command_key,source_quote_encrypted)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
           [
             id,
             this.accountId,
@@ -601,6 +714,9 @@ export class PersonalRepository {
             schedule,
             schedule.dueAt,
             creationKey,
+            sourceQuote
+              ? this.cipher.seal(`personal-reminder-source:${ctx.employeeId}`, id, sourceQuote)
+              : null,
           ],
         )
       ).rows[0];
@@ -610,6 +726,37 @@ export class PersonalRepository {
       throw new SchedulingError('PERSONAL_INVALID_OPERATION');
     const kind = op.kind.startsWith('task_') ? 'task' : 'reminder';
     const old = await this.target(db, ctx, kind, op.id, op.expectedVersion);
+    if ('quotedMessageId' in op && op.quotedMessageId !== undefined) {
+      const exact = await this.quotedReminder(db, ctx, op.quotedMessageId);
+      if (
+        !exact ||
+        exact.id !== op.id ||
+        !('occurrenceId' in op) ||
+        exact.occurrence_id !== op.occurrenceId
+      )
+        throw new SchedulingError('PERSONAL_QUOTED_REMINDER_UNAVAILABLE');
+      if (op.kind === 'reminder_snooze' && exact.occurrence_acknowledged_at)
+        throw new SchedulingError('PERSONAL_OCCURRENCE_ACKNOWLEDGED');
+    }
+    if (op.kind === 'reminder_acknowledge') {
+      if (!op.quotedMessageId || !uuid(op.occurrenceId))
+        throw new SchedulingError('PERSONAL_INVALID_OPERATION');
+      const occurrence = (
+        await db.query(
+          `UPDATE public."ramesh-reminder-occurrences" SET acknowledged_at=coalesce(acknowledged_at,clock_timestamp()),updated_at=clock_timestamp()
+         WHERE id=$1 AND account_id=$2 AND reminder_id=$3 AND state='sent' RETURNING *`,
+          [op.occurrenceId, this.accountId, op.id],
+        )
+      ).rows[0];
+      if (!occurrence) throw new SchedulingError('PERSONAL_QUOTED_REMINDER_UNAVAILABLE');
+      return {
+        ...this.record('reminder', old),
+        occurrenceId: occurrence.id,
+        occurrenceState: occurrence.state,
+        occurrenceDueAt: occurrence.eligible_at.toISOString(),
+        occurrenceAcknowledgedAt: occurrence.acknowledged_at.toISOString(),
+      };
+    }
     if (kind === 'task') {
       if (old.state !== 'open') throw new SchedulingError('PERSONAL_TASK_CLOSED');
       if (op.kind === 'task_update') {
@@ -697,6 +844,7 @@ export class PersonalRepository {
       ).rows[0];
       if (
         !occurrence ||
+        occurrence.acknowledged_at ||
         !['pending', 'preparing', 'waiting_source', 'queued', 'sent', 'missed'].includes(
           occurrence.state,
         ) ||
@@ -872,8 +1020,8 @@ export class PersonalRepository {
       const table = kind === 'task' ? 'ramesh-tasks' : 'ramesh-reminders';
       const rows = (
         await db.query(
-          `SELECT t.*,t.created_at::text AS cursor_time ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at' : ''}
-        FROM public."${table}" t ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
+          `SELECT t.*,t.created_at::text AS cursor_time ${kind === 'reminder' ? ',o.id AS occurrence_id,o.state AS occurrence_state,o.eligible_at AS occurrence_due_at,o.acknowledged_at AS occurrence_acknowledged_at' : ''}
+        FROM public."${table}" t ${kind === 'reminder' ? `LEFT JOIN LATERAL(SELECT id,state,eligible_at,acknowledged_at FROM public."ramesh-reminder-occurrences" WHERE account_id=t.account_id AND reminder_id=t.id AND schedule_version=t.version ORDER BY CASE WHEN state IN('pending','preparing','waiting_source','queued') THEN 0 ELSE 1 END,eligible_at DESC,dispatch_generation DESC LIMIT 1)o ON true` : ''}
         WHERE t.account_id=$1 AND t.owner_employee_id=$2 AND ($3='all' OR t.state=$3)
         AND ($4::timestamptz IS NULL OR (t.created_at,t.id)>($4::timestamptz,$5::uuid))
         ORDER BY t.created_at,t.id LIMIT $6`,
@@ -1165,7 +1313,7 @@ export class PersonalRepository {
       }
       const candidates = (
         await db.query(
-          `SELECT o.*,r.text_encrypted,r.owner_employee_id FROM public."ramesh-reminder-occurrences" o JOIN public."ramesh-reminders" r ON r.id=o.reminder_id AND r.account_id=o.account_id
+          `SELECT o.*,r.text_encrypted,r.source_quote_encrypted,r.owner_employee_id FROM public."ramesh-reminder-occurrences" o JOIN public."ramesh-reminders" r ON r.id=o.reminder_id AND r.account_id=o.account_id
         WHERE o.account_id=$1 AND o.state IN('pending','waiting_source') AND o.next_attempt_at<=clock_timestamp() AND o.eligible_at<=clock_timestamp() AND o.not_after>clock_timestamp()
         AND r.state='scheduled' AND r.version=o.schedule_version AND o.attempts<5 AND NOT (o.recipient_employee_id=ANY($2::integer[]))
         AND NOT EXISTS(SELECT 1 FROM public."ramesh-reminder-occurrences" busy WHERE busy.account_id=o.account_id AND busy.recipient_employee_id=o.recipient_employee_id AND busy.state='preparing')
@@ -1195,6 +1343,20 @@ export class PersonalRepository {
           `UPDATE public."ramesh-reminder-occurrences" SET state='preparing',lease_token=$2,lease_until=least(not_after,clock_timestamp()+$3*interval '1 millisecond'),attempts=attempts+1,updated_at=clock_timestamp() WHERE id=$1`,
           [row.id, token, leaseMs],
         );
+        let sourceQuote: ReminderSourceQuote | undefined;
+        if (row.source_quote_encrypted) {
+          try {
+            const stored = this.cipher.open(
+              `personal-reminder-source:${row.owner_employee_id}`,
+              row.reminder_id,
+              row.source_quote_encrypted,
+            );
+            if (validReminderSourceQuote(stored) && stored.chatId === row.recipient_chat_id)
+              sourceQuote = stored;
+          } catch {
+            // Missing/corrupt quote provenance must not suppress an otherwise valid reminder.
+          }
+        }
         return {
           id: row.id,
           reminderId: row.reminder_id,
@@ -1207,6 +1369,7 @@ export class PersonalRepository {
           leaseToken: token,
           scheduleVersion: row.schedule_version,
           dispatchGeneration: row.dispatch_generation,
+          ...(sourceQuote ? { sourceQuote } : {}),
         };
       }
       return null;

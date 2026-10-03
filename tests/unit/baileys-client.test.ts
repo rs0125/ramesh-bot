@@ -19,6 +19,7 @@ class FakeSession implements WhatsAppSession {
   closed = false;
   saved = 0;
   acknowledgeDelivery?: (message: WAMessage) => void;
+  markRead?: (message: WAMessage) => void;
   on<K extends keyof BaileysEventMap>(event: K, handler: (value: BaileysEventMap[K]) => void) {
     this.events.on(event, handler);
     return () => {
@@ -45,6 +46,12 @@ test('delivery is acknowledged only after durable archival, including duplicates
   const session = new FakeSession();
   const saved: string[] = [];
   const acknowledged: string[] = [];
+  const read: string[] = [];
+  session.markRead = (value) => {
+    assert.ok(saved.includes(value.key.id!));
+    read.push(value.key.id!);
+    if (value.key.id === 'observed') throw new Error('read receipt failure');
+  };
   session.acknowledgeDelivery = (value) => {
     assert.ok(saved.includes(value.key.id!));
     acknowledged.push(value.key.id!);
@@ -92,7 +99,28 @@ test('delivery is acknowledged only after durable archival, including duplicates
     'full',
     'queued-audio',
   ]);
+  assert.deepEqual(read, acknowledged, 'delivery failures do not suppress blue ticks');
   assert.equal(client.getStatus().metrics.errors, 1, 'a receipt failure is not a storage failure');
+});
+
+test('local direct messages are marked read before waiting for the assistant', async () => {
+  const session = new FakeSession();
+  const read: string[] = [];
+  session.markRead = (value) => void read.push(value.key.id!);
+  const client = new BaileysClient({
+    createSession: async () => session,
+    logger: pino({ level: 'silent' }),
+    onQr() {},
+    handleMessage: async (candidate) => {
+      assert.ok(read.includes(candidate.messageId));
+      return 'sent';
+    },
+  });
+  await client.start();
+  session.events.emit('messages.upsert', { type: 'notify', messages: [message('hello')] });
+  await tick();
+  await client.stop();
+  assert.deepEqual(read, ['hello']);
 });
 
 test('offline append deliveries use durable age, mention and deduplication checks without importing history', async () => {

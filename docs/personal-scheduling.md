@@ -1,5 +1,7 @@
 # Personal tasks and scheduling
 
+QoL update, 4 October 2026: reminder notifications start with `⏰` and use WhatsApp's native reply quote for the original direct scheduling command: text, audio, or an image, video or document caption. Exact replies to a reminder notification can mark that occurrence done or snooze it without model inference. The ordered migrations through `202610040004`, including reminder quote and native reply fields, are applied and verified in production. Matching worker deployment remains a separate CI/CD step.
+
 Release status, 3 October 2026: this release includes the adversarial-review fixes described below. Production migration `202610030008` is **applied and verified**; personal tools and the scheduler remain enabled, with existing worker credentials unchanged. Worker rollout uses CI/CD after pushing `main`; confirm its exact release, schema readiness, scheduler ticks and WhatsApp connection before declaring completion. The [design overview](reminders-and-tasks-design.md) and modules 15/49/50/51 also include future policies.
 
 ## What an employee can ask
@@ -9,6 +11,7 @@ Release status, 3 October 2026: this release includes the adversarial-review fix
 - “Every Monday at 9 am, remind me to review my pipeline.” Creates a weekly schedule. Daily and monthly rules are also supported.
 - “Show my tasks/reminders”, then “show more”. Continues the last delivered selection with its original filter. Pages fetched in one turn accumulate in their displayed order, within the response limits. “Complete the second task” resolves the actual delivered selection with its recorded version.
 - “Move that reminder to tomorrow at 11 am”, “cancel it”, or “snooze it for 30 minutes”. Changes owned schedules; snooze replaces one occurrence while retaining the recurring rule.
+- Reply directly to a reminder notification with “done” or “snooze 30m” (also “snooze 2h”). The first marks only that occurrence done; the second schedules a replacement for that exact occurrence. Future recurring slots and linked tasks stay unchanged.
 - “Add a task to review the lease and remind me on 15 November at 10 am.” Creates the task and linked reminder atomically. Completing/cancelling the task cancels its unsent linked reminders.
 
 Access requires an active, unambiguous VerifiedNumber employee in their own DM. Unknown users can still chat. Personal tools do not require a Context Engine OAuth grant and do not expand CRM write access. Phone/LID mappings are rechecked when using tools and before delivery. A changed or disabled identity suppresses delivery; ownership never transfers to the next holder of the number.
@@ -39,11 +42,19 @@ Defaults: 50 open tasks and 100 scheduled reminders per owner; ten entries per t
 
 Reminder text and command/selection payloads are encrypted. Replies use the existing private delivery envelope and redacted inbox/history behavior. Ordinary logs do not contain reminder text or phone numbers.
 
+New reminder definitions also retain an encrypted, minimal original-message quote alongside the schedule. The application rereads the admitted WhatsApp message from the current command or its debounce batch, verifying its account, DM, sender, message key, expiry and non-forwarded origin. Text quotes preserve the original text, including whitespace. Image, video and document quotes preserve their matching media type and exact caption when present. Audio quotes retain only the message key and audio type. None retain media bytes, thumbnails, download credentials, nested quotes or transcripts. This snapshot follows the reminder's existing retention lifecycle, independently of the shorter inbox/media retention. Snoozes and recurring occurrences retain the original creation quote. When creation follows a clarification, the quoted message is the current authorizing instruction, such as “tomorrow at 10”.
+
+Existing reminders have no invented source quote and remain unquoted. A missing, corrupt or destination-mismatched stored snapshot also yields an otherwise valid unquoted reminder. Media captions are not presented as if they were original text messages. Source quotes never authorize delivery: the existing employee and recipient checks still run, and the outbound transport only accepts a quote belonging to the reminder's exact destination chat. All reminder messages, including legacy jobs already queued, receive the `⏰` prefix.
+
 The existing v1 admin inbox presents reminders as assistant messages for compatibility. Supabase still records the distinct `reminder` origin for queue priority, delivery checks and audit.
 
 ## Delivery and cancellation
 
 The scheduler uses templates, with **no model calls at due time**. It atomically inserts an encrypted `origin='reminder'` job into the existing outbound queue and links its occurrence. Stable job identities and command receipts prevent duplicate effects after restart. A terminal-message trigger preserves the outcome before message history expires.
+
+Exact native reminder replies also use **no model calls**. The transport extracts the quoted stanza ID only for a quote of this bot in the same chat. The repository resolves a confirmed `sent` occurrence using that saved native ID, account, active employee, phone, chat and current schedule version. It repeats that check inside the existing leased mutation transaction. Replying to an older notification does not select a newer one. Unknown/foreign quotes, replaced slots and stale schedule versions return a clarification or refusal, without falling back to the latest reminder. A quick reply must be its own direct message; mixed batches are not partially applied. Plain unquoted “done” keeps the normal conversational path.
+
+“Done” sets the occurrence's acknowledgement timestamp while retaining its original `sent` delivery history. It does not complete a linked task or cancel a recurring series; the receipt explains those limits. Repeated “done” is harmless. An acknowledged occurrence cannot be snoozed. A snooze reuses the existing generation mechanism and the authorizing message's admitted clock; repeating a reply to the replaced notification does not create another snooze. Both commands use the usual encrypted command receipts, write audit, restart recovery and delivery authorization. Confirmation failure does not discard a committed change.
 
 Unsent reminders yield to a pending human turn and its response in the same chat. This lets “cancel that reminder” run before delivery. Any necessary earlier non-reminder work keeps its relative ordering while passing the deferred reminder. A leased reminder checks again before pacing and at `beginSend`.
 
@@ -67,6 +78,10 @@ Only the dedicated worker receives table privileges. The capture role is explici
 Production migration `202610030007` was applied and verified on 3 October 2026: the checksum matches, the terminal trigger is enabled, all four tables have RLS and worker-only CRUD, and capture/API/public grants are absent. Migration `202610030008_personal_context.sql` extends the command kind constraint with `context` and adds its uniqueness/owner indexes; it creates no new table and does not widen role grants. This worker requires schema `202610030008` even with scheduling disabled. Migration `202610030008` was applied in production on 3 October 2026, with its checksum, restricted-worker schema health, role grants and RLS verified. Runtime credentials and enabled flags were preserved. Fresh environments must apply it before deploying this worker.
 
 For a new environment, apply the ordered, checksum-verified production migrations through the existing message-database provisioning workflow. Preserve the deployed `ramesh_worker` password and TLS settings; never point SQLite Prisma migrations at Supabase. The independent capture schema is unchanged.
+
+Migration `202610040002_reminder_source_quote.sql` adds nullable `source_quote_encrypted` to `ramesh-reminders` without changing existing reminder text, table access or old records. It also adds the inbound acknowledgement marker used by transport progress feedback. Keep it installed during rollback; older workers can read the unchanged reminder text but cannot decode the new version-4 reminder payloads already in the outbound queue. Stop and inspect pending deliveries before reverting to an older binary.
+
+Migration `202610040004_reminder_replies.sql` adds the occurrence's native `whatsapp_message_id` and `acknowledged_at`, with a unique native ID per account/chat. The native key is recorded only with confirmed `SENT` completion and remains valid if the outbound message row is cleaned up first. Occurrence cleanup still limits this lookup to the existing 30-day terminal-occurrence retention; older notifications cannot be matched by guessing another target. Previously sent reminders without a recorded key stay unmatched. The current worker checks schema `202610040004` at readiness, so apply the full ordered sequence before rollout.
 
 ```dotenv
 PERSONAL_SCHEDULING_ENABLED=true

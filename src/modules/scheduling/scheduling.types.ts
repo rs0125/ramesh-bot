@@ -1,4 +1,5 @@
 /** Application-owned personal scheduling contracts. Never accept actor identity from model arguments. */
+import type { ReminderSourceQuote } from '../../contracts/reminder-quote.js';
 export const SCHEDULING_TIMEZONE = 'Asia/Kolkata' as const;
 
 export interface RecurrenceRule {
@@ -44,10 +45,28 @@ export type PersonalOperation =
   | { kind: 'task_create'; text: string; alias?: string; deadline?: TaskDeadline }
   | ({ kind: 'task_update'; text?: string; deadline?: TaskDeadline | null } & VersionedTarget)
   | ({ kind: 'task_complete' | 'task_cancel' } & VersionedTarget)
-  | { kind: 'reminder_create'; text: string; schedule: ScheduleSpec; taskRef?: string }
+  | {
+      kind: 'reminder_create';
+      text: string;
+      schedule: ScheduleSpec;
+      taskRef?: string;
+      /** Application-selected current command member; rechecked against durable source rows. */
+      sourceMessageId?: string;
+    }
   | ({ kind: 'reminder_reschedule'; schedule: ScheduleSpec } & VersionedTarget)
   | ({ kind: 'reminder_cancel' } & VersionedTarget)
-  | ({ kind: 'reminder_snooze'; occurrenceId: string; dueAt: string } & VersionedTarget);
+  | ({
+      kind: 'reminder_snooze';
+      occurrenceId: string;
+      dueAt: string;
+      quotedMessageId?: string;
+    } & VersionedTarget)
+  /** Application-only exact native reminder reply, never a model-exposed operation. */
+  | ({
+      kind: 'reminder_acknowledge';
+      occurrenceId: string;
+      quotedMessageId: string;
+    } & VersionedTarget);
 
 export interface PersonalRecord {
   kind: 'task' | 'reminder';
@@ -67,6 +86,7 @@ export interface PersonalRecord {
   occurrenceId?: string;
   occurrenceState?: string;
   occurrenceDueAt?: string;
+  occurrenceAcknowledgedAt?: string;
   alreadySending?: boolean;
   affectedReminders?: number;
 }
@@ -107,6 +127,8 @@ export interface DueReminder {
   leaseToken: string;
   scheduleVersion: number;
   dispatchGeneration: number;
+  /** Minimal original transport quote; never includes retained audio or a transcript. */
+  sourceQuote?: ReminderSourceQuote;
 }
 export interface ReminderDeliveryRef {
   occurrenceId: string;

@@ -151,7 +151,8 @@ test('scheduler stores one encrypted private reminder and wakes only after commi
   assert.equal(args[3].includes(f.due.text), false);
   const cipher = authCipher(f.key);
   const payload = cipher.open('outbound-reply', args[1], args[4]) as { kind: string; text: string };
-  assert.equal(payload.kind, 'business');
+  assert.equal(payload.kind, 'reminder');
+  assert.match(payload.text, /^⏰ Reminder:/);
   assert.match(payload.text, /Review the synthetic proposal/);
   assert.match(payload.text, /IST/);
   assert.equal(
@@ -160,6 +161,35 @@ test('scheduler stores one encrypted private reminder and wakes only after commi
   );
   assert.ok(f.scheduler.getStatus().lastSuccessAt);
   assert.equal(f.scheduler.getStatus().lastError, false);
+});
+
+test('scheduler preserves exact trusted text and audio quote metadata in encrypted payload only', async () => {
+  for (const quote of [
+    { kind: 'text' as const, text: '  Remind me tomorrow at 9 to review this.\n' },
+    { kind: 'audio' as const },
+  ]) {
+    const f = schedulerFixture();
+    f.due.sourceQuote = { chatId: f.due.chatId, messageId: 'ORIGINAL-COMMAND', ...quote };
+    await f.scheduler.tick();
+    const args = f.encrypted!;
+    const cipher = authCipher(f.key);
+    const payload = cipher.open('outbound-reply', args[1], args[4]) as {
+      version: number;
+      kind: string;
+      text: string;
+      quote: unknown;
+    };
+    assert.equal(payload.version, 4);
+    assert.equal(payload.kind, 'reminder');
+    assert.match(payload.text, /^⏰ Reminder:/);
+    assert.deepEqual(payload.quote, f.due.sourceQuote);
+    assert.equal(
+      JSON.stringify(cipher.open('business-delivery', args[1], args[5])).includes(
+        'ORIGINAL-COMMAND',
+      ),
+      false,
+    );
+  }
 });
 
 test('idempotent dispatch IDs change only for an explicit new dispatch generation or scope', () => {
@@ -394,7 +424,7 @@ async function deliver(options?: {
     },
     async sendText(chatId, text) {
       assert.equal(chatId, due.chatId);
-      assert.equal(text, 'Synthetic reminder');
+      assert.equal(text, '⏰ Synthetic reminder');
       sends++;
       if (options?.uncertain) throw new Error('Unknown send result');
     },

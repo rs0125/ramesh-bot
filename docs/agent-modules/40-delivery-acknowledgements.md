@@ -27,10 +27,11 @@ by Twilio rather than this Baileys adapter.
 ## Receipt contract
 
 Keep offline presence. After successful durable message archival, explicitly
-acknowledge transport delivery using the original trusted remote JID, participant
-and message ID. This is not a read/played receipt, a model response or a business
-authorization decision. Do not acknowledge failed persistence, self messages or
-unadmitted history. Persisted duplicates can be acknowledged again.
+acknowledge transport delivery and mark the message read using the original trusted
+remote JID, participant and message ID. The 4 October QoL change adds the explicitly
+requested blue-tick read receipt; it never claims audio was played. Neither receipt
+is a business authorization decision. Do not acknowledge failed persistence, self
+messages or unadmitted history. Persisted duplicates can be acknowledged again.
 
 Admit both `messages.upsert` kinds (`notify` and `append`). The pinned Baileys
 version emits messages received while offline as `append`, including new requests
@@ -43,6 +44,35 @@ Receipt dispatch must be bounded and must not hold up admission of the next item
 in a forwarded burst. Receipt failures must not change a saved queue job into a
 persistence failure. Keep error logs free of message content, JIDs and credentials.
 Use fake sockets in tests; never send diagnostic receipts to an old user message.
+
+## Working acknowledgement
+
+When the graph begins planning/tool work, send one fixed `Sure, just a sec.` reply
+and a `✏️` reaction to the original request. A burst targets its latest direct
+instruction, falling back to its last member. Simple direct chat and catalogue
+loading alone do not trigger this. Actual tool calls and confirmed business-write
+dispatch also signal the same hook; the transport deduplicates them.
+
+The application supplies the target and fixed text, never model arguments. Before
+dispatch, claim `ramesh-inbound-queue.acknowledged_at` under the current live lease.
+This persists across retry/restart. It records an attempt, not guaranteed delivery:
+a crash after claiming may omit cosmetic feedback instead of duplicating it.
+The claim is bounded and cancelled when answer preparation ends, preventing a slow
+claim from sending progress after the answer is ready. Socket feedback is bounded,
+best effort, and independent of the durable final-answer outbox; failures cannot
+repeat tools or close the session. The pencil remains as an acknowledgement, not
+a success receipt. No extra model call or business content is involved.
+
+Migration `202610040002_reminder_source_quote.sql` adds this marker and reminder
+quote provenance. The current pending QoL batch also includes migrations through
+`202610040004`; apply the complete ordered sequence before worker rollout.
+
+Typing presence now follows active preparation, including thinking/tool work,
+with an eight-second refresh, five-minute cutoff and cleanup on completion or
+cancellation. Direct `stop` is a durable ingress control that can cancel unsent
+investigations without waiting for that chat's worker. Neither cosmetic feedback
+nor cancellation claims successful rollback of an already committed effect.
+See [WhatsApp QoL](../whatsapp-qol.md) for exact reminder replies and control limits.
 
 ## Delivery verification contract
 
@@ -63,7 +93,9 @@ send of the old incident is part of diagnosis.
 ## Validation
 
 Test persisted text/audio/batched messages, duplicated messages, full inbox and
-persistence failure; prove receipt calls never become read receipts or sends.
+persistence failure; prove explicit read receipts preserve the original keys and
+never become played receipts. Verify one work acknowledgement across concurrent
+claims and restart, and suppression of late feedback.
 Exercise the reproduced delivery failure, concurrent reads, source changes,
 revocation, cancellation and restart. Keep the normal provider evaluation frozen
 while transport changes are implemented in an isolated checkout. Re-run the

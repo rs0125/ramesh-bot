@@ -107,7 +107,7 @@ const draft = tool(
 );
 const signal = () => AbortSignal.timeout(5000);
 
-function harness(resultData?: Record<string, unknown>) {
+function harness(resultData?: Record<string, unknown>, onToolActivity?: () => void) {
   const operations = new Map<string, WriteOperation>();
   const sources = new Map<string, WriteSourceMessage>();
   const calls: Array<{ tool: string; args: Record<string, unknown>; operationId: string }> = [];
@@ -282,6 +282,7 @@ function harness(resultData?: Record<string, unknown>) {
     return {
       runId: randomUUID(),
       key: { remoteJid: actor.chatId },
+      onToolActivity,
       checkpointLease: { leaseToken: randomUUID() },
       commandMessages: [
         member,
@@ -534,6 +535,91 @@ test('a later exact direct text confirmation dispatches frozen arguments once', 
   await h.service.recover(confirmation, signal());
   assert.equal(h.calls.length, 1);
 });
+
+test('write activity precedes confirm and retry dispatch, but not staging or receipt recovery', async () => {
+  const activityAtCalls: number[] = [];
+  const h = harness(undefined, () => activityAtCalls.push(h.calls.length));
+  const { request, reply, operation } = await h.proposed();
+  await h.service.recover(request, signal());
+  await h.service.canDeliver(request.key, reply.delivery, signal());
+  await h.service.recover(h.trusted('retry ABCDEF12'), signal());
+  assert.deepEqual(activityAtCalls, []);
+  assert.equal(h.calls.length, 0);
+
+  h.useUnknown(true);
+  const confirmed = await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.match(confirmed!.text, /may already have completed/);
+  assert.deepEqual(activityAtCalls, [0]);
+  assert.equal(h.operations.get(operation.operationId)!.state, 'UNKNOWN');
+
+  h.useUnknown(false);
+  const retry = h.trusted('retry ABCDEF12');
+  const completed = await h.service.recover(retry, signal());
+  assert.match(completed!.text, /^Saved:/);
+  assert.deepEqual(activityAtCalls, [0, 1]);
+  assert.deepEqual(h.calls[1], h.calls[0]);
+
+  await h.service.recover(retry, signal());
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.deepEqual(activityAtCalls, [0, 1]);
+  assert.equal(h.calls.length, 2);
+});
+
+test('cancelled, invalid and denied confirmations do not report write activity', async () => {
+  let activities = 0;
+  const h = harness(undefined, () => activities++);
+  await h.proposed();
+  await h.service.recover(h.trusted('confirm ABCDEF12', { forwarded: true }), signal());
+  await h.service.recover(h.trusted('confirm ABCDEF12', { kind: 'audio' }), signal());
+  await h.service.recover(h.trusted('confirm 12345678'), signal());
+  await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  h.revoke();
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.equal(activities, 0);
+  assert.equal(h.calls.length, 0);
+});
+
+for (const change of ['actor', 'contract'] as const) {
+  test(`write activity waits for the live ${change} check after the dispatch claim`, async () => {
+    let activities = 0;
+    const h = harness(undefined, () => activities++);
+    const { operation } = await h.proposed();
+    const claim = h.repository.claim;
+    h.repository.claim = async (...args) => {
+      const result = await claim(...args);
+      if (change === 'actor') h.changeActor({ ...actor, employeeId: actor.employeeId + 1 });
+      else h.changeDefinitions([]);
+      return result;
+    };
+    await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+    assert.equal(
+      h.operations.get(operation.operationId)!.result!.code,
+      change === 'actor' ? 'ACCESS_CHANGED' : 'TOOL_CHANGED',
+    );
+    assert.equal(activities, 0);
+    assert.equal(h.calls.length, 0);
+  });
+}
+
+for (const failure of ['synchronous', 'asynchronous'] as const) {
+  test(`${failure} activity callback errors cannot alter a confirmed write`, async () => {
+    let activities = 0;
+    const fail = () => {
+      activities++;
+      throw new Error('Synthetic activity failure');
+    };
+    const h = harness(undefined, failure === 'synchronous' ? fail : async () => fail());
+    const { operation } = await h.proposed();
+    const result = await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.match(result!.text, /^Saved:/);
+    assert.equal(activities, 1);
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.operations.get(operation.operationId)!.state, 'SUCCEEDED');
+  });
+}
 
 test('email drafts keep typed confirmation and deliver verified metadata without reopening private history', async () => {
   const h = harness({

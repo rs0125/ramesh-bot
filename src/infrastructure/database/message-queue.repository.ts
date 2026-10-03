@@ -9,6 +9,11 @@ import type {
 import type { GreetingCandidate } from '../../modules/greetings/greeting.types.js';
 import type { ReminderDeliveryRef } from '../../modules/scheduling/scheduling.types.js';
 import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
+import {
+  isInvestigationStop,
+  storedInvestigationStopSchema,
+  type InvestigationStopResult,
+} from '../../modules/messaging/investigation-stop.js';
 
 export type TerminalState = 'SENT' | 'EXPIRED' | 'FAILED' | 'UNCERTAIN';
 export type QueueDirection = 'inbound' | 'outbound';
@@ -61,7 +66,7 @@ export class MessageQueueRepository {
 
   async health(): Promise<void> {
     const result = await this.pool.query(`SELECT current_user AS role, version
-      FROM public."ramesh-schema-migrations" WHERE version='202610030009'`);
+      FROM public."ramesh-schema-migrations" WHERE version='202610040004'`);
     if (result.rows[0]?.role !== 'ramesh_worker')
       throw new Error('Message queue schema or runtime role is not ready');
   }
@@ -216,6 +221,195 @@ export class MessageQueueRepository {
           [first.message_id, available, message.text?.length ?? 0, media ? 1 : 0],
         );
       return 'queued';
+    });
+  }
+
+  /** A direct STOP bypasses model admission, but its acknowledgement uses the durable outbox. */
+  async stopInvestigations(
+    id: string,
+    message: GreetingCandidate,
+    payloadEncrypted: string,
+    contentEncrypted: string,
+    maxAgeMs: number,
+    renderReply: (result: InvestigationStopResult) => string,
+    capacity = 100,
+  ): Promise<InvestigationStopResult> {
+    const now = Date.now();
+    if (
+      !isInvestigationStop(message) ||
+      !Number.isFinite(maxAgeMs) ||
+      maxAgeMs <= 0 ||
+      !Number.isSafeInteger(capacity) ||
+      capacity < 1 ||
+      !Number.isFinite(message.sentAtMs) ||
+      message.sentAtMs > now + 60000 ||
+      now - message.sentAtMs > Math.min(maxAgeMs, 300000) ||
+      message.isGroup !== message.chatId.endsWith('@g.us') ||
+      (message.isGroup && !/^[\w.-]+@(s\.whatsapp\.net|lid)$/.test(message.senderId!))
+    )
+      throw new Error('INVALID_STOP_COMMAND');
+    const senderKey = createHash('sha256')
+      .update(JSON.stringify([message.chatId, message.senderId ?? message.chatId]))
+      .digest('hex');
+    return this.transaction(async (db) => {
+      const existing = (
+        await db.query<{ stop_result: unknown }>(
+          `SELECT stop_result FROM public."ramesh-messages"
+         WHERE account_id=$1 AND chat_id=$2 AND whatsapp_message_id=$3`,
+          [this.accountId, message.chatId, message.messageId],
+        )
+      ).rows[0];
+      if (existing) {
+        // A replay of an older ordinary message must not cancel newly admitted work either.
+        if (!existing.stop_result)
+          return {
+            duplicate: true,
+            cancelledRunIds: [],
+            alreadySending: 0,
+            preservedOutcomes: 0,
+            replyQueued: false,
+          };
+        const { version: _version, ...saved } = storedInvestigationStopSchema.parse(
+          existing.stop_result,
+        );
+        return { ...saved, duplicate: true };
+      }
+      const admitted = (
+        await db.query<{ queue_order: string }>(
+          `INSERT INTO public."ramesh-messages"
+         (id,account_id,chat_id,whatsapp_message_id,sent_at,expires_at,state,payload_encrypted,
+          content_encrypted,mentions_bot)
+         VALUES ($1,$2,$3,$4,$5,$6,'READY_TO_SEND',$7,$8,$9) RETURNING queue_order`,
+          [
+            id,
+            this.accountId,
+            message.chatId,
+            message.messageId,
+            new Date(message.sentAtMs),
+            new Date(message.sentAtMs + Math.min(maxAgeMs, 300000)),
+            payloadEncrypted,
+            contentEncrypted,
+            message.mentionsBot,
+          ],
+        )
+      ).rows[0]!;
+      // Lock first, then inspect effects in a fresh statement snapshot. A writer may have
+      // committed while this transaction waited for its message/queue row locks.
+      const candidates = (
+        await db.query<{ id: string; state: string }>(
+          `SELECT m.id,m.state FROM public."ramesh-messages" m
+         JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
+         WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp'
+           AND m.queue_order<$3 AND q.sender_key=$4 AND q.batch_parent IS NULL
+           AND (m.state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')
+             OR (m.state='UNCERTAIN' AND m.expires_at>clock_timestamp()))
+         ORDER BY m.queue_order FOR UPDATE OF m,q`,
+          [this.accountId, message.chatId, admitted.queue_order, senderKey],
+        )
+      ).rows;
+      const candidateIds = candidates.map((row) => row.id);
+      const effects = candidateIds.length
+        ? (
+            await db.query<{ run_id: string }>(
+              `SELECT run_id FROM public."ramesh-assistant-commands"
+         WHERE account_id=$1 AND run_id=ANY($2::uuid[]) AND kind='mutation'
+         UNION
+         SELECT e.run_id FROM public."ramesh-write-events" e
+         JOIN public."ramesh-write-operations" o ON o.id=e.operation_id AND o.account_id=e.account_id
+         WHERE e.account_id=$1 AND e.run_id=ANY($2::uuid[]) AND e.operation_id IS NOT NULL
+           AND e.kind NOT IN ('drafted','draft_revised') AND o.state<>'DRAFT'`,
+              [this.accountId, candidateIds],
+            )
+          ).rows
+        : [];
+      const protectedRuns = new Set(effects.map((row) => row.run_id));
+      const cancelledRunIds = candidates
+        .filter(
+          (row) =>
+            !protectedRuns.has(row.id) &&
+            ['QUEUED', 'PROCESSING', 'READY_TO_SEND'].includes(row.state),
+        )
+        .map((row) => row.id);
+      if (cancelledRunIds.length) {
+        // Clear every lease before returning IDs to the process-local abort mechanism.
+        // Old owners cannot commit personal actions, publish writes, hand off or begin sending.
+        await db.query(
+          `UPDATE public."ramesh-inbound-queue" SET state='DONE',lease_token=NULL,lease_until=NULL,
+           updated_at=clock_timestamp() WHERE account_id=$1
+           AND (message_id=ANY($2::uuid[]) OR batch_parent=ANY($2::uuid[]))`,
+          [this.accountId, cancelledRunIds],
+        );
+        await db.query(
+          `UPDATE public."ramesh-outbound-queue" SET state='DONE',lease_token=NULL,lease_until=NULL,
+           payload_encrypted=NULL,media_payload_encrypted=NULL,media_byte_length=NULL,media_expires_at=NULL,
+           updated_at=clock_timestamp() WHERE account_id=$1 AND message_id=ANY($2::uuid[])`,
+          [this.accountId, cancelledRunIds],
+        );
+        await db.query(
+          `UPDATE public."ramesh-messages" m SET state='EXPIRED',reason='user_stopped',
+           payload_encrypted=NULL,reply_encrypted=NULL,reply_kind='conversation',
+           business_evidence_encrypted=NULL,reply_created_at=NULL,finished_at=clock_timestamp(),
+           updated_at=clock_timestamp() WHERE m.account_id=$1
+           AND (m.id=ANY($2::uuid[]) OR EXISTS (
+             SELECT 1 FROM public."ramesh-inbound-queue" q
+             WHERE q.message_id=m.id AND q.account_id=m.account_id AND q.batch_parent=ANY($2::uuid[])))
+           AND m.state IN ('QUEUED','PROCESSING','READY_TO_SEND')`,
+          [this.accountId, cancelledRunIds],
+        );
+        await db.query(
+          `UPDATE public."ramesh-agent-runs" SET state='failed',updated_at=clock_timestamp()
+           WHERE account_id=$1 AND id=ANY($2::uuid[]) AND state='running'`,
+          [this.accountId, cancelledRunIds],
+        );
+      }
+      // STOP remains effective during saturation, without providing an unlimited reply queue.
+      // Cancellation can free a slot; other owners' work and prior STOP replies still count.
+      const count = await db.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM public."ramesh-messages"
+         WHERE account_id=$1 AND id<>$2 AND state IN ('QUEUED','PROCESSING','READY_TO_SEND','SENDING')`,
+        [this.accountId, id],
+      );
+      const replyQueued = count.rows[0]!.count < capacity;
+      const result: InvestigationStopResult = {
+        duplicate: false,
+        cancelledRunIds,
+        alreadySending: candidates.filter((row) => ['SENDING', 'UNCERTAIN'].includes(row.state))
+          .length,
+        preservedOutcomes: protectedRuns.size,
+        replyQueued,
+      };
+      // Rendering is a pure, trusted callback that encrypts fixed acknowledgement text.
+      // A failure rolls back both cancellation and STOP admission, so retry stays safe.
+      const replyPayload = replyQueued ? renderReply(result) : null;
+      await db.query(
+        `UPDATE public."ramesh-messages" SET stop_result=$3::jsonb,reply_encrypted=$4,
+         reply_created_at=CASE WHEN $5 THEN clock_timestamp() ELSE NULL END,
+         state=CASE WHEN $5 THEN 'READY_TO_SEND' ELSE 'OBSERVED' END,
+         payload_encrypted=CASE WHEN $5 THEN payload_encrypted ELSE NULL END,
+         finished_at=CASE WHEN $5 THEN NULL ELSE clock_timestamp() END,
+         reason=CASE WHEN $5 THEN NULL ELSE 'stop_reply_queue_full' END,
+         updated_at=clock_timestamp() WHERE id=$1 AND account_id=$2`,
+        [
+          id,
+          this.accountId,
+          JSON.stringify({
+            version: 1,
+            cancelledRunIds,
+            alreadySending: result.alreadySending,
+            preservedOutcomes: result.preservedOutcomes,
+            replyQueued,
+          }),
+          replyPayload,
+          replyQueued,
+        ],
+      );
+      if (replyQueued)
+        await db.query(
+          `INSERT INTO public."ramesh-outbound-queue" (message_id,account_id,payload_encrypted)
+         VALUES ($1,$2,$3)`,
+          [id, this.accountId, replyPayload],
+        );
+      return result;
     });
   }
 
@@ -849,6 +1043,21 @@ export class MessageQueueRepository {
     });
   }
 
+  /** Best-effort progress text/reaction have no retry after an ambiguous transport outcome. */
+  async claimAcknowledgement(job: MessageJob): Promise<boolean> {
+    if (job.direction !== 'inbound') return false;
+    return this.transaction(async (db) => {
+      const row = await this.owned(db, job);
+      if (!row || row.state !== 'PROCESSING') return false;
+      const result = await db.query(
+        `UPDATE public."ramesh-inbound-queue" SET acknowledged_at=clock_timestamp()
+         WHERE message_id=$1 AND account_id=$2 AND acknowledged_at IS NULL RETURNING message_id`,
+        [job.id, this.accountId],
+      );
+      return !!result.rowCount;
+    });
+  }
+
   /** One journal row per inbound message; a new lease advances the retry attempt, never a completed run. */
   async beginAgentRun(job: MessageJob): Promise<boolean> {
     if (job.direction !== 'inbound') return false;
@@ -1000,11 +1209,46 @@ export class MessageQueueRepository {
     job: MessageJob,
     state: TerminalState,
     reason: string | null = null,
+    transportMessageId?: string,
   ): Promise<boolean> {
+    if (
+      transportMessageId !== undefined &&
+      (state !== 'SENT' ||
+        job.direction !== 'outbound' ||
+        job.origin !== 'reminder' ||
+        !job.reminder ||
+        !/^3EB0[A-F0-9]{36}$/.test(transportMessageId))
+    )
+      throw new Error('INVALID_REMINDER_TRANSPORT_ID');
     return this.transaction(async (db) => {
       const row = await this.owned(db, job);
       if (!row || (state === 'SENT' && (job.direction !== 'outbound' || row.state !== 'SENDING')))
         return false;
+      if (transportMessageId !== undefined) {
+        const ref = job.reminder!;
+        const saved = await db.query(
+          `UPDATE public."ramesh-reminder-occurrences" o SET whatsapp_message_id=$3
+           FROM public."ramesh-messages" m
+           WHERE o.outbound_message_id=$1 AND o.account_id=$2 AND o.state='queued'
+           AND o.id=$4 AND o.reminder_id=$5 AND o.schedule_version=$6 AND o.dispatch_generation=$7
+           AND o.recipient_employee_id=$8 AND o.recipient_phone_e164=$9
+           AND m.id=o.outbound_message_id AND m.account_id=o.account_id AND m.origin='reminder'
+           AND m.state='SENDING' AND m.chat_id=o.recipient_chat_id
+           AND (o.whatsapp_message_id IS NULL OR o.whatsapp_message_id=$3) RETURNING o.id`,
+          [
+            job.id,
+            this.accountId,
+            transportMessageId,
+            ref.occurrenceId,
+            ref.reminderId,
+            ref.scheduleVersion,
+            ref.dispatchGeneration,
+            ref.ownerEmployeeId,
+            ref.recipientPhoneE164,
+          ],
+        );
+        if (saved.rowCount !== 1) throw new Error('REMINDER_TRANSPORT_RECEIPT_MISMATCH');
+      }
       await this.finish(db, job, state, reason);
       return true;
     });

@@ -14,6 +14,8 @@ import { createAuthStore } from '../database/auth-store.js';
 import { DeliveryReceipts } from './delivery-receipts.js';
 import { privateTransportLogger } from './sdk-logger.js';
 import { persistableMessageContent } from './media-privacy.js';
+import { TransportFeedback } from './transport-feedback.js';
+import { TypingPresence } from './typing-presence.js';
 
 export interface WhatsAppSession {
   readonly botJids: readonly string[];
@@ -23,8 +25,11 @@ export interface WhatsAppSession {
   ): () => void;
   saveCredentials(): Promise<void>;
   acknowledgeDelivery?(message: WAMessage): void;
-  reply(message: WAMessage, text: string): Promise<void>;
-  sendText?(chatId: string, text: string): Promise<void>;
+  markRead?(message: WAMessage): void;
+  acknowledgeToolUse?(message: WAMessage): void;
+  startTyping?(chatId: string, signal: AbortSignal): () => void;
+  reply(message: WAMessage, text: string, options?: { messageId: string }): Promise<void>;
+  sendText?(chatId: string, text: string, options?: { messageId: string }): Promise<void>;
   sendMedia?(chatId: string, media: OutboundMediaSend): Promise<void>;
   downloadMedia?(message: WAMessage, signal: AbortSignal): Promise<MediaUpload>;
   chatName?(chatId: string): Promise<string | undefined>;
@@ -104,6 +109,11 @@ export function createSessionFactory(
       (jid, participant, ids, type) => socket.sendReceipt(jid, participant, ids, type),
       () => logger.warn('WhatsApp delivery acknowledgement failed'),
     );
+    const reactions = new TransportFeedback(() => logger.warn('WhatsApp reaction failed'));
+    const typing = new TypingPresence(
+      (chatId, presence) => socket.sendPresenceUpdate(presence, chatId),
+      () => logger.warn('WhatsApp typing update failed'),
+    );
     socket.ev.on('groups.update', (updates) => {
       for (const update of updates) if (update.id) groups.delete(update.id);
     });
@@ -111,11 +121,19 @@ export function createSessionFactory(
       groups.delete(id);
     });
 
-    const send = async (chatId: string, content: AnyMessageContent, quoted?: WAMessage) => {
+    const send = async (
+      chatId: string,
+      content: AnyMessageContent,
+      quoted?: WAMessage,
+      options?: { messageId: string },
+    ) => {
+      if (options && !/^3EB0[A-F0-9]{36}$/.test(options.messageId))
+        throw new Error('INVALID_OUTGOING_MESSAGE_ID');
       let timer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
           socket.sendMessage(chatId, content, {
+            ...(options ? { messageId: options.messageId } : {}),
             ...(quoted ? { quoted } : {}),
             mediaUploadTimeoutMs: sendTimeoutMs,
           }),
@@ -143,8 +161,24 @@ export function createSessionFactory(
       },
       saveCredentials: () => auth.saveCredentials(),
       acknowledgeDelivery: (message) => deliveryReceipts.acknowledge(message),
-      reply: (message, text) => send(message.key.remoteJid!, plainTextMessage(text), message),
-      sendText: (chatId, text) => send(chatId, plainTextMessage(text)),
+      markRead: (message) => deliveryReceipts.markRead(message),
+      startTyping: (chatId, signal) => typing.start(chatId, signal),
+      acknowledgeToolUse: (message) => {
+        const { key } = message;
+        if (key.fromMe || !key.id || !key.remoteJid) return;
+        const target = { ...key };
+        reactions.submit(() =>
+          socket.sendMessage(target.remoteJid!, { react: { text: '✏️', key: target } }),
+        );
+        reactions.submit(() =>
+          socket.sendMessage(target.remoteJid!, plainTextMessage('Sure, just a sec.'), {
+            quoted: message,
+          }),
+        );
+      },
+      reply: (message, text, options) =>
+        send(message.key.remoteJid!, plainTextMessage(text), message, options),
+      sendText: (chatId, text, options) => send(chatId, plainTextMessage(text), undefined, options),
       sendMedia: (chatId, media) => send(chatId, outboundMediaMessage(media)),
       async downloadMedia(message, signal) {
         const content = persistableMessageContent(message.message);
@@ -201,7 +235,7 @@ export function createSessionFactory(
         chatId.endsWith('@g.us') ? (await groupMetadata(chatId)).subject : undefined,
       async close() {
         try {
-          await deliveryReceipts.close();
+          await Promise.all([deliveryReceipts.close(), reactions.close(), typing.close()]);
           await socket.end(undefined);
         } finally {
           await auth.flush();

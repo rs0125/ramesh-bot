@@ -7,6 +7,7 @@ import type { BusinessReadResult } from './business-reads.js';
 import { FORMATTER_PROMPT } from './prompts.js';
 import { finishReply } from './style.js';
 import { renderFollowups } from './followups.js';
+import { notifyToolActivity } from './tool-activity.js';
 
 export const READ_PROMPT_VERSION = 'ramesh-assigned-followups-v1';
 export const readIntentSchema = z
@@ -33,6 +34,7 @@ const state = new StateSchema({
 export function buildBusinessGraph(
   model: TextModel,
   read: (signal: AbortSignal) => Promise<BusinessReadResult>,
+  onToolActivity?: () => void,
 ) {
   return new StateGraph(state)
     .addNode('converser', async (value, config) => {
@@ -61,10 +63,11 @@ export function buildBusinessGraph(
     })
     .addNode('worker', async (value, config) => {
       const started = Date.now();
+      const signal = config.signal ?? new AbortController().signal;
+      signal.throwIfAborted();
+      if (value.audience !== 'group') notifyToolActivity(onToolActivity);
       const business =
-        value.audience === 'group'
-          ? { outcome: 'denied' as const }
-          : await read(config.signal ?? new AbortController().signal);
+        value.audience === 'group' ? { outcome: 'denied' as const } : await read(signal);
       return {
         business,
         stages: [

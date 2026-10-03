@@ -4,6 +4,7 @@ import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { proto } from '@whiskeysockets/baileys';
 import { config as dotenv } from 'dotenv';
 import { loadAssistantConfig } from '../src/config/assistant.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
@@ -308,7 +309,17 @@ export async function runSchedulingEvaluation() {
               await queue.enqueue(
                 member.id,
                 candidate,
-                cipher.seal('message', member.id, Buffer.from('synthetic-local-capture')),
+                cipher.seal(
+                  'message',
+                  member.id,
+                  Buffer.from(
+                    proto.WebMessageInfo.encode({
+                      key: { remoteJid: chatId, id: member.id, fromMe: false },
+                      messageTimestamp: Math.floor(member.receivedAtMs / 1000),
+                      message: { conversation: member.text },
+                    }).finish(),
+                  ),
+                ),
                 300000,
                 100,
                 {

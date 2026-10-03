@@ -1,6 +1,10 @@
 /** Versioned encrypted queue payload; transcript bytes never belong in the receipt journal. */
 import { validVoiceReference, type VoiceReplyReference } from '../media/voice-reply.js';
 import type { OutboundAutomationMedia } from '../../contracts/outbound-automation.js';
+import {
+  validReminderSourceQuote,
+  type ReminderSourceQuote,
+} from '../../contracts/reminder-quote.js';
 
 export interface OutboundMediaMetadata {
   mimeType: OutboundAutomationMedia['mimeType'];
@@ -12,6 +16,13 @@ interface DecodedReply {
   text: string;
   voice?: VoiceReplyReference;
   automation?: { media?: OutboundMediaMetadata };
+  reminder?: { quote?: ReminderSourceQuote };
+}
+
+export function encodeReminderReply(text: string, quote?: ReminderSourceQuote) {
+  if (quote !== undefined && !validReminderSourceQuote(quote))
+    throw new Error('INVALID_REMINDER_QUOTE');
+  return { version: 4, kind: 'reminder', text, ...(quote ? { quote } : {}) };
 }
 
 export function encodeAutomationReply(text: string, media?: OutboundMediaMetadata) {
@@ -30,7 +41,24 @@ export function decodeReply(value: unknown, kind: 'business' | 'conversation'): 
     text?: unknown;
     voice?: unknown;
     media?: unknown;
+    quote?: unknown;
   };
+  if (v.version === 4) {
+    if (
+      kind !== 'business' ||
+      v.kind !== 'reminder' ||
+      typeof v.text !== 'string' ||
+      !v.text.trim() ||
+      v.text.length > 16000 ||
+      Object.keys(v).some((key) => !['version', 'kind', 'text', 'quote'].includes(key)) ||
+      (v.quote !== undefined && !validReminderSourceQuote(v.quote))
+    )
+      throw new Error('INVALID_REPLY_PAYLOAD');
+    return {
+      text: v.text,
+      reminder: { ...(v.quote ? { quote: v.quote as ReminderSourceQuote } : {}) },
+    };
+  }
   if (v.version === 3) {
     if (
       kind !== 'conversation' ||

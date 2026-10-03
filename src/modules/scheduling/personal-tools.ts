@@ -22,6 +22,11 @@ import {
 } from './scheduling.types.js';
 
 export interface PersonalRepositoryPort {
+  /** Exact native reminder quote resolution; deliberately not exposed as a model tool. */
+  resolveReminderQuote?(
+    context: PersonalCommandContext,
+    quotedMessageId: string,
+  ): Promise<PersonalRecord | null>;
   getReceipt(context: PersonalCommandContext): Promise<PersonalCommandReceipt | null>;
   applyBatch(
     context: PersonalCommandContext,
@@ -439,6 +444,57 @@ export class PersonalToolRun {
       ? { text: renderReceipt(receipt), delivery: this.receiptDelivery(receipt) }
       : undefined;
   }
+  /** Small explicit commands bypass model inference and never resolve an ambiguous recent target. */
+  async quickReply(signal: AbortSignal): Promise<PersonalReply | undefined> {
+    const members = this.trusted.commandMessages!;
+    const command = members.find(
+      (member) =>
+        !member.forwarded &&
+        (member.hasQuotedMessage || member.quotedMessageId) &&
+        parseReminderQuickReply(member.text),
+    );
+    if (!command) return undefined;
+    await this.authorize(signal);
+    const failure = (code: string): PersonalReply => ({
+      text: renderFailure(code),
+      delivery: this.delivery(),
+    });
+    if (members.length !== 1 || !command.quotedMessageId)
+      return failure('PERSONAL_QUOTED_REMINDER_REQUIRED');
+    const action = parseReminderQuickReply(command.text)!;
+    if (action.kind === 'invalid') return failure('PERSONAL_QUICK_REPLY_DURATION');
+    if (!this.repository.resolveReminderQuote) return failure('UNAVAILABLE');
+    const context = { ...this.command, requestTimeMs: command.receivedAtMs };
+    const target = await this.repository.resolveReminderQuote(context, command.quotedMessageId);
+    await this.authorize(signal);
+    if (!target?.occurrenceId || target.occurrenceState !== 'sent')
+      return failure('PERSONAL_QUOTED_REMINDER_UNAVAILABLE');
+    const common = {
+      id: target.id,
+      expectedVersion: target.version,
+      occurrenceId: target.occurrenceId,
+      quotedMessageId: command.quotedMessageId,
+    };
+    const operation: PersonalOperation =
+      action.kind === 'done'
+        ? { kind: 'reminder_acknowledge', ...common }
+        : {
+            kind: 'reminder_snooze',
+            ...common,
+            dueAt: resolveSchedule({ afterMinutes: action.minutes }, command.receivedAtMs).dueAt,
+          };
+    let receipt: PersonalCommandReceipt;
+    try {
+      receipt = await this.repository.applyBatch(context, [operation]);
+    } catch (error) {
+      if (!(error instanceof SchedulingError)) throw error;
+      await this.authorize(signal);
+      return failure(error.code);
+    }
+    // A post-commit identity/error remains recoverable through the existing durable receipt.
+    await this.authorize(signal);
+    return { text: renderReceipt(receipt), delivery: this.receiptDelivery(receipt) };
+  }
   async execute(
     name: string,
     argumentsText: string,
@@ -576,6 +632,7 @@ export class PersonalToolRun {
             operations.push({
               kind: proposal.kind,
               text: proposal.text,
+              sourceMessageId: member.id,
               schedule: resolveSchedule(proposal.time, member.receivedAtMs),
               ...(proposal.taskRef ? { taskRef: proposal.taskRef } : {}),
             });
@@ -722,6 +779,21 @@ export class PersonalToolRun {
   }
 }
 
+function parseReminderQuickReply(
+  text: string,
+): { kind: 'done' } | { kind: 'snooze'; minutes: number } | { kind: 'invalid' } | undefined {
+  if (/^done[.!]?$/iu.test(text.trim())) return { kind: 'done' };
+  const match =
+    /^snooze\s+(?:for\s+)?([0-9]+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)[.!]?$/iu.exec(
+      text.trim(),
+    );
+  if (!match) return undefined;
+  const minutes = Number(match[1]) * (/^h/i.test(match[2]!) ? 60 : 1);
+  return Number.isSafeInteger(minutes) && minutes > 0 && minutes <= 4000000000
+    ? { kind: 'snooze', minutes }
+    : { kind: 'invalid' };
+}
+
 /** Inspect the complete trusted instruction; a model-selected quote cannot hide a condition. */
 function hasReminderCondition(message: string, reminderText?: string): boolean {
   // Exclude only clearly separate read requests. A clause that mentions reminder delivery,
@@ -783,6 +855,14 @@ function hasReminderCondition(message: string, reminderText?: string): boolean {
 
 function renderFailure(code: string): string {
   const reason: Record<string, string> = {
+    PERSONAL_QUOTED_REMINDER_REQUIRED:
+      'Reply directly to the reminder notification with "done" or "snooze 30m", as a separate message, so I change exactly that occurrence.',
+    PERSONAL_QUOTED_REMINDER_UNAVAILABLE:
+      "I couldn't match that reply to an available reminder notification in your chat. It may have been replaced, cancelled or expired. Please reply to the specific notification; I haven't changed another reminder.",
+    PERSONAL_OCCURRENCE_ACKNOWLEDGED:
+      "That reminder occurrence is already marked done. I haven't snoozed it or changed future reminders.",
+    PERSONAL_QUICK_REPLY_DURATION:
+      'Please use a positive duration such as "snooze 30m" or "snooze 2h" when replying to the reminder.',
     CONDITIONAL_REMINDERS_UNAVAILABLE:
       "I couldn't save a conditional reminder. I can't check a business condition when it becomes due. Would you like a regular time-based reminder instead?",
     TEXT_MUST_BE_USER_AUTHORED:

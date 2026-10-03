@@ -250,6 +250,7 @@ export class BaileysClient {
           if (chatName) candidate = { ...candidate, chatName: chatName.slice(0, 256) };
         }
         this.status.metrics.received++;
+        if (!this.options.durableMessages && !signal.aborted) this.markRead(session, message);
         const outcome = this.options.durableMessages
           ? await this.options.durableMessages.enqueue(message, candidate, session)
           : toGreetingCandidate(message, session.botJids)
@@ -261,12 +262,14 @@ export class BaileysClient {
             : 'ignored';
         if (this.options.durableMessages && outcome !== 'ignored' && !signal.aborted) {
           // Queued, observed, duplicate and full all mean the inbox archive exists.
-          // This does not send a reply or mark the message read/played.
+          // Explicit read receipts follow durable archival, without waiting for the agent.
+          // This never sends a played receipt for audio or a reply to an unmentioned group.
           try {
             session.acknowledgeDelivery?.(message);
           } catch {
             this.options.logger.warn('WhatsApp delivery acknowledgement failed');
           }
+          this.markRead(session, message);
         }
         if (!this.options.durableMessages && outcome === 'ignored')
           this.options.observeMessage?.(candidate);
@@ -283,6 +286,14 @@ export class BaileysClient {
         else this.options.logger.error({ err: error }, 'Greeting failed; claim retained');
         this.record('A greeting failed; see worker logs', 'error');
       }
+    }
+  }
+
+  private markRead(session: WhatsAppSession, message: WAMessage): void {
+    try {
+      session.markRead?.(message);
+    } catch {
+      this.options.logger.warn('WhatsApp read acknowledgement failed');
     }
   }
 

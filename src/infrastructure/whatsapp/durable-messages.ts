@@ -29,6 +29,11 @@ import {
   getPersonalDelivery,
   getWriteDelivery,
 } from '../../modules/messaging/delivery-evidence.js';
+import { reminderQuotedMessage, reminderTransportMessageId } from './reminder-quote.js';
+import {
+  isInvestigationStop,
+  renderInvestigationStop,
+} from '../../modules/messaging/investigation-stop.js';
 
 export interface DurableMessageOptions {
   encryptionKey: string;
@@ -84,6 +89,8 @@ type DurableRepository = Pick<
       | 'claimNext'
       | 'renewLease'
       | 'yieldReminderToHuman'
+      | 'claimAcknowledgement'
+      | 'stopInvestigations'
     >
   >;
 
@@ -97,6 +104,7 @@ export class DurableMessages {
   private readonly stoppingDownloads = new AbortController();
   // Conversation memory is intentionally process-local. Persisted reply text survives restarts.
   private readonly sentCallbacks = new Map<string, { expiresAt: number; run: () => void }>();
+  private readonly activeRuns = new Map<string, AbortController>();
 
   constructor(
     private readonly repository: DurableRepository,
@@ -209,6 +217,38 @@ export class DurableMessages {
     const id = randomUUID();
     const receivedAt = new Date();
     const payload = this.cipher.seal('message', id, Buffer.from(wire));
+    const content = this.cipher.seal('inbox', id, {
+      text: candidate.text ?? '',
+      senderId: candidate.senderId ?? null,
+      senderName: candidate.senderName || candidate.senderId?.split('@')[0] || 'Unknown sender',
+      chatName: candidate.chatName ?? null,
+      kind: candidate.kind ?? 'text',
+      ...(candidate.location ? { location: candidate.location } : {}),
+    });
+    if (replyEligible && isInvestigationStop(candidate) && this.repository.stopInvestigations) {
+      const result = await this.repository.stopInvestigations(
+        id,
+        candidate,
+        payload,
+        content,
+        this.options.maxAgeMs,
+        (outcome) =>
+          this.cipher.seal(
+            'outbound-reply',
+            id,
+            encodeReply(renderInvestigationStop(outcome), false),
+          ),
+        this.options.capacity,
+      );
+      if (!result.duplicate) {
+        for (const runId of result.cancelledRunIds) {
+          this.activeRuns.get(runId)?.abort();
+          this.sentCallbacks.delete(runId);
+        }
+        this.notifyOutbound();
+      }
+      return result.duplicate ? 'duplicate' : result.replyQueued === false ? 'observed' : 'queued';
+    }
     const result = await this.repository.enqueue(
       id,
       candidate,
@@ -217,14 +257,7 @@ export class DurableMessages {
       this.options.capacity,
       {
         replyEligible,
-        content: this.cipher.seal('inbox', id, {
-          text: candidate.text ?? '',
-          senderId: candidate.senderId ?? null,
-          senderName: candidate.senderName || candidate.senderId?.split('@')[0] || 'Unknown sender',
-          chatName: candidate.chatName ?? null,
-          kind: candidate.kind ?? 'text',
-          ...(candidate.location ? { location: candidate.location } : {}),
-        }),
+        content,
       },
     );
     if (result === 'queued' && session && this.options.media)
@@ -413,7 +446,9 @@ export class DurableMessages {
     report: (outcome: 'sent' | 'error') => void,
   ): Promise<void> {
     const lease = new AbortController();
-    const ownedSignal = AbortSignal.any([signal, lease.signal]);
+    const cancelled = new AbortController();
+    this.activeRuns.set(job.id, cancelled);
+    const ownedSignal = AbortSignal.any([signal, lease.signal, cancelled.signal]);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let pending: Promise<void> | undefined;
     let finished = false;
@@ -440,6 +475,7 @@ export class DurableMessages {
       );
     } finally {
       finished = true;
+      if (this.activeRuns.get(job.id) === cancelled) this.activeRuns.delete(job.id);
       clearTimeout(timer);
       await pending;
     }
@@ -452,6 +488,7 @@ export class DurableMessages {
     report: (outcome: 'sent' | 'error') => void,
   ): Promise<void> {
     let sendInvoked = false;
+    let stopTyping: (() => void) | undefined;
     try {
       if (signal.aborted) {
         await this.repository.releaseUnsent(job, true);
@@ -483,6 +520,11 @@ export class DurableMessages {
       }
       if (job.direction === 'inbound') {
         if (!candidate || !message) throw new Error('Missing inbound message');
+        try {
+          stopTyping = session.startTyping?.(candidate.chatId, signal);
+        } catch {
+          /* Cosmetic only. */
+        }
         if (this.usageEnabled) {
           // Covers fresh and restarted/pending media before any extractor or model can run.
           const scope = currentUsageScope()?.scope;
@@ -590,6 +632,10 @@ export class DurableMessages {
               text: audio?.text ?? item.candidate.text ?? '',
               receivedAtMs,
               forwarded: item.candidate.forwarded === true,
+              ...(item.candidate.quotedMessageId
+                ? { quotedMessageId: item.candidate.quotedMessageId }
+                : {}),
+              ...(item.candidate.hasQuotedMessage ? { hasQuotedMessage: true } : {}),
             },
           ];
         });
@@ -611,30 +657,62 @@ export class DurableMessages {
             },
           ];
         });
+        // A debounced burst gets one acknowledgement on its latest direct instruction.
+        // Every target comes from decoded, same-owner transport members, never tool arguments.
+        const toolTarget =
+          [...originals].reverse().find((item) => !item.candidate.forwarded) ?? originals.at(-1)!;
+        let toolAcknowledged = false;
+        const feedbackFinished = new AbortController();
         const prepared = this.options.prepareReply
-          ? await this.options.prepareReply(candidate, signal, {
-              runId: job.id,
-              checkpointLease: { leaseToken: job.token },
-              commandMessages,
-              locationMessages,
-              mediaContext,
-              key: {
-                remoteJid: message.key.remoteJid,
-                participant: message.key.participant,
-                fromMe: message.key.fromMe,
-              },
-              ...(this.options.agentRuns
-                ? {
-                    record: async (kind, value) => {
-                      await this.repository.recordAgentEvent!(
-                        job,
-                        kind,
-                        this.cipher.seal(`agent-event:${kind}`, job.id, value),
-                      );
-                    },
-                  }
-                : {}),
-            })
+          ? await this.options
+              .prepareReply(candidate, signal, {
+                runId: job.id,
+                checkpointLease: { leaseToken: job.token },
+                commandMessages,
+                locationMessages,
+                mediaContext,
+                onToolActivity: () => {
+                  if (toolAcknowledged || signal.aborted) return;
+                  toolAcknowledged = true;
+                  if (!session.acknowledgeToolUse) return;
+                  const feedbackSignal = AbortSignal.any([
+                    signal,
+                    feedbackFinished.signal,
+                    AbortSignal.timeout(2000),
+                  ]);
+                  void (async () => {
+                    if (
+                      this.repository.claimAcknowledgement &&
+                      !(await cancellable(
+                        () => this.repository.claimAcknowledgement!(job),
+                        feedbackSignal,
+                      ))
+                    )
+                      return;
+                    feedbackSignal.throwIfAborted();
+                    session.acknowledgeToolUse!(toolTarget.message);
+                  })().catch(() => {
+                    /* Progress feedback must never abort or repeat tool execution. */
+                  });
+                },
+                key: {
+                  remoteJid: message.key.remoteJid,
+                  participant: message.key.participant,
+                  fromMe: message.key.fromMe,
+                },
+                ...(this.options.agentRuns
+                  ? {
+                      record: async (kind, value) => {
+                        await this.repository.recordAgentEvent!(
+                          job,
+                          kind,
+                          this.cipher.seal(`agent-event:${kind}`, job.id, value),
+                        );
+                      },
+                    }
+                  : {}),
+              })
+              .finally(() => feedbackFinished.abort())
           : { text: 'hello', onSent: undefined };
         if (signal.aborted) {
           await this.repository.releaseUnsent(job, true);
@@ -695,6 +773,7 @@ export class DurableMessages {
       }
       let reply: unknown;
       let voice: VoiceReplyReference | undefined;
+      let reminderQuote: WAMessage | undefined;
       let outgoingMedia: Omit<OutboundMediaSend, 'caption'> | undefined;
       try {
         const decoded = decodeReply(
@@ -703,6 +782,11 @@ export class DurableMessages {
         );
         reply = decoded.text;
         voice = decoded.voice;
+        if (decoded.reminder && !reminder) throw new Error('INVALID_REMINDER_ORIGIN');
+        if (decoded.reminder?.quote)
+          reminderQuote = reminderQuotedMessage(decoded.reminder.quote, job.chatId ?? '');
+        // Older reminders already waiting in the queue also receive the visible prefix.
+        if (reminder && !decoded.text.startsWith('⏰')) reply = `⏰ ${decoded.text}`;
         if (
           reminder &&
           (job.replyKind !== 'business' ||
@@ -854,11 +938,16 @@ export class DurableMessages {
         return;
       }
       sendInvoked = true;
+      const reminderMessageId = reminder
+        ? reminderTransportMessageId(this.options.accountId ?? 'primary', job.id)
+        : undefined;
+      const sendOptions = reminderMessageId ? { messageId: reminderMessageId } : undefined;
       if (automation && outgoingMedia)
         await session.sendMedia!(job.chatId!, { ...outgoingMedia, caption: reply as string });
-      else if (manual) await session.sendText!(job.chatId!, reply as string);
+      else if (reminderQuote) await session.reply(reminderQuote, reply as string, sendOptions);
+      else if (manual) await session.sendText!(job.chatId!, reply as string, sendOptions);
       else await session.reply(message!, reply as string);
-      const completed = await this.repository.complete(job, 'SENT');
+      const completed = await this.repository.complete(job, 'SENT', null, reminderMessageId);
       if (completed) this.sentCallbacks.get(job.id)?.run();
       this.sentCallbacks.delete(job.id);
       report(completed ? 'sent' : 'error');
@@ -874,6 +963,12 @@ export class DurableMessages {
         /* Durable lease recovery owns work whose final write could not complete. */
       }
       report('error');
+    } finally {
+      try {
+        stopTyping?.();
+      } catch {
+        /* A presence error must not alter the queue result. */
+      }
     }
   }
 }

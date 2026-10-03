@@ -18,6 +18,7 @@ const result = (text: string) => ({ text, inputTokens: 0, outputTokens: 0 });
 
 async function scenario(withPersonal: boolean, repeatExhausted = false) {
   let dispatched = 0;
+  let activity = 0;
   const reader: BoundContextReader = {
     employeeId: actor.employeeId,
     async discover() {
@@ -147,6 +148,9 @@ async function scenario(withPersonal: boolean, repeatExhausted = false) {
   const response = await buildSalesGraph(model, async () => ({ status: 'available', run }), {
     personal,
     now: () => now,
+    onToolActivity: () => {
+      activity++;
+    },
   }).invoke(
     { input: 'Review warehouse records.', history: [], audience: 'dm' },
     { recursionLimit: 76 },
@@ -155,6 +159,7 @@ async function scenario(withPersonal: boolean, repeatExhausted = false) {
   assert.equal(response.unavailable, false);
   assert.equal(response.business?.delivery.checks.length, 24);
   assert.equal(dispatched, 24);
+  assert.equal(activity, dispatched + 1, 'Planning signals once; exhausted proposals stay silent');
   return { outputs, continuations };
 }
 

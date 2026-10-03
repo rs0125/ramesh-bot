@@ -1,4 +1,4 @@
-/** Fake transport only; normal delivery must never become a read/played receipt. */
+/** Fake transport only; reading is explicit and must never claim audio was played. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DeliveryReceipts } from '../../src/infrastructure/whatsapp/delivery-receipts.js';
@@ -69,4 +69,35 @@ test('failed writes are observed and release capacity', async () => {
   receipts.acknowledge(message('two'));
   await receipts.close();
   assert.equal(failures, 2);
+});
+
+test('explicit read receipts preserve DM/LID and group participant keys without playing audio', async () => {
+  const calls: unknown[] = [];
+  const receipts = new DeliveryReceipts(
+    async (...args) => void calls.push(args),
+    () => {},
+  );
+  receipts.markRead(message('group'));
+  receipts.markRead({ key: { remoteJid: '222@lid', id: 'voice' } });
+  receipts.markRead({ key: { ...message('self').key, fromMe: true } });
+  receipts.markRead({ key: { remoteJid: '222@lid' } });
+  await receipts.close();
+  receipts.markRead(message('closed'));
+  assert.deepEqual(calls, [
+    ['100@g.us', '222@lid', ['group'], 'read'],
+    ['222@lid', undefined, ['voice'], 'read'],
+  ]);
+});
+
+test('failed feedback logging cannot break admission or shutdown', async () => {
+  const receipts = new DeliveryReceipts(
+    async () => {
+      throw new Error('offline');
+    },
+    () => {
+      throw new Error('logger unavailable');
+    },
+  );
+  receipts.markRead(message('one'));
+  await receipts.close();
 });

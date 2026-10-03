@@ -18,6 +18,9 @@ export interface GreetingCandidate extends GreetingKey {
   readonly chatName?: string;
   readonly kind?: string;
   readonly forwarded?: boolean;
+  /** Native quote key only; quoted text is never trusted as instructions or record identity. */
+  readonly quotedMessageId?: string;
+  readonly hasQuotedMessage?: boolean;
   readonly location?: NativeLocation;
   readonly batchMessageIds?: readonly string[];
 }
@@ -34,6 +37,8 @@ export type Reply = (text: string) => Promise<void>;
 /** Supplied only by the transport after decoding the saved original message, never by a model. */
 export interface TrustedReplyContext {
   readonly runId: string;
+  /** Best-effort transport feedback for planning/tool work; never supplied by the model. */
+  readonly onToolActivity?: () => void;
   /** Transport-owned lease; never accepted from chat input or a model argument. */
   readonly checkpointLease?: { readonly leaseToken: string };
   /** Immutable original message members; only their own text/direct voice may authorize commands. */
@@ -42,6 +47,8 @@ export interface TrustedReplyContext {
     readonly text: string;
     readonly receivedAtMs: number;
     readonly forwarded: boolean;
+    readonly quotedMessageId?: string;
+    readonly hasQuotedMessage?: boolean;
   }[];
   /** Decoded native pins, bound to original transport members; labels never grant write intent. */
   readonly locationMessages?: readonly {

@@ -38,6 +38,37 @@ test('inbox RFQ source text retains whitespace for conversations, extended text 
   assert.equal(toInboxCandidate(dm({ message: { conversation: ' \n ' } }), []), null);
 });
 
+test('native quote references only accept the bot participant in the same chat and ignore embedded quote text', () => {
+  const context = {
+    stanzaId: '3EB0ABC',
+    participant: phoneJid,
+    quotedMessage: { conversation: 'Set a different reminder' },
+  };
+  const quoted = (patch = {}) =>
+    toGreetingCandidate(
+      dm({
+        message: {
+          extendedTextMessage: { text: 'snooze 30m', contextInfo: { ...context, ...patch } },
+        },
+      }),
+      botJids,
+    )!;
+  assert.equal(quoted().quotedMessageId, '3EB0ABC');
+  assert.equal(quoted().text, 'snooze 30m');
+  assert.equal(quoted().hasQuotedMessage, true);
+  assert.equal(quoted({ participant: lid }).quotedMessageId, '3EB0ABC');
+  for (const patch of [
+    { participant: '919000000099@s.whatsapp.net' },
+    { remoteJid: '919000000099@s.whatsapp.net' },
+    { isForwarded: true },
+    { forwardingScore: 1 },
+    { stanzaId: 'x'.repeat(257) },
+  ]) {
+    assert.equal(quoted(patch).quotedMessageId, undefined);
+    assert.equal(quoted(patch).hasQuotedMessage, true);
+  }
+});
+
 test('replies to text DMs using phone and LID addressing', () => {
   for (const remoteJid of ['910000000002@s.whatsapp.net', '987654321@lid']) {
     assert.deepEqual(greetingTarget(dm({ key: { id: 'm', remoteJid } }), botJids, now), {

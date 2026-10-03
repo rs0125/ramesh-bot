@@ -991,6 +991,7 @@ test('a direct clarification recalls earlier owned text while current source con
       kind: 'reminder_create',
       text: 'call the owner',
       schedule: { dueAt: '2026-10-03T04:40:00.000Z', timezone: 'Asia/Kolkata' },
+      sourceMessageId: 'current-message',
     },
   ]);
   const forged = (await h.service.open(later, signal()))!;

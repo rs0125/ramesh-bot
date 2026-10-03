@@ -5,7 +5,7 @@ import type { EmployeeIdentity } from '../identity/employee-identity.js';
 import type { DueReminder, PersonalActor, ReminderDeliveryRef } from './scheduling.types.js';
 import type { MessageQueueRepository } from '../../infrastructure/database/message-queue.repository.js';
 import { authCipher } from '../../infrastructure/database/auth-store.js';
-import { encodeReply } from '../messaging/reply-payload.js';
+import { encodeReminderReply } from '../messaging/reply-payload.js';
 import { cancellable } from '../../lib/cancellable.js';
 
 export interface ReminderSchedulerRepository {
@@ -273,7 +273,7 @@ export class PersonalSchedulerService {
         minute: '2-digit',
         hour12: true,
       }).format(new Date(due.dueAt));
-      const text = `Reminder: ${due.text}\nScheduled for ${date} IST.`;
+      const text = `⏰ Reminder: ${due.text}\nScheduled for ${date} IST.`;
       const result = await this.repository.enqueueDue(
         due,
         {
@@ -295,7 +295,7 @@ export class PersonalSchedulerService {
               chatName: null,
               kind: 'text',
             }),
-            this.cipher.seal('outbound-reply', id, encodeReply(text, true)),
+            this.cipher.seal('outbound-reply', id, encodeReminderReply(text, due.sourceQuote)),
             this.cipher.seal('business-delivery', id, { kind: 'reminder', version: 1, ...ref }),
             this.options.capacity,
             ref,

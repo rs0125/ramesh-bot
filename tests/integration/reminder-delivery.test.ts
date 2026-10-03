@@ -2,6 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
+import type { WAMessage } from '@whiskeysockets/baileys';
+import type { ReminderSourceQuote } from '../../src/contracts/reminder-quote.js';
 import {
   MessageQueueRepository,
   type MessageJob,
@@ -10,6 +12,8 @@ import { PersonalRepository } from '../../src/infrastructure/database/personal.r
 import { PersonalSchedulerService } from '../../src/modules/scheduling/scheduler.service.js';
 import { authCipher } from '../../src/infrastructure/database/auth-store.js';
 import { InboxRepository } from '../../src/infrastructure/database/inbox.repository.js';
+import { DurableMessages } from '../../src/infrastructure/whatsapp/durable-messages.js';
+import { encodeReply } from '../../src/modules/messaging/reply-payload.js';
 import { postgresTestsEnabled, temporaryMessageDatabase } from '../fixtures/message-database.js';
 
 const employee = {
@@ -106,6 +110,133 @@ test(
       assert.equal(await queue.complete(job, 'SENT'), true);
     };
     try {
+      await t.test(
+        'durable sender quotes the original command; legacy jobs send unquoted with alarm prefix',
+        async () => {
+          for (const kind of ['text', 'audio', 'legacy'] as const) {
+            const f = await fixture(`reminder-native-quote-${kind}`);
+            const source: ReminderSourceQuote | undefined =
+              kind === 'legacy'
+                ? undefined
+                : {
+                    chatId: chat,
+                    messageId: `ORIGINAL-${kind}`,
+                    ...(kind === 'text'
+                      ? { kind, text: '  Remind me tomorrow at 9 to review this.\n' }
+                      : { kind }),
+                  };
+            if (source)
+              await db.admin.query(
+                `UPDATE public."ramesh-reminders" SET source_quote_encrypted=$2 WHERE id=$1`,
+                [f.reminderId, cipher.seal('personal-reminder-source:23', f.reminderId, source)],
+              );
+            await f.scheduler.tick();
+            if (kind === 'legacy') {
+              const row = (
+                await db.admin.query(
+                  `SELECT id FROM public."ramesh-messages" WHERE account_id=$1`,
+                  [f.account],
+                )
+              ).rows[0];
+              await db.admin.query(
+                `UPDATE public."ramesh-outbound-queue" SET payload_encrypted=$2 WHERE message_id=$1`,
+                [
+                  row.id,
+                  cipher.seal(
+                    'outbound-reply',
+                    row.id,
+                    encodeReply('Reminder: Existing queued reminder', true),
+                  ),
+                ],
+              );
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 3000);
+            const sends: Array<{
+              text: string;
+              quoted?: WAMessage;
+              chat?: string;
+              messageId?: string;
+            }> = [];
+            let completed: string | undefined;
+            const repository = new Proxy(f.queue, {
+              get(target, property) {
+                if (property === 'complete')
+                  return async (...args: Parameters<MessageQueueRepository['complete']>) => {
+                    const result = await target.complete(...args);
+                    completed = args[1];
+                    controller.abort();
+                    return result;
+                  };
+                const member = Reflect.get(target, property);
+                return typeof member === 'function' ? member.bind(target) : member;
+              },
+            });
+            const consumer = new DurableMessages(repository, {
+              encryptionKey: key,
+              accountId: f.account,
+              maxAgeMs: 300000,
+              capacity: 100,
+              leaseMs: 30000,
+              pollMs: 5,
+              waitBeforeReply: async () => true,
+              prepareReply: async () => {
+                throw new Error('No graph calls at reminder delivery');
+              },
+              reminderEmployee: async () => employee,
+            });
+            try {
+              await consumer.consume(
+                {
+                  botJids: [],
+                  on: () => () => {},
+                  async close() {},
+                  async saveCredentials() {},
+                  async reply(quoted, text, options) {
+                    sends.push({ quoted, text, messageId: options?.messageId });
+                  },
+                  async sendText(destination, text, options) {
+                    sends.push({ chat: destination, text, messageId: options?.messageId });
+                  },
+                },
+                controller.signal,
+                () => {},
+              );
+            } finally {
+              clearTimeout(timer);
+            }
+            assert.equal(completed, 'SENT');
+            assert.equal(sends.length, 1);
+            assert.match(sends[0]!.text, /^⏰ /);
+            assert.match(sends[0]!.messageId!, /^3EB0[A-F0-9]{36}$/);
+            const occurrence = (
+              await db.admin.query(
+                `SELECT state,whatsapp_message_id FROM public."ramesh-reminder-occurrences" WHERE account_id=$1 AND reminder_id=$2`,
+                [f.account, f.reminderId],
+              )
+            ).rows[0];
+            assert.equal(occurrence.state, 'sent');
+            assert.equal(occurrence.whatsapp_message_id, sends[0]!.messageId);
+            if (source) {
+              assert.deepEqual(sends[0]!.quoted?.key, {
+                remoteJid: chat,
+                id: source.messageId,
+                fromMe: false,
+              });
+              assert.deepEqual(
+                sends[0]!.quoted?.message,
+                source.kind === 'text'
+                  ? { conversation: source.text }
+                  : { audioMessage: { ptt: true } },
+              );
+            } else {
+              assert.equal(sends[0]!.quoted, undefined);
+              assert.equal(sends[0]!.chat, chat);
+              assert.equal(sends[0]!.text, '⏰ Reminder: Existing queued reminder');
+            }
+          }
+        },
+      );
       await t.test(
         'due admission commits private job and occurrence together; final state survives cleanup',
         async () => {

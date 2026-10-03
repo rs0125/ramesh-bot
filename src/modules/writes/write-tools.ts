@@ -2,6 +2,7 @@
 import { z } from 'zod';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import type { ToolSessionRequest } from '../assistant/assistant.types.js';
+import { notifyToolActivity } from '../assistant/tool-activity.js';
 import type {
   BoundContextWriter,
   ContextToolDefinition,
@@ -450,13 +451,15 @@ export class BusinessWriteService {
               message:
                 'No new Gmail creation was dispatched after approval expiry. Earlier uncertain attempts remain unresolved.',
             };
-          else
+          else {
+            notifyToolActivity(trusted.onToolActivity);
             result = await current.writer.call(
               operation.payload.toolName,
               operation.payload.arguments,
               operation.operationId,
               signal,
             );
+          }
         }
       } catch {
         result = {

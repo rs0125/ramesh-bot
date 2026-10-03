@@ -44,13 +44,16 @@ async function scenario(options: {
   listOrder?: 'before' | 'after';
 }) {
   const requestText = `Remind me in 20 minutes to ${reminderText}.${options.workflow === 'general' ? ' Also tell me what to check first.' : ''}${options.listOrder ? ' Also show my reminders.' : ''}`;
+  const events: string[] = [];
   const trusted: TrustedReplyContext = {
     runId: randomUUID(),
     key: { remoteJid: actor.chatId },
     checkpointLease: { leaseToken: randomUUID() },
     commandMessages: [{ id: 'source', text: requestText, receivedAtMs: now, forwarded: false }],
+    onToolActivity: () => {
+      events.push('tool_activity');
+    },
   };
-  const events: string[] = [];
   const requests: ModelRequest[] = [];
   const sessions: ToolSessionRequest[] = [];
   const applied: PersonalOperation[][] = [];
@@ -298,6 +301,8 @@ async function scenario(options: {
 test('personal workflow saves the requested IST reminder using only router, worker and verifier inference', async () => {
   const h = await scenario({ workflow: 'personal', business: true });
   assert.equal(h.reply.trace.outcome, 'completed');
+  assert.equal(h.events.filter((event) => event === 'tool_activity').length, 2);
+  assert.ok(h.events.indexOf('tool_activity') < h.events.indexOf('worker'));
   assert.deepEqual(
     h.events.filter((event) =>
       ['converser', 'planner', 'worker', 'formatter', 'verifier'].includes(event),
