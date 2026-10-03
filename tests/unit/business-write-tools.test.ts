@@ -333,6 +333,178 @@ function harness(resultData?: Record<string, unknown>) {
   };
 }
 
+const rfqCreate = tool(
+  'create_crm_rfq',
+  'create',
+  { raw_text: { type: 'string', minLength: 1, maxLength: 3000 } },
+  { requiredScopes: ['crm.rfq:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
+);
+test('an RFQ validation failure offers correction without redisclosing stored business details', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(
+    h.trusted('Save this RFQ: a large warehouse in Hoskote'),
+    signal(),
+  ))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  await run.finalize(signal());
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'CRM_RFQ_INCOMPLETE',
+    message: 'Private upstream details',
+  });
+  const result = await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.equal(h.operations.values().next().value!.state, 'APPROVED');
+  assert.match(result!.text, /not sent/);
+  assert.match(result!.text, /CRM_RFQ_INCOMPLETE/);
+  assert.match(result!.text, /cancel ABCDEF12/);
+  assert.match(result!.text, /corrected proposal/);
+  assert.doesNotMatch(result!.text, /Private upstream|large warehouse|Hoskote/);
+  assert.equal(h.calls.length, 1);
+  const cancelled = await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  assert.match(cancelled!.text, /cancelled/i);
+  assert.equal(h.calls.length, 1);
+});
+test('an RFQ with an earlier uncertain attempt never suggests cancellation or replacement after a rejected retry', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(h.trusted('Save an RFQ for 5000 sqft in Hoskote'), signal()))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  await run.finalize(signal());
+  h.useUnknown(true);
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'FORBIDDEN',
+    message: 'Private upstream details',
+  });
+  const result = await h.service.recover(h.trusted('retry ABCDEF12'), signal());
+  assert.equal(h.operations.values().next().value!.state, 'UNKNOWN');
+  assert.match(result!.text, /same approved operation/);
+  assert.match(result!.text, /administrator to reconcile/);
+  assert.doesNotMatch(result!.text, /cancel ABCDEF12|corrected proposal|not sent|Private upstream/);
+  assert.deepEqual(h.calls[1], h.calls[0]);
+  await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
+  assert.equal(h.operations.values().next().value!.state, 'UNKNOWN');
+});
+test('RFQ proposals preserve original source text and keep the normal confirmation boundary', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const raw = '  #twenty\nNeed 5000 sqft in Hoskote.\n';
+  const request = h.trusted(raw);
+  const run = (await h.service.open(request, signal()))!;
+  const schema = run.tools.find((t) => t.name === rfqCreate.name)!.inputSchema;
+  assert.equal('raw_text' in (schema.properties as object), false);
+  assert.equal((schema.required as string[]).includes('raw_text'), false);
+  const mismatch = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({ raw_text: raw.trim() }),
+    signal(),
+  );
+  assert.equal((mismatch as { code: string }).code, 'WRITE_ARGUMENTS_INVALID');
+  assert.equal(h.proposals.length, 0);
+  const accepted = await run.execute(rfqCreate.name, '{}', signal());
+  assert.equal((accepted as { ok: boolean }).ok, true);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, raw);
+  const reply = (await run.finalize(signal()))!;
+  assert.match(reply.text, /confirm ABCDEF12/);
+  await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, raw);
+});
+test('RFQ text can select earlier/forwarded sources without treating them as authorization', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const forwarded = h.trusted('#twenty\nNeed 5000 sqft in Hoskote.', { forwarded: true });
+  const extra = h.trusted('Budget 20/sqft.');
+  assert.equal(await h.service.open(forwarded, signal()), undefined);
+  const run = (await h.service.open(h.trusted('Create an RFQ from those messages.'), signal()))!;
+  const first = forwarded.commandMessages![0]!;
+  const second = extra.commandMessages![0]!;
+  const result = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({
+      _source_message_ids: [first.id, second.id],
+    }),
+    signal(),
+  );
+  assert.equal((result as { ok: boolean }).ok, true);
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, `${first.text}\n\n${second.text}`);
+  const history = (await run.execute('write_history', '{}', signal())) as { operations: unknown[] };
+  assert.deepEqual(history.operations, []);
+  assert.equal(h.calls.length, 0);
+  const altered = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({ raw_text: 'Summarized RFQ', _source_message_ids: [first.id] }),
+    signal(),
+  );
+  assert.equal((altered as { code: string }).code, 'WRITE_ARGUMENTS_INVALID');
+  assert.equal(await run.finalize(signal()), undefined);
+});
+test('RFQ text follows selected source order, not repository return order', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const first = h.trusted('  5000 sqft in Hoskote\n').commandMessages![0]!;
+  const second = h.trusted('Budget 20 per sqft\n').commandMessages![0]!;
+  const run = (await h.service.open(h.trusted('Save those as an RFQ'), signal()))!;
+  const readSources = h.repository.readSources.bind(h.repository);
+  h.repository.readSources = async (ctx, ids) => (await readSources(ctx, ids)).reverse();
+  assert.equal(
+    (
+      (await run.execute(
+        rfqCreate.name,
+        JSON.stringify({ _source_message_ids: [first.id, second.id] }),
+        signal(),
+      )) as { ok: boolean }
+    ).ok,
+    true,
+  );
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, `${first.text}\n\n${second.text}`);
+});
+for (const [label, text] of [
+  ['oversized', 'x'.repeat(3001)],
+  ['empty', ' \n '],
+  ['NUL', 'RFQ\u0000text'],
+]) {
+  test(`RFQ binding rejects ${label} source text before storing a proposal`, async () => {
+    const h = harness();
+    const definition = structuredClone(rfqCreate);
+    (definition.inputSchema.properties as Record<string, unknown>).raw_text = {
+      type: 'string',
+      minLength: 1,
+      maxLength: 3000,
+      pattern: '^[^\\u0000]+$',
+    };
+    h.changeDefinitions([definition]);
+    const source = h.trusted(text!).commandMessages![0]!;
+    const run = (await h.service.open(h.trusted('Save this RFQ'), signal()))!;
+    const result = await run.execute(
+      rfqCreate.name,
+      JSON.stringify({ _source_message_ids: [source.id] }),
+      signal(),
+    );
+    assert.equal(
+      (result as { code: string }).code,
+      label === 'empty' ? 'WRITE_SOURCE_UNAVAILABLE' : 'WRITE_SOURCE_TEXT_INVALID',
+    );
+    assert.equal(h.proposals.length, 0);
+    assert.equal(h.calls.length, 0);
+  });
+}
+test('RFQ source selection cannot invent or import inaccessible messages', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(h.trusted('Save the RFQ'), signal()))!;
+  const result = await run.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_message_ids: ['inaccessible-message'] }),
+    signal(),
+  );
+  assert.equal((result as { code: string }).code, 'WRITE_SOURCE_UNAVAILABLE');
+  assert.equal(h.proposals.length, 0);
+});
+
 test('staging, reviewed publication and delivery checks never call the remote write port', async () => {
   const h = harness();
   const { request, run, reply, operation } = await h.proposed();

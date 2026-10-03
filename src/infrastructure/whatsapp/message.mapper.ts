@@ -89,7 +89,9 @@ function mapMessage(
     isGroup,
     sentAtMs: Number(message.messageTimestamp ?? 0) * 1000,
     mentionsBot: mentions.some((jid) => identities.has(jidNormalizedUser(jid))),
-    text: text.trim(),
+    // Inbox text is source evidence for writes such as CRM RFQs. Retain the
+    // original bytes/whitespace; the greeting-only adapter keeps normalization.
+    text: includeMedia ? text : text.trim(),
     kind,
     forwarded,
     ...(location ? { location } : {}),

@@ -34,6 +34,11 @@ const contractSchema = z
     effect: z.enum(['create', 'update', 'delete', 'compensate']),
     // Explicit tool policy permitting employee-owned journal redisclosure. Omission grants none.
     auditHistory: z.literal('actor_scoped').optional(),
+    // Application-supplied complete source text; hidden from model arguments.
+    sourceTextArgument: z
+      .string()
+      .regex(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/)
+      .optional(),
     compensates: z.string().regex(TOOL_NAME).optional(),
     originalOperationArgument: z
       .string()
@@ -120,6 +125,14 @@ export function contextWriteDescriptor(tool: ContextToolDefinition): boolean {
     return false;
   const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
   if ('_source_message_ids' in properties) return false;
+  if (
+    contract.sourceTextArgument &&
+    (contract.sourceTextArgument === contract.idempotencyArgument ||
+      properties[contract.sourceTextArgument]?.type !== 'string' ||
+      !Array.isArray(tool.inputSchema.required) ||
+      !tool.inputSchema.required.includes(contract.sourceTextArgument))
+  )
+    return false;
   const coordinates = contract.coordinateArguments;
   if (
     coordinates &&
