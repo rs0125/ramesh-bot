@@ -1645,3 +1645,86 @@ test('a destructive update without direct policy retains separate confirmation',
   assert.equal(h.counts().publishCount, 1);
   assert.match(reply.text, /confirm ABCDEF12/);
 });
+
+test('direct note receipts show verified CRM text once while recovery and generic history stay private', async () => {
+  const recordId = randomUUID();
+  const noteId = randomUUID();
+  const body = 'Verified CRM note text.\n\n  Keep the exact saved spacing.';
+  const definitions = ['create_crm_note', 'update_crm_note', 'undo_crm_note'].map((name) => {
+    const definition = directTool(
+      tool(
+        name,
+        name === 'create_crm_note' ? 'create' : 'update',
+        {
+          raw_text: { type: 'string', minLength: 1, maxLength: 3000 },
+          title: { type: 'string' },
+          body: { type: 'string' },
+        },
+        { requiredScopes: ['crm.note:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
+      ),
+    );
+    definition.annotations!.destructiveHint = name === 'undo_crm_note';
+    return definition;
+  });
+  for (const [name, outcome, undoKind, headline] of [
+    ['create_crm_note', 'created', undefined, 'Saved note on deal:'],
+    ['update_crm_note', 'updated', undefined, 'Updated note on deal:'],
+    ['undo_crm_note', 'rolled_back', 'creation', 'Removed this note from deal:'],
+    ['undo_crm_note', 'rolled_back', 'edit', 'Undid the note edit on deal:'],
+  ] as const) {
+    const h = harness();
+    h.changeDefinitions(definitions);
+    h.useResult({
+      outcome,
+      code: 'OK',
+      message: 'Do not display provider prose.',
+      data: {
+        id: noteId,
+        deal: {
+          id: recordId,
+          name: 'Verified CRM target deal',
+          url: `https://crm.wareongo.com/object/opportunity/${recordId}`,
+        },
+        note: { title: 'Verified CRM title', body },
+        undo_available: true,
+        ...(undoKind ? { undo_kind: undoKind } : {}),
+      },
+    });
+    const request = h.trusted('Make the requested note change on that deal.');
+    const run = (await h.service.open(request, signal()))!;
+    assert.equal(
+      (
+        (await run.execute(
+          name,
+          JSON.stringify({ title: 'Unverified model title', body: 'Unverified model body' }),
+          signal(),
+        )) as { ok: boolean }
+      ).ok,
+      true,
+    );
+    assert.equal(h.calls.length, 0);
+    const receipt = (await run.finalize(signal()))!;
+    assert.ok(receipt.text.startsWith(`${headline} Verified CRM target deal`));
+    assert.ok(receipt.text.includes(body));
+    assert.match(receipt.text, /Verified CRM title/);
+    assert.doesNotMatch(
+      receipt.text,
+      /Unverified model|provider prose|confirm ABCDEF12|audit trail/,
+    );
+    assert.equal(h.counts().publishCount, 0);
+    assert.equal(h.calls.length, 1);
+    assert.equal(await h.service.canDeliver(request.key, receipt.delivery, signal()), true);
+
+    const recovered = (await h.service.recover(request, signal()))!;
+    assert.match(recovered.text, /require current record authorization/);
+    assert.doesNotMatch(recovered.text, /Verified CRM|Keep the exact saved spacing/);
+    assert.equal(h.calls.length, 1);
+    const later = (await h.service.open(h.trusted('Show my write history.'), signal()))!;
+    const history = (await later.execute('write_history', '{}', signal())) as {
+      ok: boolean;
+      operations: unknown[];
+    };
+    assert.equal(history.ok, true);
+    assert.deepEqual(history.operations, []);
+  }
+});
