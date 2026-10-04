@@ -1,4 +1,4 @@
-/** Exact Gmail draft previews and receipts. The application owns the outgoing link. */
+/** Readable Gmail draft previews and receipts. The application owns the outgoing link. */
 import { z } from 'zod';
 import type { ContextToolDefinition } from '../context-engine/context.types.js';
 import { gmailWriteRecoverySchema, writeContract } from '../context-engine/write-contract.js';
@@ -34,20 +34,55 @@ const draftArguments = z
   })
   .strict();
 
-/** Match CE's normalization before arguments are frozen and the user reviews them. */
+const updateArguments = draftArguments.extend({
+  draft_ref: z.string().uuid(),
+  expected_message_id: z
+    .string()
+    .min(1)
+    .max(256)
+    .regex(/^[A-Za-z0-9_-]+$/),
+});
+
+function isMailDraft(operation: WriteOperation): boolean {
+  return (
+    ['create_email_draft', 'update_email_draft'].includes(operation.payload.toolName) &&
+    operation.payload.sourceFamily === 'mail' &&
+    operation.payload.idempotencyArgument === 'operation_id' &&
+    !operation.payload.parentOperationId
+  );
+}
+
+function mailArguments(operation: WriteOperation) {
+  return (
+    operation.payload.toolName === 'update_email_draft' ? updateArguments : draftArguments
+  ).safeParse(operation.payload.arguments);
+}
+
+function readableContent(args: z.infer<typeof draftArguments>): string {
+  return [
+    `To: ${args.to.length ? args.to.join(', ') : 'Not added'}`,
+    ...(args.cc.length ? [`CC: ${args.cc.join(', ')}`] : []),
+    `Subject: ${args.subject}`,
+    '',
+    args.body,
+  ].join('\n');
+}
+
+/** Match CE's normalization before arguments are frozen and reviewed. */
 export function normalizeMailDraftArguments(
   tool: ContextToolDefinition,
   args: Record<string, unknown>,
 ) {
   const contract = writeContract(tool);
   if (
-    tool.name !== 'create_email_draft' ||
+    !['create_email_draft', 'update_email_draft'].includes(tool.name) ||
     contract?.sourceFamily !== 'mail' ||
-    contract.effect !== 'create' ||
+    contract.effect !== (tool.name === 'update_email_draft' ? 'update' : 'create') ||
     contract.idempotencyArgument !== 'operation_id'
   )
     return args;
-  const parsed = draftArguments.omit({ operation_id: true }).safeParse(args);
+  const schema = tool.name === 'update_email_draft' ? updateArguments : draftArguments;
+  const parsed = schema.omit({ operation_id: true }).safeParse(args);
   return parsed.success ? { ...args, subject: parsed.data.subject } : args;
 }
 const draftReceipt = z
@@ -62,24 +97,16 @@ const draftReceipt = z
 
 /** Hide server bindings only for the complete known payload; future fields stay visible generically. */
 export function mailDraftProposalText(operation: WriteOperation): string | undefined {
-  if (
-    operation.payload.toolName !== 'create_email_draft' ||
-    operation.payload.sourceFamily !== 'mail' ||
-    operation.payload.idempotencyArgument !== 'operation_id' ||
-    operation.payload.parentOperationId ||
-    !['DRAFT', 'PROPOSED'].includes(operation.state)
-  )
-    return undefined;
-  const parsed = draftArguments.safeParse(operation.payload.arguments);
+  if (!isMailDraft(operation) || !['DRAFT', 'PROPOSED'].includes(operation.state)) return undefined;
+  const parsed = mailArguments(operation);
   if (!parsed.success || parsed.data.operation_id !== operation.operationId) return undefined;
-  const { to, cc, subject, body } = parsed.data;
   return [
-    '*Review this email draft*',
-    'Save a draft in your connected work Gmail; this does not send email.',
-    `To: ${JSON.stringify(to)}`,
-    `CC: ${JSON.stringify(cc)}`,
-    `Subject: ${JSON.stringify(subject)}`,
-    `Body: ${JSON.stringify(body)}`,
+    operation.payload.toolName === 'update_email_draft'
+      ? '*Review the draft changes*'
+      : '*Review this email draft*',
+    'This saves to Gmail Drafts for you to review and send.',
+    '',
+    readableContent(parsed.data),
   ].join('\n');
 }
 
@@ -89,12 +116,15 @@ export function mailDraftRecoveryText(
   now = Date.now(),
 ): string | undefined {
   if (
-    operation.payload.toolName !== 'create_email_draft' ||
-    operation.payload.sourceFamily !== 'mail' ||
-    operation.payload.idempotencyArgument !== 'operation_id' ||
-    operation.payload.parentOperationId ||
-    !['APPROVED', 'UNKNOWN', 'DISPATCHING'].includes(operation.state) ||
-    !/^[A-F0-9]{8}$/.test(operation.confirmationCode) ||
+    !isMailDraft(operation) ||
+    ![
+      'APPROVED',
+      'UNKNOWN',
+      'DISPATCHING',
+      ...(operation.payload.executionMode === 'direct_request' ? ['REJECTED'] : []),
+    ].includes(operation.state) ||
+    (operation.payload.executionMode !== 'direct_request' &&
+      !/^[A-F0-9]{8}$/.test(operation.confirmationCode)) ||
     (operation.result && operation.result.operation_id !== operation.operationId)
   )
     return undefined;
@@ -108,6 +138,68 @@ export function mailDraftRecoveryText(
       dateStyle: 'medium',
       timeStyle: 'medium',
     }).format(new Date(time)) + ' (IST)';
+  if (operation.payload.executionMode === 'direct_request') {
+    const updating = operation.payload.toolName === 'update_email_draft';
+    const saved = updating ? 'these changes were saved' : 'this draft was saved';
+    const unchanged = updating ? "I haven't changed the draft." : "I haven't saved the draft.";
+    const repair = !recovery.success
+      ? ''
+      : recovery.data.action === 'finish_gmail_disconnect'
+        ? ' Finish disconnecting Gmail on the connection page, then reconnect the same Google account.'
+        : recovery.data.action === 'check_gmail_connection'
+          ? ' Ask me to check your Gmail connection.'
+          : ' Reconnect the same Google account through the Gmail connection page.';
+    if (
+      operation.hasUncertainAttempt ||
+      operation.state === 'UNKNOWN' ||
+      operation.state === 'DISPATCHING' ||
+      operation.result?.outcome === 'outcome_unknown'
+    ) {
+      const expiresAt = Date.parse(operation.expiresAt);
+      const canRetry = expiresAt > now && (retryAt === undefined || retryAt < expiresAt);
+      const wait =
+        retryAt !== undefined && retryAt > now
+          ? ` Wait until ${when(retryAt)} before asking me to check again.`
+          : '';
+      return `I couldn't confirm whether ${saved}.${repair}${wait} Check Gmail Drafts before trying again. I won't create a replacement while the result is uncertain.${canRetry ? ' You can say “try that draft again” to check the same attempt.' : ' This request can no longer be retried automatically.'}`;
+    }
+    if (
+      !(
+        (operation.state === 'APPROVED' && operation.result?.outcome === 'not_dispatched') ||
+        (operation.state === 'REJECTED' && operation.result?.outcome === 'rejected')
+      )
+    )
+      return undefined;
+    switch (operation.result.code) {
+      case 'GMAIL_APPROVAL_EXPIRED':
+        return `This request expired before it could be saved. ${unchanged} Ask me to prepare it again as a new request.`;
+      case 'GMAIL_CONNECTION_CHANGED':
+        return `Your Gmail connection changed. ${unchanged} Say “cancel that draft attempt”, then ask me to prepare it again with the current connection.`;
+      case 'GMAIL_CONNECT_REQUIRED':
+      case 'GMAIL_RECONNECT_REQUIRED':
+      case 'GMAIL_AUTH_REQUIRED':
+      case 'GMAIL_SCOPE_REQUIRED':
+        return `${unchanged} Connect your work Gmail with draft access. Then say “cancel that draft attempt” and ask me to prepare it again. I can get you the connection link.`;
+      case 'GMAIL_REVOCATION_PENDING':
+        return `${unchanged} Finish disconnecting Gmail on the connection page and reconnect. Then say “cancel that draft attempt” and ask me to prepare it again.`;
+      case 'GMAIL_RATE_LIMITED':
+      case 'GMAIL_RETRY_LATER':
+        return `Gmail is temporarily limiting requests. ${unchanged} ${retryAt !== undefined && retryAt > now ? `Say “try that draft again” after ${when(retryAt)}.` : 'Give it a little time, then say “try that draft again”.'}`;
+      case 'GMAIL_UNAVAILABLE':
+      case 'GMAIL_OAUTH_UNAVAILABLE':
+        return `Gmail is temporarily unavailable. ${unchanged} Say “try that draft again” once it is back.`;
+      case 'GMAIL_DRAFT_UPDATE_PENDING':
+        return 'An earlier edit to that draft is still unresolved. Say “try that draft again” to check that attempt before making another edit.';
+      case 'GMAIL_DRAFT_CHANGED':
+      case 'GMAIL_DRAFT_VERSION_CHANGED':
+        return "The draft changed in Gmail. I haven't overwritten it. I'll need to read the latest version before applying your edit.";
+      case 'GMAIL_DRAFT_UNAVAILABLE':
+      case 'GMAIL_DRAFT_NOT_EDITABLE':
+        return "I couldn't edit that draft. It may have been sent, deleted or changed outside Ramesh. Check Gmail Drafts; I haven't created a replacement.";
+      default:
+        return undefined;
+    }
+  }
   // An earlier ambiguous attempt takes precedence over any later definite failure.
   if (
     operation.hasUncertainAttempt ||
@@ -163,30 +255,44 @@ export function mailDraftRecoveryText(
   }
 }
 
-/** Only fresh, successful create receipts enter here; historical redisclosure stays separately gated. */
+/** Fresh authenticated receipts may display the exact saved payload; history has its own access gate. */
 export function mailDraftResultText(operation: WriteOperation): string | undefined {
+  const updating = operation.payload.toolName === 'update_email_draft';
   if (
-    operation.payload.toolName !== 'create_email_draft' ||
-    operation.payload.sourceFamily !== 'mail' ||
+    !isMailDraft(operation) ||
     operation.state !== 'SUCCEEDED' ||
-    operation.payload.parentOperationId ||
     operation.result?.operation_id !== operation.operationId ||
-    !['created', 'replayed'].includes(operation.result.outcome)
+    ![updating ? 'updated' : 'created', 'replayed'].includes(operation.result.outcome)
   )
     return undefined;
   const parsed = draftReceipt.safeParse(operation.result.data);
-  if (!parsed.success)
+  if (
+    !parsed.success ||
+    (updating && parsed.data.draft_ref !== operation.payload.arguments.draft_ref)
+  )
     return 'The operation completed, but I could not verify its draft details. Read the draft again before using it.';
   const { mailbox, subject } = parsed.data;
   const replayed = operation.result.outcome === 'replayed';
-  return [
-    replayed
-      ? 'This email draft was previously saved. This action did not send it.'
-      : 'Email draft saved. This action did not send it.',
-    `Mailbox: ${mailbox}`,
-    `Subject: ${JSON.stringify(subject)}`,
-    'Open Gmail Drafts: https://mail.google.com/mail/#drafts',
-    `Choose ${mailbox} in Gmail. This opens the Drafts folder, not a specific draft.`,
-    ...(replayed ? ['The saved receipt does not check its current Gmail status.'] : []),
+  const args = mailArguments(operation);
+  // A replay proves the earlier save, not the current body after possible Gmail edits.
+  const content =
+    !replayed &&
+    args.success &&
+    args.data.operation_id === operation.operationId &&
+    args.data.subject === subject
+      ? readableContent(args.data)
+      : `Subject: ${subject}`;
+  const lead = replayed
+    ? `This ${updating ? 'draft edit' : 'draft'} was already saved in ${mailbox}.`
+    : `${updating ? 'Draft updated' : 'Draft saved'} in ${mailbox}.`;
+  const footer = [
+    'Open it in Gmail to review and send when ready:',
+    'https://mail.google.com/mail/#drafts',
+    ...(replayed ? ["I haven't checked for later changes in Gmail."] : []),
   ].join('\n');
+  const complete = [lead, content, footer].join('\n\n');
+  // Show the full short email, or metadata and the link. Never truncate the saved body.
+  return complete.length <= 4800
+    ? complete
+    : [lead, `Subject: ${subject}`, 'The full draft is in Gmail.', footer].join('\n\n');
 }

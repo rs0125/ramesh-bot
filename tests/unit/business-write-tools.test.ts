@@ -4,7 +4,12 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { BusinessWriteService } from '../../src/modules/writes/write-tools.js';
 import {
+  writeContract,
+  contextWriteDescriptor,
+} from '../../src/modules/context-engine/write-contract.js';
+import {
   WriteStorageError,
+  directRecoveryAction,
   type WriteActor,
   type WriteCommandContext,
   type WriteOperation,
@@ -54,8 +59,7 @@ function tool(
     },
     annotations: {
       readOnlyHint: false,
-      // These legacy confirmation tests use a protected descriptor. Direct-request cases below opt in.
-      destructiveHint: true,
+      destructiveHint: effect === 'compensate',
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -113,6 +117,7 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
   const sources = new Map<string, WriteSourceMessage>();
   const calls: Array<{ tool: string; args: Record<string, unknown>; operationId: string }> = [];
   const proposals: WriteOperation[] = [];
+  const recoveryRuns = new Map<string, string>();
   let definitions = [create, rollback, crm].map((t) => structuredClone(t));
   let currentActor = { ...actor };
   let resultOverride: Omit<ContextWriteResult, 'operation_id'> | undefined;
@@ -181,20 +186,41 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
       return structuredClone(op);
     },
     async findByRun(ctx) {
-      return [...operations.values()].find((op) => op.proposalRunId === ctx.runId) ?? null;
+      return (
+        [...operations.values()].find(
+          (op) => op.proposalRunId === ctx.runId || op.operationId === recoveryRuns.get(ctx.runId),
+        ) ?? null
+      );
     },
     async publish(_ctx, id) {
       publishCount++;
       return transition(id, 'PROPOSED');
     },
-    async approveDirect(ctx, id) {
-      const operation = operations.get(id)!;
-      assert.equal(ctx.runId, operation.proposalRunId);
-      assert.equal(operation.payload.executionMode, 'direct_request');
+    async approveDirect(ctx, id, version) {
+      const op = operations.get(id)!;
+      assert.equal(op.state, 'DRAFT');
+      assert.equal(op.version, version);
+      assert.equal(op.proposalRunId, ctx.runId);
+      assert.equal(op.sourceMessageId, ctx.sourceMessageId);
+      assert.equal(op.payload.executionMode, 'direct_request');
+      if (Date.parse(op.expiresAt) <= now) return transition(id, 'EXPIRED');
       approveCount++;
-      operation.approvalRunId = ctx.runId;
-      operation.approvalSourceMessageId = ctx.sourceMessageId;
+      op.approvalRunId = ctx.runId;
+      op.approvalSourceMessageId = ctx.sourceMessageId;
       return transition(id, 'APPROVED');
+    },
+    async findDirectRecovery(ctx) {
+      assert.ok(directRecoveryAction((await repository.authorizeSource(ctx)).text));
+      const pending = [...operations.values()].filter((op) =>
+        ['APPROVED', 'DISPATCHING', 'UNKNOWN'].includes(op.state),
+      );
+      if (pending.length > 1) throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
+      const op = pending[0];
+      return op?.payload.executionMode === 'direct_request' &&
+        op.payload.sourceFamily === 'mail' &&
+        op.approvalRunId
+        ? structuredClone(op)
+        : null;
     },
     async findByCode(a, code) {
       const op = [...operations.values()].find((op) => op.confirmationCode === code);
@@ -207,7 +233,13 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
       operations.get(id)!.approvalRunId = ctx.runId;
       return op;
     },
-    async claim(_ctx, id) {
+    async claim(ctx, id) {
+      const op = operations.get(id)!;
+      recoveryRuns.set(ctx.runId, id);
+      if (op.payload.executionMode === 'direct_request' && Date.parse(op.expiresAt) <= now) {
+        if (op.state === 'APPROVED' && !op.hasUncertainAttempt) transition(id, 'EXPIRED');
+        return null;
+      }
       return { operation: transition(id, 'DISPATCHING'), dispatchToken: randomUUID() };
     },
     async finish(_ctx, id, _token, result) {
@@ -398,7 +430,7 @@ test('an RFQ with an earlier uncertain attempt never suggests cancellation or re
   await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
   assert.equal(h.operations.values().next().value!.state, 'UNKNOWN');
 });
-test('legacy protected RFQ proposals preserve original source text and their confirmation boundary', async () => {
+test('RFQ proposals preserve original source text and keep the normal confirmation boundary', async () => {
   const h = harness();
   h.changeDefinitions([rfqCreate]);
   const raw = '  #twenty\nNeed 5000 sqft in Hoskote.\n';
@@ -631,7 +663,7 @@ for (const failure of ['synchronous', 'asynchronous'] as const) {
   });
 }
 
-test('legacy protected email drafts keep typed confirmation and verified metadata without reopening private history', async () => {
+test('email drafts keep typed confirmation and deliver verified metadata without reopening private history', async () => {
   const h = harness({
     draft_ref: randomUUID(),
     mailbox: 'employee@example.com',
@@ -655,17 +687,18 @@ test('legacy protected email drafts keep typed confirmation and verified metadat
     true,
   );
   const preview = (await run.finalize(signal()))!;
-  assert.match(
-    preview.text,
-    /Save a draft in your connected work Gmail; this does not send email\./,
-  );
+  assert.match(preview.text, /This saves to Gmail Drafts for you to review and send\./);
   for (const [label, key] of [
     ['To', 'to'],
     ['CC', 'cc'],
     ['Subject', 'subject'],
-    ['Body', 'body'],
   ] as const)
-    assert.ok(preview.text.includes(`${label}: ${JSON.stringify(args[key])}`));
+    assert.ok(
+      preview.text.includes(
+        `${label}: ${Array.isArray(args[key]) ? args[key].join(', ') : args[key]}`,
+      ),
+    );
+  assert.ok(preview.text.includes(args.body));
   assert.match(preview.text, /confirm ABCDEF12/);
   assert.match(preview.text, /Or cancel ABCDEF12\. Confirm before .* \(IST\)\./);
   assert.doesNotMatch(
@@ -676,7 +709,7 @@ test('legacy protected email drafts keep typed confirmation and verified metadat
   assert.equal(h.calls.length, 0);
   const command = h.trusted('confirm ABCDEF12');
   const reply = (await h.service.recover(command, signal()))!;
-  assert.match(reply.text, /Email draft saved\. This action did not send it\./);
+  assert.match(reply.text, /Draft saved in employee@example\.com/);
   assert.match(reply.text, /employee@example\.com/);
   assert.match(reply.text, /https:\/\/mail\.google\.com\/mail\/#drafts/);
   assert.equal(h.calls.length, 1);
@@ -762,7 +795,7 @@ test('a normalized Gmail subject is shown and frozen before a later confirmation
     true,
   );
   const preview = (await run.finalize(signal()))!;
-  assert.match(preview.text, /Subject: "Reviewed subject"/);
+  assert.match(preview.text, /Subject: Reviewed subject/);
   assert.match(preview.text, /confirm ABCDEF12/);
   assert.equal(h.calls.length, 0);
   const frozen = [...h.operations.values()][0]!.payload.arguments;
@@ -1099,10 +1132,7 @@ test('rollback binds the owned successful original and displays its actual targe
     h.operations.get(operation.operationId)!.version,
   );
   assert.notEqual(compensation.operationId, operation.operationId);
-  assert.equal(h.calls.length, 2);
-  assert.equal(compensation.state, 'SUCCEEDED');
-  assert.match(reply.text, /Reversed/);
-  assert.doesNotMatch(reply.text, /confirm ABCDEF12/);
+  assert.equal(h.calls.length, 1);
 });
 
 test('rollback cannot target unresolved or unowned operations', async () => {
@@ -1317,9 +1347,224 @@ test('generic CRM write permission does not expose historical records or authori
   assert.equal(h.calls.length, 1);
 });
 
-const directTool = (definition: ContextToolDefinition): ContextToolDefinition => ({
-  ...structuredClone(definition),
-  annotations: { ...definition.annotations, destructiveHint: false },
+function directTool(definition: ContextToolDefinition): ContextToolDefinition {
+  const current = structuredClone(definition);
+  (current._meta!['wareongo/context-write-v1'] as Record<string, unknown>).executionMode =
+    'direct_request';
+  return current;
+}
+const draftArgs = () => ({
+  subject: 'Synthetic update',
+  body: 'Please review the supplied details.',
+  to: [],
+  cc: [],
+  connection_id: randomUUID(),
+  connection_version: 1,
+});
+
+async function stageDirect(
+  h: ReturnType<typeof harness>,
+  definition = directTool(create),
+  args: Record<string, unknown> = { name: 'Example' },
+) {
+  h.changeDefinitions([definition]);
+  const request = h.trusted('Save the requested change with these exact details.');
+  const run = (await h.service.open(request, signal()))!;
+  assert.equal(
+    ((await run.execute(definition.name, JSON.stringify(args), signal())) as { ok: boolean }).ok,
+    true,
+  );
+  return { request, run, operation: [...h.operations.values()].at(-1)! };
+}
+
+test('execution policy is authenticated metadata, never a heuristic or a model argument', async () => {
+  assert.equal(writeContract(create)?.executionMode, 'confirmation');
+  const direct = directTool(create);
+  assert.equal(contextWriteDescriptor(direct), true);
+  assert.equal(writeContract(direct)?.executionMode, 'direct_request');
+  (direct._meta!['wareongo/context-write-v1'] as Record<string, unknown>).executionMode =
+    'automatic';
+  assert.equal(contextWriteDescriptor(direct), false);
+  const h = harness();
+  const { run } = await stageDirect(h);
+  assert.equal(
+    (
+      (await run.execute(
+        create.name,
+        JSON.stringify({ name: 'Example', executionMode: 'confirmation' }),
+        signal(),
+      )) as { ok: boolean }
+    ).ok,
+    false,
+  );
+  assert.equal(run.preview(), undefined);
+  assert.equal(h.calls.length, 0);
+});
+
+test('direct request stages for review then approves and dispatches once without publishing a code', async () => {
+  const h = harness();
+  const { run, request, operation } = await stageDirect(h);
+  assert.equal(run.pendingExecutionMode, 'direct_request');
+  assert.match(run.preview()!, /Not executed yet/);
+  assert.doesNotMatch(run.preview()!, /confirm [A-F0-9]{8}/);
+  assert.equal(h.calls.length, 0);
+  const reply = (await run.finalize(signal()))!;
+  assert.match(reply.text, /^Saved:/);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.counts().approveCount, 1);
+  assert.equal(h.counts().publishCount, 0);
+  assert.equal(h.operations.get(operation.operationId)!.approvalRunId, request.runId);
+  assert.equal(await h.service.canDeliver(request.key, reply.delivery, signal()), true);
+  await h.service.recover(request, signal());
+  assert.equal(h.calls.length, 1, 'a completed same-turn operation is never executed again');
+});
+
+test('same-run restart resumes only an already approved direct request with frozen arguments', async () => {
+  const h = harness();
+  const { request, operation } = await stageDirect(h);
+  operation.state = 'APPROVED';
+  operation.approvalRunId = request.runId!;
+  operation.approvalSourceMessageId = operation.sourceMessageId;
+  const frozen = structuredClone(operation.payload.arguments);
+  const reply = (await h.service.recover(request, signal()))!;
+  assert.match(reply.text, /^Saved:/);
+  assert.deepEqual(h.calls[0]?.args, frozen);
+  assert.equal(h.calls[0]?.operationId, operation.operationId);
+  assert.equal(
+    h.counts().approveCount,
+    0,
+    'restart reuses durable review rather than approving anew',
+  );
+});
+
+test('direct metadata changes cannot upgrade an old confirmation or dispatch a staged request', async () => {
+  const legacy = harness();
+  const { operation } = await legacy.proposed();
+  legacy.changeDefinitions([directTool(create)]);
+  const reply = await legacy.service.recover(legacy.trusted('confirm ABCDEF12'), signal());
+  assert.match(reply!.text, /tool or your permissions changed/);
+  assert.equal(legacy.calls.length, 0);
+  assert.equal(legacy.operations.get(operation.operationId)!.state, 'PROPOSED');
+  const h = harness();
+  const { run } = await stageDirect(h);
+  h.changeDefinitions([create]);
+  await assert.rejects(run.finalize(signal()), /WRITE_TOOL_CHANGED/);
+  assert.equal(h.calls.length, 0);
+});
+
+test('revoked identity and a forwarded-only source cannot authorize direct writes', async () => {
+  const h = harness();
+  const { run } = await stageDirect(h);
+  h.revoke();
+  await assert.rejects(run.finalize(signal()), /WRITE_ACCESS_CHANGED/);
+  assert.equal(h.calls.length, 0);
+  const forwarded = harness();
+  forwarded.changeDefinitions([directTool(create)]);
+  assert.equal(
+    await forwarded.service.open(forwarded.trusted('Save this.', { forwarded: true }), signal()),
+    undefined,
+  );
+});
+
+test('explicit draft recovery preserves the original direct operation while generic retry stays conversational', async () => {
+  const h = harness();
+  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
+  h.useUnknown(true);
+  await run.finalize(signal());
+  assert.equal(h.operations.get(operation.operationId)!.state, 'UNKNOWN');
+  for (const text of ['try again', 'retry', 'cancel that attempt'])
+    assert.equal(await h.service.recover(h.trusted(text), signal()), undefined);
+  assert.equal(h.calls.length, 1);
+  const retry = h.trusted('try that draft again');
+  h.useUnknown(false);
+  await h.service.recover(retry, signal());
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[1]!.operationId, operation.operationId);
+  assert.deepEqual(h.calls[1]!.args, h.calls[0]!.args);
+  await h.service.recover(retry, signal());
+  assert.equal(h.calls.length, 2, 'a restarted recovery turn reads its completed receipt');
+});
+
+test('code-free draft recovery rejects ambiguity, altered batches, forwarded commands and confirmation operations', async () => {
+  const h = harness();
+  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
+  h.useUnknown(true);
+  await run.finalize(signal());
+  assert.equal(
+    await h.service.recover(h.trusted('try that draft again', { forwarded: true }), signal()),
+    undefined,
+  );
+  assert.equal(
+    await h.service.recover(
+      h.trusted('try that draft again', { extra: 'Change the recipient first.' }),
+      signal(),
+    ),
+    undefined,
+  );
+  const copy = structuredClone(h.operations.get(operation.operationId)!);
+  copy.operationId = randomUUID();
+  h.operations.set(copy.operationId, copy);
+  const ambiguous = await h.service.recover(h.trusted('try that draft again'), signal());
+  assert.match(ambiguous!.text, /more than one unresolved/);
+  assert.equal(h.calls.length, 1);
+  h.operations.delete(copy.operationId);
+  h.operations.get(operation.operationId)!.payload.executionMode = 'confirmation';
+  const legacy = await h.service.recover(h.trusted('try that draft again'), signal());
+  assert.match(legacy!.text, /no single unresolved direct draft/);
+  assert.equal(h.calls.length, 1);
+});
+
+test('direct expired drafts return a definite no-dispatch response and uncertain expiry never retries', async () => {
+  const h = harness();
+  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
+  operation.expiresAt = new Date(now - 1).toISOString();
+  const reply = (await run.finalize(signal()))!;
+  assert.match(reply.text, /expired before a change was dispatched/);
+  assert.equal(h.calls.length, 0);
+  const uncertain = harness();
+  const staged = await stageDirect(uncertain, directTool(draft), draftArgs());
+  uncertain.useUnknown(true);
+  await staged.run.finalize(signal());
+  uncertain.operations.get(staged.operation.operationId)!.expiresAt = new Date(
+    now - 1,
+  ).toISOString();
+  await uncertain.service.recover(uncertain.trusted('try that draft again'), signal());
+  assert.equal(uncertain.calls.length, 1);
+  assert.equal(uncertain.operations.get(staged.operation.operationId)!.state, 'UNKNOWN');
+});
+
+test('a definite unsent direct draft can be cancelled without a code, but an unknown attempt cannot', async () => {
+  const h = harness();
+  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'GMAIL_CONNECTION_CHANGED',
+    message: 'Synthetic private detail',
+  });
+  await run.finalize(signal());
+  const cancelled = await h.service.recover(h.trusted('cancel that draft attempt'), signal());
+  assert.match(cancelled!.text, /cancelled/i);
+  assert.equal(h.operations.get(operation.operationId)!.state, 'CANCELLED');
+  assert.equal(h.calls.length, 1);
+  const unknown = harness();
+  const staged = await stageDirect(unknown, directTool(draft), draftArgs());
+  unknown.useUnknown(true);
+  await staged.run.finalize(signal());
+  await unknown.service.recover(unknown.trusted('cancel that draft attempt'), signal());
+  assert.equal(unknown.operations.get(staged.operation.operationId)!.state, 'UNKNOWN');
+});
+
+test('updated direct results are persisted as successful completion', async () => {
+  const h = harness();
+  const { run, operation } = await stageDirect(h, directTool(crm), {
+    record_id: randomUUID(),
+    expected_version: 1,
+    stage: 'review',
+  });
+  h.useResult({ outcome: 'updated', code: 'UPDATED', message: 'Synthetic update' });
+  await run.finalize(signal());
+  assert.equal(h.operations.get(operation.operationId)!.state, 'SUCCEEDED');
+  assert.equal(h.calls.length, 1);
 });
 
 test('an explicit RFQ create dispatches once after review, with exact stored source and no confirm loop', async () => {
@@ -1352,58 +1597,6 @@ test('an explicit RFQ create dispatches once after review, with exact stored sou
   assert.equal(h.calls.length, 1);
 });
 
-test('an explicit edit dispatches the frozen target and version in the original turn', async () => {
-  const h = harness();
-  h.changeDefinitions([directTool(crm)]);
-  h.useResult({ outcome: 'updated', code: 'UPDATED', message: 'Updated.' });
-  const request = h.trusted('Update that RFQ to the review stage.');
-  const run = (await h.service.open(request, signal()))!;
-  const args = { record_id: randomUUID(), expected_version: 4, stage: 'review' };
-  await run.execute(crm.name, JSON.stringify(args), signal());
-  const result = (await run.finalize(signal()))!;
-  assert.deepEqual(h.calls[0]!.args, { ...args, operation_id: h.calls[0]!.operationId });
-  assert.equal(h.calls.length, 1);
-  assert.doesNotMatch(result.text, /confirm ABCDEF12/);
-});
-
-test('direct writes preserve failed/unknown outcomes and retry the original frozen operation', async () => {
-  for (const outcome of ['not_dispatched', 'outcome_unknown'] as const) {
-    const h = harness();
-    h.changeDefinitions([directTool(create)]);
-    h.useResult({ outcome, code: 'TEMPORARY_FAILURE', message: 'Synthetic failure.' });
-    const request = h.trusted('Save a point called Example.');
-    const run = (await h.service.open(request, signal()))!;
-    await run.execute(create.name, JSON.stringify({ name: 'Example' }), signal());
-    const failed = (await run.finalize(signal()))!;
-    assert.doesNotMatch(failed.text, /Saved:/);
-    assert.match(failed.text, /retry ABCDEF12/);
-    h.useResult({ outcome: 'replayed', code: 'OK', message: 'Saved.' });
-    const recovered = await h.service.recover(request, signal());
-    assert.match(recovered!.text, /Saved:/);
-    assert.equal(h.calls.length, 2);
-    assert.deepEqual(h.calls[1], h.calls[0]);
-    assert.equal(h.proposals.length, 1);
-  }
-});
-
-test('failed review, revoked access and a forwarded-only request never dispatch direct tools', async () => {
-  const h = harness();
-  h.changeDefinitions([directTool(create)]);
-  assert.equal(
-    await h.service.open(h.trusted('Create a point named Injected', { forwarded: true }), signal()),
-    undefined,
-  );
-  const request = h.trusted('Create a point named Example');
-  const run = (await h.service.open(request, signal()))!;
-  await run.execute(create.name, JSON.stringify({ name: 'Example' }), signal());
-  assert.equal(h.calls.length, 0); // Rejecting review never calls finalize.
-  assert.equal([...h.operations.values()][0]!.state, 'DRAFT');
-  h.revoke();
-  await assert.rejects(run.finalize(signal()), /WRITE_ACCESS_CHANGED/);
-  assert.equal(h.calls.length, 0);
-  assert.equal(h.counts().approveCount, 0);
-});
-
 test('domain RFQ undo executes directly without enabling generic CRM journal disclosure', async () => {
   const h = harness();
   const undo = tool(
@@ -1415,7 +1608,8 @@ test('domain RFQ undo executes directly without enabling generic CRM journal dis
     },
     { requiredScopes: ['crm.rfq:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
   );
-  h.changeDefinitions([undo]);
+  undo.annotations!.destructiveHint = true;
+  h.changeDefinitions([directTool(undo)]);
   h.useResult({ outcome: 'rolled_back', code: 'OK', message: 'Undone.' });
   const request = h.trusted('Undo the RFQ change you just made.');
   const run = (await h.service.open(request, signal()))!;
@@ -1431,7 +1625,7 @@ test('domain RFQ undo executes directly without enabling generic CRM journal dis
   assert.doesNotMatch(reply.text, /confirm/);
 });
 
-test('the narrow RFQ undo exception does not enable other destructive updates', async () => {
+test('a destructive update without direct policy retains separate confirmation', async () => {
   const h = harness();
   const destructive = tool(
     'replace_all_crm_details',
@@ -1442,6 +1636,7 @@ test('the narrow RFQ undo exception does not enable other destructive updates', 
       sourceFamily: 'crm',
     },
   );
+  destructive.annotations!.destructiveHint = true;
   h.changeDefinitions([destructive]);
   const run = (await h.service.open(h.trusted('Replace these details.'), signal()))!;
   await run.execute(destructive.name, JSON.stringify({ record_id: randomUUID() }), signal());
@@ -1449,38 +1644,4 @@ test('the narrow RFQ undo exception does not enable other destructive updates', 
   assert.equal(h.calls.length, 0);
   assert.equal(h.counts().publishCount, 1);
   assert.match(reply.text, /confirm ABCDEF12/);
-});
-
-test('a direct Gmail draft saves only a draft with the frozen mailbox binding and no extra confirmation', async () => {
-  const h = harness({
-    draft_ref: randomUUID(),
-    mailbox: 'employee@example.com',
-    subject: 'Warehouse options',
-    status: 'draft',
-    provider: 'gmail',
-  });
-  h.changeDefinitions([directTool(draft)]);
-  const run = (await h.service.open(
-    h.trusted(
-      'Save an email draft titled Warehouse options for recipient@example.com, saying Please review the options.',
-    ),
-    signal(),
-  ))!;
-  const args = {
-    subject: 'Warehouse options',
-    body: 'Please review the options.',
-    to: ['recipient@example.com'],
-    cc: [],
-    connection_id: randomUUID(),
-    connection_version: 3,
-  };
-  await run.execute(draft.name, JSON.stringify(args), signal());
-  assert.equal(h.calls.length, 0);
-  assert.equal(run.hasTool('send_email'), false);
-  const result = (await run.finalize(signal()))!;
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.calls[0]!.tool, 'create_email_draft');
-  assert.deepEqual(h.calls[0]!.args, { ...args, operation_id: h.calls[0]!.operationId });
-  assert.match(result.text, /Email draft saved. This action did not send it./);
-  assert.doesNotMatch(result.text, /confirm ABCDEF12/);
 });

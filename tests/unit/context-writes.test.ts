@@ -224,6 +224,30 @@ test('model-free delivery rediscovery never sends a write', async () => {
   await client.describeWrites(sender);
   assert.equal(state.dispatched, 0);
 });
+test('execution policy defaults to confirmation and is admitted only from valid authenticated metadata', () => {
+  const tool = descriptor();
+  assert.equal(writeContract(tool)?.executionMode, 'confirmation');
+  const contract = tool._meta![WRITE_CONTRACT_KEY] as Record<string, unknown>;
+  contract.executionMode = 'direct_request';
+  assert.equal(writeContract(tool)?.executionMode, 'direct_request');
+  assert.equal(admittedWriteTool(tool, ['notes:write']), true);
+  contract.executionMode = 'confirmation';
+  assert.equal(writeContract(tool)?.executionMode, 'confirmation');
+  contract.executionMode = 'model_decides';
+  assert.equal(contextWriteDescriptor(tool), false);
+});
+test('updated outcomes retain their bound authoritative receipt through MCP transport', async () => {
+  const { state, call } = fixture();
+  (state.tool._meta![WRITE_CONTRACT_KEY] as Record<string, unknown>).effect = 'update';
+  state.mutate = (receipt) => {
+    receipt.outcome = 'updated';
+    receipt.code = 'NOTE_UPDATED';
+  };
+  const result = await call();
+  assert.equal(result.outcome, 'updated');
+  assert.deepEqual(result.data, { id: 'synthetic' });
+  assert.equal(state.dispatched, 1);
+});
 test('bound write receipts preserve allowlisted recovery and absolute retry timing without replaying the action', async () => {
   const { state, call } = fixture();
   Object.assign(state.tool.outputSchema!.properties as object, {

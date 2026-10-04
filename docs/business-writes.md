@@ -1,12 +1,25 @@
 # Audited business writes and compensation
 
-Implemented 3 October 2026; direct-request execution added 4 October. Deployment evidence is recorded separately; the default configuration remains disabled. This supersedes the deferred generic-writer portions of modules 17 and 52. Domain capabilities still require their own explicit permissions and configuration.
+Implemented 3 October 2026. Deployment evidence is recorded separately; the default configuration remains disabled. This supersedes the deferred generic-writer portions of modules 17 and 52. Domain capabilities still require their own explicit permissions and configuration.
 
 ## Ownership
 
-Ramesh owns independent action review, direct-request authorization, durable intent, the employee/chat boundary and outcome presentation. Context Engine owns the dynamically discovered tool catalogue, schemas, permissions and signed domain adapters. The dashboard or future CRM command handler owns validation, transactional mutations, authoritative receipts and domain-specific compensation. A model never receives a database credential, chooses the caller identity, constructs an authorization header or sends arbitrary SQL.
+Ramesh owns proposal review, durable intent, the employee/chat boundary, policy enforcement and outcome presentation. Context Engine owns the dynamically discovered tool catalogue, schemas, execution policy, permissions and signed domain adapters. The dashboard or CRM command handler owns validation, transactional mutations, authoritative receipts and domain-specific compensation. A model never receives a database credential, chooses the caller identity, constructs an authorization header or sends arbitrary SQL.
 
-Reads and writes use separate ports. `ContextToolRun`, conversation recall, evidence refresh, verifier checks and outbound delivery preflight never execute a write. `BusinessWriteRun.execute` only stages a proposal. `BusinessWriteRun.finalize` durably approves and dispatches the final independently reviewed direct request. `BusinessWriteService.recover` resumes already approved work and handles legacy exact confirmation/retry commands. Both use the same claim, fresh authorization, single remote call and persisted-result path.
+Reads and writes use separate ports. `ContextToolRun`, conversation recall, evidence refresh, verifier checks and outbound delivery preflight never execute a write. `BusinessWriteRun.execute` only stages a proposal. After verifier review, `BusinessWriteRun.finalize` selects the path declared by authenticated tool metadata. Both paths share durable approval, dispatch, audit and recovery code.
+
+## Extensible execution policies
+
+`wareongo/context-write-v1.executionMode` declares one of two policies:
+
+| Policy           | User experience                                                | Runtime boundary                                                                             |
+| ---------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `direct_request` | An explicit current request executes in the same turn.         | Review, freeze and durably approve the exact operation before dispatch.                      |
+| `confirmation`   | Show the proposed change and wait for a separate confirmation. | A delivered preview and matching current employee confirmation are required before approval. |
+
+Omitted policy defaults to `confirmation`. The model cannot choose the policy, downgrade it from source content or infer it from a tool name. The frozen operation includes its policy and authenticated tool contract; a changed live contract requires review of a fresh operation, never silent promotion of an old proposal. New tools can use either path without a new agent or graph branch. Policy is an owner decision per capability, not a claim that every create or update is low risk.
+
+Current Context Engine actions declare `direct_request`: GIS point creation, its guarded compensation, CRM RFQ creation, owned RFQ detail editing and guarded undo, Gmail draft creation and editing. Future actions such as sending an email or destructive record changes should declare `confirmation` when exposed. Those capabilities are not implied by the generic writer. Gmail never sends email; it creates or edits an owned app-created draft for the user to review in Gmail.
 
 ## Flow
 
@@ -15,10 +28,12 @@ flowchart TD
   A[Current employee request] --> B[Discover current permitted write tools]
   B --> C[Worker stages encrypted DRAFT]
   C --> D[Verifier reviews exact proposal]
-  D --> E{Eligible direct request?}
-  E -->|Create, update or supported undo| G[Verify actor, expiry and current tool contract]
-  E -->|Protected destructive action| F[Deliver proposal and require later confirm CODE]
-  F --> G
+  D --> P{Authenticated tool execution policy}
+  P -->|confirmation| E[Publish PROPOSED and deliver preview]
+  P -->|direct_request| R[Revalidate current explicit request and run lease]
+  R --> H
+  E --> F[Later direct confirm CODE]
+  F --> G[Verify actor, delivery, expiry and current tool contract]
   G --> H[Persist APPROVED then DISPATCHING]
   H --> I[Call Context Engine once with frozen operation ID]
   I --> J[Domain transaction: mutation and idempotency receipt]
@@ -26,9 +41,9 @@ flowchart TD
   K --> L[Authorize receipt delivery without replaying the write]
 ```
 
-Clear direct create/update requests and supported undo execute after independent review in the same turn. The user receives a concise authoritative result rather than internal JSON and a confirmation code. Missing material inputs, ambiguous targets or unclear intent still need clarification. Forwarded/quoted instructions, attachment contents and native-location labels provide data only. A current direct clarification may continue an earlier explicit direct request. Direct voice and sender-authored captions are admitted source material; the independent verifier checks their actual intent.
+For `confirmation`, the user receives exact material fields and `confirm CODE` / `cancel CODE`. The proposal lasts one hour. The runtime requires a later, standalone, directly typed command in the same private conversation, from the same currently active employee and phone binding. The original proposal must already be recorded as sent, with an encrypted delivery receipt naming this operation and its published version, and the actual reply containing the confirmation code. A sent fallback or stale draft does not satisfy this proof. The final confirmation must be typed.
 
-Protected destructive tools and already published proposals retain the legacy `confirm CODE` / `cancel CODE` flow. The one-hour proposal must have been delivered before a later standalone typed command from the same current employee and phone can approve it. Its encrypted delivery receipt must name the published operation version, and the actual reply must contain the code. A sent fallback or stale draft does not satisfy that proof.
+For `direct_request`, the same verified current employee request authorizes approval after independent review, without a code. Forwarded text, image captions, quoted instructions, native-location labels and historical messages cannot authorize either path. A direct voice request can supply intent through its trusted transcript. Permission, source provenance, lease ownership, frozen arguments and duplicate prevention apply to both policies.
 
 A draft can be revised during verifier repair; every revision is audited and invalidates its earlier unpublished code. Once directly approved or published, its payload is immutable. A changed request needs a new reviewed operation. No capture queue or playground identity has production journal access, and the live-data playground does not compose the writer.
 
@@ -74,9 +89,11 @@ receipt. Missing or mismatched receipts retain the original run for bounded
 recovery. Delivery authorization outages retain saved confirmations for retry;
 they cannot replace an actual write outcome with a generic “try again” message.
 
-An operation uses one server-generated UUID for its lifetime. Unknown results retain their exact arguments and ID. `retry CODE` resumes that same approved operation; it cannot create a second operation or change the payload. Uncertain approved operations remain recoverable after the original proposal deadline. The durable approved transition preserves the direct source or verified delivery proof, so later inbox cleanup does not strand a pending outcome. A later permission failure does not establish that an earlier uncertain request never committed. A restarted inbound run can recover its own already approved frozen operation; it cannot create a new identity or reauthorize a changed payload. There is no independent background retry loop or LLM-controlled retry budget.
+An operation uses one server-generated UUID for its lifetime. Unknown results retain their exact arguments and ID. `retry CODE` resumes that same approved operation; it cannot create a second operation or change the payload. Uncertain approved operations remain recoverable after the original proposal deadline. The durable approved transition preserves the verified delivery proof, so later inbox cleanup does not strand a pending outcome. A later permission failure does not establish that an earlier uncertain request never committed. There is no autonomous retry loop or LLM-controlled retry budget.
 
-Undo is a new audited **compensating action**, linked to the original operation. It does not delete or rewrite the original audit record. The worker first reads `write_history`, then may stage a currently advertised tool whose contract explicitly declares which action it compensates. The owned original must have a successful authoritative receipt. An explicitly requested supported compensation gets independent review, a new operation ID and its own result in the same turn. A domain may instead expose a narrow undo update tool that validates its original receipt and current record access in the backend, without redisclosing generic journal payloads.
+Direct Gmail recovery accepts “retry that draft” or “try that draft again” only when exactly one unresolved, owned direct Gmail operation can be selected. Generic “try again” does not execute an older write. Ambiguous targets require clarification. Recovery keeps the frozen operation ID and arguments; it cannot create a replacement draft to hide an uncertain result.
+
+Undo is a new audited **compensating action**, linked to the original operation. It does not delete or rewrite the original audit record. The worker first reads `write_history`, then may stage a currently advertised tool whose contract explicitly declares which action it compensates. The owned original must have a successful authoritative receipt. The compensation gets its own operation ID, result and independently declared execution policy.
 
 The initial `rollback_gis_poi` tool compensates an employee's own `create_gis_poi`. The dashboard locks the point and compares its current fields and update timestamp with the creation receipt. It removes only an unchanged point and atomically stores a separate compensation receipt, including before/after state. It refuses edited records and arbitrary point IDs. Repeating the original create after a rollback returns its historical creation receipt; it cannot resurrect the point.
 
@@ -87,7 +104,7 @@ This follows the [Compensating Transaction pattern](https://learn.microsoft.com/
 No GIS branch is required in the graph or writer to add a CRM action. A new Context Engine tool must provide:
 
 1. A closed, bounded input schema, a required UUID idempotency argument and a concrete output receipt schema.
-2. `wareongo/context-write-v1` metadata with required scopes, source family and effect (`create`, `update`, `delete` or `compensate`). Current employee permissions and platform configuration determine discovery on every request. Historical arguments/results may be redisclosed only when the current tool explicitly declares `auditHistory: actor_scoped` (the GIS policy). The default is closed. A future CRM integration with record-level permissions must add current per-record authorization before enabling audit history or compensation previews; the existence of a write scope is insufficient.
+2. `wareongo/context-write-v1` metadata with required scopes, source family, effect (`create`, `update`, `delete` or `compensate`) and an explicit `executionMode` (`direct_request` or `confirmation`). Omission requires confirmation. Current employee permissions and platform configuration determine discovery on every request. Historical arguments/results may be redisclosed only when the current tool explicitly declares `auditHistory: actor_scoped` (the GIS policy). The default is closed. A future CRM integration with record-level permissions must add current per-record authorization before enabling audit history or compensation previews; the existence of a write scope is insufficient.
 3. A source-system handler that rechecks employee access and commits the mutation and receipt together. Do not write Twenty's replicated CRM tables as a shortcut.
 4. For updates and deletes, expected record version or equivalent preconditions checked inside the mutation transaction. Record the exact prior value, resulting value and authoritative revision. A CRM mirror's delay is not evidence that a write failed.
 5. If reversible, a separately advertised compensation tool with `compensates` and `originalOperationArgument`. It must verify that the current record still matches the result of the original action. Restore only affected fields and refuse intervening edits. Noncompensable actions must remain explicitly noncompensable.
@@ -99,7 +116,7 @@ Examples include adding a CRM note, assigning a lead or changing a follow-up dat
 
 `write_sources` can retrieve at most 32 original messages / 32 KB from the same account and private conversation within 24 hours, at or before the current request. Structured native pins survive raw-protocol cleanup. Historical messages have unknown forwarding status and cannot authorize a new action. A selected source ID is stored alongside the exact proposal. For tools declaring `coordinateArguments`, selected native coordinates must match the proposed coordinates exactly.
 
-Google Maps links and raw coordinates are resolved through Context Engine's read-only `resolve_location`. It preserves ambiguity and provenance. It does not silently choose a viewport, geocode an unsupported address or treat a user-supplied URL as a trusted WhatsApp pin. The internal review uses the final exact coordinates regardless of origin; protected tools also show them in their confirmation preview.
+Google Maps links and raw coordinates are resolved through Context Engine's read-only `resolve_location`. It preserves ambiguity and provenance. It does not silently choose a viewport, geocode an unsupported address or treat a user-supplied URL as a trusted WhatsApp pin. The confirmation preview displays the final coordinates regardless of origin.
 
 ## Configuration and rollout
 
@@ -108,3 +125,5 @@ Google Maps links and raw coordinates are resolved through Context Engine's read
 Apply the bot journal migration and additive dashboard compensation migration before the code that requires them. Run local synthetic PostgreSQL, HTTP-signature, transport and graph tests. Deployment probes may inspect identity, catalogue admission, schema health and invalid requests; they must not create production business records or send test WhatsApp messages. No paid model evaluation is needed for these boundaries.
 
 Disabling new writes does not undo existing writes. Keep the journal and authoritative receipts, inspect any uncertain operations, and preserve the delivery authorization fence. Never rotate operation IDs to get past a failed or timed-out request.
+
+RFQ edits and undo use domain-owned list_crm_rfq_changes/read_crm_rfq references and fresh record authorization. Generic write_history intentionally omits CRM records; no actor_scoped CRM payload-disclosure policy is granted. Only RFQs created by this agent for the current employee can be edited. See [RFQ integration](crm-rfq-writes.md).

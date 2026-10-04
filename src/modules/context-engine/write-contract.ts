@@ -32,6 +32,8 @@ const contractSchema = z
       ),
     sourceFamily: z.string().regex(/^[a-z][a-z0-9_.-]{0,63}$/),
     effect: z.enum(['create', 'update', 'delete', 'compensate']),
+    // Server policy only. Older descriptors retain the separately confirmed flow.
+    executionMode: z.enum(['direct_request', 'confirmation']).default('confirmation'),
     // Explicit tool policy permitting employee-owned journal redisclosure. Omission grants none.
     auditHistory: z.literal('actor_scoped').optional(),
     // Application-supplied complete source text; hidden from model arguments.

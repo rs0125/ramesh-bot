@@ -65,7 +65,7 @@ function writeRun(
     employeeId?: number;
     historyOnly?: boolean;
     failFinalize?: boolean;
-    direct?: boolean;
+    executionMode?: 'direct_request' | 'confirmation';
   } = {},
 ) {
   let staged: Record<string, unknown> | undefined;
@@ -82,7 +82,8 @@ function writeRun(
     tools: [writeDefinition, definition('write_history')],
     remaining: 8,
     blocked: false,
-    context: 'Advertised writes only stage proposals. Separate direct confirmation is required.',
+    context: 'Authenticated tool metadata determines the write execution policy.',
+    pendingExecutionMode: options.executionMode ?? 'confirmation',
     evidence,
     failures: [],
     get usedPrivateData() {
@@ -114,13 +115,14 @@ function writeRun(
     preview,
     async finalize() {
       finalized++;
-      events.push(options.direct ? 'dispatch' : 'publish');
+      events.push(options.executionMode === 'direct_request' ? 'dispatch' : 'publish');
       if (options.failFinalize) throw new Error('AUTHORIZATION_CHANGED');
       return staged
         ? {
-            text: options.direct
-              ? 'Saved RFQ: Example reference.'
-              : `${preview()}\nReply confirm ABC123.`,
+            text:
+              options.executionMode === 'direct_request'
+                ? 'Saved the requested record.'
+                : `${preview()}\nReply confirm ABC123.`,
             delivery: receipt,
           }
         : undefined;
@@ -298,7 +300,69 @@ test('dynamic writes can follow reads but publish exact proposals only after ind
   );
   assert.deepEqual(payload(fake.requests, 'verifier').business_write_evidence[0].arguments, exact);
   assert.equal(payload(fake.requests, 'verifier').evidence.length, 1);
-  assert.ok(fake.sessions[0]!.instructions.includes('after independent review in the same turn'));
+  assert.equal(payload(fake.requests, 'verifier').business_write_execution_mode, 'confirmation');
+});
+
+test('direct writes dispatch after independent review and replace the unexecuted preview with the authoritative result', async () => {
+  events.length = 0;
+  const writes = writeRun({ executionMode: 'direct_request' });
+  const reads = readRun();
+  const fake = model([
+    { name: 'read_example_reference' },
+    { name: writeDefinition.name, args: exact },
+  ]);
+  const result = await buildSalesGraph(
+    fake.fake,
+    async () => ({ status: 'available', run: reads.run }),
+    {
+      writes: writes.run,
+    },
+  ).invoke(input);
+  assert.equal(writes.finalized(), 1);
+  assert.ok(events.indexOf('verifier') < events.indexOf('dispatch'));
+  assert.equal(result.reply, 'Saved the requested record.');
+  assert.doesNotMatch(result.reply, /confirm|Not yet saved|Proposed/i);
+  assert.equal(result.write?.delivery, receipt);
+  assert.deepEqual(reads.readCalls, ['read_example_reference']);
+  assert.equal(
+    result.business,
+    undefined,
+    'receipt-only delivery must not replay an old version invalidated by its own write',
+  );
+  assert.equal(payload(fake.requests, 'verifier').business_write_execution_mode, 'direct_request');
+  assert.match(payload(fake.requests, 'verifier').answer, /Not yet saved/);
+});
+
+test('a separate read answer accompanying a direct write retains its full freshness checks', async () => {
+  const writes = writeRun({ executionMode: 'direct_request' });
+  const reads = readRun();
+  const fake = model(
+    [{ name: 'read_example_reference' }, { name: writeDefinition.name, args: exact }],
+    {
+      supplement: 'The reference is available.',
+    },
+  );
+  const result = await buildSalesGraph(
+    fake.fake,
+    async () => ({ status: 'available', run: reads.run }),
+    {
+      writes: writes.run,
+    },
+  ).invoke(input);
+  assert.equal(result.reply, 'The reference is available.\n\nSaved the requested record.');
+  assert.equal(result.business?.delivery, reads.delivery);
+  assert.equal(result.write?.delivery, receipt);
+});
+
+test('direct policy cannot bypass an unsuccessful verifier review', async () => {
+  const writes = writeRun({ executionMode: 'direct_request' });
+  const fake = model([{ name: writeDefinition.name, args: exact }], { approved: false });
+  const result = await buildSalesGraph(fake.fake, async () => ({ status: 'denied' }), {
+    writes: writes.run,
+  }).invoke(input);
+  assert.equal(writes.finalized(), 0);
+  assert.equal(result.write, undefined);
+  assert.doesNotMatch(result.reply, /Saved the requested record|78\.125/);
 });
 
 test('rejected proposals never become confirmable and their exact data is withheld', async () => {
@@ -754,18 +818,4 @@ test('write recovery and discovery isolation preserve caller cancellation and ch
       );
     }
   }
-});
-
-test('the graph executes direct requests only after verification and replaces the internal preview with the receipt', async () => {
-  events.length = 0;
-  const writes = writeRun({ direct: true });
-  const fake = model([{ name: writeDefinition.name, args: exact }]);
-  const result = await buildSalesGraph(fake.fake, async () => ({ status: 'denied' }), {
-    writes: writes.run,
-  }).invoke(input);
-  assert.equal(writes.finalized(), 1);
-  assert.ok(events.indexOf('verifier') < events.indexOf('dispatch'));
-  assert.equal(result.reply, 'Saved RFQ: Example reference.');
-  assert.doesNotMatch(result.reply, /confirm|Proposed|latitude|78.125/);
-  assert.deepEqual(result.write?.delivery, receipt);
 });

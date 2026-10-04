@@ -164,23 +164,21 @@ test('mail reads and draft writes remain separately admitted under the explicit 
   assert.equal(contextWriteDescriptor(write), false);
 });
 
-test('draft proposals show every email field exactly without exposing technical connection bindings', () => {
+test('draft proposals show readable exact fields without JSON escaping or connection bindings', () => {
   const value = proposal();
   const before = structuredClone(value);
   const text = mailDraftProposalText(value)!;
-  assert.match(text, /Save a draft in your connected work Gmail; this does not send email\./);
-  for (const [label, key] of [
-    ['To', 'to'],
-    ['CC', 'cc'],
-    ['Subject', 'subject'],
-    ['Body', 'body'],
-  ])
-    assert.ok(text.includes(`${label}: ${JSON.stringify(value.payload.arguments[key!])}`));
-  assert.doesNotMatch(text, /connection|operation_id|11111111|22222222|business change/);
+  assert.match(text, /This saves to Gmail Drafts for you to review and send\./);
+  assert.ok(text.includes('To: recipient@example.com'));
+  assert.ok(text.includes('CC: colleague@example.com'));
+  assert.ok(text.includes('Subject: Warehouse "options"'));
+  assert.ok(text.includes(String(value.payload.arguments.body)));
+  assert.doesNotMatch(text, /\["|\\n|connection|operation_id|11111111|22222222|business change/);
   assert.deepEqual(value, before);
   delete value.payload.arguments.to;
   delete value.payload.arguments.cc;
-  assert.match(mailDraftProposalText(value)!, /To: \[\]\nCC: \[\]/);
+  assert.match(mailDraftProposalText(value)!, /To: Not added/);
+  assert.doesNotMatch(mailDraftProposalText(value)!, /CC:/);
 });
 
 test('unknown effects and malformed draft proposals require the generic full-field preview', () => {
@@ -235,19 +233,58 @@ test('unknown effects and malformed draft proposals require the generic full-fie
   }
 });
 
-test('successful draft receipts show the bound mailbox, subject and application-owned folder link', () => {
-  const text = mailDraftResultText(operation())!;
-  assert.match(text, /Email draft saved\. This action did not send it\./);
-  assert.match(text, /Mailbox: employee@example\.com/);
-  assert.match(text, /Subject: "Warehouse options"/);
+test('successful draft receipts show readable saved content and a fixed Gmail link', () => {
+  const value = proposal();
+  value.state = 'SUCCEEDED';
+  (value.result!.data as typeof receipt).subject = String(value.payload.arguments.subject);
+  const text = mailDraftResultText(value)!;
+  assert.match(text, /Draft saved in employee@example\.com/);
+  assert.ok(text.includes(String(value.payload.arguments.body)));
+  assert.match(text, /Subject: Warehouse "options"/);
   assert.match(text, /https:\/\/mail\.google\.com\/mail\/#drafts/);
-  assert.match(text, /Choose employee@example\.com/);
-  assert.match(text, /Drafts folder, not a specific draft/);
-  assert.doesNotMatch(text, /22222222|confirm|compose=|draft_ref/);
-  const replay = operation();
-  replay.result!.outcome = 'replayed';
-  assert.match(mailDraftResultText(replay)!, /previously saved/);
-  assert.match(mailDraftResultText(replay)!, /does not check its current Gmail status/);
+  assert.match(text, /Open it in Gmail to review and send when ready/);
+  assert.doesNotMatch(text, /22222222|confirm|compose=|draft_ref|This action did not send|\["|\\n/);
+  value.result!.outcome = 'replayed';
+  const replay = mailDraftResultText(value)!;
+  assert.match(replay, /already saved/);
+  assert.match(replay, /haven't checked for later changes/);
+  assert.doesNotMatch(replay, /these exact warehouse options|To:/);
+});
+
+test('updated draft receipts preserve the existing reference and show edited content', () => {
+  const value = proposal();
+  value.payload.toolName = 'update_email_draft';
+  value.payload.arguments.draft_ref = receipt.draft_ref;
+  value.payload.arguments.expected_message_id = 'providerMessage42';
+  value.payload.arguments.body = 'Hi,\nThe meeting is now at 8 pm IST.\nThanks.';
+  value.payload.arguments.subject = receipt.subject;
+  assert.match(mailDraftProposalText(value)!, /Review the draft changes/);
+  value.state = 'SUCCEEDED';
+  value.result!.outcome = 'updated';
+  const text = mailDraftResultText(value)!;
+  assert.match(text, /Draft updated in employee@example/);
+  assert.match(text, /now at 8 pm IST/);
+  assert.doesNotMatch(text, /providerMessage42|expected_message_id|22222222|confirm/);
+  value.result!.outcome = 'replayed';
+  assert.match(mailDraftResultText(value)!, /draft edit was already saved/);
+  (value.result!.data as typeof receipt).draft_ref = operationId;
+  assert.match(mailDraftResultText(value)!, /could not verify its draft details/);
+  value.result!.outcome = 'created';
+  assert.equal(mailDraftResultText(value), undefined, 'an edit cannot accept a creation receipt');
+});
+
+test('long saved drafts use the full Gmail content without changing or clipping the saved body', () => {
+  const value = proposal();
+  value.state = 'SUCCEEDED';
+  value.payload.arguments.subject = receipt.subject;
+  value.payload.arguments.body = 'A long email sentence. '.repeat(400);
+  const before = structuredClone(value);
+  const text = mailDraftResultText(value)!;
+  assert.match(text, /The full draft is in Gmail/);
+  assert.match(text, /review and send when ready/);
+  assert.doesNotMatch(text, /A long email sentence/);
+  assert.ok(text.length < 4800);
+  assert.deepEqual(value, before);
 });
 
 test('mail recovery exposes only allowlisted actions without redisclosing stored email or provider prose', () => {
@@ -416,7 +453,7 @@ test('mail subject normalization changes only a fully known create payload befor
   assert.equal(normalized.subject, 'Approved subject');
   assert.equal(args.subject, '  Approved subject  ');
   value.payload.arguments = { ...normalized, operation_id: operationId };
-  assert.match(mailDraftProposalText(value)!, /Subject: "Approved subject"/);
+  assert.match(mailDraftProposalText(value)!, /Subject: Approved subject/);
   const future = { ...args, attachments: ['unknown effect'] };
   assert.equal(normalizeMailDraftArguments(tool, future), future);
   assert.equal(normalizeMailDraftArguments({ ...tool, name: 'send_email' }, args), args);
@@ -519,4 +556,84 @@ test('draft presentation never promotes pending, failed, unrelated or mismatched
     edit(value);
     assert.equal(mailDraftResultText(value), undefined);
   }
+});
+
+test('direct Gmail recovery uses natural retry guidance without confirmation codes', () => {
+  const now = Date.parse('2026-10-04T06:00:00Z');
+  const value = operation();
+  value.payload.executionMode = 'direct_request';
+  value.state = 'UNKNOWN';
+  value.expiresAt = new Date(now + 3600000).toISOString();
+  value.hasUncertainAttempt = true;
+  value.result!.outcome = 'outcome_unknown';
+  value.result!.message = 'PRIVATE_PROVIDER_MESSAGE';
+  const text = mailDraftRecoveryText(value, now)!;
+  assert.match(text, /this draft was saved/);
+  assert.match(text, /try that draft again.*same attempt/);
+  assert.match(text, /won't create a replacement/);
+  assert.doesNotMatch(
+    text,
+    /ABCDEF12|confirm [A-F0-9]{8}|PRIVATE_PROVIDER_MESSAGE|employee@example|Warehouse options/,
+  );
+  value.payload.toolName = 'update_email_draft';
+  assert.match(mailDraftRecoveryText(value, now)!, /these changes were saved/);
+  value.expiresAt = new Date(now - 1).toISOString();
+  const expired = mailDraftRecoveryText(value, now)!;
+  assert.match(expired, /no longer be retried automatically/);
+  assert.doesNotMatch(expired, /try that draft again/);
+});
+
+test('direct definite errors avoid code loops and never overwrite or replace an unavailable edit', () => {
+  const value = operation();
+  value.payload.executionMode = 'direct_request';
+  value.payload.toolName = 'update_email_draft';
+  value.state = 'APPROVED';
+  value.result!.outcome = 'not_dispatched';
+  for (const code of [
+    'GMAIL_CONNECTION_CHANGED',
+    'GMAIL_RECONNECT_REQUIRED',
+    'GMAIL_REVOCATION_PENDING',
+    'GMAIL_RATE_LIMITED',
+    'GMAIL_UNAVAILABLE',
+  ]) {
+    value.result!.code = code;
+    const text = mailDraftRecoveryText(value)!;
+    assert.match(text, /haven't changed the draft/);
+    assert.doesNotMatch(text, /ABCDEF12|confirm|proposal|employee@example|Warehouse options/);
+  }
+  value.state = 'REJECTED';
+  value.result!.outcome = 'rejected';
+  value.result!.code = 'GMAIL_DRAFT_CHANGED';
+  assert.match(mailDraftRecoveryText(value)!, /haven't overwritten it/);
+  value.result!.code = 'GMAIL_DRAFT_UNAVAILABLE';
+  assert.match(mailDraftRecoveryText(value)!, /haven't created a replacement/);
+  value.result!.code = 'GMAIL_DRAFT_UPDATE_PENDING';
+  assert.match(
+    mailDraftRecoveryText(value)!,
+    /earlier edit.*try that draft again.*before making another edit/,
+  );
+  value.hasUncertainAttempt = true;
+  assert.match(mailDraftRecoveryText(value)!, /couldn't confirm/);
+  assert.doesNotMatch(
+    mailDraftRecoveryText(value)!,
+    /haven't changed|haven't overwritten|couldn't edit/,
+  );
+});
+
+test('a fully validated update normalizes subject but never hides unknown edit fields', () => {
+  const value = proposal();
+  value.payload.toolName = 'update_email_draft';
+  value.payload.arguments.draft_ref = receipt.draft_ref;
+  value.payload.arguments.expected_message_id = 'currentMessage';
+  const tool = descriptor();
+  tool.name = 'update_email_draft';
+  (tool._meta!['wareongo/context-write-v1'] as { effect: string }).effect = 'update';
+  const { operation_id: _operation, ...args } = value.payload.arguments;
+  args.subject = '  Edited subject  ';
+  const normalized = normalizeMailDraftArguments(tool, args);
+  assert.equal(normalized.subject, 'Edited subject');
+  value.payload.arguments = { ...normalized, operation_id: operationId };
+  assert.match(mailDraftProposalText(value)!, /Subject: Edited subject/);
+  value.payload.arguments.expected_message_id = 'bad\nversion';
+  assert.equal(mailDraftProposalText(value), undefined);
 });

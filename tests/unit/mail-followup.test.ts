@@ -33,6 +33,8 @@ test('a later turn discovers draft references, reads the draft, and rechecks con
       mailbox: z.string(),
       provider: z.literal('gmail'),
       status: z.literal('draft'),
+      message_id: z.string(),
+      editable: z.boolean(),
       subject: z.string(),
       to: z.array(z.string()),
       cc: z.array(z.string()),
@@ -69,7 +71,9 @@ test('a later turn discovers draft references, reads the draft, and rechecks con
   ];
   let now = Date.now(),
     allowed = true,
-    body = 'Synthetic draft content.';
+    body = 'Synthetic draft content.',
+    messageId = 'provider-message-1',
+    editable = true;
   const calls: string[] = [];
   const endpoint = 'https://context.example/mcp';
   const client = new ContextEngineMcpClient(
@@ -128,6 +132,8 @@ test('a later turn discovers draft references, reads the draft, and rechecks con
                   mailbox: 'employee@example.com',
                   provider: 'gmail',
                   status: 'draft',
+                  message_id: messageId,
+                  editable,
                   subject: 'Synthetic subject',
                   to: [],
                   cc: [],
@@ -191,6 +197,8 @@ test('a later turn discovers draft references, reads the draft, and rechecks con
     true,
   );
   assert.equal(run.evidence[1]!.result.data.body, body);
+  assert.equal(run.evidence[1]!.result.data.message_id, messageId);
+  assert.equal(run.evidence[1]!.result.data.editable, true);
   const receipt = run.delivery()!;
   now += 1000;
   assert.equal(
@@ -198,6 +206,20 @@ test('a later turn discovers draft references, reads the draft, and rechecks con
     true,
     'fresh retrieval metadata does not invalidate unchanged content',
   );
+  messageId = 'provider-message-2';
+  assert.equal(
+    await service.canDeliver(trusted.key, receipt, signal),
+    false,
+    'a changed provider version invalidates a stale draft even if visible text matches',
+  );
+  messageId = 'provider-message-1';
+  editable = false;
+  assert.equal(
+    await service.canDeliver(trusted.key, receipt, signal),
+    false,
+    'a draft that is no longer editable cannot reuse the prior edit evidence',
+  );
+  editable = true;
   body = 'An employee edited this draft in Gmail.';
   assert.equal(
     await service.canDeliver(trusted.key, receipt, signal),
