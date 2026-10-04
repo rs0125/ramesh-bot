@@ -21,11 +21,7 @@ include the returned `connection_id` and `connection_version`; the reviewed
 operation preserves those values so a later reconnect cannot silently select
 another mailbox. Context Engine validates the connection again before dispatch.
 
-The existing write lifecycle remains intact: the model prepares one reviewed
-proposal, the user receives the exact fields, and a later standalone typed
-`confirm CODE` authorizes creation. Proposal, verifier, delivery and recall reads
-never execute the write. An uncertain result must be recovered using the same
-operation ID and frozen arguments. No send tool is introduced.
+The model stages exact draft arguments; independent review validates the current direct request before the application saves the draft in the same turn. No extra typed confirmation is required for an explicit request to create a draft. Verifier, delivery and recall reads never execute the write. The runtime persists approval before dispatch and an authoritative outcome afterwards. An uncertain result must be recovered using the same operation ID and frozen arguments. No send tool is introduced.
 
 Recovery replies expose only application-owned guidance for allowlisted error
 codes, independently of the closed mail history policy. A changed connection or
@@ -51,12 +47,11 @@ lost quota-rejection response could otherwise authorize a new creation. The empl
 must inspect Gmail directly. A separate read-only reconciliation capability would
 be needed to automate recovery after expiry safely.
 
-The WhatsApp preview shows the complete To, CC, subject and plain-text body, with
-JSON escaping to preserve their exact contents, and says that this action saves
-a draft without sending email. Only a validated, closed draft payload hides the
+The internal review receives the complete To, CC, subject and plain-text body with
+JSON escaping. The final WhatsApp receipt says that a draft was saved without sending email. Only a validated, closed draft payload hides the
 technical connection and operation identifiers; unknown additional fields use
 the generic full-field preview. The connection remains frozen in the stored
-arguments and is checked again when the user confirms.
+arguments and is checked again immediately before dispatch.
 Leading and trailing subject whitespace is normalized before the preview and
 stored proposal, matching Context Engine's eventual draft subject.
 

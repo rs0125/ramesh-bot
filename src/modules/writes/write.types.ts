@@ -25,6 +25,8 @@ export interface WriteProposalPayload {
   toolName: string;
   toolSchema: Record<string, unknown>;
   toolDescription?: string;
+  /** Application policy derived from the authenticated tool contract, never model input. */
+  executionMode?: 'direct_request' | 'confirmation';
   toolMeta?: Record<string, unknown>;
   requiredScopes?: string[];
   sourceFamily?: string;
@@ -41,6 +43,7 @@ export interface WriteAttemptResult {
   operation_id: string;
   outcome:
     | 'created'
+    | 'updated'
     | 'replayed'
     | 'not_dispatched'
     | 'rejected'
@@ -83,6 +86,11 @@ export interface WriteRepositoryPort {
   propose(ctx: WriteCommandContext, payload: WriteProposalPayload): Promise<WriteOperation>;
   findByRun(ctx: WriteCommandContext): Promise<WriteOperation | null>;
   publish(ctx: WriteCommandContext, id: string, expectedVersion: number): Promise<WriteOperation>;
+  approveDirect(
+    ctx: WriteCommandContext,
+    id: string,
+    expectedVersion: number,
+  ): Promise<WriteOperation>;
   findByCode(
     actor: WriteActor,
     code: string,

@@ -155,6 +155,7 @@ export interface ContextWriteResult {
   operation_id: string;
   outcome:
     | 'created'
+    | 'updated'
     | 'replayed'
     | 'rolled_back'
     | 'not_dispatched'

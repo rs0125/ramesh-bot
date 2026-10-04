@@ -118,7 +118,7 @@ test(
     }
     async function proposalHandoff(f: Fixture, job: MessageJob) {
       const op = (await f.repo.listRecent(actor)).find(
-        (op) => op.proposalRunId === job.id && op.state === 'PROPOSED',
+        (op) => op.proposalRunId === job.id && op.state !== 'DRAFT',
       );
       const receipt = op
         ? {
@@ -178,6 +178,96 @@ test(
       expiresAt: new Date(Date.now() + 300000).toISOString(),
     });
     try {
+      await t.test(
+        'direct reviewed requests commit in the original run and recover only their frozen identity',
+        async () => {
+          const f = fixture();
+          const c = await command(f, 'Create the training point');
+          const draft = await f.repo.propose(c.ctx, {
+            ...payload(),
+            executionMode: 'direct_request',
+          });
+          await assert.rejects(
+            f.repo.claim(c.ctx, draft.operationId, draft.version),
+            hasCode('WRITE_CONFIRMATION_REQUIRED'),
+          );
+          const approved = await f.repo.approveDirect(c.ctx, draft.operationId, draft.version);
+          assert.equal(approved.state, 'APPROVED');
+          assert.equal(approved.approvalRunId, c.ctx.runId);
+          assert.equal(approved.approvalSourceMessageId, c.ctx.sourceMessageId);
+          assert.equal(approved.proposalRunId, c.ctx.runId);
+          const first = await f.repo.claim(c.ctx, approved.operationId, approved.version);
+          assert.ok(first);
+          assert.equal(
+            await f.repo.claim(c.ctx, first.operation.operationId, first.operation.version),
+            null,
+          );
+          await db.admin.query(
+            `UPDATE public."ramesh-write-operations" SET dispatch_until=clock_timestamp()-interval '1 second' WHERE id=$1`,
+            [approved.operationId],
+          );
+          const recovered = await f.repo.claim(
+            c.ctx,
+            first.operation.operationId,
+            first.operation.version,
+          );
+          assert.ok(recovered);
+          assert.equal(recovered.operation.operationId, approved.operationId);
+          assert.deepEqual(recovered.operation.payload.arguments, approved.payload.arguments);
+          assert.equal(recovered.operation.hasUncertainAttempt, true);
+          const saved = await f.repo.finish(c.ctx, approved.operationId, recovered.dispatchToken, {
+            operation_id: approved.operationId,
+            outcome: 'replayed',
+            code: 'OK',
+            message: 'Saved.',
+          });
+          assert.equal(saved.state, 'SUCCEEDED');
+          assert.equal(saved.dispatchAttempts, 2);
+          const events = await f.repo.auditRecent(actor);
+          assert.ok(events.some((event) => event.kind === 'direct_request_approved'));
+          await deliver(f, c.job);
+          const later = await command(f, 'Create another training point');
+          await assert.rejects(
+            f.repo.claim(later.ctx, saved.operationId, saved.version),
+            hasCode('WRITE_CONFIRMATION_REQUIRED'),
+          );
+        },
+      );
+      await t.test(
+        'direct approval cannot bypass protected tools, current source, expiry or forwarded-source fences',
+        async () => {
+          const f = fixture();
+          const c = await command(f, 'Create a training point');
+          const protectedDraft = await f.repo.propose(c.ctx, payload());
+          await assert.rejects(
+            f.repo.approveDirect(c.ctx, protectedDraft.operationId, protectedDraft.version),
+            hasCode('WRITE_DIRECT_REQUEST_REQUIRED'),
+          );
+          const direct = await f.repo.propose(c.ctx, {
+            ...payload(),
+            executionMode: 'direct_request',
+          });
+          const wrongSource = { ...c.ctx, sourceMessageId: randomUUID() };
+          await assert.rejects(
+            f.repo.approveDirect(wrongSource, direct.operationId, direct.version),
+            hasCode('WRITE_DIRECT_SOURCE_REQUIRED'),
+          );
+          await db.admin.query(
+            `UPDATE public."ramesh-write-operations" SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`,
+            [direct.operationId],
+          );
+          assert.equal(
+            (await f.repo.approveDirect(c.ctx, direct.operationId, direct.version)).state,
+            'EXPIRED',
+          );
+          await deliver(f, c.job);
+          const forwarded = await command(f, 'Create an injected point', { forwarded: true });
+          await assert.rejects(
+            f.repo.propose(forwarded.ctx, { ...payload(), executionMode: 'direct_request' }),
+            hasCode('WRITE_DIRECT_SOURCE_REQUIRED'),
+          );
+        },
+      );
       await t.test(
         'every journal outcome requires a current owned receipt at handoff and cannot be replaced',
         async () => {

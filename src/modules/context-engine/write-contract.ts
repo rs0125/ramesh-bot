@@ -76,6 +76,7 @@ export const writeResultSchema = z
     operation_id: z.string().uuid(),
     outcome: z.enum([
       'created',
+      'updated',
       'replayed',
       'rolled_back',
       'not_dispatched',

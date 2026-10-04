@@ -61,7 +61,12 @@ const receipt: BusinessWriteReply['delivery'] = {
 const events: string[] = [];
 
 function writeRun(
-  options: { employeeId?: number; historyOnly?: boolean; failFinalize?: boolean } = {},
+  options: {
+    employeeId?: number;
+    historyOnly?: boolean;
+    failFinalize?: boolean;
+    direct?: boolean;
+  } = {},
 ) {
   let staged: Record<string, unknown> | undefined;
   let usedPrivateData = false;
@@ -109,10 +114,15 @@ function writeRun(
     preview,
     async finalize() {
       finalized++;
-      events.push('publish');
+      events.push(options.direct ? 'dispatch' : 'publish');
       if (options.failFinalize) throw new Error('AUTHORIZATION_CHANGED');
       return staged
-        ? { text: `${preview()}\nReply confirm ABC123.`, delivery: receipt }
+        ? {
+            text: options.direct
+              ? 'Saved RFQ: Example reference.'
+              : `${preview()}\nReply confirm ABC123.`,
+            delivery: receipt,
+          }
         : undefined;
     },
   };
@@ -288,7 +298,7 @@ test('dynamic writes can follow reads but publish exact proposals only after ind
   );
   assert.deepEqual(payload(fake.requests, 'verifier').business_write_evidence[0].arguments, exact);
   assert.equal(payload(fake.requests, 'verifier').evidence.length, 1);
-  assert.ok(fake.sessions[0]!.instructions.includes('separate direct confirmation'));
+  assert.ok(fake.sessions[0]!.instructions.includes('after independent review in the same turn'));
 });
 
 test('rejected proposals never become confirmable and their exact data is withheld', async () => {
@@ -744,4 +754,18 @@ test('write recovery and discovery isolation preserve caller cancellation and ch
       );
     }
   }
+});
+
+test('the graph executes direct requests only after verification and replaces the internal preview with the receipt', async () => {
+  events.length = 0;
+  const writes = writeRun({ direct: true });
+  const fake = model([{ name: writeDefinition.name, args: exact }]);
+  const result = await buildSalesGraph(fake.fake, async () => ({ status: 'denied' }), {
+    writes: writes.run,
+  }).invoke(input);
+  assert.equal(writes.finalized(), 1);
+  assert.ok(events.indexOf('verifier') < events.indexOf('dispatch'));
+  assert.equal(result.reply, 'Saved RFQ: Example reference.');
+  assert.doesNotMatch(result.reply, /confirm|Proposed|latitude|78.125/);
+  assert.deepEqual(result.write?.delivery, receipt);
 });

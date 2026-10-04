@@ -398,6 +398,8 @@ export class WriteRepository implements WriteRepositoryPort {
       typeof input.arguments !== 'object' ||
       Array.isArray(input.arguments) ||
       !/^[A-Za-z][\w]{0,63}$/.test(input.idempotencyArgument) ||
+      (input.executionMode !== undefined &&
+        !['direct_request', 'confirmation'].includes(input.executionMode)) ||
       typeof input.summary !== 'string' ||
       !input.summary.trim() ||
       input.summary.length > 5000 ||
@@ -529,6 +531,30 @@ export class WriteRepository implements WriteRepositoryPort {
       return this.transition(db, ctx, row, 'PROPOSED', 'published');
     });
   }
+  /** Called only after independent review of the current direct request and exact staged arguments. */
+  async approveDirect(
+    ctx: WriteCommandContext,
+    id: string,
+    expectedVersion: number,
+  ): Promise<WriteOperation> {
+    return this.tx(ctx, async (db) => {
+      const source = await this.source(db, ctx);
+      const row = await this.required(db, ctx, id, expectedVersion);
+      if (
+        row.proposal_run_id !== ctx.runId ||
+        row.source_message_id !== ctx.sourceMessageId ||
+        row.state !== 'DRAFT' ||
+        this.operation(row).payload.executionMode !== 'direct_request' ||
+        (source.kind !== 'audio' && !source.text.trim())
+      )
+        throw new WriteStorageError('WRITE_DIRECT_REQUEST_REQUIRED');
+      if (row.expires_at.getTime() <= Date.now())
+        return this.transition(db, ctx, row, 'EXPIRED', 'expired');
+      return this.transition(db, ctx, row, 'APPROVED', 'direct_request_approved', {
+        approval: true,
+      });
+    });
+  }
   async findByCode(
     actor: WriteActor,
     code: string,
@@ -652,7 +678,16 @@ export class WriteRepository implements WriteRepositoryPort {
   ): Promise<WriteDispatchClaim | null> {
     return this.tx(ctx, async (db) => {
       const row = await this.required(db, ctx, id, expectedVersion);
-      await this.confirmation(db, ctx, row, ['confirm', 'retry']);
+      if (
+        row.proposal_run_id === ctx.runId &&
+        row.approval_run_id === ctx.runId &&
+        row.source_message_id === ctx.sourceMessageId &&
+        row.approval_source_message_id === ctx.sourceMessageId &&
+        this.operation(row).payload.executionMode === 'direct_request'
+      ) {
+        // A restarted inbound run may recover only its already reviewed, frozen operation.
+        await this.source(db, ctx);
+      } else await this.confirmation(db, ctx, row, ['confirm', 'retry']);
       if (!['APPROVED', 'UNKNOWN', 'DISPATCHING'].includes(row.state))
         throw new WriteStorageError('WRITE_STATE_CONFLICT');
       if (row.state === 'DISPATCHING' && row.dispatch_until.getTime() > Date.now()) return null;
@@ -697,6 +732,7 @@ export class WriteRepository implements WriteRepositoryPort {
       bounded.operation_id !== id ||
       ![
         'created',
+        'updated',
         'replayed',
         'not_dispatched',
         'rejected',
@@ -714,7 +750,7 @@ export class WriteRepository implements WriteRepositoryPort {
       if (!row) throw new WriteStorageError('WRITE_NOT_FOUND');
       if (row.state !== 'DISPATCHING' || row.dispatch_token !== dispatchToken)
         throw new WriteStorageError('WRITE_DISPATCH_LOST');
-      const success = ['created', 'replayed', 'rolled_back'].includes(bounded.outcome);
+      const success = ['created', 'updated', 'replayed', 'rolled_back'].includes(bounded.outcome);
       const uncertain =
         !success && (row.has_uncertain_attempt || bounded.outcome === 'outcome_unknown');
       const state: WriteState = success

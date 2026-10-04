@@ -41,6 +41,7 @@ function descriptor(): ContextToolDefinition {
           type: 'string',
           enum: [
             'created',
+            'updated',
             'replayed',
             'rolled_back',
             'not_dispatched',
@@ -169,7 +170,7 @@ function fixture() {
       result = {
         content: [],
         structuredContent: receipt,
-        ...(!['created', 'replayed', 'rolled_back'].includes(receipt.outcome)
+        ...(!['created', 'updated', 'replayed', 'rolled_back'].includes(receipt.outcome)
           ? { isError: true }
           : {}),
       };
@@ -262,7 +263,7 @@ test('bound write receipts preserve allowlisted recovery and absolute retry timi
   assert.equal(invalid.recovery, undefined);
   assert.doesNotMatch(JSON.stringify(invalid), /untrusted|send_email/);
 });
-for (const outcome of ['created', 'replayed', 'rolled_back'] as const)
+for (const outcome of ['created', 'updated', 'replayed', 'rolled_back'] as const)
   test(`accepts actor/request-bound ${outcome} exactly once`, async () => {
     const { state, call } = fixture();
     state.mutate = (r) => {

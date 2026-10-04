@@ -54,7 +54,8 @@ function tool(
     },
     annotations: {
       readOnlyHint: false,
-      destructiveHint: effect === 'compensate',
+      // These legacy confirmation tests use a protected descriptor. Direct-request cases below opt in.
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -186,6 +187,15 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
       publishCount++;
       return transition(id, 'PROPOSED');
     },
+    async approveDirect(ctx, id) {
+      const operation = operations.get(id)!;
+      assert.equal(ctx.runId, operation.proposalRunId);
+      assert.equal(operation.payload.executionMode, 'direct_request');
+      approveCount++;
+      operation.approvalRunId = ctx.runId;
+      operation.approvalSourceMessageId = ctx.sourceMessageId;
+      return transition(id, 'APPROVED');
+    },
     async findByCode(a, code) {
       const op = [...operations.values()].find((op) => op.confirmationCode === code);
       return op ? owned(a, op.operationId) : null;
@@ -203,7 +213,7 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
     async finish(_ctx, id, _token, result) {
       const op = operations.get(id)!;
       op.result = structuredClone(result);
-      const success = ['created', 'replayed', 'rolled_back'].includes(result.outcome);
+      const success = ['created', 'updated', 'replayed', 'rolled_back'].includes(result.outcome);
       op.hasUncertainAttempt =
         !success && (op.hasUncertainAttempt || result.outcome === 'outcome_unknown');
       return transition(
@@ -388,7 +398,7 @@ test('an RFQ with an earlier uncertain attempt never suggests cancellation or re
   await h.service.recover(h.trusted('cancel ABCDEF12'), signal());
   assert.equal(h.operations.values().next().value!.state, 'UNKNOWN');
 });
-test('RFQ proposals preserve original source text and keep the normal confirmation boundary', async () => {
+test('legacy protected RFQ proposals preserve original source text and their confirmation boundary', async () => {
   const h = harness();
   h.changeDefinitions([rfqCreate]);
   const raw = '  #twenty\nNeed 5000 sqft in Hoskote.\n';
@@ -621,7 +631,7 @@ for (const failure of ['synchronous', 'asynchronous'] as const) {
   });
 }
 
-test('email drafts keep typed confirmation and deliver verified metadata without reopening private history', async () => {
+test('legacy protected email drafts keep typed confirmation and verified metadata without reopening private history', async () => {
   const h = harness({
     draft_ref: randomUUID(),
     mailbox: 'employee@example.com',
@@ -1089,7 +1099,10 @@ test('rollback binds the owned successful original and displays its actual targe
     h.operations.get(operation.operationId)!.version,
   );
   assert.notEqual(compensation.operationId, operation.operationId);
-  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls.length, 2);
+  assert.equal(compensation.state, 'SUCCEEDED');
+  assert.match(reply.text, /Reversed/);
+  assert.doesNotMatch(reply.text, /confirm ABCDEF12/);
 });
 
 test('rollback cannot target unresolved or unowned operations', async () => {
@@ -1302,4 +1315,172 @@ test('generic CRM write permission does not expose historical records or authori
   assert.equal(compensation.ok, false);
   assert.equal(h.proposals.length, 1);
   assert.equal(h.calls.length, 1);
+});
+
+const directTool = (definition: ContextToolDefinition): ContextToolDefinition => ({
+  ...structuredClone(definition),
+  annotations: { ...definition.annotations, destructiveHint: false },
+});
+
+test('an explicit RFQ create dispatches once after review, with exact stored source and no confirm loop', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const text =
+    'Create an RFQ: Test Logistics needs 50,000 sqft in Nelamangala, Bangalore at Rs20/sqft/month.';
+  const request = h.trusted(text);
+  const run = (await h.service.open(request, signal()))!;
+  const staged = (await run.execute(rfqCreate.name, '{}', signal())) as {
+    authorization_request: { text: string };
+    source_messages: Array<{ text: string }>;
+  };
+  assert.equal(h.calls.length, 0);
+  assert.equal(staged.authorization_request.text, text);
+  assert.equal(staged.source_messages[0]!.text, text);
+  assert.doesNotMatch(run.preview()!, /confirm ABCDEF12/);
+  const result = (await run.finalize(signal()))!;
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, text);
+  assert.match(result.text, /Saved/);
+  assert.doesNotMatch(result.text, /confirm ABCDEF12|Review this change|raw text:/);
+  assert.equal(h.counts().publishCount, 0);
+  assert.equal(h.counts().approveCount, 1);
+  const operation = [...h.operations.values()][0]!;
+  assert.equal(operation.approvalRunId, request.runId);
+  assert.equal(operation.approvalSourceMessageId, request.commandMessages![0]!.id);
+  assert.equal(await h.service.canDeliver(request.key, result.delivery, signal()), true);
+  await h.service.recover(request, signal());
+  assert.equal(h.calls.length, 1);
+});
+
+test('an explicit edit dispatches the frozen target and version in the original turn', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(crm)]);
+  h.useResult({ outcome: 'updated', code: 'UPDATED', message: 'Updated.' });
+  const request = h.trusted('Update that RFQ to the review stage.');
+  const run = (await h.service.open(request, signal()))!;
+  const args = { record_id: randomUUID(), expected_version: 4, stage: 'review' };
+  await run.execute(crm.name, JSON.stringify(args), signal());
+  const result = (await run.finalize(signal()))!;
+  assert.deepEqual(h.calls[0]!.args, { ...args, operation_id: h.calls[0]!.operationId });
+  assert.equal(h.calls.length, 1);
+  assert.doesNotMatch(result.text, /confirm ABCDEF12/);
+});
+
+test('direct writes preserve failed/unknown outcomes and retry the original frozen operation', async () => {
+  for (const outcome of ['not_dispatched', 'outcome_unknown'] as const) {
+    const h = harness();
+    h.changeDefinitions([directTool(create)]);
+    h.useResult({ outcome, code: 'TEMPORARY_FAILURE', message: 'Synthetic failure.' });
+    const request = h.trusted('Save a point called Example.');
+    const run = (await h.service.open(request, signal()))!;
+    await run.execute(create.name, JSON.stringify({ name: 'Example' }), signal());
+    const failed = (await run.finalize(signal()))!;
+    assert.doesNotMatch(failed.text, /Saved:/);
+    assert.match(failed.text, /retry ABCDEF12/);
+    h.useResult({ outcome: 'replayed', code: 'OK', message: 'Saved.' });
+    const recovered = await h.service.recover(request, signal());
+    assert.match(recovered!.text, /Saved:/);
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(h.calls[1], h.calls[0]);
+    assert.equal(h.proposals.length, 1);
+  }
+});
+
+test('failed review, revoked access and a forwarded-only request never dispatch direct tools', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(create)]);
+  assert.equal(
+    await h.service.open(h.trusted('Create a point named Injected', { forwarded: true }), signal()),
+    undefined,
+  );
+  const request = h.trusted('Create a point named Example');
+  const run = (await h.service.open(request, signal()))!;
+  await run.execute(create.name, JSON.stringify({ name: 'Example' }), signal());
+  assert.equal(h.calls.length, 0); // Rejecting review never calls finalize.
+  assert.equal([...h.operations.values()][0]!.state, 'DRAFT');
+  h.revoke();
+  await assert.rejects(run.finalize(signal()), /WRITE_ACCESS_CHANGED/);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.counts().approveCount, 0);
+});
+
+test('domain RFQ undo executes directly without enabling generic CRM journal disclosure', async () => {
+  const h = harness();
+  const undo = tool(
+    'undo_crm_rfq',
+    'update',
+    {
+      original_operation_id: uuid,
+      raw_text: { type: 'string', minLength: 1, maxLength: 3000 },
+    },
+    { requiredScopes: ['crm.rfq:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
+  );
+  h.changeDefinitions([undo]);
+  h.useResult({ outcome: 'rolled_back', code: 'OK', message: 'Undone.' });
+  const request = h.trusted('Undo the RFQ change you just made.');
+  const run = (await h.service.open(request, signal()))!;
+  const original = randomUUID();
+  await run.execute(undo.name, JSON.stringify({ original_operation_id: original }), signal());
+  assert.equal(h.calls.length, 0);
+  const reply = (await run.finalize(signal()))!;
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.original_operation_id, original);
+  assert.equal(h.calls[0]!.args.raw_text, request.commandMessages![0]!.text);
+  assert.equal([...h.operations.values()][0]!.payload.parentOperationId, undefined);
+  assert.match(reply.text, /Undid that RFQ change/);
+  assert.doesNotMatch(reply.text, /confirm/);
+});
+
+test('the narrow RFQ undo exception does not enable other destructive updates', async () => {
+  const h = harness();
+  const destructive = tool(
+    'replace_all_crm_details',
+    'update',
+    { record_id: uuid },
+    {
+      requiredScopes: ['crm.rfq:write'],
+      sourceFamily: 'crm',
+    },
+  );
+  h.changeDefinitions([destructive]);
+  const run = (await h.service.open(h.trusted('Replace these details.'), signal()))!;
+  await run.execute(destructive.name, JSON.stringify({ record_id: randomUUID() }), signal());
+  const reply = (await run.finalize(signal()))!;
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.counts().publishCount, 1);
+  assert.match(reply.text, /confirm ABCDEF12/);
+});
+
+test('a direct Gmail draft saves only a draft with the frozen mailbox binding and no extra confirmation', async () => {
+  const h = harness({
+    draft_ref: randomUUID(),
+    mailbox: 'employee@example.com',
+    subject: 'Warehouse options',
+    status: 'draft',
+    provider: 'gmail',
+  });
+  h.changeDefinitions([directTool(draft)]);
+  const run = (await h.service.open(
+    h.trusted(
+      'Save an email draft titled Warehouse options for recipient@example.com, saying Please review the options.',
+    ),
+    signal(),
+  ))!;
+  const args = {
+    subject: 'Warehouse options',
+    body: 'Please review the options.',
+    to: ['recipient@example.com'],
+    cc: [],
+    connection_id: randomUUID(),
+    connection_version: 3,
+  };
+  await run.execute(draft.name, JSON.stringify(args), signal());
+  assert.equal(h.calls.length, 0);
+  assert.equal(run.hasTool('send_email'), false);
+  const result = (await run.finalize(signal()))!;
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.tool, 'create_email_draft');
+  assert.deepEqual(h.calls[0]!.args, { ...args, operation_id: h.calls[0]!.operationId });
+  assert.match(result.text, /Email draft saved. This action did not send it./);
+  assert.doesNotMatch(result.text, /confirm ABCDEF12/);
 });
