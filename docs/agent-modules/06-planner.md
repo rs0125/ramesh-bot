@@ -34,7 +34,7 @@ The initial candidate limit is six steps for a complex read. This is a tuning pr
 
 `assigned_followups_today` uses a code-owned contract: active authorized employee, DM, assigned-only filter, explicit current-day semantics, bounded coverage and honest source limitations. The planner is unnecessary for this request.
 
-For a lead-to-supply request, a plan may resolve the lead, obtain requirements, search supply, inspect candidates, assess the shortlist and produce a supported comparison. Requirement-dependent searches run after lead requirements are established. Independent detail reads can be marked parallelizable, but the executor decides whether concurrency is permitted.
+For a lead-to-supply request, resolve the lead and obtain its bounded current detail/description before searching supply, even when city and area are already known. Reuse current evidence and read relevant notes only for a concrete operational gap or conflict. Search on reliable area/location with unknown fields retained where supported, inspect candidates' recorded context/source values, and supplement the comparison with the advertised shortlist assessment. Missing or unparsed data can remain a specific check on a provisional option; an assessment is not a complete suitability gate. Public research is optional for a material external gap. The executor owns call budgets and concurrency.
 
 The plan stores operational decisions, not private reasoning. User-visible progress can name useful steps without showing raw tool arguments or system instructions.
 

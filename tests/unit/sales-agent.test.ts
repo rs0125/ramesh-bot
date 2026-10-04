@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   createSalesFixture,
   FIXTURE_JID,
+  FIXTURE_LEAD_ID,
   SALES_CATALOGUE,
   salesEvidence,
 } from '../../scripts/lib/sales-fixture.js';
@@ -564,6 +565,122 @@ test('a successful fallback keeps safe failure metadata through formatting and r
   const receipt = toolDeliverySchema.parse(reply.businessEvidence);
   assert.equal(receipt.checks.length, 1);
   assert.equal(await fixture.service.canDeliver(trusted.key, receipt, signal()), true);
+});
+
+test('CRM narrative and unparsed warehouse evidence survive a shortlist through worker and synthesis', async () => {
+  const fixture = createSalesFixture();
+  const sourceText = (text: string) => ({
+    state: 'present',
+    text,
+    redacted: false,
+    truncated: false,
+  });
+  const description = sourceText(
+    'Retail distribution, daily truck loading; charging was discussed earlier.',
+  );
+  const recordedContext = {
+    compliances: sourceText('Owner says fully compliant; current documents to be checked.'),
+    floor_strength_per_sqm: sourceText('Heavy-duty floor; load test report awaited.'),
+  };
+  const dockEvidence = {
+    kind: 'unknown',
+    recorded_source: sourceText('Two docks operational, one can be added'),
+  };
+  fixture.state.mutate = (evidence, tool) => {
+    if (tool === 'read_crm_lead') evidence.data.description = description;
+    if (tool === 'read_crm_lead_context')
+      evidence.data.items = [
+        { id: 'fixture-note', body: 'Confirm turning space for daily truck arrivals.' },
+      ];
+    const candidates =
+      tool === 'read_warehouse'
+        ? [evidence.data]
+        : tool === 'search_warehouses'
+          ? (evidence.data.items as Array<Record<string, unknown>>)
+          : [];
+    for (const candidate of candidates) {
+      candidate.dock_count = null;
+      candidate.recorded_context = recordedContext;
+      candidate.field_evidence = {
+        ...(candidate.field_evidence as Record<string, unknown>),
+        dock_count: dockEvidence,
+      };
+    }
+  };
+  const calls = [
+    { name: 'search_crm_leads', args: { q: 'Acme', limit: 1 } },
+    { name: 'read_crm_lead', args: { id: FIXTURE_LEAD_ID } },
+    { name: 'read_crm_lead_context', args: { id: FIXTURE_LEAD_ID, section: 'notes' } },
+    {
+      name: 'search_warehouses',
+      args: { city: 'Bengaluru', area_min_sqft: 25000, include_unknown: 'true', limit: 1 },
+    },
+    { name: 'read_warehouse', args: { id: 101 } },
+    { name: 'assess_shortlist', args: { lead_id: FIXTURE_LEAD_ID, warehouse_ids: [101] } },
+  ];
+  const fake = scriptedModel(
+    calls,
+    'ID 101: 26,000 sqft, Hoskote. Pro: recorded dock arrangements may suit daily loading. Con: truck turning space needs checking. These are provisional source claims; confirm floor capacity, documents and current availability.',
+  );
+  const input = 'Find one provisional warehouse for this lead. Charging is no longer required.';
+  const assistant = new AssistantService(
+    { model: 'fixture', timeoutMs: 5000 },
+    fake.model,
+    undefined,
+    undefined,
+    undefined,
+    fixture.service,
+  );
+  const reply = await assistant.prepare(
+    {
+      messageId: 'rich-shortlist',
+      sentAtMs: Date.now(),
+      chatId: FIXTURE_JID,
+      text: input,
+      fromMe: false,
+      isGroup: false,
+      mentionsBot: false,
+    },
+    signal(),
+    trusted,
+  );
+  assert.equal(reply.trace.outcome, 'completed');
+  assert.deepEqual(
+    fixture.state.calls.map(({ tool }) => tool),
+    calls.map(({ name }) => name),
+  );
+  const workerData = fake.outputs.map(
+    (output) => (output as { data: Record<string, unknown> }).data,
+  );
+  assert.deepEqual(workerData[1]!.description, description);
+  assert.deepEqual(workerData[4]!.recorded_context, recordedContext);
+  assert.equal(workerData[4]!.dock_count, null);
+  assert.deepEqual(
+    (workerData[4]!.field_evidence as Record<string, unknown>).dock_count,
+    dockEvidence,
+  );
+  assert.equal(fake.sessions[0]!.messages.at(-1)!.content, input);
+  for (const stage of ['formatter', 'verifier']) {
+    const request = fake.requests.find((item) => item.stage === stage)!;
+    const context = JSON.parse(request.messages[0]!.content);
+    assert.equal(
+      context.request,
+      input,
+      'the current correction survives alongside older source text',
+    );
+    for (const [tool, field] of [
+      ['read_crm_lead', 'description'],
+      ['read_crm_lead_context', 'items'],
+      ['read_warehouse', 'recorded_context'],
+      ['read_warehouse', 'field_evidence'],
+      ['read_warehouse', 'dock_count'],
+    ] as const) {
+      const original = fixture.state.evidence.find((item) => item.tool === tool)!;
+      const retained = context.evidence.find((item: { tool: string }) => item.tool === tool);
+      assert.deepEqual(retained.result.data[field], original.result.data[field]);
+    }
+  }
+  assert.equal(toolDeliverySchema.parse(reply.businessEvidence).checks.length, calls.length);
 });
 
 test('a failed review can fetch missing evidence within the same run before the final review', async () => {
