@@ -92,8 +92,30 @@ const draftReceipt = z
     subject: draftSubject,
     status: z.literal('draft'),
     provider: z.literal('gmail'),
+    // Optional provider navigation must not invalidate an otherwise valid save.
+    // Validate it separately before rendering, never accept a model-supplied URL.
+    draft_url: z.unknown().optional(),
   })
   .strict();
+
+function verifiedDraftUrl(value: unknown, mailbox: string): string | undefined {
+  if (typeof value !== 'string' || value.length > 2048 || /[\s\p{Cc}\p{Cf}]/u.test(value))
+    return undefined;
+  // Check the original spelling too: URL parsing alone normalizes backslashes,
+  // default ports and some malformed paths that we never need to accept here.
+  if (
+    !/^https:\/\/mail\.google\.com\/mail\/\?authuser=[^&#]+#drafts\?compose=[BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz]{1,512}$/.test(
+      value,
+    )
+  )
+    return undefined;
+  try {
+    const url = new URL(value);
+    return url.searchParams.get('authuser') === mailbox ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Hide server bindings only for the complete known payload; future fields stay visible generically. */
 export function mailDraftProposalText(operation: WriteOperation): string | undefined {
@@ -272,6 +294,7 @@ export function mailDraftResultText(operation: WriteOperation): string | undefin
   )
     return 'The operation completed, but I could not verify its draft details. Read the draft again before using it.';
   const { mailbox, subject } = parsed.data;
+  const draftUrl = verifiedDraftUrl(parsed.data.draft_url, mailbox);
   const replayed = operation.result.outcome === 'replayed';
   const args = mailArguments(operation);
   // A replay proves the earlier save, not the current body after possible Gmail edits.
@@ -286,8 +309,11 @@ export function mailDraftResultText(operation: WriteOperation): string | undefin
     ? `This ${updating ? 'draft edit' : 'draft'} was already saved in ${mailbox}.`
     : `${updating ? 'Draft updated' : 'Draft saved'} in ${mailbox}.`;
   const footer = [
-    'Open it in Gmail to review and send when ready:',
-    'https://mail.google.com/mail/#drafts',
+    draftUrl
+      ? 'Open this draft in Gmail to review and send when ready:'
+      : 'Open it in Gmail to review and send when ready:',
+    draftUrl ?? 'https://mail.google.com/mail/#drafts',
+    ...(draftUrl ? ['Drafts folder: https://mail.google.com/mail/#drafts'] : []),
     ...(replayed ? ["I haven't checked for later changes in Gmail."] : []),
   ].join('\n');
   const complete = [lead, content, footer].join('\n\n');

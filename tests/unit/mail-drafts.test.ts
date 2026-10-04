@@ -26,6 +26,8 @@ const receipt = {
   status: 'draft',
   provider: 'gmail',
 };
+const composeToken = 'BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz';
+const directDraftUrl = `https://mail.google.com/mail/?authuser=employee%40example.com#drafts?compose=${composeToken}`;
 const object = (properties: Record<string, z.ZodType>) =>
   z.toJSONSchema(z.object(properties).strict());
 const descriptor = (): ContextToolDefinition => ({
@@ -249,6 +251,101 @@ test('successful draft receipts show readable saved content and a fixed Gmail li
   assert.match(replay, /already saved/);
   assert.match(replay, /haven't checked for later changes/);
   assert.doesNotMatch(replay, /these exact warehouse options|To:/);
+});
+
+test('authenticated direct draft links open the saved draft for the matching mailbox', () => {
+  for (const updating of [false, true]) {
+    const value = proposal();
+    value.state = 'SUCCEEDED';
+    value.payload.arguments.subject = receipt.subject;
+    if (updating) {
+      value.payload.toolName = 'update_email_draft';
+      value.payload.arguments.draft_ref = receipt.draft_ref;
+      value.payload.arguments.expected_message_id = 'providerMessage42';
+      value.result!.outcome = 'updated';
+    }
+    value.result!.data = { ...receipt, draft_url: directDraftUrl };
+    const before = structuredClone(value);
+    const text = mailDraftResultText(value)!;
+    assert.ok(text.includes(updating ? 'Draft updated' : 'Draft saved'));
+    assert.ok(text.includes(String(value.payload.arguments.body)));
+    assert.ok(text.includes(directDraftUrl));
+    assert.match(text, /Open this draft in Gmail to review and send when ready/);
+    assert.doesNotMatch(text, /could not verify|confirm/);
+    assert.match(text, /Drafts folder: https:\/\/mail\.google\.com\/mail\/#drafts/);
+    assert.deepEqual(value, before);
+    value.result!.outcome = 'replayed';
+    const replay = mailDraftResultText(value)!;
+    assert.ok(replay.includes(directDraftUrl));
+    assert.match(replay, /already saved.*haven't checked for later changes/s);
+    assert.doesNotMatch(replay, /these exact warehouse options|To:/);
+  }
+});
+
+test('invalid optional draft links fall back to Gmail Drafts without denying a verified save', () => {
+  const invalid: unknown[] = [
+    undefined,
+    null,
+    '',
+    42,
+    [],
+    { href: directDraftUrl },
+    'https://evil.example/mail/',
+    directDraftUrl.replace('https:', 'http:'),
+    directDraftUrl.replace('mail.google.com', 'mail.google.com.evil.example'),
+    directDraftUrl.replace('mail.google.com', 'attacker@mail.google.com'),
+    directDraftUrl.replace('mail.google.com', 'mail.google.com:443'),
+    directDraftUrl.replace('/mail/', '/mail//'),
+    directDraftUrl.replace('/mail/', '/mail/../mail/'),
+    directDraftUrl.replace('/mail/', '/%6dail/'),
+    directDraftUrl.replace('employee%40example.com', 'other%40example.com'),
+    directDraftUrl.replace('#drafts', '&authuser=employee%40example.com#drafts'),
+    directDraftUrl.replace('#drafts', '&extra=value#drafts'),
+    directDraftUrl.replace('#drafts', '#inbox'),
+    `${directDraftUrl}&send=true`,
+    directDraftUrl.replace(composeToken, ''),
+    directDraftUrl.replace(composeToken, 'B'.repeat(513)),
+    directDraftUrl.replace(composeToken, '%42CDF'),
+    directDraftUrl.replace(composeToken, '12345'),
+    directDraftUrl.replace(composeToken, 'ABC_DEF'),
+    `${directDraftUrl}\n`,
+    directDraftUrl.replace('mail.google.com', 'mail.google.com\u200b'),
+    directDraftUrl.replace('/mail/', '\\mail\\'),
+    `${directDraftUrl}${'B'.repeat(2048)}`,
+  ];
+  for (const draft_url of invalid) {
+    const value = operation();
+    value.result!.data = { ...receipt, draft_url };
+    const text = mailDraftResultText(value)!;
+    assert.match(text, /Draft saved in employee@example\.com/);
+    assert.match(text, /Subject: Warehouse options/);
+    assert.ok(text.includes('https://mail.google.com/mail/#drafts'));
+    assert.doesNotMatch(text, /could not verify|compose=|evil|attacker|send=true/);
+  }
+});
+
+test('direct links are accepted only in authenticated receipts and stay bounded for long drafts', () => {
+  const value = proposal();
+  value.state = 'SUCCEEDED';
+  value.payload.arguments.subject = receipt.subject;
+  value.payload.arguments.body = 'A long email sentence. '.repeat(400);
+  const longestValid = directDraftUrl.replace(composeToken, 'B'.repeat(512));
+  value.result!.data = { ...receipt, draft_url: longestValid };
+  const text = mailDraftResultText(value)!;
+  assert.match(text, /Draft saved.*The full draft is in Gmail/s);
+  assert.ok(text.includes(longestValid));
+  assert.ok(text.length <= 4800);
+  assert.doesNotMatch(text, /A long email sentence/);
+  value.payload.arguments.draft_url = directDraftUrl;
+  value.state = 'PROPOSED';
+  assert.equal(
+    mailDraftProposalText(value),
+    undefined,
+    'a model-supplied link is not a known write argument',
+  );
+  value.state = 'SUCCEEDED';
+  value.result!.data = { ...receipt, draft_url: directDraftUrl, url: 'https://evil.example' };
+  assert.match(mailDraftResultText(value)!, /could not verify its draft details/);
 });
 
 test('updated draft receipts preserve the existing reference and show edited content', () => {

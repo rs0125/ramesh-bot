@@ -66,8 +66,8 @@ Short successful drafts show readable recipients, subject and body, followed by:
 
 > Draft saved in employee@example.com.
 >
-> Open it in Gmail to review and send when ready:
-> https://mail.google.com/mail/#drafts
+> Open this draft in Gmail to review and send when ready:
+> (a link to the saved draft in the connected mailbox)
 
 Edits say “Draft updated”. Recipient arrays and JSON-escaped bodies are never
 used for this presentation. A confirmed-mode legacy proposal still shows complete
@@ -76,12 +76,23 @@ are hidden only for the complete validated known payload; future unknown fields
 use the generic preview. Subjects are trimmed before arguments are frozen,
 matching Context Engine normalization.
 
-The fixed application-owned link opens Gmail's Drafts folder. API draft IDs are
-not converted into invented per-draft links. The named mailbox identifies which
-account to open. Replayed receipts say the earlier save already occurred and do
-not redisplay potentially stale draft content as current. A current read is
-required for later content questions. Malformed receipts cannot introduce a URL,
-mailbox or success claim.
+Context Engine can return an optional `draft_url` in the authenticated receipt.
+Ramesh accepts only the exact HTTPS Gmail `/mail/` path, one `authuser` matching
+the receipt's mailbox, and a `#drafts?compose=` token in Gmail's permitted
+alphabet. Credentials, ports, extra parameters, other accounts and other URL
+shapes are rejected. The model cannot supply this link as a write argument.
+Valid direct links include a visible Drafts-folder fallback in the same reply.
+When the link is absent or invalid, the reply keeps the verified save and uses
+`https://mail.google.com/mail/#drafts`; the named mailbox identifies which account
+to open. An invalid optional link does not turn a successful save into a failure.
+Other unknown receipt fields still fail validation. Gmail's compose route is a
+web UI convention, not a guarantee that an old draft still exists.
+
+Replayed receipts say the earlier save already occurred and do not redisplay
+potentially stale draft content as current. They use a verified direct link when
+one is present, otherwise the folder link. A current read is required for later
+content questions. Malformed receipts cannot introduce a URL, mailbox or success
+claim.
 
 Draft arguments plus summary currently have a 4,800-character staging budget.
 Although Context Engine accepts larger bodies, the bot refuses an oversized
@@ -120,3 +131,5 @@ requests. They cover explicit scope admission, dynamic reads, direct and confirm
 write boundaries, exact saved content, existing-draft edits, readable receipts,
 legacy recovery, natural direct recovery, uncertain results, stale versions,
 malformed metadata, frozen connection bindings and private delivery checks.
+Direct-link tests cover mailbox binding, hostile URL variants, malformed optional
+links, legacy folder fallback, replay and the 4,800-character reply limit.
