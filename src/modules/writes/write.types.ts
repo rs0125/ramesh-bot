@@ -25,6 +25,8 @@ export interface WriteProposalPayload {
   toolName: string;
   toolSchema: Record<string, unknown>;
   toolDescription?: string;
+  /** Frozen authenticated tool policy, never a model argument. Omission means confirmation. */
+  executionMode?: 'direct_request' | 'confirmation';
   toolMeta?: Record<string, unknown>;
   requiredScopes?: string[];
   sourceFamily?: string;
@@ -41,6 +43,7 @@ export interface WriteAttemptResult {
   operation_id: string;
   outcome:
     | 'created'
+    | 'updated'
     | 'replayed'
     | 'not_dispatched'
     | 'rejected'
@@ -83,6 +86,13 @@ export interface WriteRepositoryPort {
   propose(ctx: WriteCommandContext, payload: WriteProposalPayload): Promise<WriteOperation>;
   findByRun(ctx: WriteCommandContext): Promise<WriteOperation | null>;
   publish(ctx: WriteCommandContext, id: string, expectedVersion: number): Promise<WriteOperation>;
+  approveDirect(
+    ctx: WriteCommandContext,
+    id: string,
+    expectedVersion: number,
+  ): Promise<WriteOperation>;
+  /** Only a standalone direct recovery request for the sole unresolved approved direct operation. */
+  findDirectRecovery(ctx: WriteCommandContext): Promise<WriteOperation | null>;
   findByCode(
     actor: WriteActor,
     code: string,
@@ -143,4 +153,15 @@ export class WriteStorageError extends Error {
     super(code);
     this.name = 'WriteStorageError';
   }
+}
+
+/** Narrow runtime commands. Quoted/forwarded source text never reaches this authority boundary. */
+export function directRecoveryAction(text: string): 'retry' | 'cancel' | undefined {
+  const value = text.trim().toLowerCase().replace(/[.!]$/, '').trim();
+  if (
+    /^(?:please )?(?:retry (?:that|the last) draft|try (?:that|the last) draft again)$/.test(value)
+  )
+    return 'retry';
+  if (/^(?:please )?cancel (?:that|the last) draft attempt$/.test(value)) return 'cancel';
+  return undefined;
 }

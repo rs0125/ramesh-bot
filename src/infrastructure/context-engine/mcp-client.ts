@@ -372,7 +372,7 @@ export class ContextEngineMcpClient implements ContextToolGateway, ContextWriteG
           if (!checked.success || !schemaAccepts(tool.outputSchema!, raw))
             throw new ContextEngineError('INVALID_RESPONSE');
           const receipt = checked.data,
-            success = ['created', 'replayed', 'rolled_back'].includes(receipt.outcome);
+            success = ['created', 'updated', 'replayed', 'rolled_back'].includes(receipt.outcome);
           if (
             receipt.operation_id.toLowerCase() !== id ||
             receipt.meta?.toolName !== name ||

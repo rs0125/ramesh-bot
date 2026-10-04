@@ -6,8 +6,10 @@ import { authCipher } from './auth-store.js';
 import { toInboxCandidate } from '../whatsapp/message.mapper.js';
 import type { InboxContent } from './inbox.repository.js';
 import { decodeReply } from '../../modules/messaging/reply-payload.js';
+import { writeContract } from '../../modules/context-engine/write-contract.js';
 import {
   WriteStorageError,
+  directRecoveryAction,
   type WriteActor,
   type WriteAttemptResult,
   type WriteAuditRecord,
@@ -398,10 +400,21 @@ export class WriteRepository implements WriteRepositoryPort {
       typeof input.arguments !== 'object' ||
       Array.isArray(input.arguments) ||
       !/^[A-Za-z][\w]{0,63}$/.test(input.idempotencyArgument) ||
+      (input.executionMode !== undefined &&
+        !['direct_request', 'confirmation'].includes(input.executionMode)) ||
       typeof input.summary !== 'string' ||
       !input.summary.trim() ||
       input.summary.length > 5000 ||
       (input.sourceFamily !== undefined && !/^[\w.-]{1,64}$/.test(input.sourceFamily))
+    )
+      throw new WriteStorageError('WRITE_INVALID_PAYLOAD');
+    if (
+      input.executionMode === 'direct_request' &&
+      writeContract({
+        name: input.toolName,
+        inputSchema: input.toolSchema,
+        _meta: input.toolMeta,
+      })?.executionMode !== 'direct_request'
     )
       throw new WriteStorageError('WRITE_INVALID_PAYLOAD');
     if (
@@ -431,6 +444,11 @@ export class WriteRepository implements WriteRepositoryPort {
         )
           throw new WriteStorageError('WRITE_ACCESS_DENIED');
         if (old.fingerprint === fingerprint) return this.operation(old);
+        if (
+          (this.operation(old).payload.executionMode ?? 'confirmation') !==
+          (input.executionMode ?? 'confirmation')
+        )
+          throw new WriteStorageError('WRITE_PROPOSAL_CONFLICT');
         if (old.state !== 'DRAFT' || old.dispatch_attempts !== 0)
           throw new WriteStorageError('WRITE_PROPOSAL_CONFLICT');
         if (old.expires_at.getTime() <= Date.now())
@@ -505,12 +523,22 @@ export class WriteRepository implements WriteRepositoryPort {
   }
   async findByRun(ctx: WriteCommandContext): Promise<WriteOperation | null> {
     return this.tx(ctx, async (db) => {
-      const row = (
+      const rows = (
         await db.query(
-          `SELECT * FROM public."ramesh-write-operations" WHERE account_id=$1 AND proposal_run_id=$2 AND owner_employee_id=$3 AND phone_e164=$4 AND chat_id=$5`,
-          [this.accountId, ctx.runId, ctx.employeeId, ctx.phoneE164, ctx.chatId],
+          `SELECT o.* FROM public."ramesh-write-operations" o WHERE o.account_id=$1 AND o.owner_employee_id=$3 AND o.phone_e164=$4 AND o.chat_id=$5
+          AND (o.proposal_run_id=$2 OR EXISTS (SELECT 1 FROM public."ramesh-write-events" e WHERE e.operation_id=o.id AND e.account_id=o.account_id AND e.owner_employee_id=o.owner_employee_id AND e.phone_e164=o.phone_e164 AND e.chat_id=o.chat_id AND e.run_id=$2 AND e.source_message_id=$6 AND e.kind IN ('dispatch_claimed','cancelled'))) LIMIT 2`,
+          [
+            this.accountId,
+            ctx.runId,
+            ctx.employeeId,
+            ctx.phoneE164,
+            ctx.chatId,
+            ctx.sourceMessageId,
+          ],
         )
-      ).rows[0];
+      ).rows;
+      if (rows.length > 1) throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
+      const row = rows[0];
       return row ? this.operation(row) : null;
     });
   }
@@ -522,11 +550,93 @@ export class WriteRepository implements WriteRepositoryPort {
     return this.tx(ctx, async (db) => {
       await this.source(db, ctx);
       const row = await this.required(db, ctx, id, expectedVersion);
-      if (row.proposal_run_id !== ctx.runId || row.state !== 'DRAFT')
+      if (
+        row.proposal_run_id !== ctx.runId ||
+        row.state !== 'DRAFT' ||
+        this.operation(row).payload.executionMode === 'direct_request'
+      )
         throw new WriteStorageError('WRITE_STATE_CONFLICT');
       if (row.expires_at.getTime() <= Date.now())
         return this.transition(db, ctx, row, 'EXPIRED', 'expired');
       return this.transition(db, ctx, row, 'PROPOSED', 'published');
+    });
+  }
+  /** The graph has reviewed the frozen arguments and current direct request before this transition. */
+  async approveDirect(
+    ctx: WriteCommandContext,
+    id: string,
+    expectedVersion: number,
+  ): Promise<WriteOperation> {
+    return this.tx(ctx, async (db) => {
+      const source = await this.source(db, ctx);
+      const row = await this.required(db, ctx, id, expectedVersion);
+      const payload = this.operation(row).payload;
+      if (
+        row.proposal_run_id !== ctx.runId ||
+        row.source_message_id !== ctx.sourceMessageId ||
+        row.state !== 'DRAFT' ||
+        payload.executionMode !== 'direct_request' ||
+        writeContract({
+          name: payload.toolName,
+          inputSchema: payload.toolSchema,
+          _meta: payload.toolMeta,
+        })?.executionMode !== 'direct_request' ||
+        (source.kind !== 'audio' && !source.text.trim())
+      )
+        throw new WriteStorageError('WRITE_DIRECT_REQUEST_REQUIRED');
+      if (row.expires_at.getTime() <= Date.now())
+        return this.transition(db, ctx, row, 'EXPIRED', 'expired');
+      return this.transition(db, ctx, row, 'APPROVED', 'direct_request_approved', {
+        approval: true,
+      });
+    });
+  }
+  private async directRecovery(
+    db: PoolClient,
+    ctx: WriteCommandContext,
+    action?: 'retry' | 'cancel',
+  ): Promise<Row | null> {
+    const source = await this.source(db, ctx);
+    const requested = source.kind === 'text' ? directRecoveryAction(source.text) : undefined;
+    if (!requested || (action && requested !== action))
+      throw new WriteStorageError('WRITE_DIRECT_RECOVERY_REQUIRED');
+    const batch = (
+      await db.query(
+        `SELECT m.* FROM public."ramesh-messages" m JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
+      WHERE m.account_id=$1 AND m.chat_id=$2 AND (m.id=$3 OR q.batch_parent=$3) LIMIT 17`,
+        [this.accountId, ctx.chatId, ctx.runId],
+      )
+    ).rows;
+    const direct = batch
+      .map((row) => this.decodeSource(row, true))
+      .filter(
+        (item) => item && item.forwarded === false && (item.text.trim() || item.kind === 'audio'),
+      );
+    if (batch.length > 16 || direct.length !== 1 || direct[0]!.id !== ctx.sourceMessageId)
+      throw new WriteStorageError('WRITE_DIRECT_RECOVERY_REQUIRED');
+    // Include every unresolved operation: neither a hidden older operation nor a legacy confirmation may be silently skipped.
+    const rows = (
+      await db.query(
+        `SELECT * FROM public."ramesh-write-operations" WHERE account_id=$1 AND owner_employee_id=$2 AND phone_e164=$3 AND chat_id=$4
+      AND state IN ('APPROVED','UNKNOWN','DISPATCHING') ORDER BY created_at DESC,id DESC LIMIT 2 FOR UPDATE`,
+        [this.accountId, ctx.employeeId, ctx.phoneE164, ctx.chatId],
+      )
+    ).rows;
+    if (rows.length > 1) throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
+    const row = rows[0];
+    if (!row) return null;
+    const payload = this.operation(row).payload;
+    return row.approval_run_id &&
+      row.approval_source_message_id &&
+      payload.executionMode === 'direct_request' &&
+      payload.sourceFamily === 'mail'
+      ? row
+      : null;
+  }
+  async findDirectRecovery(ctx: WriteCommandContext): Promise<WriteOperation | null> {
+    return this.tx(ctx, async (db) => {
+      const row = await this.directRecovery(db, ctx);
+      return row ? this.operation(row) : null;
     });
   }
   async findByCode(
@@ -652,7 +762,22 @@ export class WriteRepository implements WriteRepositoryPort {
   ): Promise<WriteDispatchClaim | null> {
     return this.tx(ctx, async (db) => {
       const row = await this.required(db, ctx, id, expectedVersion);
-      await this.confirmation(db, ctx, row, ['confirm', 'retry']);
+      const payload = this.operation(row).payload;
+      if (
+        payload.executionMode === 'direct_request' &&
+        row.approval_run_id === ctx.runId &&
+        row.proposal_run_id === ctx.runId &&
+        row.source_message_id === ctx.sourceMessageId &&
+        row.approval_source_message_id === ctx.sourceMessageId
+      ) {
+        await this.source(db, ctx);
+      } else if (
+        payload.executionMode === 'direct_request' &&
+        directRecoveryAction((await this.source(db, ctx)).text) === 'retry'
+      ) {
+        if ((await this.directRecovery(db, ctx, 'retry'))?.id !== row.id)
+          throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
+      } else await this.confirmation(db, ctx, row, ['confirm', 'retry']);
       if (!['APPROVED', 'UNKNOWN', 'DISPATCHING'].includes(row.state))
         throw new WriteStorageError('WRITE_STATE_CONFLICT');
       if (row.state === 'DISPATCHING' && row.dispatch_until.getTime() > Date.now()) return null;
@@ -664,8 +789,7 @@ export class WriteRepository implements WriteRepositoryPort {
         // A lost quota-rejection response may look uncertain here while Gmail
         // storage permits another POST. An expired mail approval cannot retry
         // the write endpoint, even for apparent recovery. Keep uncertainty intact.
-        if (payload.toolName === 'create_email_draft' && payload.sourceFamily === 'mail')
-          return null;
+        if (payload.sourceFamily === 'mail') return null;
       }
       if (
         row.expires_at.getTime() <= Date.now() &&
@@ -697,6 +821,7 @@ export class WriteRepository implements WriteRepositoryPort {
       bounded.operation_id !== id ||
       ![
         'created',
+        'updated',
         'replayed',
         'not_dispatched',
         'rejected',
@@ -714,7 +839,7 @@ export class WriteRepository implements WriteRepositoryPort {
       if (!row) throw new WriteStorageError('WRITE_NOT_FOUND');
       if (row.state !== 'DISPATCHING' || row.dispatch_token !== dispatchToken)
         throw new WriteStorageError('WRITE_DISPATCH_LOST');
-      const success = ['created', 'replayed', 'rolled_back'].includes(bounded.outcome);
+      const success = ['created', 'updated', 'replayed', 'rolled_back'].includes(bounded.outcome);
       const uncertain =
         !success && (row.has_uncertain_attempt || bounded.outcome === 'outcome_unknown');
       const state: WriteState = success
@@ -740,7 +865,13 @@ export class WriteRepository implements WriteRepositoryPort {
       const row = await this.required(db, ctx, id, expectedVersion);
       if (row.state === 'DRAFT' && row.proposal_run_id === ctx.runId && code === undefined)
         await this.source(db, ctx);
-      else await this.confirmation(db, ctx, row, ['cancel'], code);
+      else if (
+        code === undefined &&
+        this.operation(row).payload.executionMode === 'direct_request'
+      ) {
+        if ((await this.directRecovery(db, ctx, 'cancel'))?.id !== row.id)
+          throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
+      } else await this.confirmation(db, ctx, row, ['cancel'], code);
       if (!['DRAFT', 'PROPOSED', 'APPROVED'].includes(row.state) || row.has_uncertain_attempt)
         throw new WriteStorageError('WRITE_CANNOT_CANCEL_DISPATCHED');
       return this.transition(db, ctx, row, 'CANCELLED', 'cancelled');

@@ -117,9 +117,13 @@ test(
       return { ctx, job };
     }
     async function proposalHandoff(f: Fixture, job: MessageJob) {
-      const op = (await f.repo.listRecent(actor)).find(
-        (op) => op.proposalRunId === job.id && op.state === 'PROPOSED',
-      );
+      const op = await f.repo.findByRun({
+        ...actor,
+        runId: job.id,
+        sourceMessageId: job.id,
+        leaseToken: job.token,
+        requestTimeMs: Date.now(),
+      });
       const receipt = op
         ? {
             kind: 'write_bundle',
@@ -178,6 +182,235 @@ test(
       expiresAt: new Date(Date.now() + 300000).toISOString(),
     });
     try {
+      await t.test(
+        'direct approval is mode-bound, source-fenced and cannot upgrade persisted confirmation',
+        async () => {
+          const f = fixture(),
+            c = await command(f, 'Save this explicitly requested draft');
+          const legacy = await f.repo.propose(c.ctx, payload());
+          await assert.rejects(
+            f.repo.approveDirect(c.ctx, legacy.operationId, legacy.version),
+            hasCode('WRITE_DIRECT_REQUEST_REQUIRED'),
+          );
+          const direct = {
+            ...payload(),
+            executionMode: 'direct_request' as const,
+            sourceFamily: 'mail',
+            toolMeta: {
+              'wareongo/context-write-v1': {
+                requiredScopes: ['mail:drafts'],
+                sourceFamily: 'mail',
+                effect: 'create',
+                idempotencyArgument: 'operation_id',
+                executionMode: 'direct_request',
+              },
+            },
+          };
+          await assert.rejects(f.repo.propose(c.ctx, direct), hasCode('WRITE_PROPOSAL_CONFLICT'));
+          const separate = fixture(),
+            next = await command(separate, 'Save the requested change');
+          const op = await separate.repo.propose(next.ctx, direct);
+          await assert.rejects(
+            separate.repo.publish(next.ctx, op.operationId, op.version),
+            hasCode('WRITE_STATE_CONFLICT'),
+          );
+          const approved = await separate.repo.approveDirect(next.ctx, op.operationId, op.version);
+          assert.equal(approved.state, 'APPROVED');
+          assert.equal(approved.approvalRunId, next.ctx.runId);
+          assert.equal(approved.approvalSourceMessageId, next.ctx.sourceMessageId);
+          const audit = await separate.repo.auditRecent(actor);
+          assert.ok(audit.some((item) => item.kind === 'direct_request_approved'));
+          const claim = await separate.repo.claim(next.ctx, op.operationId, approved.version);
+          assert.ok(claim);
+          assert.equal(
+            await separate.repo.claim(next.ctx, op.operationId, claim.operation.version),
+            null,
+          );
+          const finished = await separate.repo.finish(
+            next.ctx,
+            op.operationId,
+            claim.dispatchToken,
+            {
+              operation_id: op.operationId,
+              outcome: 'updated',
+              code: 'UPDATED',
+              message: 'Synthetic update',
+            },
+          );
+          assert.equal(finished.state, 'SUCCEEDED');
+          assert.equal((await separate.repo.findByRun(next.ctx))!.operationId, op.operationId);
+        },
+      );
+      await t.test(
+        'natural draft retry reuses one frozen approved operation and restart resolves its audit receipt',
+        async () => {
+          const f = fixture(),
+            c = await command(f, 'Save this requested draft');
+          const input = {
+            ...payload(),
+            executionMode: 'direct_request' as const,
+            sourceFamily: 'mail',
+            toolMeta: {
+              'wareongo/context-write-v1': {
+                requiredScopes: ['mail:drafts'],
+                sourceFamily: 'mail',
+                effect: 'create',
+                idempotencyArgument: 'operation_id',
+                executionMode: 'direct_request',
+              },
+            },
+          };
+          const op = await f.repo.propose(c.ctx, input);
+          const approved = await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+          const claim = (await f.repo.claim(c.ctx, op.operationId, approved.version))!;
+          await f.repo.finish(c.ctx, op.operationId, claim.dispatchToken, {
+            operation_id: op.operationId,
+            outcome: 'outcome_unknown',
+            code: 'OUTCOME_UNKNOWN',
+            message: 'Synthetic uncertainty',
+          });
+          await deliver(f, c.job);
+          const retry = await command(f, 'try that draft again');
+          const found = (await f.repo.findDirectRecovery(retry.ctx))!;
+          assert.equal(found.operationId, op.operationId);
+          assert.deepEqual(found.payload.arguments, op.payload.arguments);
+          const resumed = (await f.repo.claim(retry.ctx, found.operationId, found.version))!;
+          assert.ok(resumed);
+          await f.repo.finish(retry.ctx, op.operationId, resumed.dispatchToken, {
+            operation_id: op.operationId,
+            outcome: 'updated',
+            code: 'UPDATED',
+            message: 'Synthetic update',
+          });
+          assert.equal((await f.repo.findByRun(retry.ctx))!.state, 'SUCCEEDED');
+          assert.equal(await f.repo.findDirectRecovery(retry.ctx), null);
+          const events = (await f.repo.auditRecent(actor)).filter(
+            (item) => item.operationId === op.operationId,
+          );
+          assert.ok(
+            events.some(
+              (item) => item.runId === retry.ctx.runId && item.kind === 'dispatch_claimed',
+            ),
+          );
+        },
+      );
+      await t.test(
+        'expired direct requests remain definite while expired uncertain mail cannot redispatch',
+        async () => {
+          for (const uncertain of [false, true]) {
+            const f = fixture(),
+              c = await command(f, 'Save this requested draft');
+            const op = await f.repo.propose(c.ctx, {
+              ...payload(),
+              executionMode: 'direct_request',
+              sourceFamily: 'mail',
+              toolMeta: {
+                'wareongo/context-write-v1': {
+                  requiredScopes: ['mail:drafts'],
+                  sourceFamily: 'mail',
+                  effect: 'update',
+                  idempotencyArgument: 'operation_id',
+                  executionMode: 'direct_request',
+                },
+              },
+            });
+            let approved = await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+            if (uncertain) {
+              const claim = (await f.repo.claim(c.ctx, approved.operationId, approved.version))!;
+              approved = await f.repo.finish(c.ctx, op.operationId, claim.dispatchToken, {
+                operation_id: op.operationId,
+                outcome: 'outcome_unknown',
+                code: 'OUTCOME_UNKNOWN',
+                message: 'Synthetic uncertainty',
+              });
+            }
+            await db.admin.query(
+              `UPDATE public."ramesh-write-operations" SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`,
+              [op.operationId],
+            );
+            assert.equal(await f.repo.claim(c.ctx, approved.operationId, approved.version), null);
+            assert.equal(
+              (await f.repo.receiptLookup(actor, op.operationId))!.state,
+              uncertain ? 'UNKNOWN' : 'EXPIRED',
+            );
+          }
+        },
+      );
+      await t.test(
+        'natural recovery is atomically unique, typed and cannot cancel an uncertain dispatch',
+        async () => {
+          const f = fixture();
+          const pending = async () => {
+            const c = await command(f, 'Save this exact requested draft');
+            const draft = await f.repo.propose(c.ctx, {
+              ...payload(),
+              executionMode: 'direct_request',
+              sourceFamily: 'mail',
+              toolMeta: {
+                'wareongo/context-write-v1': {
+                  requiredScopes: ['mail:drafts'],
+                  sourceFamily: 'mail',
+                  effect: 'create',
+                  idempotencyArgument: 'operation_id',
+                  executionMode: 'direct_request',
+                },
+              },
+            });
+            const approved = await f.repo.approveDirect(c.ctx, draft.operationId, draft.version);
+            await deliver(f, c.job);
+            return approved;
+          };
+          const first = await pending(),
+            second = await pending();
+          const retry = await command(f, 'try that draft again');
+          await assert.rejects(
+            f.repo.findDirectRecovery(retry.ctx),
+            hasCode('WRITE_RECOVERY_AMBIGUOUS'),
+          );
+          await assert.rejects(
+            f.repo.claim(retry.ctx, first.operationId, first.version),
+            hasCode('WRITE_RECOVERY_AMBIGUOUS'),
+          );
+          assert.equal((await f.repo.receiptLookup(actor, first.operationId))!.dispatchAttempts, 0);
+          await db.admin.query(
+            `UPDATE public."ramesh-write-operations" SET state='REJECTED' WHERE id=$1`,
+            [second.operationId],
+          );
+          const selected = (await f.repo.findDirectRecovery(retry.ctx))!;
+          assert.equal(selected.operationId, first.operationId);
+          const dispatched = (await f.repo.claim(retry.ctx, first.operationId, first.version))!;
+          const unknown = await f.repo.finish(
+            retry.ctx,
+            first.operationId,
+            dispatched.dispatchToken,
+            {
+              operation_id: first.operationId,
+              outcome: 'outcome_unknown',
+              code: 'UNKNOWN',
+              message: 'Synthetic uncertainty',
+            },
+          );
+          await deliver(f, retry.job);
+          const cancel = await command(f, 'cancel that draft attempt');
+          await assert.rejects(
+            f.repo.cancel(cancel.ctx, unknown.operationId, unknown.version),
+            hasCode('WRITE_CANNOT_CANCEL_DISPATCHED'),
+          );
+          assert.equal((await f.repo.receiptLookup(actor, unknown.operationId))!.state, 'UNKNOWN');
+          const other = fixture(),
+            loose = await command(other, 'try again');
+          await assert.rejects(
+            other.repo.findDirectRecovery(loose.ctx),
+            hasCode('WRITE_DIRECT_RECOVERY_REQUIRED'),
+          );
+          const forwarded = fixture(),
+            forward = await command(forwarded, 'try that draft again', { forwarded: true });
+          await assert.rejects(
+            forwarded.repo.findDirectRecovery(forward.ctx),
+            hasCode('WRITE_DIRECT_SOURCE_REQUIRED'),
+          );
+        },
+      );
       await t.test(
         'every journal outcome requires a current owned receipt at handoff and cannot be replaced',
         async () => {

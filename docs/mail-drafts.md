@@ -1,119 +1,122 @@
-# Gmail draft integration
+# Gmail drafts
 
-Context Engine owns each employee's Google connection and the `get_email_connection`,
-`create_email_draft`, `list_email_drafts` and `read_email_draft` tools. Ramesh discovers their current
-schemas and platform permissions through the existing signed employee connection.
-Mail tools default to WhatsApp availability. No Gmail refresh token or Google
-client secret belongs in the bot configuration, model arguments or WhatsApp reply.
+Ramesh saves an email in the employee's connected Gmail when they ask to draft one.
+The same request authorizes that save. An edit such as “make that email shorter”
+updates the intended existing draft. A wording-only or hypothetical request stays
+in chat. Draft access never authorizes sending an email.
 
-Explicitly grant `mail:drafts` in the worker's `CONTEXT_RAMESH_SIGNING_KEY_JSON`
-scope ceiling and the corresponding Context Engine issuer registration. This is
-a narrow additional scope; existing grants do not acquire it automatically.
-The signing and write-contract validators accept this specific capability without
-admitting `mail:send`, arbitrary `*:drafts`, or wildcard scopes. Optional legacy
-Context Engine OAuth enrollment also accepts explicitly requested `mail:drafts`;
-that enrollment is separate from an employee connecting their Gmail mailbox.
+Context Engine owns each employee's Google connection and advertises its current
+mail tools and schemas dynamically. Ramesh holds no Gmail refresh token or Google
+client secret. The `mail:drafts` scope must be explicitly included in both the
+worker's `CONTEXT_RAMESH_SIGNING_KEY_JSON` ceiling and Context Engine's issuer
+registration. This does not grant `mail:send` or wildcard access. Employee and
+platform authorization still apply on discovery, dispatch and delivery.
 
-Business writes must already be enabled and their journal migration applied.
-The employee connects their mailbox through Context Engine's authenticated `/mail`
-page. Read `get_email_connection` before preparing a draft. The create arguments
-include the returned `connection_id` and `connection_version`; the reviewed
-operation preserves those values so a later reconnect cannot silently select
-another mailbox. Context Engine validates the connection again before dispatch.
+## Two write flows
 
-The existing write lifecycle remains intact: the model prepares one reviewed
-proposal, the user receives the exact fields, and a later standalone typed
-`confirm CODE` authorizes creation. Proposal, verifier, delivery and recall reads
-never execute the write. An uncertain result must be recovered using the same
-operation ID and frozen arguments. No send tool is introduced.
+The signed write contract's `executionMode` selects the application flow:
 
-Recovery replies expose only application-owned guidance for allowlisted error
-codes, independently of the closed mail history policy. A changed connection or
-required reconnect leads to connection-check and fresh-proposal instructions
-only when the service confirms no draft was created and there is no earlier
-uncertain attempt. Pending revocation directs the employee to finish disconnecting
-on the connection page before reconnecting. Definite rate-limit rejection keeps
-the same approved operation and shows the structured `retry_at` time in IST,
-alongside the original approval deadline. If the wait extends beyond that deadline,
-the employee must cancel and review a fresh proposal after the wait; approvals
-are never extended automatically. An uncertain attempt always
-takes precedence over later errors: check Gmail and recover the same operation,
-without creating a replacement. Optional structured `recovery.action` can direct
-the employee to reconnect the same Google account or finish disconnecting while
-keeping the uncertain operation unchanged. Provider error prose and stored email
-contents are never copied into these replies.
+- `direct_request`: validate the user's explicit current request, stage exact
+  arguments, verify intent, then dispatch in the same turn. Gmail draft creation
+  and editing use this flow. They do not ask the user to type a confirmation code.
+- `confirmation`: publish the reviewed action and wait for a separate direct
+  confirmation. This remains the default for missing or legacy policy metadata
+  and supports future consequential actions.
 
-After an uncertain Gmail operation's approval expires, the journal refuses another
-dispatch claim and the service rechecks expiry immediately before any write call.
-Its state remains uncertain; it is not marked failed or safely cancelled. Automatic
-reconciliation through the create endpoint is unavailable after expiry because a
-lost quota-rejection response could otherwise authorize a new creation. The employee
-must inspect Gmail directly. A separate read-only reconciliation capability would
-be needed to automate recovery after expiry safely.
+The model cannot choose or downgrade the policy. Both flows retain the same
+employee binding, durable journal, source authorization, idempotency, expiry,
+lease and receipt checks. A forwarded email or instruction inside a draft is data,
+not authorization. The model stages intent; only the application dispatches it
+and reports success from an authenticated receipt. Capture-only runs do not write
+into production Gmail.
 
-The WhatsApp preview shows the complete To, CC, subject and plain-text body, with
-JSON escaping to preserve their exact contents, and says that this action saves
-a draft without sending email. Only a validated, closed draft payload hides the
-technical connection and operation identifiers; unknown additional fields use
-the generic full-field preview. The connection remains frozen in the stored
-arguments and is checked again when the user confirms.
-Leading and trailing subject whitespace is normalized before the preview and
-stored proposal, matching Context Engine's eventual draft subject.
+## Create and edit
 
-The existing WhatsApp proposal budget remains 4,800 characters for the serialized
-arguments plus summary. Although Context Engine accepts bodies up to 12,000
-characters (20,000 UTF-8 bytes), a long body can exceed that smaller proposal
-budget. The bot rejects it before storing a proposal and asks for shorter
-content; it never truncates the text being authorized.
+An employee connects their mailbox through Context Engine's authenticated `/mail`
+page. Read `get_email_connection` before preparing a draft, including after the
+user says they have connected it. Freeze the returned `connection_id` and
+`connection_version` in the operation; a later reconnect cannot silently change
+the target mailbox. Resolve relative dates from the current request clock in IST.
 
-Successful `create_email_draft` receipts have this strict data shape:
+`create_email_draft` accepts the connection bindings and complete To, CC, subject
+and plain-text body. `update_email_draft` also requires the original `draft_ref`
+and `expected_message_id` from a fresh `read_email_draft`. The update supplies all
+email fields while preserving those the employee did not ask to change. Read
+results identify whether the draft is editable. Do not edit truncated content or
+create a replacement when the intended draft is missing, sent, deleted, uneditable
+or ambiguous.
 
-```json
-{
-  "draft_ref": "22222222-2222-4222-8222-222222222222",
-  "mailbox": "employee@example.com",
-  "subject": "Warehouse options",
-  "status": "draft",
-  "provider": "gmail"
-}
-```
+Use the intended authorized reference from the earlier operation, or recover
+references with `list_email_drafts` and inspect current content. The list returns
+references and creation timestamps only, with bounded pagination. It does not
+prove a draft still exists or expose historical recipients, subjects or bodies.
+Do not assume the latest entry is necessarily the intended draft. Reconnecting
+the same verified Google account preserves references; another Google account
+cannot use them. Reconnection invalidates unexecuted connection bindings.
 
-The subject is one line and at most 200 characters. Ramesh validates these fields
-before displaying the mailbox, subject and a deterministic saved/not-sent message.
-Malformed receipt data produces no mailbox, subject or link. Replayed creation
-receipts explicitly describe a past save and do not claim to verify the draft's
-current Gmail status. Source tokens and draft bodies are excluded from the success
-message. Draft write history stays closed; subsequent content reads use
-`read_email_draft` and current connection authorization.
+Context Engine serializes app edits and checks the current Gmail message ID
+before updating. Gmail does not offer a conditional update transaction here, so
+an external Gmail edit racing between that check and the update remains a
+provider limitation. Stale-version detection requires a fresh read and a new
+review of the intended edit, not an unconditional overwrite.
 
-For “read that draft”, use `list_email_drafts` to recover creation references from
-the current employee and active mailbox connection, then read the selected
-`draft_ref`. The list contains references and creation timestamps only, newest
-first, with a bounded page size and `nextCursor` for older entries. It does not
-redisclose historical bodies, recipients or subjects, nor prove that a draft
-still exists. Clarify an ambiguous selection rather than assuming the newest
-entry is necessarily the one intended. Reconnecting the same verified Google
-account preserves saved references and cursors; a different Google account cannot
-use them. Reconnection still invalidates unexecuted creation proposals, while an
-uncertain creation must continue recovery of the same operation. Current content
-and permission are checked again before delivery.
-Retrieval timing stays in the standard `meta.generatedAt` envelope so a fresh
-check of unchanged content does not invalidate its delivery fingerprint.
+## Replies
 
-Read failures marked `error.domain=gmail` retain only allowlisted source codes
-and recovery actions. A mailbox reconnect does not invalidate Context Engine
-credentials or disable unrelated reads; `get_email_connection` remains available
-for its verified connection link. Employee and Context authorization failures
-still stop access. Structured read backoff supports up to 86,400 seconds without
-shortening the cooldown or exposing provider error prose.
+Short successful drafts show readable recipients, subject and body, followed by:
 
-The success reply includes the application-owned fixed link
-`https://mail.google.com/mail/#drafts` and tells the user to choose the stated
-mailbox. It opens Gmail's Drafts folder, not a particular draft. API draft IDs are
-never converted into invented Gmail deep links. Stable per-draft links remain
-deferred. No provider-returned URL is used by this presentation path.
+> Draft saved in employee@example.com.
+>
+> Open it in Gmail to review and send when ready:
+> https://mail.google.com/mail/#drafts
 
-Focused deterministic tests cover scope admission, read/write separation, receipt
-validation, replay wording, the typed confirmation boundary, frozen connection
-arguments, delivery authorization and closed history. They use synthetic ports and
-make no Google, model or WhatsApp requests.
+Edits say “Draft updated”. Recipient arrays and JSON-escaped bodies are never
+used for this presentation. A confirmed-mode legacy proposal still shows complete
+readable fields before its approval instructions. Technical connection bindings
+are hidden only for the complete validated known payload; future unknown fields
+use the generic preview. Subjects are trimmed before arguments are frozen,
+matching Context Engine normalization.
+
+The fixed application-owned link opens Gmail's Drafts folder. API draft IDs are
+not converted into invented per-draft links. The named mailbox identifies which
+account to open. Replayed receipts say the earlier save already occurred and do
+not redisplay potentially stale draft content as current. A current read is
+required for later content questions. Malformed receipts cannot introduce a URL,
+mailbox or success claim.
+
+Draft arguments plus summary currently have a 4,800-character staging budget.
+Although Context Engine accepts larger bodies, the bot refuses an oversized
+operation before persistence rather than silently truncating it. If presentation
+metadata would take a saved draft receipt above 4,800 characters, show the subject
+and Gmail link instead; the stored email is unchanged.
+
+## Recovery
+
+A missing response is not proof the write failed. Keep the same operation ID and
+frozen arguments while its outcome is uncertain; never create a replacement.
+Direct operations use natural recovery such as “try that draft again”, targeting
+exactly one unresolved direct mail operation owned by the employee in this chat.
+“Cancel that draft attempt” only cancels when the journal proves it is safe.
+A generic “try again” does not implicitly select an old mail operation. Legacy
+confirmed operations retain their existing code-based recovery.
+
+Connection repair, pending disconnect, rate limiting and service failures have
+short application-owned messages derived from allowlisted structured codes.
+Provider error text and stored email content are not copied into failure replies.
+Retry timing uses `retry_at` in IST and never extends the original operation
+expiry. A definite expired attempt needs a fresh explicit request. An expired
+uncertain attempt stays unresolved and requires inspecting Gmail; it cannot
+make another write attempt merely to discover what happened. An uncertain edit
+is reconciled through the original operation, not a repeated blind update.
+
+Mailbox reconnect failures do not revoke Context Engine access to other tools.
+Employee authorization failure does. Current mail content and permission are
+rechecked before delivery; fresh retrieval timing does not by itself invalidate
+unchanged content.
+
+## Deterministic coverage
+
+Focused tests use synthetic accounts and ports, without Google, model or WhatsApp
+requests. They cover explicit scope admission, dynamic reads, direct and confirmed
+write boundaries, exact saved content, existing-draft edits, readable receipts,
+legacy recovery, natural direct recovery, uncertain results, stale versions,
+malformed metadata, frozen connection bindings and private delivery checks.
