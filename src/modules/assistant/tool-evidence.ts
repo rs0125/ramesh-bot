@@ -45,12 +45,31 @@ export const toolDeliverySchema = z
             kind: z.literal('warehouse'),
             id: z.number().int().positive().safe(),
             position: z.number().int().min(1).max(100).optional(),
+            group: z
+              .string()
+              .regex(/^group-[1-9]\d{0,2}$/)
+              .optional(),
+            subject: z
+              .object({ kind: z.literal('crm_lead'), id: z.uuid() })
+              .strict()
+              .optional(),
           })
           .strict(),
       )
       .min(1)
       .max(100)
-      .refine((records) => new Set(records.map((record) => record.id)).size === records.length)
+      .refine(
+        (records) =>
+          new Set(records.map((record) => `${record.group ?? ''}:${record.id}`)).size ===
+          records.length,
+      )
+      .refine((records) => {
+        const positioned = records.filter((record) => record.position !== undefined);
+        return (
+          new Set(positioned.map((record) => `${record.group ?? ''}:${record.position}`)).size ===
+          positioned.length
+        );
+      })
       .optional(),
     checks: z
       .array(

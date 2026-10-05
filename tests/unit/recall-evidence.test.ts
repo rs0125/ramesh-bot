@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { currentRecall } from '../../src/modules/assistant/recall-evidence.js';
+import { recallEvidenceView } from '../../src/modules/assistant/recall-payload.js';
 import type { ToolEvidence } from '../../src/modules/assistant/tool-evidence.js';
 
 function evidence(
@@ -100,6 +101,96 @@ test('a changed replacement removes old prose but preserves independently author
     JSON.stringify(result),
     /OLD_SUPPORTED_ANSWER|OLD_PAGINATION|OLD_CONTINUATION|"rent":20/,
   );
+});
+
+test('rebound selections retain group-local ordinals and freshly rebound CRM subjects', () => {
+  const first = warehouse('first', 101),
+    second = warehouse('second', 202);
+  const lead = evidence(
+    'lead-old',
+    'read_crm_lead',
+    { id: 'subject' },
+    { id: 'subject', name: 'Earlier subject' },
+  );
+  const freshLead = evidence(
+    'lead-new',
+    'read_crm_lead',
+    { id: 'subject' },
+    { id: 'subject', name: 'Current subject' },
+  );
+  const value = recalled([first, second, lead], {
+    previous_reply_verified: false,
+    selection_count: 2,
+    selection_targeted: true,
+    displayed_selection: [
+      {
+        kind: 'warehouse',
+        id: 101,
+        position: 2,
+        group: 'group-1',
+        evidence_id: 'first',
+        subject: { kind: 'crm_lead', id: 'subject', evidence_id: 'lead-old' },
+      },
+      { kind: 'warehouse', id: 202, position: 2, group: 'group-2', evidence_id: 'second' },
+    ],
+  });
+  const result = currentRecall(value, [first, second, lead], [first, second, freshLead])!;
+  assert.equal(result.selection_status, 'complete');
+  assert.equal(result.selection_targeted, true);
+  const displayed = result.displayed_selection as any[];
+  assert.deepEqual(
+    displayed.map(({ id, group, position }) => [id, group, position]),
+    [
+      [101, 'group-1', 2],
+      [202, 'group-2', 2],
+    ],
+  );
+  assert.equal(displayed[0].subject.evidence_id, 'lead-new');
+  assert.ok(!JSON.stringify(result).includes('Earlier subject'));
+  const revoked = currentRecall(value, [first, second, lead], [first, second])!;
+  assert.equal((revoked.displayed_selection as any[])[0].subject, undefined);
+  assert.ok(!JSON.stringify(revoked).includes('subject'));
+});
+
+test('large active evidence stays useful after recall rebinding instead of losing every source body', () => {
+  const sources = [warehouse('first', 101), warehouse('second', 202)];
+  for (const source of sources) source.result.data.large_field = 'x'.repeat(45000);
+  const result = currentRecall(recalled(sources), sources, sources)!;
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) < 80000);
+  const fresh = result.fresh_evidence as any[];
+  assert.deepEqual(
+    fresh.map((entry) => entry.data.id),
+    [101, 202],
+  );
+  assert.ok(fresh.every((entry) => entry.data.rent === 20 && entry.data_truncated === true));
+});
+
+test('compact arrays preserve original reference indices and the full source evidence ID', () => {
+  const source = evidence(
+    'accepted-array-source',
+    'search_warehouses',
+    {},
+    {
+      items: [
+        { id: 101, details: ['first', 'x'.repeat(10000), 'later'] },
+        { id: 202, details: ['second', 'x'.repeat(10000), 'later'] },
+      ],
+    },
+  );
+  const snapshot = structuredClone(source);
+  const compact = recallEvidenceView([source], 2400)[0] as any;
+  assert.equal(compact.evidence_id, source.id);
+  assert.equal(compact.data_truncated, true);
+  assert.deepEqual(compact.data.items, [
+    { id: 101, details: ['first'] },
+    { id: 202, details: ['second'] },
+  ]);
+  for (const [index, item] of compact.data.items.entries()) {
+    assert.equal(item.id, (source.result.data.items as any[])[index].id);
+    assert.equal(item.details[0], (source.result.data.items as any[])[index].details[0]);
+  }
+  assert.ok(compact.omitted_paths.includes('data.items.0.details.1'));
+  assert.deepEqual(source, snapshot);
 });
 
 test('revoking all active warehouse evidence hides identities, arguments, old values and prose', () => {

@@ -138,14 +138,100 @@ for (const transient of [false, true])
       [
         ['read_warehouse', 103],
         ['read_warehouse', 101],
-        ...(transient ? [['read_warehouse', 103]] : []),
+        ...(transient
+          ? [
+              ['read_warehouse', 103],
+              ['read_warehouse', 101],
+            ]
+          : []),
       ],
     );
     assert.deepEqual(
       requests.map((r) => r.stage),
-      ['formatter', 'verifier'],
+      ['verifier'],
     );
   });
+
+test('successive targeted recalls retain both groups from the same historical turn for final review', async () => {
+  const fixture = createSalesFixture();
+  const original = (await fixture.service.openTools(trusted, signal())).run!;
+  await original.execute('search_warehouses', '{"limit":5}', signal());
+  const receipt = original.delivery()!;
+  receipt.displayedRecords = [
+    { kind: 'warehouse', id: 103, position: 2, group: 'group-1' },
+    { kind: 'warehouse', id: 101, position: 2, group: 'group-2' },
+  ];
+  const history: ChatMessage[] = [
+    {
+      role: 'assistant',
+      content: PRIVATE_HISTORY_REPLY,
+      protectedReply: { text: 'First list\n2. ID 103\nSecond list\n2. ID 101', receipt },
+    },
+  ];
+  fixture.state.calls.length = 0;
+  let step = 0;
+  let reviewed = false;
+  const model: TextModel = {
+    startToolSession() {
+      return {
+        async next() {
+          const group = ['group-1', 'group-2'][step++];
+          return {
+            ...result('The second option in each list remains available for comparison.'),
+            calls: group
+              ? [
+                  {
+                    id: `recall-${group}`,
+                    name: RECALL_TOOL,
+                    arguments: JSON.stringify({ turn: 1, group, positions: [2] }),
+                  },
+                ]
+              : [],
+          };
+        },
+        accept() {},
+      };
+    },
+    async complete(request) {
+      const plan = planningResult(request);
+      if (plan) return plan;
+      assert.equal(request.stage, 'verifier');
+      const input = JSON.parse(request.messages[0]!.content);
+      assert.equal(input.recalled.length, 2);
+      assert.deepEqual(
+        input.recalled.map((recall: any) => [
+          recall.turn,
+          recall.selection_status,
+          ...recall.displayed_selection.map((record: any) => [
+            record.id,
+            record.position,
+            record.group,
+          ]),
+        ]),
+        [
+          [1, 'complete', [103, 2, 'group-1']],
+          [1, 'complete', [101, 2, 'group-2']],
+        ],
+      );
+      assert.ok(input.recalled.every((recall: any) => recall.previous_reply === undefined));
+      reviewed = true;
+      return result('{"supported":true,"feedback":"","repair":"none","reason":"none"}');
+    },
+  };
+  const output = await buildSalesGraph(model, (s) => fixture.service.openTools(trusted, s)).invoke(
+    { input: 'Compare the second option from each earlier list.', history, audience: 'dm' },
+    { recursionLimit: 30 },
+  );
+  assert.equal(output.approved, true);
+  assert.equal(reviewed, true);
+  assert.deepEqual(
+    fixture.state.calls.map(({ tool, args }) => [tool, args.id]),
+    [
+      ['read_warehouse', 103],
+      ['read_warehouse', 101],
+    ],
+  );
+});
 
 test('review exhaustion reports sanitized reasons without sending rejected claims or blaming query scope', async () => {
   const fixture = createSalesFixture();

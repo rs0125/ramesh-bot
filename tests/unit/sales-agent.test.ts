@@ -140,8 +140,9 @@ test('model proposals must satisfy the advertised schema and cannot carry identi
   assert.equal(fixture.state.calls.length, 1);
 });
 
-test('identical calls are deduplicated and failed evidence persistence cannot reach the model', async () => {
+test('explicitly reusable identical calls are deduplicated and failed evidence persistence cannot reach the model', async () => {
   const fixture = createSalesFixture(() => now);
+  fixture.state.allowEvidenceReuse = true;
   const run = (await fixture.service.openTools(trusted, signal())).run!;
   const first = await run.execute('get_context', '{}', signal());
   assert.equal(first.ok, true);
@@ -470,7 +471,8 @@ test('failed review permits one repair then suppresses unsupported business clai
       trusted,
     );
     assert.equal(fake.requests.filter((r) => r.stage === 'verifier').length, 2);
-    assert.equal(fake.requests.filter((r) => r.stage === 'formatter').length, 2);
+    assert.equal(fake.requests.filter((r) => r.stage === 'formatter').length, 1);
+    assert.equal(reply.trace.stages.filter((s) => s.stage === 'formatter').length, 2);
     assert.equal(reply.businessEvidence !== undefined, reviews[1]);
     if (!reviews[1]) assert.ok(!reply.text.includes('Fixture Acme'));
   }
@@ -554,7 +556,11 @@ test('a successful fallback keeps safe failure metadata through formatting and r
     trusted,
   );
   assert.equal(reply.trace.outcome, 'completed');
-  for (const stage of ['formatter', 'verifier']) {
+  assert.equal(
+    fake.requests.some((r) => r.stage === 'formatter'),
+    false,
+  );
+  for (const stage of ['verifier']) {
     const request = fake.requests.find((r) => r.stage === stage)!;
     const input = JSON.parse(request.messages[0]!.content);
     assert.equal(input.failures[0].recovery.sourceCode, 'ANALYTICS_REPORT_UNAVAILABLE');
@@ -660,7 +666,11 @@ test('CRM narrative and unparsed warehouse evidence survive a shortlist through 
     dockEvidence,
   );
   assert.equal(fake.sessions[0]!.messages.at(-1)!.content, input);
-  for (const stage of ['formatter', 'verifier']) {
+  assert.equal(
+    fake.requests.some((r) => r.stage === 'formatter'),
+    false,
+  );
+  for (const stage of ['verifier']) {
     const request = fake.requests.find((item) => item.stage === stage)!;
     const context = JSON.parse(request.messages[0]!.content);
     assert.equal(

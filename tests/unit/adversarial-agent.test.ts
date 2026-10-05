@@ -36,6 +36,7 @@ test('planning reference is derived from live permitted tools and trusted audien
 
 test('cached evidence still requires an active identical employee and a live deadline', async () => {
   const fixture = createSalesFixture();
+  fixture.state.allowEvidenceReuse = true;
   const run = (await fixture.service.openTools(trusted, signal())).run!;
   const first = await run.execute('get_context', '{}', signal());
   const second = await run.execute('get_context', '{}', signal());
@@ -54,6 +55,7 @@ test('cached evidence still requires an active identical employee and a live dea
 
 test('identical transient reads recover once without altering the requested query', async () => {
   const fixture = createSalesFixture();
+  fixture.state.allowEvidenceReuse = true;
   let attempts = 0;
   fixture.state.mutate = (_e, tool) => {
     if (tool === 'ga4_report' && attempts++ === 0)
@@ -142,8 +144,11 @@ test('report-specific unavailability permits a supported report in the same sour
 test('in-run cache cannot extend evidence freshness', async () => {
   let now = Date.now();
   const fixture = createSalesFixture(() => now);
+  fixture.state.allowEvidenceReuse = true;
   const run = (await fixture.service.openTools(trusted, signal())).run!;
   const initial = await run.execute('get_context', '{}', signal());
+  assert.equal((await run.execute('get_context', '{}', signal())).reused_in_run, true);
+  assert.equal(fixture.state.calls.length, 1);
   now += 360001;
   const refreshed = await run.execute('get_context', '{}', signal());
   assert.equal(refreshed.ok, true);

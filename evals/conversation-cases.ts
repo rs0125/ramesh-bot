@@ -38,6 +38,48 @@ export interface ConversationCase {
 }
 export const CONVERSATION_CASES: ConversationCase[] = [
   {
+    id: 'warehouse-provisional-brief-and-ordinal',
+    generic: true,
+    category: 'supply',
+    setup: (state) => {
+      state.messyWarehouseFacts = true;
+    },
+    turns: [
+      'Find three suitable warehouses for Fixture Acme Storage using its full CRM requirement, with practical pros and cons. Missing paperwork should become a question, not exclude a candidate.',
+      'Compare the second and third options you showed. Which would you visit first, and what should I ask each owner? Keep it short.',
+    ],
+    expectation:
+      'Return a useful provisional shortlist based on the recorded distribution-hub narrative, not just area. Fully compliant has no defined checklist and is not established by a fire flag. The follow-up resolves the actual displayed second and third records and preserves their order. Recommend a visit with reasons supported by those records; never swap fire evidence between IDs, sum separate area options, invent acres, or withhold an otherwise useful answer for optional missing washroom/gate facts. Optional unknowns may be grouped into relevant owner questions. No writes or claims of live site verification.',
+  },
+  {
+    id: 'warehouse-explicit-brief-correction',
+    generic: true,
+    category: 'supply',
+    setup: (state) => {
+      state.messyWarehouseFacts = true;
+    },
+    turns: [
+      'Find three warehouse options for Fixture Acme Storage, keeping missing specifications as things to investigate.',
+      'Correction: for this search I can accept 27,000 to 29,000 sq ft, and the use is indoor sports. Keep budget unspecified. Revise the recommendation and separate these changes from the CRM brief.',
+    ],
+    expectation:
+      'Complete both turns with qualified, useful recommendations. Preserve the original recorded 25,000 sq ft distribution-hub brief while treating the new area range and indoor-sports use as explicit user overrides for this task. Do not claim the CRM was updated, infer a budget, silently combine offered-space options, or declare indoor-sports permissions confirmed. Explain material layout/use checks and retain plausible candidates with unknown specs instead of demanding a complete questionnaire.',
+  },
+  {
+    id: 'warehouse-grouped-client-selection',
+    generic: true,
+    category: 'supply',
+    setup: (state) => {
+      state.messyWarehouseFacts = true;
+    },
+    turns: [
+      'Give me two provisional warehouse options each for Fixture Acme Storage and Fixture Beacon Retail. Keep their CRM briefs and shortlists separate and number each list.',
+      'Compare the second Acme option with the first Beacon option for their respective needs. Give one next action for each.',
+    ],
+    expectation:
+      'Complete a separate two-item group per client, then preserve the exact historical group and ordinal bindings even if the same warehouse appears in both groups. Do not silently merge client narratives or substitute records by current search order. Use supported fields and label material unknowns. If a detail/assessment was never called, do not say it timed out; report only recorded execution limitations. Preserve useful partial evidence rather than replacing it with a generic verification failure.',
+  },
+  {
     id: 'deal-cards',
     turns: [INITIAL_DEALS],
     expectation:

@@ -233,7 +233,7 @@ function model(
           const call = calls[index];
           if (call) index++;
           return {
-            ...output('Model prose must not replace the exact proposal.'),
+            ...output(options.supplement ?? 'Model prose must not replace the exact proposal.'),
             calls: call
               ? [{ id: String(index), name: call.name, arguments: JSON.stringify(call.args ?? {}) }]
               : [],
@@ -363,6 +363,46 @@ test('direct policy cannot bypass an unsuccessful verifier review', async () => 
   assert.equal(writes.finalized(), 0);
   assert.equal(result.write, undefined);
   assert.doesNotMatch(result.reply, /Saved the requested record|78\.125/);
+});
+
+test('a contradictory supported verdict with a blocking finding never dispatches a write', async () => {
+  const writes = writeRun({ executionMode: 'direct_request' });
+  const fake = model([{ name: writeDefinition.name, args: exact }]);
+  const complete = fake.fake.complete.bind(fake.fake);
+  fake.fake.complete = async (request, signal) => {
+    if (request.stage !== 'verifier') return complete(request, signal);
+    const context = JSON.parse(request.messages[0]!.content);
+    assert.equal(
+      context.execution_status.tools[writeDefinition.name],
+      undefined,
+      'read execution status must not describe a staged mutation as completed',
+    );
+    return output(
+      JSON.stringify({
+        supported: true,
+        feedback: 'The target needs clarification.',
+        repair: 'format',
+        reason: 'incomplete_answer',
+        remainder_supported: false,
+        findings: [
+          {
+            severity: 'blocking',
+            kind: 'scope',
+            message: 'Unresolved target.',
+            quote: '',
+            replacement: null,
+            references: [],
+          },
+        ],
+      }),
+    );
+  };
+  const result = await buildSalesGraph(fake.fake, async () => ({ status: 'denied' }), {
+    writes: writes.run,
+  }).invoke(input);
+  assert.equal(writes.finalized(), 0);
+  assert.equal(result.write, undefined);
+  assert.equal(result.unavailable, true);
 });
 
 test('rejected proposals never become confirmable and their exact data is withheld', async () => {

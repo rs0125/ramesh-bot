@@ -240,7 +240,7 @@ test('fresh changed source data invalidates the dependent model suffix, while ea
   const after = await h.service(second.model).prepare(message, AbortSignal.timeout(5000), trusted);
   assert.match(after.text, /12 recorded warehouses/);
   assert.equal(after.trace.replayedSteps, 4);
-  assert.deepEqual(second.generated, ['worker:2', 'formatter', 'verifier']);
+  assert.deepEqual(second.generated, ['worker:2', 'verifier']);
   assert.equal(h.fixture.state.calls.length, 4);
   assert.equal(h.store.consumed.tool, 4);
 });

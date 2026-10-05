@@ -14,14 +14,64 @@ const search: ToolEvidence = {
   result: salesEvidence('search_warehouses', { limit: 5 }),
 };
 
-test('separate ranked groups do not invent one global historical position', () => {
+test('separate ranked groups retain local positions and stable structural group identities', () => {
   assert.deepEqual(
     displayedWarehouseRecords(
       'First brief\n1. ID 101\n2. ID 102\nSecond brief\n1. ID 103\n2. ID 104',
       [search],
     ),
-    [],
+    [
+      { kind: 'warehouse', id: 101, position: 1, group: 'group-1' },
+      { kind: 'warehouse', id: 102, position: 2, group: 'group-1' },
+      { kind: 'warehouse', id: 103, position: 1, group: 'group-2' },
+      { kind: 'warehouse', id: 104, position: 2, group: 'group-2' },
+    ],
   );
+});
+
+test('source-backed CRM headings bind separate lists without trusting heading text as facts', () => {
+  const crm: ToolEvidence = {
+    id: 'crm',
+    tool: 'search_crm_leads',
+    arguments: {},
+    result: {
+      ...search.result,
+      data: {
+        items: [
+          { id: '00000000-0000-4000-8000-000000000101', name: 'First client' },
+          { id: '00000000-0000-4000-8000-000000000102', name: 'Second client' },
+        ],
+      },
+    },
+  };
+  const records = displayedWarehouseRecords(
+    '**First client**\n- ID 101\n- ID 103\n**Second client**\n- ID 103\n- ID 104',
+    [search, crm],
+  );
+  assert.deepEqual(
+    records.map(({ id, position, group, subject }) => [id, position, group, subject?.id]),
+    [
+      [101, 1, 'group-1', '00000000-0000-4000-8000-000000000101'],
+      [103, 2, 'group-1', '00000000-0000-4000-8000-000000000101'],
+      [103, 1, 'group-2', '00000000-0000-4000-8000-000000000102'],
+      [104, 2, 'group-2', '00000000-0000-4000-8000-000000000102'],
+    ],
+  );
+  assert.ok(
+    displayedWarehouseRecords('**Unverified client**\n1. ID 101', [search, crm]).every(
+      (record) => !record.subject,
+    ),
+  );
+  for (const reply of [
+    '1. ID 104\n**First client**\n1. ID 101\n2. ID 103',
+    '**First client**\n1. ID 101\n2. ID 103\nUnknown client\n1. ID 104',
+    '**First client**\n- ID 101\n**Unknown client**\n- ID 104',
+  ]) {
+    const ambiguous = displayedWarehouseRecords(reply, [search, crm]);
+    assert.ok(ambiguous.some((record) => record.id === 104));
+    assert.ok(ambiguous.some((record) => record.id === 101));
+    assert.ok(ambiguous.every((record) => !record.subject));
+  }
 });
 
 test('capture keeps displayed ranked subset order, deduplicates and requires entity corroboration', () => {

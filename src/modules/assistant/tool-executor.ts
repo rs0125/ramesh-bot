@@ -160,6 +160,9 @@ export class ContextToolRun {
   get remaining() {
     return this.denied ? 0 : Math.max(0, MAX_TOOL_CALLS - this.proposals);
   }
+  get remainingEvidenceBytes() {
+    return Math.max(0, MAX_RUN_EVIDENCE_BYTES - this.bytes);
+  }
   get blocked() {
     return this.denied;
   }

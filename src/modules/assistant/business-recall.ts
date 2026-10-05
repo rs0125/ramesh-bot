@@ -2,18 +2,48 @@
 import { z } from 'zod';
 import type { ChatMessage, ToolSessionRequest } from './assistant.types.js';
 import type { ContextToolRun } from './tool-executor.js';
-import { toolDeliverySchema, toolEvidenceFingerprint } from './tool-evidence.js';
+import { toolDeliverySchema, toolEvidenceFingerprint, type ToolEvidence } from './tool-evidence.js';
 import { paginationContinuations, paginationCoverage } from './pagination.js';
 import { recordIdentity } from './record-identity.js';
 import { getBusinessReply } from '../messaging/delivery-evidence.js';
 import { displayedWarehouseLabels } from './displayed-records.js';
+import { recallEvidenceView } from './recall-payload.js';
 
 export const RECALL_TOOL = 'recall_business_context';
-const input = z.object({ turn: z.number().int().positive().optional() }).strict();
+const input = z
+  .object({
+    turn: z.number().int().positive().optional(),
+    group: z
+      .string()
+      .regex(/^group-[1-9]\d{0,2}$/)
+      .optional()
+      .describe(
+        'Original displayed list group: group-1 is the first list, group-2 the second. Required for ordinals when multiple groups exist.',
+      ),
+    positions: z
+      .array(z.number().int().min(1).max(100))
+      .min(1)
+      .max(20)
+      .optional()
+      .describe('Only refresh these original positions in the selected group.'),
+    warehouse_ids: z
+      .array(z.number().int().min(1).max(2147483647))
+      .min(1)
+      .max(20)
+      .optional()
+      .describe(
+        'Only refresh these IDs already present in the stored displayed selection. Cannot add new records.',
+      ),
+  })
+  .strict()
+  .refine(
+    (value) => !value.positions || !value.warehouse_ids,
+    'Choose positions or warehouse_ids, not both.',
+  );
 export const recallDefinition: ToolSessionRequest['tools'][number] = {
   name: RECALL_TOOL,
   description:
-    'Recall an earlier private business answer with fresh permission and source checks. Use before resolving "these deals", "the second one", "five warehouses for each", or another reference to an earlier list. The latest eligible business turn is the default. Preserve verified original selection/order; if it changed, use the successful fresh evidence and relevant continuations instead of treating change as denied access. Returned IDs are internal references. No permission question or resupplied IDs are needed.',
+    'Recall an earlier private business answer with fresh permission and source checks. Use positions, warehouse_ids or group to refresh only the requested displayed options, for example positions=[2,3]; for multiple client lists add group="group-2". The latest eligible business turn is the default. Original group positions are retained; missing options are not replaced or renumbered. A source-backed CRM subject is refreshed when stored. Compact fresh_evidence retains useful facts and marks omissions; omitted is not missing. Returned references never expand access. No permission question or resupplied IDs are needed.',
   inputSchema: z.toJSONSchema(input),
 };
 
@@ -51,8 +81,8 @@ export function businessRecall(
       ? `${content}\n[Recallable business turn ${numbered.get(index)}]`
       : content,
   }));
-  const attempted = new Map<number, number>();
-  const retryable = new Set<number>();
+  const attempted = new Map<string, number>();
+  const retryable = new Set<string>();
   return {
     messages,
     available: entries.length > 0,
@@ -66,52 +96,124 @@ export function businessRecall(
       const turn = parsed.turn ?? entries.length;
       const stored = entries[turn - 1]?.[1];
       if (!run || !stored || run.blocked) return { ok: false, code: 'CONTEXT_UNAVAILABLE' };
-      const attempt = (attempted.get(turn) ?? 0) + 1;
-      if (attempt > 1 && (!retryable.has(turn) || attempt > 2))
+      const scope = JSON.stringify({
+        turn,
+        group: parsed.group,
+        positions: parsed.positions?.slice().sort((a, b) => a - b),
+        ids: parsed.warehouse_ids?.slice().sort((a, b) => a - b),
+      });
+      const attempt = (attempted.get(scope) ?? 0) + 1;
+      if (attempt > 1 && (!retryable.has(scope) || attempt > 2))
         return { ok: false, code: 'ALREADY_RECALLED', guidance: 'Use the earlier recall result.' };
-      attempted.set(turn, attempt);
-      retryable.delete(turn);
-      const displayedReferences = stored.receipt.displayedRecords?.length
-        ? stored.receipt.displayedRecords
-        : displayedWarehouseLabels(stored.text);
+      attempted.set(scope, attempt);
+      retryable.delete(scope);
+      const references = (
+        stored.receipt.displayedRecords?.length
+          ? stored.receipt.displayedRecords
+          : displayedWarehouseLabels(stored.text)
+      ).map((reference, index) => ({ ...reference, position: reference.position ?? index + 1 }));
+      const groups = new Set(references.map((reference) => reference.group ?? 'group-1'));
+      if (parsed.positions && groups.size > 1 && !parsed.group)
+        return {
+          ok: false,
+          code: 'AMBIGUOUS_SELECTION',
+          guidance:
+            'Call recall_business_context with only turn (or {} for the latest turn) to freshly resolve the displayed groups and their authorized CRM subjects, then select the original group-N and positions. Do not ask the user to resupply IDs or guess a group-to-client association.',
+        };
+      const displayedReferences = references.filter(
+        (reference, index) =>
+          (!parsed.group || (reference.group ?? 'group-1') === parsed.group) &&
+          (!parsed.positions || parsed.positions.includes(reference.position ?? index + 1)) &&
+          (!parsed.warehouse_ids || parsed.warehouse_ids.includes(reference.id)),
+      );
+      if (
+        (parsed.group || parsed.positions || parsed.warehouse_ids) &&
+        (!displayedReferences.length ||
+          parsed.warehouse_ids?.some(
+            (id) => !displayedReferences.some((reference) => reference.id === id),
+          ) ||
+          parsed.positions?.some(
+            (position) =>
+              !displayedReferences.some(
+                (reference, index) => (reference.position ?? index + 1) === position,
+              ),
+          ))
+      )
+        return {
+          ok: false,
+          code: 'SELECTION_NOT_FOUND',
+          guidance: 'Target only records and positions in the original displayed selection.',
+        };
       if (displayedReferences.length) {
-        const selectionCount = Math.max(
-          ...displayedReferences.map((reference, index) => reference.position ?? index + 1),
-        );
-        const refreshed = [];
+        const counts = new Map<string, number>();
+        for (const [index, reference] of displayedReferences.entries())
+          counts.set(
+            reference.group ?? 'group-1',
+            Math.max(
+              counts.get(reference.group ?? 'group-1') ?? 0,
+              reference.position ?? index + 1,
+            ),
+          );
+        const targeted = !!(parsed.positions || parsed.warehouse_ids);
+        const selectionCount = targeted
+          ? displayedReferences.length
+          : [...counts.values()].reduce((sum, count) => sum + count, 0);
+        const refreshed: ToolEvidence[] = [];
         const displayed = [];
         const unavailable: Array<{ tool: string; code: string }> = [];
+        const subjects = new Map<string, { kind: 'crm_lead'; id: string; evidence_id: string }>();
+        const checkedSubjects = new Set<string>();
+        const warehouses = new Map<number, ToolEvidence>();
+        const checkedWarehouses = new Set<number>();
+        for (const reference of displayedReferences) {
+          if (!reference.subject || checkedSubjects.has(reference.subject.id)) continue;
+          checkedSubjects.add(reference.subject.id);
+          const result = await run.executeCached(
+            'read_crm_lead',
+            { id: reference.subject.id },
+            signal,
+          );
+          if (run.blocked) return { ok: false, code: 'ACCESS_DENIED' };
+          if (result?.result.data.id === reference.subject.id) {
+            refreshed.push(result);
+            subjects.set(reference.subject.id, { ...reference.subject, evidence_id: result.id });
+          } else unavailable.push({ tool: 'read_crm_lead', code: 'SUBJECT_NOT_REFRESHED' });
+        }
         for (const [index, reference] of displayedReferences.entries()) {
-          const result = await run.executeCached('read_warehouse', { id: reference.id }, signal);
+          const result = checkedWarehouses.has(reference.id)
+            ? warehouses.get(reference.id)
+            : await run.executeCached('read_warehouse', { id: reference.id }, signal);
+          const alreadyChecked = checkedWarehouses.has(reference.id);
+          checkedWarehouses.add(reference.id);
           if (run.blocked) return { ok: false, code: 'ACCESS_DENIED' };
           if (!result || result.result.data.id !== reference.id) {
-            unavailable.push({
-              tool: 'read_warehouse',
-              code: result
-                ? 'RECORD_ID_MISMATCH'
-                : run.remaining === 0
-                  ? 'TOOL_BUDGET_EXHAUSTED'
-                  : (run.failures.filter((failure) => failure.tool === 'read_warehouse').at(-1)
-                      ?.code ?? 'CHECK_NOT_REFRESHED'),
-            });
+            if (!alreadyChecked)
+              unavailable.push({
+                tool: 'read_warehouse',
+                code: result
+                  ? 'RECORD_ID_MISMATCH'
+                  : run.remaining === 0
+                    ? 'TOOL_BUDGET_EXHAUSTED'
+                    : (run.failures.filter((failure) => failure.tool === 'read_warehouse').at(-1)
+                        ?.code ?? 'CHECK_NOT_REFRESHED'),
+              });
             continue;
           }
-          refreshed.push(result);
+          if (!alreadyChecked) refreshed.push(result);
+          warehouses.set(reference.id, result);
           displayed.push({
             kind: 'warehouse' as const,
             id: reference.id,
             position: reference.position ?? index + 1,
             evidence_id: result.id,
+            ...(reference.group ? { group: reference.group } : {}),
+            ...(reference.subject && subjects.has(reference.subject.id)
+              ? { subject: subjects.get(reference.subject.id)! }
+              : {}),
           });
         }
-        const fresh = refreshed.map((entry) => ({
-          evidence_id: entry.id,
-          tool: entry.tool,
-          arguments: entry.arguments,
-          data: entry.result.data,
-        }));
         const retryAvailable = unavailable.length > 0 && attempt === 1 && run.remaining > 0;
-        if (retryAvailable) retryable.add(turn);
+        if (retryAvailable) retryable.add(scope);
         return {
           ok: true,
           turn,
@@ -124,27 +226,27 @@ export function businessRecall(
                 : 'unavailable',
           displayed_selection: displayed,
           selection_count: selectionCount,
+          selection_targeted: targeted || !!parsed.group,
           retry_available: retryAvailable,
           selection_source: stored.receipt.displayedRecords?.length
             ? 'receipt'
             : 'legacy_explicit_labels',
           refresh_status: unavailable.length ? 'partial' : 'selection_refreshed',
           refreshed_checks: refreshed.length,
-          requested_checks: displayedReferences.length,
+          requested_checks:
+            new Set(displayedReferences.map((reference) => reference.id)).size +
+            new Set(
+              displayedReferences.flatMap((reference) =>
+                reference.subject ? [reference.subject.id] : [],
+              ),
+            ).size,
           unavailable_checks: unavailable,
           source_record_checks: refreshed.map((entry) => ({
             evidence_id: entry.id,
             same_records: true,
             same_order: true,
           })),
-          fresh_evidence:
-            Buffer.byteLength(JSON.stringify(fresh)) <= 80000
-              ? fresh
-              : refreshed.map((entry) => ({
-                  evidence_id: entry.id,
-                  tool: entry.tool,
-                  arguments: entry.arguments,
-                })),
+          fresh_evidence: recallEvidenceView(refreshed),
           pagination: [],
           continuations: [],
           guidance:
@@ -190,12 +292,6 @@ export function businessRecall(
       }
       const reads = run.evidence.filter((e) => ids.includes(e.id));
       // Keep the provider's tool-output limit; the formatter/reviewer still receive the full ledger.
-      const fresh = reads.map((e) => ({
-        evidence_id: e.id,
-        tool: e.tool,
-        arguments: e.arguments,
-        data: e.result.data,
-      }));
       return {
         ok: true,
         turn,
@@ -209,10 +305,7 @@ export function businessRecall(
         pagination: paginationCoverage(reads),
         continuations: paginationContinuations(reads),
         ...(unchanged ? { previous_reply: stored.text } : {}),
-        fresh_evidence:
-          Buffer.byteLength(JSON.stringify(fresh)) <= 80000
-            ? fresh
-            : reads.map((e) => ({ evidence_id: e.id, tool: e.tool, arguments: e.arguments })),
+        fresh_evidence: recallEvidenceView(reads),
         guidance: stored.receipt.publicWebUsed
           ? 'This earlier answer also used public web research, which business recall does not refresh. Use the fresh private evidence and its check status. Search/read public sources again when needed; the old combined answer is not fresh evidence. This does not establish changed private records or lost selection/order.'
           : unchanged

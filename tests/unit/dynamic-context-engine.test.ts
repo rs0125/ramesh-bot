@@ -303,69 +303,81 @@ test('new read tools accept schema-declared recipient and destination filters wi
   assert.equal(sourceCalls(state.calls).length, 1);
 });
 
-test('all graph roles receive live source guidance and safe context for a newly advertised read tool', async () => {
-  const { service } = fixture();
-  const stages = new Set<string>();
-  const check = (instructions: string) => {
-    assert.match(instructions, /LIVE_SOURCE_GUIDANCE_23/);
-    assert.match(instructions, /LIVE_CONTEXT_23/);
-    assert.doesNotMatch(instructions, /PRIVATE_SECRET|PRIVATE_PHONE/);
-  };
-  const model: TextModel = {
-    async complete(request) {
-      stages.add(request.stage);
-      check(request.instructions);
-      if (request.stage === 'formatter') {
-        const input = JSON.parse(request.messages[0]!.content);
-        assert.deepEqual(input.source_tool_definitions, [
-          { name, description: descriptor().description },
-        ]);
-      }
-      const text =
-        request.stage === 'converser'
-          ? JSON.stringify({ route: 'work', objective: 'Count my documents', reply: '' })
-          : request.stage === 'planner'
-            ? JSON.stringify({
-                objective: 'Count my documents',
-                successCriteria: ['Return permitted document count'],
-                steps: [
-                  {
-                    id: 'read',
-                    goal: 'Read permitted documents',
-                    dependsOn: [],
-                    toolNames: [name],
-                  },
-                ],
-              })
-            : request.stage === 'verifier'
-              ? JSON.stringify({ supported: true, repair: 'none', feedback: '' })
-              : 'You have 2 documents.';
-      return { text, inputTokens: 1, outputTokens: 1 };
-    },
-    startToolSession(request) {
-      check(request.instructions);
-      stages.add('worker');
-      assert.ok(request.tools.some((tool) => tool.name === name));
-      let count = 0;
-      return {
-        async next() {
-          return {
-            text: count++ ? 'You have 2 documents.' : '',
-            calls: count === 1 ? [{ id: 'one', name, arguments: '{}' }] : [],
-            inputTokens: 1,
-            outputTokens: 1,
-          };
-        },
-        accept() {},
-      };
-    },
-  };
-  const graph = buildSalesGraph(model, (s) => service.openTools(trusted, s));
-  const result = await graph.invoke(
-    { input: 'How many documents can I see?', history: [], audience: 'dm' },
-    { recursionLimit: 30 },
-  );
-  assert.equal(result.reply, 'You have 2 documents.');
-  assert.deepEqual([...stages].sort(), ['converser', 'formatter', 'planner', 'verifier', 'worker']);
-  assert.equal(await service.canDeliver(trusted.key, result.business?.delivery, signal()), true);
-});
+for (const needsFormatter of [false, true]) {
+  test(`applicable graph roles receive live guidance and safe context with ${needsFormatter ? 'model synthesis' : 'deterministic formatting'}`, async () => {
+    const { service } = fixture();
+    const stages = new Set<string>();
+    const check = (instructions: string) => {
+      assert.match(instructions, /LIVE_SOURCE_GUIDANCE_23/);
+      assert.match(instructions, /LIVE_CONTEXT_23/);
+      assert.doesNotMatch(instructions, /PRIVATE_SECRET|PRIVATE_PHONE/);
+    };
+    const model: TextModel = {
+      async complete(request) {
+        stages.add(request.stage);
+        check(request.instructions);
+        if (request.stage === 'formatter') {
+          assert.equal(needsFormatter, true, 'a completed bounded answer needs no model rewrite');
+          const input = JSON.parse(request.messages[0]!.content);
+          assert.deepEqual(input.source_tool_definitions, [
+            { name, description: descriptor().description },
+          ]);
+        }
+        const text =
+          request.stage === 'converser'
+            ? JSON.stringify({ route: 'work', objective: 'Count my documents', reply: '' })
+            : request.stage === 'planner'
+              ? JSON.stringify({
+                  objective: 'Count my documents',
+                  successCriteria: ['Return permitted document count'],
+                  steps: [
+                    {
+                      id: 'read',
+                      goal: 'Read permitted documents',
+                      dependsOn: [],
+                      toolNames: [name],
+                    },
+                  ],
+                })
+              : request.stage === 'verifier'
+                ? JSON.stringify({ supported: true, repair: 'none', feedback: '' })
+                : 'You have 2 documents.';
+        return { text, inputTokens: 1, outputTokens: 1 };
+      },
+      startToolSession(request) {
+        check(request.instructions);
+        stages.add('worker');
+        assert.ok(request.tools.some((tool) => tool.name === name));
+        let count = 0;
+        return {
+          async next() {
+            return {
+              // Oversized completed drafts still need synthesis; ordinary answers retain the worker text.
+              text: count++
+                ? 'You have 2 documents.\n'.repeat(needsFormatter ? 650 : 1).trim()
+                : '',
+              calls: count === 1 ? [{ id: 'one', name, arguments: '{}' }] : [],
+              inputTokens: 1,
+              outputTokens: 1,
+            };
+          },
+          accept() {},
+        };
+      },
+    };
+    const graph = buildSalesGraph(model, (s) => service.openTools(trusted, s));
+    const result = await graph.invoke(
+      { input: 'How many documents can I see?', history: [], audience: 'dm' },
+      { recursionLimit: 30 },
+    );
+    assert.equal(result.reply, 'You have 2 documents.');
+    assert.deepEqual([...stages].sort(), [
+      'converser',
+      ...(needsFormatter ? ['formatter'] : []),
+      'planner',
+      'verifier',
+      'worker',
+    ]);
+    assert.equal(await service.canDeliver(trusted.key, result.business?.delivery, signal()), true);
+  });
+}

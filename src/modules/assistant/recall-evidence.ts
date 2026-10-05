@@ -3,6 +3,7 @@ import { canonicalJson } from '../context-engine/read-contract.js';
 import { paginationContinuations, paginationCoverage } from './pagination.js';
 import { recordIdentity } from './record-identity.js';
 import { toolEvidenceFingerprint, type ToolEvidence } from './tool-evidence.js';
+import { recallEvidenceView } from './recall-payload.js';
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -68,8 +69,14 @@ export function currentRecall(
 
   const hasSelection = Array.isArray(value.displayed_selection);
   const selection = (hasSelection ? value.displayed_selection : []) as unknown[];
-  const displayed: Array<{ kind: 'warehouse'; id: number; position: number; evidence_id: string }> =
-    [];
+  const displayed: Array<{
+    kind: 'warehouse';
+    id: number;
+    position: number;
+    evidence_id: string;
+    group?: string;
+    subject?: { kind: 'crm_lead'; id: string; evidence_id: string };
+  }> = [];
   for (const item of selection) {
     const reference = object(item);
     if (
@@ -81,7 +88,9 @@ export function currentRecall(
       !Number.isSafeInteger(reference.position) ||
       reference.position <= 0 ||
       typeof reference.evidence_id !== 'string' ||
-      displayed.some((entry) => entry.position === reference.position)
+      displayed.some(
+        (entry) => entry.position === reference.position && entry.group === reference.group,
+      )
     )
       continue;
     const source = originals.get(reference.evidence_id);
@@ -100,11 +109,28 @@ export function currentRecall(
           entry.result.data.id === reference.id,
       );
     if (!current) continue;
+    const subject = object(reference.subject);
+    const subjectSource =
+      typeof subject?.evidence_id === 'string' ? originals.get(subject.evidence_id) : undefined;
+    const subjectCurrent = subjectSource && currentQueries.get(queryKey(subjectSource));
+    const currentSubject =
+      subject?.kind === 'crm_lead' &&
+      typeof subject.id === 'string' &&
+      subjectSource?.tool === 'read_crm_lead' &&
+      subjectSource.arguments.id === subject.id &&
+      subjectSource.result.data.id === subject.id &&
+      subjectCurrent?.result.data.id === subject.id
+        ? { kind: 'crm_lead' as const, id: subject.id, evidence_id: subjectCurrent.id }
+        : undefined;
     displayed.push({
       kind: 'warehouse',
       id: reference.id,
       position: reference.position,
       evidence_id: current.id,
+      ...(typeof reference.group === 'string' && /^group-[1-9]\d{0,2}$/.test(reference.group)
+        ? { group: reference.group }
+        : {}),
+      ...(currentSubject ? { subject: currentSubject } : {}),
     });
     currentReads.set(current.id, current);
     if (!recordChecks.has(current.id))
@@ -114,7 +140,11 @@ export function currentRecall(
         same_order: true,
       });
   }
-  displayed.sort((left, right) => left.position - right.position);
+  displayed.sort(
+    (left, right) =>
+      Number(left.group?.slice(6) ?? 1) - Number(right.group?.slice(6) ?? 1) ||
+      left.position - right.position,
+  );
 
   // Include live continuation pages from the same scope so coverage cannot describe a retired cursor.
   const pageGroups = new Set(
@@ -129,12 +159,6 @@ export function currentRecall(
     }
   }
   const reads = active.filter((entry) => currentReads.has(entry.id));
-  const fresh = reads.map((entry) => ({
-    evidence_id: entry.id,
-    tool: entry.tool,
-    arguments: structuredClone(entry.arguments),
-    data: structuredClone(entry.result.data),
-  }));
   const unavailable = [
     ...(Array.isArray(value.unavailable_checks)
       ? value.unavailable_checks.flatMap((item) => {
@@ -177,16 +201,14 @@ export function currentRecall(
     requested_checks: requested,
     unavailable_checks: unavailable,
     source_record_checks: [...recordChecks.values()],
-    fresh_evidence:
-      Buffer.byteLength(JSON.stringify(fresh)) <= 80000
-        ? fresh
-        : fresh.map(({ data: _data, ...entry }) => entry),
+    fresh_evidence: recallEvidenceView(reads),
     pagination: paginationCoverage(reads),
     continuations: paginationContinuations(reads),
     ...(hasSelection
       ? {
           displayed_selection: displayed,
           selection_count: selectionCount,
+          ...(value.selection_targeted === true ? { selection_targeted: true } : {}),
           selection_status:
             displayed.length === selectionCount && selectionCount > 0
               ? 'complete'

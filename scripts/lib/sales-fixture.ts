@@ -11,6 +11,13 @@ import {
 } from '../../src/modules/context-engine/context.types.js';
 import { indiaDate } from '../../src/modules/assistant/followups.js';
 import { analyticsFixture } from './analytics-fixture.js';
+import {
+  fixtureMatchingPolicy,
+  fixtureWarehouseMatches,
+  fixtureWarehouses,
+  recordedText,
+} from './warehouse-fixture-contract.js';
+import { fixtureAssessment } from './shortlist-fixture-contract.js';
 
 export const SALES_CATALOGUE = JSON.parse(
   readFileSync(
@@ -70,6 +77,7 @@ export function salesEvidence(
   options: {
     warehouseCount?: number;
     warehousePageOverlap?: boolean;
+    messyWarehouseFacts?: boolean;
     visibleLeadIds?: readonly string[];
   } = {},
 ): ContextEvidence {
@@ -81,6 +89,18 @@ export function salesEvidence(
     timezone: 'Asia/Kolkata',
     local_date: localDate,
   };
+  const [dateFrom, dateTo] = dateBounds(args, localDate);
+  const queryContext = {
+    ...clock,
+    date_field: args.date_field ?? 'created',
+    period: args.period ?? null,
+    date_from: dateFrom ?? null,
+    date_to: dateTo ?? null,
+    start_at: dateFrom ? new Date(`${dateFrom}T00:00:00+05:30`).toISOString() : null,
+    end_before: dateTo
+      ? new Date(Date.parse(`${dateTo}T00:00:00+05:30`) + DAY).toISOString()
+      : null,
+  };
   const lead = {
     id: FIXTURE_LEAD_ID,
     name: 'Fixture Acme Storage',
@@ -91,11 +111,19 @@ export function salesEvidence(
     requirement_sqft: 25000,
     next_follow_up: new Date(start + 36_000_000).toISOString(),
     verification_required: true,
+    company_name: null,
+    description: recordedText(
+      'Needs approximately 25,000 sq ft in Bengaluru for a distribution hub. Fully compliant is requested without a supplied checklist. Keep candidates with missing paperwork for owner follow-up. Truck access and usable floor layout matter; no numeric dock, height or power minimum has been agreed.',
+    ),
   };
   const tomorrowLead = {
     ...lead,
     id: '00000000-0000-4000-8000-000000000102',
     name: 'Fixture Beacon Retail',
+    company_name: null,
+    description: recordedText(
+      'Needs a Bengaluru warehouse of approximately 25,000 sq ft for retail distribution. Keep this requirement separate from Acme. Delivery access needs confirmation.',
+    ),
     source_created_at: '2026-09-12T21:30:00Z',
     next_follow_up: new Date(start + 122_400_000).toISOString(),
   };
@@ -138,52 +166,13 @@ export function salesEvidence(
       return true;
     });
   };
-  const warehouse = {
-    id: 101,
-    city: 'Bengaluru',
-    micro_market: 'Hoskote',
-    warehouse_type: 'PEB',
-    area_sqft: 30000,
-    total_space_sqft: 30000,
-    clear_height_ft: 28,
-    dock_count: 3,
-    asking_rate_per_sqft: null,
-    fire_noc_available: null,
-    micromarkets: ['Hoskote'],
-    verification_required: true,
-    field_evidence: {
-      availability: { status: 'unknown', reason: 'Confirm current availability with the owner.' },
-    },
-  };
-  const warehouses = Array.from({ length: options.warehouseCount ?? 9 }, (_, i) => ({
-    ...warehouse,
-    id: 101 + i,
-    city: options.warehouseCount !== undefined || i < 5 ? 'Bengaluru' : 'Pune',
-    micro_market: i < 5 ? 'Hoskote' : 'Chakan',
-    micromarkets: [i < 5 ? 'Hoskote' : 'Chakan'],
-    total_space_sqft: 26000 + i * 1000,
-    area_sqft: 26000 + i * 1000,
-    dock_count: i + 1,
-    clear_height_ft: 24 + i,
-    ...(options.warehouseCount !== undefined
-      ? {
-          created_at: new Date(start - i * DAY).toISOString(),
-          updated_at: new Date(start).toISOString(),
-        }
-      : {}),
-  }));
-  const matchingWarehouses = () =>
-    warehouses.filter(
-      (row) =>
-        (!args.city || row.city.toLowerCase() === String(args.city).toLowerCase()) &&
-        (!args.micromarket ||
-          row.micro_market.toLowerCase() === String(args.micromarket).toLowerCase()) &&
-        (args.area_min_sqft === undefined || row.area_sqft >= Number(args.area_min_sqft)) &&
-        (args.area_max_sqft === undefined || row.area_sqft <= Number(args.area_max_sqft)) &&
-        (args.docks_min === undefined || row.dock_count >= Number(args.docks_min)) &&
-        (args.clear_height_min_ft === undefined ||
-          row.clear_height_ft >= Number(args.clear_height_min_ft)),
-    );
+  const warehouses = fixtureWarehouses(
+    options.warehouseCount ?? 9,
+    options.warehouseCount !== undefined,
+    start,
+    options.messyWarehouseFacts === true,
+  );
+  const matchingWarehouses = () => warehouses.filter((row) => fixtureWarehouseMatches(row, args));
   const page = {
     id: 'warehouse-visits',
     title: 'Warehouse visit checklist',
@@ -242,11 +231,11 @@ export function salesEvidence(
         items,
         nextCursor,
         query_context: {
-          ...clock,
+          ...queryContext,
           sort: args.sort ?? 'id_asc',
           returned_count: items.length,
           has_more: nextCursor !== null,
-          date_field: args.date_field ?? null,
+          date_field: args.date_field ?? 'created',
           period: args.period ?? null,
           date_from: from ?? null,
           date_to: to ?? null,
@@ -272,7 +261,7 @@ export function salesEvidence(
         groups,
         other_count: 0,
         groups_truncated: false,
-        query_context: { ...clock, ...args },
+        query_context: { ...queryContext, ...args },
       };
       break;
     }
@@ -283,7 +272,6 @@ export function salesEvidence(
       data = {
         ...leads.find((row) => row.id === args.id),
         id: args.id,
-        description: 'Needs a Bengaluru warehouse, approximately 25,000 square feet.',
       };
       break;
     case 'read_crm_lead_context':
@@ -341,12 +329,12 @@ export function salesEvidence(
         items,
         nextCursor,
         query_context: {
-          ...clock,
+          ...queryContext,
           sort: args.sort ?? 'id_asc',
           returned_count: items.length,
           has_more: nextCursor !== null,
         },
-        matching_policy: 'Recorded values only; verify current availability and specifications.',
+        matching_policy: fixtureMatchingPolicy(args),
       };
       break;
     }
@@ -361,7 +349,8 @@ export function salesEvidence(
           .filter((r) => r.count),
         other_count: 0,
         groups_truncated: false,
-        query_context: clock,
+        query_context: queryContext,
+        matching_policy: fixtureMatchingPolicy(args),
       };
       break;
     }
@@ -369,9 +358,15 @@ export function salesEvidence(
       if (!warehouses.some((row) => row.id === args.id))
         throw new ContextEngineError('TOOL_UNAVAILABLE');
       path = `/api/v1/warehouses/${args.id}`;
-      data = {
-        ...warehouses.find((row) => row.id === args.id),
-      };
+      data = structuredClone(warehouses.find((row) => row.id === args.id)!);
+      if (Array.isArray(args.context_fields)) {
+        data.recorded_context = Object.fromEntries(
+          args.context_fields.map((field) => [
+            field,
+            (data.recorded_context as Record<string, unknown>)[String(field)] ?? recordedText(null),
+          ]),
+        );
+      }
       break;
     case 'search_knowledge':
       path = `/api/v1/wiki/${args.q ? 'search' : 'pages'}`;
@@ -386,16 +381,19 @@ export function salesEvidence(
       if (!leads.some((row) => row.id === args.lead_id))
         throw new ContextEngineError('TOOL_UNAVAILABLE');
       path = `/api/v1/crm/opportunities/${args.lead_id}/assessment`;
-      data = {
-        lead_id: args.lead_id,
-        requirements: { area_sqft: 25000, city: 'Bengaluru' },
-        candidates: ((args.warehouse_ids as number[] | undefined) ?? []).map((id) => ({
-          id,
-          fit: 'potential_match',
-          verification_required: true,
-        })),
-        disclaimer: 'Recorded fit only. Confirm current availability and requirements.',
-      };
+      if (
+        ((args.warehouse_ids as number[] | undefined) ?? []).some(
+          (id) => !warehouses.some((row) => row.id === id),
+        )
+      )
+        throw new ContextEngineError('TOOL_UNAVAILABLE');
+      data = fixtureAssessment(
+        leads.find((row) => row.id === args.lead_id)!,
+        ((args.warehouse_ids as number[] | undefined) ?? []).map(
+          (id) => warehouses.find((row) => row.id === id)!,
+        ),
+        args,
+      );
       break;
     default:
       throw new Error('Unsupported synthetic tool');
@@ -431,6 +429,9 @@ export function createSalesFixture(now = Date.now) {
     guidance: CONTEXT_GUIDANCE,
     warehouseCount: undefined as number | undefined,
     warehousePageOverlap: false,
+    messyWarehouseFacts: false,
+    // Production reauthorizes and refreshes source reads. Cache tests opt in explicitly.
+    allowEvidenceReuse: false,
     visibleLeadIds: undefined as string[] | undefined,
     failures: new Map<ContextReadTool, ContextEngineError>(),
     mutate: undefined as
@@ -444,7 +445,7 @@ export function createSalesFixture(now = Date.now) {
       search: async () => salesEvidence('search_crm_leads', {}, now(), state),
       tools: {
         employeeId: state.employeeId,
-        allowEvidenceReuse: true,
+        allowEvidenceReuse: state.allowEvidenceReuse,
         discover: async () => {
           state.discoveries++;
           return state.tools;

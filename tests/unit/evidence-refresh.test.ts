@@ -21,6 +21,7 @@ const query = { view: 'accessible', limit: 1 };
 async function setup() {
   let now = Date.parse('2026-10-02T06:00:00Z');
   const fixture = createSalesFixture(() => now);
+  fixture.state.allowEvidenceReuse = true;
   const run = (await fixture.service.openTools(trusted, signal())).run!;
   const first = await run.execute('search_crm_leads', JSON.stringify(query), signal());
   assert.equal(first.ok, true);

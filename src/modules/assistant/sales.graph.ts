@@ -25,7 +25,7 @@ import { dealDisplayFacts, dealDisplayIssues, withDealDates } from './deal-displ
 import { planningContext } from './planning-context.js';
 import { routeSchema, taskPlanSchema, validateTaskPlan } from './task-plan.js';
 import { isUtilityTool, type UtilityToolName, type UtilityToolRun } from './utility-tools.js';
-import { bindReplayAuthority } from './model-replay.js';
+import { bindReplayAuthority, currentCheckpoint } from './model-replay.js';
 import { CheckpointError } from './checkpoint.types.js';
 import { presentEvidence, presentToolOutput, presentOrientation } from './evidence-presentation.js';
 import type { PersonalToolRun, PersonalReply } from '../scheduling/personal-tools.js';
@@ -35,15 +35,15 @@ import { currentRecall } from './recall-evidence.js';
 import { reviewFailure, reviewMetric, reviewFailureReply } from './review-diagnostics.js';
 import type { BusinessWriteRun, BusinessWriteReply } from '../writes/write-tools.js';
 import { notifyToolActivity } from './tool-activity.js';
+import { workingContext } from './working-context.js';
+import {
+  answerReviewSchema,
+  ANSWER_REVIEW_CONTRACT,
+  resolveAnswerReview,
+  preservesAnswerFacts,
+  type ExecutionReport,
+} from './answer-review.js';
 
-const verdict = z
-  .object({
-    supported: z.boolean(),
-    feedback: z.string().max(1200),
-    repair: z.enum(['none', 'format', 'tools']).default('tools'),
-    reason: reviewFailure.default('other'),
-  })
-  .strict();
 const supplementSchema = z.object({ additional_reply: z.string().max(4000) }).strict();
 const state = new StateSchema({
   input: z.string(),
@@ -54,6 +54,7 @@ const state = new StateSchema({
   personalOnly: z.boolean().default(false),
   plan: taskPlanSchema.optional(),
   draft: z.string().default(''),
+  draftReady: z.boolean().default(false),
   reply: z.string().default(''),
   supplement: z.string().default(''),
   calls: z.array(z.custom<ModelToolCall>()).default([]),
@@ -62,6 +63,7 @@ const state = new StateSchema({
   feedback: z.string().default(''),
   repairKind: z.enum(['none', 'format', 'tools']).default('none'),
   reviewReason: reviewFailure.default('none'),
+  reviewPatched: z.boolean().default(false),
   repairs: z.number().default(0),
   blocked: z.boolean().default(false),
   unavailable: z.boolean().default(false),
@@ -105,9 +107,32 @@ export function buildSalesGraph(
   let modelHistory: ChatMessage[] = [];
   let toolSteps = 0;
   let sessionTools: typeof tools = [];
+  const execution: ExecutionReport['tools'] = {};
+  const executionReport = (limited: boolean): ExecutionReport => ({
+    research_limited: limited,
+    tools: Object.fromEntries(
+      tools
+        .filter(({ name }) => toolFamily(name) === 'business')
+        .map(({ name }) => [
+          name,
+          execution[name] ?? {
+            status: run?.evidence.some((entry) => entry.tool === name)
+              ? 'evidence_available'
+              : run?.failures.some((failure) => failure.tool === name && failure.code === 'TIMEOUT')
+                ? 'timed_out'
+                : run?.failures.some((failure) => failure.tool === name)
+                  ? 'failed'
+                  : 'not_attempted',
+            attempts: 0,
+            successes: 0,
+          },
+        ]),
+    ),
+  });
   const recalled: Array<{
     value: Record<string, unknown>;
     sources: import('./tool-evidence.js').ToolEvidence[];
+    scope?: string;
   }> = [];
   let utilities: UtilityToolRun | undefined;
   const personal = options.personal;
@@ -137,7 +162,27 @@ export function buildSalesGraph(
       ? sessionTools.filter(({ name }) => budgets[toolFamily(name)] > 0).map(({ name }) => name)
       : [];
   };
-  const toolBudget = () => ({ remaining: remainingTools(), families: familyBudgets() });
+  const toolBudget = () => ({
+    remaining: remainingTools(),
+    families: familyBudgets(),
+    evidence_remaining_bytes: run?.remainingEvidenceBytes ?? 0,
+  });
+  const observedBudget = async (step: string) => {
+    const observed =
+      options.researchDeadlineMs === undefined
+        ? null
+        : Math.max(0, options.researchDeadlineMs - Date.now());
+    // Replaying a completed response must see the same clock hint. The runtime still
+    // enforces the real absolute deadline; this is an observation, not extra time.
+    const checkpoint = currentCheckpoint();
+    const snapshot = checkpoint
+      ? await checkpoint.policy<{ remainingMs: number | null }>(
+          `research-clock:${step}`,
+          (current) => current ?? { remainingMs: observed },
+        )
+      : { remainingMs: observed };
+    return { ...toolBudget(), research_remaining_ms_at_observation: snapshot?.remainingMs ?? null };
+  };
   const currentRecalls = () => {
     return recalled.flatMap(({ value, sources }) => {
       const current = currentRecall(value, sources, run?.evidence ?? []);
@@ -342,6 +387,7 @@ export function buildSalesGraph(
       const result = attempt.result;
       return {
         draft: result.text,
+        draftReady: result.calls.length === 0 && !!result.text.trim(),
         calls: result.calls,
         stages: [
           ...value.stages,
@@ -375,6 +421,12 @@ export function buildSalesGraph(
           });
         signal.throwIfAborted();
         notifyToolActivity(options.onToolActivity);
+        const prior = execution[call.name];
+        execution[call.name] = {
+          status: 'interrupted',
+          attempts: (prior?.attempts ?? 0) + 1,
+          successes: prior?.successes ?? 0,
+        };
         return personal?.hasTool(call.name)
           ? personal.execute(call.name, call.arguments, signal)
           : writes?.hasTool(call.name)
@@ -400,18 +452,47 @@ export function buildSalesGraph(
       if (!attempt.result || typeof attempt.result !== 'object' || Array.isArray(attempt.result))
         throw new Error('INVALID_TOOL_OUTPUT');
       const output = attempt.result as Record<string, unknown>;
+      const attemptStatus = execution[call.name];
+      if (attemptStatus) {
+        attemptStatus.status =
+          output.ok === true ? 'completed' : output.code === 'TIMEOUT' ? 'timed_out' : 'failed';
+        if (output.ok === true) attemptStatus.successes++;
+      }
       if (call.name === RECALL_TOOL) {
-        const snapshot = { value: output, sources: structuredClone(run?.evidence ?? []) };
+        const selectors = output.ok === true ? JSON.parse(call.arguments) : {};
+        const scope =
+          output.ok === true
+            ? JSON.stringify({
+                turn: output.turn,
+                group: selectors.group,
+                positions: selectors.positions?.slice().sort((a: number, b: number) => a - b),
+                warehouse_ids: selectors.warehouse_ids
+                  ?.slice()
+                  .sort((a: number, b: number) => a - b),
+              })
+            : undefined;
+        const snapshot = { value: output, sources: structuredClone(run?.evidence ?? []), scope };
         const prior =
           output.ok === true
-            ? recalled.findIndex(
-                (entry) => entry.value.ok === true && entry.value.turn === output.turn,
-              )
+            ? recalled.findIndex((entry) => entry.value.ok === true && entry.scope === scope)
             : -1;
         if (prior >= 0) recalled.splice(prior, 1, snapshot);
         else recalled.push(snapshot);
       }
-      session!.accept(call.id, presentToolOutput(output, call.name));
+      session!.accept(call.id, {
+        ...presentToolOutput(output, call.name),
+        runtime_budget: await observedBudget(`tool-${toolSteps}`),
+        ...(['read_crm_lead', 'assess_shortlist', RECALL_TOOL].includes(call.name)
+          ? {
+              working_context: workingContext(
+                run?.evidence ?? [],
+                modelHistory,
+                value.input,
+                currentRecalls(),
+              ),
+            }
+          : {}),
+      });
       return {
         calls: [],
         blocked: !!run?.blocked || !!personal?.blocked || !!writes?.blocked,
@@ -432,12 +513,36 @@ export function buildSalesGraph(
       if (value.personalOnly && preview && !writePreview) return { reply: preview, supplement: '' };
       const started = Date.now();
       const composed = !!preview || !!writePreview;
+      // Preserve a completed worker answer; an unconstrained rewrite can change its decisions.
+      if (
+        !composed &&
+        !value.feedback &&
+        value.draftReady &&
+        run?.evidence.length &&
+        value.draft.length <= 12000
+      ) {
+        const reply = withDealDates(finishReply(value.draft), run.evidence);
+        return {
+          reply,
+          supplement: '',
+          stages: [
+            ...value.stages,
+            recordMetric({
+              stage: 'formatter',
+              durationMs: Date.now() - started,
+              inputTokens: 0,
+              outputTokens: 0,
+            }),
+          ],
+        };
+      }
+      const budget = await observedBudget(`formatter-${toolSteps}-${value.repairs}`);
       const result = await model.complete(
         {
           stage: 'formatter',
           reasoningEffort:
             run?.evidence.length || utilities?.evidence.length || value.feedback ? 'low' : 'none',
-          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies personal_result and business_write_result separately. It appends authoritative personal receipts/lists and the application-owned business write response. The internal write preview has not executed yet: after review, the runtime either executes direct_request and substitutes the saved outcome, or publishes a confirmation step. Do not repeat those receipts, independently claim success, invent confirmation codes, or ask for confirmation for direct_request. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Correct every identified issue without inventing replacements, and independently check every candidate against its actual fields; clearly state any unresolved limitation.' : ''}`,
+          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies personal_result and business_write_result separately. It appends authoritative personal receipts/lists and the application-owned business write response. The internal write preview has not executed yet: after review, the runtime either executes direct_request and substitutes the saved outcome, or publishes a confirmation step. Do not repeat those receipts, independently claim success, invent confirmation codes, or ask for confirmation for direct_request. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Make only the smallest supported correction to previous_reply. Preserve all unaffected text, record order, units and recommendations. Never infer a failure cause or apply an unvalidated factual correction.' : ''}`,
           messages: [
             {
               role: 'user',
@@ -445,17 +550,25 @@ export function buildSalesGraph(
                 request: value.input,
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
-                tool_budget: toolBudget(),
+                execution_status: executionReport(value.researchExhausted),
+                tool_budget: budget,
                 history: modelHistory,
                 request_clock: requestClock,
                 application_context: applicationContext(),
                 audience: value.audience,
                 access: accessStatus,
                 draft: value.draft,
+                response_character_budget: composed ? 4000 : 12000,
                 source_tool_definitions: tools
                   .filter((tool) => run?.evidence.some((entry) => entry.tool === tool.name))
                   .map(({ name, description }) => ({ name, description })),
                 recalled: currentRecalls(),
+                working_context: workingContext(
+                  run?.evidence ?? [],
+                  modelHistory,
+                  value.input,
+                  currentRecalls(),
+                ),
                 evidence: presentEvidence(run?.evidence ?? []),
                 utility_evidence: utilities?.evidence ?? [],
                 utility_failures: utilities?.failures ?? [],
@@ -491,8 +604,12 @@ export function buildSalesGraph(
       const additional = composed
         ? supplementSchema.parse(JSON.parse(result.text)).additional_reply
         : result.text;
-      const supplement = additional.trim()
-        ? withDealDates(finishReply(additional), run?.evidence ?? [])
+      const protectedAdditional =
+        !composed && value.feedback && value.reply && !preservesAnswerFacts(value.reply, additional)
+          ? value.reply
+          : additional;
+      const supplement = protectedAdditional.trim()
+        ? withDealDates(finishReply(protectedAdditional), run?.evidence ?? [])
         : '';
       const reply = composed
         ? [supplement, preview, writePreview].filter(Boolean).join('\n\n')
@@ -524,11 +641,12 @@ export function buildSalesGraph(
         ...dealDisplayIssues(prose, run?.evidence ?? [], run?.internalCrmIds),
         ...chatLayoutIssues(prose),
       ];
+      const budget = await observedBudget(`verifier-${toolSteps}-${value.repairs}`);
       const result = await model.complete(
         {
           stage: 'verifier',
           reasoningEffort: 'medium',
-          instructions: `${SALES_VERIFIER_PROMPT}\n${engineOrientation()}`,
+          instructions: `${SALES_VERIFIER_PROMPT}\n${engineOrientation()}\n${ANSWER_REVIEW_CONTRACT}`,
           messages: [
             {
               role: 'user',
@@ -536,9 +654,16 @@ export function buildSalesGraph(
                 request: value.input,
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
-                tool_budget: toolBudget(),
+                execution_status: executionReport(value.researchExhausted),
+                tool_budget: budget,
                 history: modelHistory,
                 recalled: currentRecalls(),
+                working_context: workingContext(
+                  run?.evidence ?? [],
+                  modelHistory,
+                  value.input,
+                  currentRecalls(),
+                ),
                 deal_display: dealDisplayFacts(run?.evidence ?? []),
                 request_clock: requestClock,
                 application_context: applicationContext(),
@@ -574,11 +699,29 @@ export function buildSalesGraph(
               }),
             },
           ],
-          jsonSchema: { name: 'ramesh_sales_review', schema: z.toJSONSchema(verdict) },
+          jsonSchema: { name: 'ramesh_sales_review', schema: z.toJSONSchema(answerReviewSchema) },
         },
         config.signal,
       );
-      const review = verdict.parse(JSON.parse(result.text));
+      const rawReview = answerReviewSchema.parse(JSON.parse(result.text));
+      const review = resolveAnswerReview(
+        rawReview,
+        value.reply,
+        run?.evidence ?? [],
+        executionReport(value.researchExhausted),
+        !personal?.preview() &&
+          !writes?.preview() &&
+          !personal?.usedPrivateData &&
+          !writes?.usedPrivateData,
+      );
+      if (review.patchedAnswer) {
+        const patchedIssues = [
+          ...dealDisplayIssues(review.patchedAnswer, run?.evidence ?? [], run?.internalCrmIds),
+          ...chatLayoutIssues(review.patchedAnswer),
+        ];
+        // A patch is reviewed as a complete answer; old presentation issues may have been fixed.
+        issues.splice(0, issues.length, ...patchedIssues);
+      }
       const modelApproved = review.supported;
       if (issues.length) {
         review.supported = false;
@@ -587,6 +730,8 @@ export function buildSalesGraph(
       const diagnostic = reviewMetric({ ...review, supported: modelApproved }, issues.length);
       return {
         approved: review.supported,
+        ...(review.patchedAnswer && !issues.length ? { reply: review.patchedAnswer } : {}),
+        reviewPatched: !!review.patchedAnswer && !issues.length,
         repairKind: issues.length && modelApproved ? ('format' as const) : review.repair,
         feedback: review.feedback,
         reviewReason: diagnostic.reason,
@@ -711,15 +856,17 @@ export function buildSalesGraph(
     .addConditionalEdges('verifier', (value) =>
       value.approved || value.repairs >= 2
         ? 'finish'
-        : !value.researchExhausted &&
-            Date.now() < (options.researchDeadlineMs ?? Infinity) &&
-            value.repairKind !== 'format' &&
-            remainingTools() > 0 &&
-            toolSteps < 28
-          ? session?.revise
-            ? 'revise'
-            : 'planner'
-          : 'formatter',
+        : value.reviewPatched
+          ? 'verifier'
+          : !value.researchExhausted &&
+              Date.now() < (options.researchDeadlineMs ?? Infinity) &&
+              value.repairKind !== 'format' &&
+              remainingTools() > 0 &&
+              toolSteps < 28
+            ? session?.revise
+              ? 'revise'
+              : 'planner'
+            : 'formatter',
     )
     .addEdge('revise', 'worker')
     .addEdge('finish', END)
