@@ -471,7 +471,8 @@ test('failed review permits one repair then suppresses unsupported business clai
       trusted,
     );
     assert.equal(fake.requests.filter((r) => r.stage === 'verifier').length, 2);
-    assert.equal(fake.requests.filter((r) => r.stage === 'formatter').length, 1);
+    // Each completed worker draft is styled deterministically, including its repair.
+    assert.equal(fake.requests.filter((r) => r.stage === 'formatter').length, 0);
     assert.equal(reply.trace.stages.filter((s) => s.stage === 'formatter').length, 2);
     assert.equal(reply.businessEvidence !== undefined, reviews[1]);
     if (!reviews[1]) assert.ok(!reply.text.includes('Fixture Acme'));
