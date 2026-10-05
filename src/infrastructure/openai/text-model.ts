@@ -4,6 +4,7 @@ import { replayModelResponse } from '../../modules/assistant/model-replay.js';
 import { CheckpointError } from '../../modules/assistant/checkpoint.types.js';
 import { effectiveReasoningEffort, type AssistantConfig } from '../../config/assistant.js';
 import { withUsageStage } from '../../modules/usage/usage-scope.js';
+import { MEMORY_INSTRUCTIONS } from '../../modules/assistant/chat-context.js';
 import type {
   ModelRequest,
   ModelResult,
@@ -33,6 +34,48 @@ export class OpenAITextModel implements TextModel {
     });
   }
 
+  private instructions(value: string) {
+    return this.config.context && !value.includes(MEMORY_INSTRUCTIONS)
+      ? `${value}\n${MEMORY_INSTRUCTIONS}`
+      : value;
+  }
+
+  private async checkInput(
+    body: OpenAI.Responses.ResponseCreateParamsNonStreaming,
+    stage: string,
+    signal?: AbortSignal,
+  ) {
+    if (!this.config.context) return;
+    const stageLimit =
+      stage === 'context' || stage === 'converser'
+        ? 24000
+        : stage === 'planner'
+          ? 48000
+          : stage === 'worker'
+            ? this.config.context.maxInputTokens
+            : 64000;
+    const limit = Math.min(stageLimit, this.config.context.maxInputTokens);
+    const count = await this.client.responses.inputTokens.count(
+      {
+        model: body.model,
+        instructions: body.instructions,
+        input: body.input,
+        tools: body.tools,
+        text: body.text,
+        reasoning: body.reasoning,
+        tool_choice: body.tool_choice,
+        parallel_tool_calls: body.parallel_tool_calls,
+      },
+      { signal },
+    );
+    if (
+      !Number.isSafeInteger(count.input_tokens) ||
+      count.input_tokens < 0 ||
+      count.input_tokens > limit
+    )
+      throw new ContextBudgetError();
+  }
+
   startToolSession(request: ToolSessionRequest): ToolModelSession {
     const input: OpenAI.Responses.ResponseInputItem[] = request.messages.map(
       ({ role, content }) => ({
@@ -59,8 +102,15 @@ export class OpenAITextModel implements TextModel {
           const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
             model: this.config.model,
             service_tier: 'default',
-            instructions: `${request.instructions}\nRemaining tool-call budget: ${remainingCalls}. If zero, give an honest answer from the evidence already retrieved and state any remaining limitation.`,
-            input,
+            instructions: this.instructions(request.instructions),
+            // Stable instructions/tools are the cache prefix. Per-step budget belongs at the end.
+            input: [
+              ...input,
+              {
+                role: 'developer',
+                content: `Remaining tool-call budget: ${remainingCalls}. If zero, answer from retrieved evidence and state any remaining limitation.`,
+              },
+            ],
             tools,
             tool_choice:
               remainingCalls <= 0 || !allowed.length
@@ -77,8 +127,16 @@ export class OpenAITextModel implements TextModel {
             reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },
             include: ['reasoning.encrypted_content'],
             max_output_tokens: this.config.maxOutputTokens,
+            ...(this.config.context
+              ? {
+                  context_management: [
+                    { type: 'compaction', compact_threshold: this.config.context.compactThreshold },
+                  ],
+                }
+              : {}),
           };
           const { response, replayed } = await replayModelResponse(body, async () => {
+            await this.checkInput(body, 'worker', signal);
             const value = await withUsageStage('worker', () =>
               this.client.responses.create(body, { signal }),
             );
@@ -99,12 +157,14 @@ export class OpenAITextModel implements TextModel {
             if (
               item.type !== 'message' &&
               item.type !== 'reasoning' &&
+              item.type !== 'compaction' &&
               item.type !== 'function_call'
             )
               throw new Error('Unexpected model output item');
             input.push(item);
           }
           for (const call of calls) pending.add(call.call_id);
+          pruneCompactedInput(input);
           return {
             text: response.output_text?.trim() ?? '',
             calls: calls.map((call) => ({
@@ -118,7 +178,7 @@ export class OpenAITextModel implements TextModel {
             responseId: response.id,
           };
         } catch (error) {
-          if (error instanceof CheckpointError) throw error;
+          if (error instanceof CheckpointError || error instanceof ContextBudgetError) throw error;
           signal.throwIfAborted();
           const status = error instanceof OpenAI.APIError ? error.status : undefined;
           throw new Error(
@@ -149,7 +209,7 @@ export class OpenAITextModel implements TextModel {
       const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
         model: this.config.model,
         service_tier: 'default',
-        instructions: request.instructions,
+        instructions: this.instructions(request.instructions),
         input: request.messages.map(({ role, content }) => ({ role, content })),
         store: false,
         reasoning: {
@@ -170,6 +230,7 @@ export class OpenAITextModel implements TextModel {
           : {}),
       };
       const { response, replayed } = await replayModelResponse(body, async () => {
+        await this.checkInput(body, request.stage, signal);
         const value = await withUsageStage(request.stage, () =>
           this.client.responses.create(body, { signal }),
         );
@@ -189,7 +250,7 @@ export class OpenAITextModel implements TextModel {
         responseId: response.id,
       };
     } catch (error) {
-      if (error instanceof CheckpointError) throw error;
+      if (error instanceof CheckpointError || error instanceof ContextBudgetError) throw error;
       signal?.throwIfAborted();
       // Never bubble provider bodies, request headers or user prompts into worker logs.
       const status = error instanceof OpenAI.APIError ? error.status : undefined;
@@ -203,9 +264,52 @@ function validateToolResponse(response: OpenAI.Responses.Response) {
   if (
     calls.length > 1 ||
     (!calls.length && !response.output_text?.trim()) ||
-    response.output.some((item) => !['message', 'reasoning', 'function_call'].includes(item.type))
+    response.output.some(
+      (item) =>
+        !['message', 'reasoning', 'function_call', 'compaction'].includes(item.type) ||
+        (item.type === 'compaction' && !item.encrypted_content),
+    )
   )
     throw new Error('Invalid tool response');
+}
+
+export class ContextBudgetError extends Error {
+  constructor() {
+    super('OPENAI_CONTEXT_BUDGET_EXCEEDED');
+  }
+}
+
+/** Stateless automatic compaction: retain the encrypted item and a valid call/result tail. */
+function pruneCompactedInput(input: OpenAI.Responses.ResponseInputItem[]) {
+  let boundary = -1;
+  for (let index = input.length - 1; index >= 0; index--)
+    if ('type' in input[index]! && input[index]!.type === 'compaction') {
+      boundary = index;
+      break;
+    }
+  if (boundary <= 0) return;
+  // A compaction item can arrive in the same response as a function call. Never orphan it.
+  for (let index = 0; index < boundary; index++) {
+    const item = input[index]!;
+    if (!('type' in item) || item.type !== 'function_call') continue;
+    const output = input.findIndex(
+      (candidate) =>
+        'type' in candidate &&
+        candidate.type === 'function_call_output' &&
+        candidate.call_id === item.call_id,
+    );
+    if (output < 0 || output >= boundary) {
+      boundary = index;
+      while (
+        boundary > 0 &&
+        'type' in input[boundary - 1]! &&
+        input[boundary - 1]!.type === 'reasoning'
+      )
+        boundary--;
+      break;
+    }
+  }
+  input.splice(0, boundary);
 }
 
 function usageDetails(usage: OpenAI.Responses.ResponseUsage | undefined) {

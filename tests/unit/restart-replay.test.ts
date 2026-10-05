@@ -98,6 +98,55 @@ function textResponse(text = 'Fixture answer.', id = 'fixture_response') {
   });
 }
 
+test('encrypted automatic compaction replays without repeating token counts or paid generation', async () => {
+  const checkpoint = new FixtureCheckpoint();
+  let counts = 0,
+    responses = 0;
+  const compact = {
+    type: 'compaction',
+    id: 'compact-fixture',
+    encrypted_content: 'opaque-summary',
+  };
+  const model = new OpenAITextModel(
+    { ...config, context: { maxInputTokens: 96000, compactThreshold: 64000 } },
+    async (url) => {
+      if (String(url).endsWith('/input_tokens')) {
+        counts++;
+        return Response.json({ input_tokens: 100, object: 'response.input_tokens' });
+      }
+      responses++;
+      return responses === 1
+        ? Response.json({
+            id: 'first',
+            object: 'response',
+            status: 'completed',
+            output: [
+              compact,
+              { type: 'function_call', call_id: 'c', name: 'read', arguments: '{}' },
+            ],
+          })
+        : textResponse();
+    },
+  );
+  const execute = () =>
+    withModelReplay(checkpoint, async () => {
+      const session = model.startToolSession({
+        ...request,
+        tools: [{ name: 'read', inputSchema: { type: 'object' } }],
+      });
+      const first = await session.next(1, AbortSignal.timeout(2000));
+      session.accept(first.calls[0]!.id, { freshly_authorized: true });
+      return session.next(0, AbortSignal.timeout(2000));
+    });
+  await execute();
+  const replay = await execute();
+  assert.equal(replay.inputTokens, 0);
+  assert.equal(counts, 2);
+  assert.equal(responses, 2);
+  assert.match(JSON.stringify(checkpoint.rows.get(1)?.request), /opaque-summary/);
+  assert.ok(!JSON.stringify(checkpoint.rows.get(1)?.request).includes('Fixture question.'));
+});
+
 test('restart restores native reasoning and function calls before continuing the same tool session', async () => {
   const checkpoint = new FixtureCheckpoint();
   const reasoning = {
@@ -146,7 +195,7 @@ test('restart restores native reasoning and function calls before continuing the
     });
   assert.equal((await resume()).text, '17 fixture records.');
   assert.equal(bodies.length, 2);
-  assert.deepEqual(bodies[1]!.input.slice(-3), [
+  assert.deepEqual(bodies[1]!.input.slice(-4, -1), [
     reasoning,
     functionCall,
     { type: 'function_call_output', call_id: 'call_fixture', output: '{"total":17}' },

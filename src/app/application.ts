@@ -1,3 +1,5 @@
+import { ChatContext, contextScope } from '../modules/assistant/chat-context.js';
+import { ChatContextRepository } from '../infrastructure/database/chat-context.repository.js';
 /** Composition root: constructs adapters and controls their startup/shutdown order. */
 import qrcode from 'qrcode-terminal';
 import type { Logger } from 'pino';
@@ -34,12 +36,7 @@ import { PersonalToolService } from '../modules/scheduling/personal-tools.js';
 import { PersonalSchedulerService } from '../modules/scheduling/scheduler.service.js';
 import { WriteRepository } from '../infrastructure/database/write.repository.js';
 import { BusinessWriteService } from '../modules/writes/write-tools.js';
-import {
-  compositeDeliverySchema,
-  getPersonalDelivery,
-  getWriteDelivery,
-  withoutWriteDelivery,
-} from '../modules/messaging/delivery-evidence.js';
+import { authorizeDelivery } from '../modules/messaging/delivery-evidence.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -187,10 +184,37 @@ export function createApplication(
           new OpenAIMediaProcessor(assistantConfig),
         )
       : undefined;
+  const assistantModel = assistantConfig
+    ? (overrides.model ?? new OpenAITextModel(assistantConfig))
+    : undefined;
+  const contextRepository =
+    assistantConfig?.context && messagePool && config.messageDatabase
+      ? new ChatContextRepository(
+          messagePool,
+          config.messageDatabase.accountId,
+          config.encryptionKey,
+        )
+      : undefined;
+  if (assistantConfig?.context && (!contextRepository || !inboxRepository || !schedulingSender))
+    throw new Error('CONTEXT_DURABLE_DATABASE_REQUIRED');
+  const conversationContext =
+    contextRepository && inboxRepository && assistantModel && schedulingSender
+      ? new ChatContext({
+          store: contextRepository,
+          source: inboxRepository,
+          model: assistantModel,
+          resolve: async (key, signal) => {
+            const resolved = await schedulingSender.resolve({ key }, signal);
+            return resolved?.sender.audience === 'dm' && resolved.employee.active
+              ? contextScope(config.messageDatabase!.accountId, key.remoteJid!, resolved.employee)
+              : null;
+          },
+        })
+      : undefined;
   const assistant = assistantConfig
     ? new AssistantService(
         assistantConfig,
-        overrides.model ?? new OpenAITextModel(assistantConfig),
+        assistantModel!,
         undefined,
         (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
         inboxRepository ? (message) => inboxRepository.context(message) : undefined,
@@ -198,6 +222,7 @@ export function createApplication(
         {
           usageMeter,
           checkpoints,
+          conversationContext,
           personalTools: config.scheduling?.toolsEnabled ? personalTools : undefined,
           businessWrites: config.businessWrites ? businessWrites : undefined,
         },
@@ -216,7 +241,8 @@ export function createApplication(
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
           prepareReply,
-          agentRuns: !!businessReads || !!personalTools || !!businessWrites,
+          agentRuns:
+            !!businessReads || !!personalTools || !!businessWrites || !!conversationContext,
           media,
           accountId: config.messageDatabase.accountId,
           usageMode: usagePolicy?.mode ?? 'off',
@@ -228,38 +254,29 @@ export function createApplication(
           onUsageAttributionFailure: (reason) =>
             logger.warn({ reason }, 'Usage attribution unavailable'),
           businessPreflight:
-            businessReads || personalTools || businessWrites
+            businessReads || personalTools || businessWrites || conversationContext
               ? async (message, evidence, signal) => {
                   const bounded = AbortSignal.any([
                     signal,
                     AbortSignal.timeout(config.businessReads?.context.timeoutMs ?? 10000),
                   ]);
-                  const write = getWriteDelivery(evidence);
-                  if (write) {
-                    if (
-                      !businessWrites ||
-                      !(await businessWrites.canDeliver(message.key, write, bounded))
-                    )
-                      return false;
-                    evidence = withoutWriteDelivery(evidence);
-                    if (!evidence) return true;
-                  }
-                  const personal = getPersonalDelivery(evidence);
-                  if (personal) {
-                    if (
-                      !personalTools ||
-                      !(await personalTools.canDeliver(message.key, personal, bounded))
-                    )
-                      return false;
-                    const composite = compositeDeliverySchema.safeParse(evidence);
-                    if (!composite.success) return true;
-                    evidence = composite.data.business;
-                  }
-                  return businessReads
-                    ? businessReads.canDeliver(message.key, evidence, bounded, (reason, tool) =>
-                        logger.warn({ reason, tool }, 'Business delivery check failed'),
-                      )
-                    : false;
+                  return authorizeDelivery(evidence, {
+                    context: conversationContext
+                      ? (receipt) => conversationContext.canDeliver(message.key, receipt, bounded)
+                      : undefined,
+                    write: businessWrites
+                      ? (receipt) => businessWrites.canDeliver(message.key, receipt, bounded)
+                      : undefined,
+                    personal: personalTools
+                      ? (receipt) => personalTools.canDeliver(message.key, receipt, bounded)
+                      : undefined,
+                    business: businessReads
+                      ? (receipt) =>
+                          businessReads.canDeliver(message.key, receipt, bounded, (reason, tool) =>
+                            logger.warn({ reason, tool }, 'Business delivery check failed'),
+                          )
+                      : undefined,
+                  });
                 }
               : undefined,
         })
@@ -362,6 +379,7 @@ export function createApplication(
         if (!ready) throw new Error('Worker not ready');
         await db.$queryRaw`SELECT 1`;
         await messageRepository?.health();
+        await contextRepository?.health();
         return { release: config.release };
       },
     },
@@ -383,11 +401,13 @@ export function createApplication(
           );
         if (messageRepository) {
           await messageRepository.health();
+          await contextRepository?.health();
           await usageMeter?.summarize('startup-readiness');
           // Existing local claims suppress replies after the storage transition too.
           await messageRepository.importLegacy(await db.greeting.findMany());
           await messageRepository.clean();
           await checkpoints?.clean();
+          await contextRepository?.clean();
           await media?.clean();
           await personalRepository?.clean();
           await db.botSetting.upsert({
@@ -406,6 +426,7 @@ export function createApplication(
             .then(() => adminAccess.clean())
             .then(() => messageRepository?.clean())
             .then(() => checkpoints?.clean())
+            .then(() => contextRepository?.clean())
             .then(() => media?.clean())
             .then(() => personalRepository?.clean())
             .catch((error) => logger.error({ err: error }, 'State cleanup failed'));

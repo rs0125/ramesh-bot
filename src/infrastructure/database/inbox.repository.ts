@@ -2,6 +2,7 @@
 import type { Pool } from 'pg';
 import type { ConversationPage, InboxMessage, InboxPage } from '../../contracts/admin-api.js';
 import type { ChatMessage } from '../../modules/assistant/assistant.types.js';
+import type { ContextSource, ContextEntry } from '../../modules/assistant/chat-context.js';
 import {
   MAX_HISTORY_MESSAGES,
   MAX_HISTORY_CHARACTERS,
@@ -20,6 +21,8 @@ export interface InboxContent {
   chatName: string | null;
   kind: string;
   location?: NativeLocation;
+  forwarded?: boolean;
+  hasQuotedMessage?: boolean;
 }
 interface InboxRow {
   id: string;
@@ -71,7 +74,7 @@ function cursorFor(row: InboxRow, key: 'created_at' | 'updated_at'): string {
   ).toString('base64url');
 }
 
-export class InboxRepository {
+export class InboxRepository implements ContextSource {
   private readonly cipher;
   constructor(
     private readonly pool: Pool,
@@ -213,6 +216,81 @@ export class InboxRepository {
         .sort((a, b) => a.at.localeCompare(b.at)),
       nextCursor: rows.length > 25 ? cursorFor(rows[24]!, 'created_at') : null,
     };
+  }
+
+  async anchor(message: GreetingCandidate) {
+    const row = (
+      await this.pool.query<{ at: string; id: string }>(
+        `SELECT id,to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS at FROM public."ramesh-messages" WHERE account_id=$1 AND chat_id=$2 AND whatsapp_message_id=$3`,
+        [this.accountId, message.chatId, message.messageId],
+      )
+    ).rows[0];
+    if (!row) throw new Error('CONTEXT_ANCHOR_MISSING');
+    return { before: `${row.at}:${row.id}:0`, start: row.at };
+  }
+
+  /** Event ordering also captures replies delivered after a prior summary boundary. */
+  async page(message: GreetingCandidate, after: string, before: string, floor: string = after) {
+    const rows = (
+      await this.pool.query<
+        InboxRow & { direction: 'inbound' | 'outbound'; context_cursor: string }
+      >(
+        `
+      SELECT m.*,e.direction,to_char(e.at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||':'||m.id::text||':'||e.suffix AS context_cursor
+      FROM public."ramesh-messages" m CROSS JOIN LATERAL (VALUES
+        ('inbound',m.created_at,'0'),('outbound',m.finished_at,'1')
+      ) e(direction,at,suffix)
+      WHERE m.account_id=$1 AND m.chat_id=$2 AND m.content_encrypted IS NOT NULL
+        AND (to_char(m.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||':'||m.id::text||':0')>=$5
+        AND ((e.direction='inbound' AND m.origin='whatsapp') OR (e.direction='outbound' AND m.state='SENT' AND m.reply_encrypted IS NOT NULL))
+        AND (to_char(e.at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||':'||m.id::text||':'||e.suffix)>$3
+        AND (to_char(e.at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||':'||m.id::text||':'||e.suffix)<$4
+      ORDER BY context_cursor LIMIT 129`,
+        [this.accountId, message.chatId, after, before, floor],
+      )
+    ).rows;
+    const entries: ContextEntry[] = rows.slice(0, 128).map((row) => {
+      if (row.direction === 'inbound') {
+        const data = this.content(row);
+        return {
+          id: row.context_cursor,
+          at: row.created_at.getTime(),
+          role: 'user',
+          content:
+            data.forwarded || data.hasQuotedMessage
+              ? `[Forwarded or quoted source data]\n${data.text}`
+              : data.text,
+        };
+      }
+      const business = row.reply_kind === 'business';
+      return {
+        id: row.context_cursor,
+        at: row.finished_at!.getTime(),
+        role: 'assistant',
+        content: business
+          ? PRIVATE_HISTORY_REPLY
+          : decodeReply(
+              this.cipher.open('outbound-reply', row.id, row.reply_encrypted!),
+              'conversation',
+            ).text,
+        ...(business && !message.isGroup && row.business_evidence_encrypted
+          ? {
+              protectedReply: {
+                text: decodeReply(
+                  this.cipher.open('outbound-reply', row.id, row.reply_encrypted!),
+                  'business',
+                ).text,
+                receipt: this.cipher.open(
+                  'business-delivery',
+                  row.id,
+                  row.business_evidence_encrypted,
+                ),
+              },
+            }
+          : {}),
+      };
+    });
+    return { entries, more: rows.length > 128 };
   }
 
   /** Read messages preceding this trigger, across all group participants, never across chats/accounts. */

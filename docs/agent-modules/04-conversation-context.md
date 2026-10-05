@@ -1,49 +1,57 @@
 # Conversation context
 
-Status: **Implemented 32-message context and fresh authorized recall; this release includes explicit warehouse selection recovery. Worker rollout uses CI/CD after pushing `main`, with exact-release and runtime-health verification.** Depends on [identity](02-identity-resolver.md), [shared contracts](00-shared-contracts.md) and [persistence](13-supabase-persistence.md).
+Status: **Implemented, opt-in for verified employee DMs. Migration and enablement are separate deployment steps.**
 
-**Current contract:** The inbox replaces protected reply bodies with a private placeholder for operators. Model history uses a content-free completion marker for captured or sent business replies, so completed questions do not look unanswered; no business facts enter that marker. Process-local fallback follows the same rule. Server-only stored reply/receipt envelopes support `recall_business_context`, which checks the current employee and repeats scoped reads before restoring an unchanged previous answer and order. Changed source results withhold old wording. The local [follow-up recovery update](../followup-recovery.md) stores explicit warehouse IDs and positions in existing encrypted receipts, refreshes those exact records, and preserves general recall across identical evidence replacement. Named CRM selections, grouped warehouse lists and general clarification threads remain extensions. See the [personal-assistant runbook](../sales-manager-agent.md) for the broader contract; production enablement remains separate.
+## Enablement and storage
 
-## Responsibility and current foundation
+Apply message migrations through `202610050001_conversation_context.sql`, then set `AGENT_CONTEXT_ENABLED=true`. It defaults to false. Use `AGENT_TIMEOUT_MS=240000` and `AGENT_MAX_OUTPUT_TOKENS=6000` for summarization plus research/review. Startup checks the new table when enabled; it does not auto-migrate.
 
-Assemble the minimum history and entity references needed for the current request without treating old messages as current authorization or current business facts. Reuse [assistant.service.ts](../../src/modules/assistant/assistant.service.ts), [conversation-memory.ts](../../src/modules/assistant/conversation-memory.ts) and [inbox.repository.ts](../../src/infrastructure/database/inbox.repository.ts).
+`ChatContext.prepare` combines the inbox source, encrypted PostgreSQL store and a freshly resolved employee. State lives in `public."ramesh-conversation-context"`. Account, chat, employee ID, canonical phone and email determine the scope. A new binding starts at the current message rather than adopting history with unknown ownership. Each chat has one active owner binding; changing owners replaces the old state, including when a previous owner later returns. A denied identity receives no private history. Groups retain the existing 32-message/48,000-character shared window; persistent group pins require a membership policy and are not enabled.
 
-Production reads encrypted Supabase inbox history. Local chat uses bounded process memory. Group history includes other participants and untagged context, which must remain labeled as background. A captured image/media label is not its contents. Previously sent assistant text is conversational history, not fresh evidence.
+The source cursor independently orders inbound admission and **sent** outbound events, preserving PostgreSQL microseconds. Future replies and unsent drafts are excluded. Late replies remain eligible after an earlier inbound event was summarized, but their originating request must be inside the current owner/forget boundary. Summary and cursor commit atomically with a revision check; production reads and saves require the current inbound lease. No transaction stays open during inference. Summarization runs before the turn's checkpoint replay sequence.
 
-The [old logistics bot review](23-context-and-media-reference.md) supplies the reference for app-owned Postgres history, bounded turns and expiring media pins. The completion marker is a Ramesh adaptation: preserving the fact that a reply occurred avoids treating a sequence of old business questions as outstanding work. Only the latest request, plus references needed to interpret it, should trigger reads. Private bodies remain excluded from ordinary model history and can only be restored via the bounded recall tool. The context window is 32 messages / 48,000 characters; recall metadata is separately bounded to 96 KB and 24 hours. See [module 24](24-business-recall-and-deal-display.md). Attachment processing is implemented in module 30; typed durable entity references remain an extension.
+Memory commands and model replies carry an encrypted owner binding through the existing protected outbox. Delivery freshly resolves that binding; revocation, reassignment, changed owner attributes or disabled memory authorization suppress the private reply. Mixed responses retain their business, personal and committed-write checks, with another memory identity check after remote preflight. Memory-only historical reply text is restored only after the current context owner matches the saved binding. Legacy history readers cannot unwrap these replies.
 
-## Interface and projections
+## User commands
 
-`loadConversationContext(InboundRef, ActorBinding, policy, signal)` is a proposed application port. It returns bounded history, unresolved references, pending-run references, locale/timezone, context provenance and truncation indicators. The authority object remains outside model-visible content.
+| Command             | Behavior                                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `/pin name: text`   | Creates or replaces a named pin in this chat.                                                                                         |
+| `remember that ...` | Creates a note and returns its name.                                                                                                  |
+| `/pins`, `/pins 2`  | Lists stored notes in pages that fit the 16,000-character reply limit; the reply gives the next-page command.                         |
+| `/unpin name`       | Removes that pin and resets generated working notes/history so the preference cannot reappear from old history. Other pins remain.    |
+| `/forget context`   | Clears pins, summary and remembered selections and advances the history boundary. Inbox/action records retain their normal retention. |
 
-| Projection | Allowed contents                                                                               |
-| ---------- | ---------------------------------------------------------------------------------------------- |
-| Converser  | Recent audience-safe messages, current request, enabled capabilities and unresolved references |
-| Planner    | Objective, explicit requirements, permitted tool summaries and selected verified references    |
-| Worker     | One step, required entity IDs, relevant fresh evidence and that step's tool schemas            |
-| Verifier   | Request, frozen contract, candidate result and registered source evidence                      |
-| Formatter  | Authorized answer bundle and language preferences                                              |
+Commands must match the original unquoted, unforwarded single message. Batches and extracted media cannot mutate pins. Commands save before acknowledging success and are idempotent for a retry of the same message. Limits: 24 pins, 1,000 characters each, 4,000 estimated tokens combined. Explicit pins remain until removed.
 
-No role automatically receives another role's full message history. Do not infer a standing instruction or grant from a stored summary.
+## Summaries and references
 
-## Isolation and freshness
+Compaction starts above 32 unsummarized messages or 10,000 estimated history tokens. It keeps a recent verbatim tail, normally 16 messages, and summarizes bounded older chunks. Notes track objectives, constraints, corrections, decisions, pending questions and completed work with source IDs. Output must pass the schema, use supplied source IDs and fit 3,000 estimated tokens. Invalid output leaves the last saved cursor intact; it does not silently discard messages. Summarization excludes protected business reply bodies and attachment extracts.
 
-Use account, chat, audience and employee binding to select business context. Public group history can remain shared within that group; personal business history cannot. A phone changing employee ownership starts a new business-context binding. Unknown identities cannot receive cached results from a previously verified session.
+Each historical entry has an application-owned event timestamp and a 4,000-token selection ceiling. Entries above 6,000 characters or that token ceiling use explicitly marked head/tail excerpts; historical user input above the 32,000-character maximum supported input size is represented by an omission notice. The original inbox text is retained under its existing policy. The assistant must ask for missing passages when needed and cannot infer omitted requirements. This applies only to old history, not the current request or fresh tool evidence. Literal tokenizer markers are counted as ordinary text. One historical entry cannot prevent all later turns from advancing.
 
-Record entity references separately from factual snapshots. “That lead” may resolve to a recent lead ID only when unambiguous, but using it requires a new scoped read. Before replaying stored business facts, check current permission and relevant freshness. If source access cannot be established, omit the protected context and explain that live data is unavailable when relevant.
+Up to four warehouse lists retain at most 32 IDs and original positions each, independently of the recent-message window. Displayed groups and source-backed CRM subject references survive compaction too; no cached record facts are retained. `recall_business_context` checks the current employee and freshly reads only the requested group, positions or warehouse IDs and their CRM subjects. Ambiguous group positions require a group selection; unavailable positions are not replaced or renumbered. Old prose receipts keep their existing 24-hour/96KB limits. Standalone named CRM selections remain an extension.
 
-In the first read slice, prefer request-local tool evidence and exclude prior generated business-result bodies from ordinary chat history. Add durable, reauthorized business memory only with explicit content classification. This avoids accidentally making a conversational follow-up bypass current scope checks.
+Generated notes expire 30 days after their oldest cited source, rather than 30 days after the latest merge. The application assigns expiry from source timestamps and carries the earliest prior expiry forward; models cannot extend it. Expired recent messages are also withheld. Legacy notes without expiry metadata are discarded on load into a turn, while pins and the history boundary remain. Reference lists keep their original 30-day expiry. Minute-by-minute maintenance deletes unpinned idle rows and clears old generated state from pinned idle rows. Only explicit pins are indefinite. Unknown ownership, unavailable storage and invalid summary output fail closed.
 
-## Pending input and user changes
+Memory is historical source data, not authorization, current business evidence or proof of a completed write. Current corrections supersede older notes. Current requests and the existing personal/business journals remain authoritative for actions; `ramesh-write-events` is unchanged. Prompt caching does not replace memory.
 
-A clarification record identifies its run, epoch, question, permitted responding actor/audience and expiry. A reply containing an explicit message/run reference can resume it. If several tasks await input and “yes” is ambiguous, clarify. An unrelated request creates another run; it does not confirm a pending write.
+## Token admission and native compaction
 
-Cancellation invalidates the run epoch and unsent prepared output. A changed objective versions the contract. Never convert new group context from another participant into a private employee's confirmation.
+The local `o200k_base` tokenizer estimates which history fits. With the feature enabled, `responses.inputTokens.count` counts the **complete rendered request**, including instructions, schemas, tools, history and current evidence, before generation. Input caps are 24k for routing/summary, 48k for planning, 64k for formatting/review and `AGENT_CONTEXT_MAX_INPUT_TOKENS` (default 96k) for the worker. Output has a separate cap. Oversized requests fail before generation; current requests and evidence are not silently truncated. Formatting/review receive memory and the latest eight ordinary messages.
 
-## Limits, failures and acceptance
+Worker requests enable `context_management` at `AGENT_CONTEXT_COMPACT_THRESHOLD` (default 64k), with `store:false`. The adapter accepts encrypted compaction items, prunes covered history and preserves function-call/result pairs. Checkpoints encrypt and replay native response items. Static instructions and tool definitions stay stable; remaining tool budgets appear in a trailing developer message.
 
-Enforce size bounds before constructing prompts. Current local memory limits are a baseline, not an excuse to concatenate unbounded receipts. Truncation preserves the latest request, required caveats and reference ambiguity. Retrieval failure returns a typed unavailable context; a safe greeting may still be answered.
+The usage meter allows the non-generating input-count endpoint and meters generating responses, including automatic compaction usage. Summary, agent and reviewer share the model/key and campaign cap in evaluations.
 
-Acceptance covers concurrent employees, separate groups, phone reassignment, removed record access, quoted instructions, ambiguous references, pending-task collisions, missing media contents and history after uncertain delivery. Only transport-accepted assistant replies enter sent conversation history; an unsent candidate must not be presented as a prior conversation turn.
+## Verification
 
-Retention and operator visibility follow the persistence/observability policies. Protected recall uses the existing encrypted inbox and delivery receipts, not a second independent CRM cache. Worker deployment and runtime verification remain separate from implementation and database migration.
+Deterministic coverage includes pin replacement and forgetting, forwarded commands, owner changes, expiry, summary provenance failure, encrypted restarts, concurrent revisions, SQL lease fencing/RLS, microsecond ordering, token admission, encrypted compaction continuations and fresh reference reads. Native compaction uses fake provider responses in tests; short live conversations do not exercise a 64k worker threshold.
+
+Adversarial regressions cover send-time identity changes, mixed-receipt authorization, encrypted outbox restart, literal special-token strings, rejected oversized history, token-dense excerpts, expiry across repeated summary merges, legacy undated notes and multi-page pin listings. These checks use synthetic data and fake models/transports; PostgreSQL tests use only an isolated local test database.
+
+[Local context evaluations](../../evals/README.md#local-context-evaluation-with-real-reads) use real read tools with local state and private transcripts. Deployment, migration and runtime enablement remain separate from implementation.
+
+The implementation follows [OpenAI compaction](https://developers.openai.com/api/docs/guides/compaction), [input counting](https://developers.openai.com/api/docs/guides/token-counting) and [prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching). App-owned structured memory complements native within-run compaction.
+
+The initial three real-data Luna scenarios passed **2/3**, spending **$0.03552** under the approved $2 cap. Selection after restart and forgetting before switching to CRM passed. The correction scenario persisted the corrected requirement but omitted it from the final answer. The memory instructions were strengthened afterward and the stage handoff was covered by an offline regression. No extra paid scenario was run; the prompt change still needs a future live validation. Private transcripts and original failures remain local.

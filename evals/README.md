@@ -214,3 +214,22 @@ code; failed earlier turns remain failures.
 See the [production evaluation review](../docs/agent-modules/37-production-evaluation.md)
 for the primary-source research, remaining holdout/monitoring gaps and proposed
 release process.
+
+## Local context evaluation with real reads
+
+`npm run eval:context` runs three Luna scenarios once each: correction after compaction, warehouse selection after restart, and forgetting context before switching to CRM. Seed chatter is synthetic; warehouse/CRM evidence comes from current authorized reads. The assistant and its source reviewer both use `gpt-6-luna`. The normal campaign meter includes summarization and all SDK attempts.
+
+```sh
+npm run eval:context -- \
+  --env-file /absolute/path/to/live-playground-production.env \
+  --key-env-file /absolute/path/to/the/existing/ramesh.env \
+  --prices-file /absolute/path/to/reviewed-luna-prices.json \
+  --allow-live-reads --max-usd 2 \
+  --output .local/context-evals/unique-run-id
+```
+
+The dollar value must be approved for the specific run. The source files are read directly; credentials are not copied into reports. The dedicated playground database login is used only for roster SELECTs inside `READ ONLY` transactions. Mutation scopes are stripped; no business writer, scheduling service, message queue, outbox or WhatsApp transport is composed. The Context Engine enforces current read permissions independently for every request.
+
+Context state is encrypted locally with a per-run key. Transcripts, source evidence and accounting are saved under the ignored `.local` directory, with private directory/file modes. Nothing is uploaded or saved into the remote playground conversation tables. Failed preflights and scenario executions are preserved; the runner does not retry scenarios. CI invocation is refused. Do not publish these private artifacts or copy their content into shared fixtures.
+
+Price profiles use the existing `usagePricesSchema`. Review current provider prices and ceilings before running; this harness caps exact rendered input at 96k, below Luna's long-context pricing threshold. A short live scenario tests app-owned summary/pins/recall, not the 64k native worker compaction threshold.

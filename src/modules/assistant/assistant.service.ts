@@ -14,12 +14,18 @@ import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
 import type { BusinessReadService } from './business-reads.js';
 import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js';
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
-import { getBusinessReply, writeDeliveryBundle } from '../messaging/delivery-evidence.js';
+import {
+  contextDeliveryBundle,
+  getBusinessReply,
+  writeDeliveryBundle,
+} from '../messaging/delivery-evidence.js';
+import type { ContextDelivery } from '../messaging/context-delivery.js';
 import { bindUsageEmployee, currentUsageScope, withUsageScope } from '../usage/usage-scope.js';
 import type { UsageMeter } from '../usage/usage-meter.js';
 import { UtilityToolRun } from './utility-tools.js';
 import { CheckpointError, type AgentCheckpointStore } from './checkpoint.types.js';
 import { withModelReplay, replayedModelSteps } from './model-replay.js';
+import type { ChatContext } from './chat-context.js';
 import type { PersonalToolRun, PersonalToolService } from '../scheduling/personal-tools.js';
 import type {
   BusinessWriteReply,
@@ -53,6 +59,7 @@ export class AssistantService {
       checkpoints?: AgentCheckpointStore;
       personalTools?: PersonalToolService;
       businessWrites?: BusinessWriteService;
+      conversationContext?: ChatContext;
     } = {},
   ) {
     this.graph = buildAssistantGraph(model);
@@ -129,7 +136,12 @@ export class AssistantService {
       stages: [],
       outcome: 'completed',
     };
+    if (this.runtime.conversationContext) trace.promptVersion += '+memory-v2';
+    let contextDelivery: ContextDelivery | undefined;
+    const protect = (evidence?: unknown) =>
+      contextDelivery ? contextDeliveryBundle(contextDelivery, evidence) : evidence;
     const finish = async (reply: Omit<AssistantReply, 'trace'>): Promise<AssistantReply> => {
+      const evidence = protect(reply.businessEvidence);
       trace.durationMs = Date.now() - started;
       const reused = replayedModelSteps();
       if (reused) trace.replayedSteps = reused;
@@ -142,7 +154,7 @@ export class AssistantService {
         }
       }
       this.observe(trace);
-      return { ...reply, trace };
+      return { ...reply, ...(evidence ? { businessEvidence: evidence } : {}), trace };
     };
     const input = message.text?.trim() ?? '';
     if (!input || input.length > (message.batchMessageIds ? 32000 : 6000)) {
@@ -154,6 +166,8 @@ export class AssistantService {
       });
     }
     let personal: PersonalToolRun | undefined;
+    let contextHistory: ChatMessage[] | undefined;
+    let durableContextEnabled = false;
     let writes: BusinessWriteRun | undefined;
     let recoveredWrite: BusinessWriteReply | undefined;
     try {
@@ -191,6 +205,21 @@ export class AssistantService {
       const quickReply = await personal?.quickReply(recoverySignal);
       if (quickReply)
         return finish({ text: quickReply.text, businessEvidence: quickReply.delivery });
+      if (this.runtime.conversationContext) {
+        const contextDeadline = AbortSignal.timeout(
+          Math.max(1, started + this.modelConfig.timeoutMs - Date.now()),
+        );
+        const prepared = await this.runtime.conversationContext.prepare(
+          message,
+          trusted,
+          signal ? AbortSignal.any([signal, contextDeadline]) : contextDeadline,
+          (stage) => trace.stages.push(stage),
+        );
+        contextHistory = prepared?.history;
+        contextDelivery = prepared?.delivery;
+        durableContextEnabled = prepared?.enabled === true;
+        if (prepared?.reply !== undefined) return finish({ text: prepared.reply });
+      }
       if (writeSignal && trusted) {
         try {
           writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
@@ -252,11 +281,9 @@ export class AssistantService {
       const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
       const key = this.key(message);
       try {
-        const history = this.readHistory
-          ? await this.readHistory(message)
-          : key
-            ? this.memory.get(key)
-            : [];
+        const history =
+          contextHistory ??
+          (this.readHistory ? await this.readHistory(message) : key ? this.memory.get(key) : []);
         combined.throwIfAborted();
         const inputState = {
           input:
@@ -284,6 +311,7 @@ export class AssistantService {
                   now: checkpoint ? () => checkpoint.metadata.requestTimeMs : this.runtime.now,
                   researchDeadlineMs:
                     deadlineAtMs - Math.min(60000, this.modelConfig.timeoutMs / 4),
+                  durableContextEnabled,
                   onStage: (stage) => trace.stages.push(stage),
                   onContext: this.runtime.observeContext,
                   onToolActivity,
@@ -308,7 +336,10 @@ export class AssistantService {
                 ).invoke(inputState, graphConfig)
               : await this.graph.invoke(inputState, graphConfig);
         combined.throwIfAborted();
-        trace.stages = result.stages;
+        trace.stages = [
+          ...trace.stages.filter((stage) => stage.stage === 'context'),
+          ...result.stages,
+        ];
         if ('researchExhausted' in result && result.researchExhausted)
           trace.limitedBy = 'research_deadline';
         const business = 'business' in result ? result.business : undefined;
@@ -330,6 +361,7 @@ export class AssistantService {
         if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
         if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
         let remembered = false;
+        const protectedEvidence = protect(evidence);
         return finish({
           text: result.reply,
           draft: result.draft,
@@ -339,8 +371,10 @@ export class AssistantService {
               this.memory.remember(
                 key,
                 this.input(message),
-                evidence ? PRIVATE_HISTORY_REPLY : result.reply,
-                evidence ? getBusinessReply({ text: result.reply, receipt: evidence }) : undefined,
+                protectedEvidence ? PRIVATE_HISTORY_REPLY : result.reply,
+                protectedEvidence
+                  ? getBusinessReply({ text: result.reply, receipt: protectedEvidence })
+                  : undefined,
               );
               remembered = true;
             }

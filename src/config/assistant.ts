@@ -14,6 +14,8 @@ export interface AssistantConfig {
   usagePolicy?: UsagePolicy;
   /** Runtime dependency shared by text, judges and media; never serialized into provider requests. */
   usageMeter?: UsageMeter;
+  /** Opt-in until the conversation-context migration is deployed. */
+  context?: { maxInputTokens: number; compactThreshold: number };
 }
 
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
@@ -45,12 +47,24 @@ export function loadAssistantConfig(
       throw new Error(`${name} must be between ${min} and ${max}`);
     return value;
   };
+  if (env.AGENT_CONTEXT_ENABLED && !['true', 'false'].includes(env.AGENT_CONTEXT_ENABLED))
+    throw new Error('Invalid AGENT_CONTEXT_ENABLED');
+  const context =
+    env.AGENT_CONTEXT_ENABLED === 'true'
+      ? {
+          maxInputTokens: integer('AGENT_CONTEXT_MAX_INPUT_TOKENS', 96000, 16000, 240000),
+          compactThreshold: integer('AGENT_CONTEXT_COMPACT_THRESHOLD', 64000, 8000, 200000),
+        }
+      : undefined;
+  if (context && context.compactThreshold >= context.maxInputTokens)
+    throw new Error('Context compaction threshold must be below the input budget');
   return {
     apiKey,
     sttApiKey: env.OPENAI_STT_API_KEY?.trim() || apiKey,
     transcriptionModel,
     tavilyApiKey,
     model,
+    context,
     usagePolicy: loadUsagePolicy(env),
     toolReasoningEffort: toolReasoningEffort as 'low' | 'medium' | 'high',
     timeoutMs: integer('AGENT_TIMEOUT_MS', 45_000, 1000, 300_000),
