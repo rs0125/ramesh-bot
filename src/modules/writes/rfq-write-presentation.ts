@@ -78,17 +78,19 @@ export function rfqWriteResultText(
 ): string | undefined {
   const tool = operation.payload.toolName;
   if (
-    !['create_crm_rfq', 'update_crm_rfq', 'undo_crm_rfq'].includes(tool) ||
+    !['create_crm_rfq', 'update_crm_rfq', 'undo_crm_rfq', 'delete_crm_rfq'].includes(tool) ||
     operation.payload.sourceFamily !== 'crm' ||
     operation.payload.idempotencyArgument !== 'operation_id' ||
     operation.state !== 'SUCCEEDED' ||
     operation.result?.operation_id !== operation.operationId ||
     !(
-      tool === 'undo_crm_rfq'
-        ? ['rolled_back', 'replayed']
-        : tool === 'update_crm_rfq'
-          ? ['updated', 'replayed']
-          : ['created', 'replayed']
+      tool === 'delete_crm_rfq'
+        ? ['deleted', 'replayed']
+        : tool === 'undo_crm_rfq'
+          ? ['rolled_back', 'replayed']
+          : tool === 'update_crm_rfq'
+            ? ['updated', 'replayed']
+            : ['created', 'replayed']
     ).includes(operation.result.outcome)
   )
     return undefined;
@@ -98,6 +100,22 @@ export function rfqWriteResultText(
     return replayed ? 'That RFQ change was already undone.' : 'Undid that RFQ change.';
 
   const data = object(operation.result.data);
+  if (tool === 'delete_crm_rfq') {
+    if (replayed && operation.result.data === undefined)
+      return 'That opportunity was already moved to CRM trash.';
+    if (
+      typeof data.id !== 'string' ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(data.id) ||
+      typeof data.name !== 'string' ||
+      !data.name.trim() ||
+      data.name.length > 500 ||
+      /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(data.name) ||
+      data.deletion_kind !== 'trash' ||
+      data.undo_available !== false
+    )
+      return 'I could not verify the deleted opportunity details from this receipt. Check CRM before retrying.';
+    return `${replayed ? 'This opportunity was already moved' : 'Moved opportunity'} to CRM trash: ${data.name}${replayed ? '\nThese are the details recorded when that change completed.' : ''}`;
+  }
   const args = operation.payload.arguments;
   const editing = tool === 'update_crm_rfq';
   const values = editing ? object(args.changes ?? args.patch) : args;

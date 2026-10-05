@@ -201,3 +201,59 @@ test('unconfirmed, mismatched, unrelated, or contradictory receipts never look s
     assert.equal(rfqWriteResultText(op), undefined);
   }
 });
+
+test('opportunity deletion names only the verified provider record and does not offer edit or undo', () => {
+  const op = operation();
+  op.payload.toolName = 'delete_crm_rfq';
+  op.result!.outcome = 'deleted';
+  op.result!.data = {
+    id: recordId,
+    name: 'Verified Opportunity',
+    url: recordUrl,
+    undo_available: false,
+    deletion_kind: 'trash',
+  };
+  assert.equal(
+    rfqWriteResultText(op, allTools),
+    'Moved opportunity to CRM trash: Verified Opportunity',
+  );
+  op.result!.outcome = 'replayed';
+  assert.match(
+    rfqWriteResultText(op)!,
+    /^This opportunity was already moved to CRM trash: Verified Opportunity/,
+  );
+  assert.match(rfqWriteResultText(op)!, /details recorded when that change completed/);
+  op.result!.data = undefined;
+  assert.equal(
+    rfqWriteResultText(op, allTools),
+    'That opportunity was already moved to CRM trash.',
+  );
+});
+
+test('opportunity deletion requires authoritative identity and deletion facts without falling back to arguments', () => {
+  const valid = {
+    id: recordId,
+    name: 'Verified Opportunity',
+    undo_available: false,
+    deletion_kind: 'trash',
+  };
+  for (const invalid of [
+    undefined,
+    {},
+    { ...valid, id: 'not-a-record' },
+    { ...valid, name: undefined },
+    { ...valid, name: '' },
+    { ...valid, name: 'A'.repeat(501) },
+    { ...valid, name: 'Company\nFake Receipt' },
+    { ...valid, undo_available: true },
+    { ...valid, deletion_kind: 'destroyed' },
+  ]) {
+    const op = operation();
+    op.payload.toolName = 'delete_crm_rfq';
+    op.result!.outcome = 'deleted';
+    op.result!.data = invalid;
+    const text = rfqWriteResultText(op, allTools)!;
+    assert.match(text, /could not verify/);
+    assert.doesNotMatch(text, /Moved|ask me|Test Logistics|Verified Opportunity|Open in CRM/);
+  }
+});

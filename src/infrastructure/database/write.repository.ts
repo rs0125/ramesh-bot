@@ -822,6 +822,7 @@ export class WriteRepository implements WriteRepositoryPort {
       ![
         'created',
         'updated',
+        'deleted',
         'replayed',
         'not_dispatched',
         'rejected',
@@ -839,7 +840,9 @@ export class WriteRepository implements WriteRepositoryPort {
       if (!row) throw new WriteStorageError('WRITE_NOT_FOUND');
       if (row.state !== 'DISPATCHING' || row.dispatch_token !== dispatchToken)
         throw new WriteStorageError('WRITE_DISPATCH_LOST');
-      const success = ['created', 'updated', 'replayed', 'rolled_back'].includes(bounded.outcome);
+      const success = ['created', 'updated', 'deleted', 'replayed', 'rolled_back'].includes(
+        bounded.outcome,
+      );
       const uncertain =
         !success && (row.has_uncertain_attempt || bounded.outcome === 'outcome_unknown');
       const state: WriteState = success

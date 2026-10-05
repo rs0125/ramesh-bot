@@ -242,3 +242,45 @@ test('unrelated, incomplete or contradictory receipts are not note successes', (
     assert.equal(crmNoteResultText(op), undefined);
   }
 });
+
+test('note deletion quotes exact verified deleted text and deal without edit or undo offers', () => {
+  const op = operation();
+  op.payload.toolName = 'delete_crm_note';
+  op.result!.outcome = 'deleted';
+  op.result!.data = { ...data(), undo_available: false, deletion_kind: 'note' };
+  const text = crmNoteResultText(op, [...tools, 'delete_crm_note'])!;
+  assert.equal(
+    text,
+    [
+      'Moved this note to CRM trash from deal: Test Logistics – Bangalore',
+      'Title: Site visit',
+      `Deleted note:\n${data().note.body}`,
+      `Open deal in CRM: ${dealUrl}`,
+    ].join('\n\n'),
+  );
+  assert.doesNotMatch(text, /ask me|undo|Model|Private|Provider/);
+  op.result!.outcome = 'replayed';
+  assert.match(crmNoteResultText(op)!, /already moved to CRM trash/);
+  assert.match(crmNoteResultText(op)!, /details recorded when that change completed/);
+  op.result!.data = undefined;
+  assert.equal(crmNoteResultText(op), 'That note was already moved to CRM trash.');
+});
+
+test('note deletion rejects missing or contradictory authoritative deletion facts', () => {
+  for (const invalid of [
+    undefined,
+    {},
+    data(),
+    { ...data(), undo_available: false, deletion_kind: 'deal_link' },
+    { ...data(), undo_available: true, deletion_kind: 'note' },
+    { ...data(), undo_available: false, deletion_kind: 'note', note: undefined },
+  ]) {
+    const op = operation();
+    op.payload.toolName = 'delete_crm_note';
+    op.result!.outcome = 'deleted';
+    op.result!.data = invalid;
+    const text = crmNoteResultText(op, tools)!;
+    assert.match(text, /could not verify/);
+    assert.doesNotMatch(text, /Moved|Model|Private|ask me|Site visit|Test Logistics/);
+  }
+});

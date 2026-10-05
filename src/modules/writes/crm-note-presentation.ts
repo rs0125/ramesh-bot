@@ -1,7 +1,7 @@
 /** CRM note receipts render only the authoritative text returned by the write service. */
 import type { WriteOperation } from './write.types.js';
 
-const noteTools = ['create_crm_note', 'update_crm_note', 'undo_crm_note'];
+const noteTools = ['create_crm_note', 'update_crm_note', 'undo_crm_note', 'delete_crm_note'];
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 
 function object(value: unknown): Record<string, unknown> {
@@ -57,6 +57,7 @@ export function crmNoteResultText(
   const tool = operation.payload.toolName;
   const undo = tool === 'undo_crm_note';
   const editing = tool === 'update_crm_note';
+  const deleting = tool === 'delete_crm_note';
   if (
     !noteTools.includes(tool) ||
     operation.payload.sourceFamily !== 'crm' ||
@@ -64,14 +65,19 @@ export function crmNoteResultText(
     operation.state !== 'SUCCEEDED' ||
     operation.result?.operation_id !== operation.operationId ||
     !(
-      undo
-        ? ['rolled_back', 'replayed']
-        : editing
-          ? ['updated', 'replayed']
-          : ['created', 'replayed']
+      deleting
+        ? ['deleted', 'replayed']
+        : undo
+          ? ['rolled_back', 'replayed']
+          : editing
+            ? ['updated', 'replayed']
+            : ['created', 'replayed']
     ).includes(operation.result.outcome)
   )
     return undefined;
+
+  if (deleting && operation.result.outcome === 'replayed' && operation.result.data === undefined)
+    return 'That note was already moved to CRM trash.';
 
   if (operation.result.outcome === 'replayed' && operation.result.data === undefined)
     return `That note ${undo ? 'change was already undone' : editing ? 'was already updated' : 'was already saved'}. Its stored text needs a fresh authorized read before I can show it.`;
@@ -87,25 +93,28 @@ export function crmNoteResultText(
     !text(deal.name, 500) ||
     !text(note.title, 160) ||
     !text(note.body, 2000) ||
-    (undo && data.undo_kind !== 'creation' && data.undo_kind !== 'edit')
+    (undo && data.undo_kind !== 'creation' && data.undo_kind !== 'edit') ||
+    (deleting && (data.deletion_kind !== 'note' || data.undo_available !== false))
   )
     return 'I could not verify the note details from this receipt. Check CRM before retrying.';
 
   const replayed = operation.result.outcome === 'replayed';
   const removed = undo && data.undo_kind === 'creation';
-  const headline = undo
-    ? removed
-      ? `${replayed ? 'This note was already removed from' : 'Removed this note from'} deal: ${deal.name}`
-      : `${replayed ? 'This note edit was already undone on' : 'Undid the note edit on'} deal: ${deal.name}`
-    : `${replayed ? `This note was already ${editing ? 'updated' : 'saved'} on` : `${editing ? 'Updated' : 'Saved'} note on`} deal: ${deal.name}`;
+  const headline = deleting
+    ? `${replayed ? 'This note was already moved' : 'Moved this note'} to CRM trash from deal: ${deal.name}`
+    : undo
+      ? removed
+        ? `${replayed ? 'This note was already removed from' : 'Removed this note from'} deal: ${deal.name}`
+        : `${replayed ? 'This note edit was already undone on' : 'Undid the note edit on'} deal: ${deal.name}`
+      : `${replayed ? `This note was already ${editing ? 'updated' : 'saved'} on` : `${editing ? 'Updated' : 'Saved'} note on`} deal: ${deal.name}`;
   const link = dealLink(deal.url, deal.id);
   return [
     headline,
     `${undo && !removed ? 'Restored title' : 'Title'}: ${note.title}`,
-    `${undo ? (removed ? 'Removed note' : 'Restored note') : 'Note'}:\n${note.body}`,
+    `${deleting ? 'Deleted note' : undo ? (removed ? 'Removed note' : 'Restored note') : 'Note'}:\n${note.body}`,
     replayed ? 'These are the details recorded when that change completed.' : undefined,
     link ? `Open deal in CRM: ${link}` : undefined,
-    !undo ? offer(availableToolNames, data.undo_available === true) : undefined,
+    !undo && !deleting ? offer(availableToolNames, data.undo_available === true) : undefined,
   ]
     .filter((value) => value !== undefined)
     .join('\n\n');

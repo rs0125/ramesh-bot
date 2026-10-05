@@ -242,6 +242,56 @@ test(
         },
       );
       await t.test(
+        'deleted results persist as success and cannot be reclaimed after restart',
+        async () => {
+          const f = fixture(),
+            c = await command(f, 'Delete the opportunity you edited for me');
+          const input = {
+            ...payload(),
+            toolName: 'delete_crm_rfq',
+            executionMode: 'direct_request' as const,
+            sourceFamily: 'crm',
+            toolMeta: {
+              'wareongo/context-write-v1': {
+                requiredScopes: ['crm:read', 'crm.rfq:write'],
+                sourceFamily: 'crm',
+                effect: 'delete',
+                idempotencyArgument: 'operation_id',
+                executionMode: 'direct_request',
+              },
+            },
+          };
+          const op = await f.repo.propose(c.ctx, input);
+          const approved = await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+          const claim = (await f.repo.claim(c.ctx, op.operationId, approved.version))!;
+          const result = {
+            operation_id: op.operationId,
+            outcome: 'deleted' as const,
+            code: 'CRM_RFQ_DELETED',
+            message: 'Moved opportunity to CRM trash.',
+            data: {
+              id: randomUUID(),
+              name: 'Verified opportunity',
+              undo_available: false,
+              deletion_kind: 'trash',
+            },
+          };
+          const finished = await f.repo.finish(c.ctx, op.operationId, claim.dispatchToken, result);
+          assert.equal(finished.state, 'SUCCEEDED');
+          assert.equal(finished.hasUncertainAttempt, false);
+          const restarted = new WriteRepository(db.runtime, f.account, key);
+          const recovered = (await restarted.findByRun(c.ctx))!;
+          assert.equal(recovered.state, 'SUCCEEDED');
+          assert.deepEqual(recovered.result, result);
+          await assert.rejects(
+            restarted.claim(c.ctx, op.operationId, recovered.version),
+            hasCode('WRITE_STATE_CONFLICT'),
+          );
+          const events = await restarted.auditRecent(actor);
+          assert.equal(events.filter((event) => event.kind === 'dispatch_result').length, 1);
+        },
+      );
+      await t.test(
         'natural draft retry reuses one frozen approved operation and restart resolves its audit receipt',
         async () => {
           const f = fixture(),

@@ -245,7 +245,9 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
     async finish(_ctx, id, _token, result) {
       const op = operations.get(id)!;
       op.result = structuredClone(result);
-      const success = ['created', 'updated', 'replayed', 'rolled_back'].includes(result.outcome);
+      const success = ['created', 'updated', 'deleted', 'replayed', 'rolled_back'].includes(
+        result.outcome,
+      );
       op.hasUncertainAttempt =
         !success && (op.hasUncertainAttempt || result.outcome === 'outcome_unknown');
       return transition(
@@ -1727,4 +1729,268 @@ test('direct note receipts show verified CRM text once while recovery and generi
     assert.equal(history.ok, true);
     assert.deepEqual(history.operations, []);
   }
+});
+
+function crmDeleteTool(kind: 'note' | 'rfq', direct = true) {
+  const definition = tool(
+    `delete_crm_${kind}`,
+    'delete',
+    {
+      ...(kind === 'note' ? { deal_id: uuid, note_id: uuid } : { id: uuid }),
+      expected_updated_at: { type: 'string', format: 'date-time' },
+      raw_text: { type: 'string', minLength: 1, maxLength: 3000 },
+    },
+    {
+      requiredScopes: ['crm:read', kind === 'note' ? 'crm.notes:write' : 'crm.rfq:write'],
+      sourceFamily: 'crm',
+      sourceTextArgument: 'raw_text',
+      ...(direct ? { executionMode: 'direct_request' } : {}),
+    },
+  );
+  definition.annotations!.destructiveHint = true;
+  return definition;
+}
+
+test('edited note and opportunity deletion dispatch once after review using the fresh sourced version', async () => {
+  for (const kind of ['note', 'rfq'] as const) {
+    const h = harness();
+    const definition = crmDeleteTool(kind);
+    const dealId = randomUUID();
+    const noteId = randomUUID();
+    const expectedVersion = '2026-10-05T10:20:30.123Z';
+    const args = {
+      ...(kind === 'note' ? { deal_id: dealId, note_id: noteId } : { id: dealId }),
+      expected_updated_at: expectedVersion,
+    };
+    h.changeDefinitions([definition]);
+    h.useResult({
+      outcome: 'deleted',
+      code: 'CRM_DELETED',
+      message: 'Private upstream text',
+      data:
+        kind === 'note'
+          ? {
+              id: noteId,
+              deal: {
+                id: dealId,
+                name: 'Verified Test Logistics',
+                url: `https://crm.wareongo.com/object/opportunity/${dealId}`,
+              },
+              note: { title: 'Fire advisory', body: 'Fire advisory\n\n  Exact verified spacing.' },
+              undo_available: false,
+              deletion_kind: 'note',
+            }
+          : {
+              id: dealId,
+              name: 'Verified Test Logistics',
+              undo_available: false,
+              deletion_kind: 'trash',
+            },
+    });
+    const request = h.trusted(
+      `Delete that ${kind === 'note' ? 'note' : 'opportunity'} you edited for me.`,
+    );
+    const run = (await h.service.open(request, signal()))!;
+    const staged = (await run.execute(definition.name, JSON.stringify(args), signal())) as {
+      ok: boolean;
+    };
+    assert.equal(staged.ok, true);
+    assert.equal(h.calls.length, 0);
+    const receipt = (await run.finalize(signal()))!;
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.calls[0]!.args, {
+      ...args,
+      operation_id: h.calls[0]!.operationId,
+      raw_text: request.commandMessages![0]!.text,
+    });
+    assert.equal(h.counts().publishCount, 0);
+    assert.equal(h.counts().approveCount, 1);
+    assert.equal([...h.operations.values()][0]!.state, 'SUCCEEDED');
+    assert.match(receipt.text, /Moved.*to CRM trash.*Verified Test Logistics/);
+    assert.doesNotMatch(receipt.text, /confirm|ask me|undo|Private upstream/);
+    if (kind === 'note')
+      assert.ok(receipt.text.includes('Fire advisory\n\n  Exact verified spacing.'));
+    assert.equal(await h.service.canDeliver(request.key, receipt.delivery, signal()), true);
+    const recovered = (await h.service.recover(request, signal()))!;
+    assert.equal(h.calls.length, 1);
+    assert.doesNotMatch(recovered.text, /Verified Test Logistics|Fire advisory/);
+  }
+});
+
+test('destructive deletion does not imply direct authorization when metadata omits it', async () => {
+  const h = harness();
+  const definition = crmDeleteTool('note', false);
+  h.changeDefinitions([definition]);
+  const run = (await h.service.open(h.trusted('Delete that note.'), signal()))!;
+  await run.execute(
+    definition.name,
+    JSON.stringify({
+      deal_id: randomUUID(),
+      note_id: randomUUID(),
+      expected_updated_at: '2026-10-05T10:20:30.123Z',
+    }),
+    signal(),
+  );
+  const receipt = (await run.finalize(signal()))!;
+  assert.match(receipt.text, /confirm ABCDEF12/);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.counts().publishCount, 1);
+});
+
+test('stale, rejected and unknown deletions never claim a saved or deleted record', async () => {
+  for (const [outcome, code] of [
+    ['not_dispatched', 'CRM_NOTE_VERSION_CONFLICT'],
+    ['rejected', 'CRM_NOTE_NOT_OWNED'],
+    ['outcome_unknown', 'CRM_NOTE_OUTCOME_UNKNOWN'],
+  ] as const) {
+    const h = harness();
+    const definition = crmDeleteTool('note');
+    h.changeDefinitions([definition]);
+    h.useResult({ outcome, code, message: 'Private upstream body and deal name' });
+    const run = (await h.service.open(h.trusted('Delete that edited note.'), signal()))!;
+    await run.execute(
+      definition.name,
+      JSON.stringify({
+        deal_id: randomUUID(),
+        note_id: randomUUID(),
+        expected_updated_at: '2026-10-05T10:20:30.123Z',
+      }),
+      signal(),
+    );
+    const receipt = (await run.finalize(signal()))!;
+    assert.equal(h.calls.length, 1);
+    assert.doesNotMatch(
+      receipt.text,
+      /Moved|Deleted note|Saved:|Private upstream|ask me to edit|ask me to undo/,
+    );
+    assert.match(
+      receipt.text,
+      outcome === 'not_dispatched'
+        ? /not sent/
+        : outcome === 'rejected'
+          ? /not completed/
+          : /cannot yet confirm/,
+    );
+  }
+});
+
+test('a saved then edited note can be deleted in one subsequent reviewed turn without an undo chain', async () => {
+  const h = harness();
+  const dealId = randomUUID();
+  const noteId = randomUUID();
+  const createdVersion = '2026-10-05T10:20:30.000Z';
+  const editedVersion = '2026-10-05T10:21:30.000Z';
+  const definitions = [
+    directTool(
+      tool(
+        'create_crm_note',
+        'create',
+        {
+          deal_id: uuid,
+          title: { type: 'string' },
+          body: { type: 'string' },
+          raw_text: { type: 'string', minLength: 1, maxLength: 3000 },
+        },
+        {
+          requiredScopes: ['crm:read', 'crm.notes:write'],
+          sourceFamily: 'crm',
+          sourceTextArgument: 'raw_text',
+        },
+      ),
+    ),
+    directTool(
+      tool(
+        'update_crm_note',
+        'update',
+        {
+          deal_id: uuid,
+          note_id: uuid,
+          title: { type: 'string' },
+          body: { type: 'string' },
+          expected_updated_at: { type: 'string', format: 'date-time' },
+          raw_text: { type: 'string', minLength: 1, maxLength: 3000 },
+        },
+        {
+          requiredScopes: ['crm:read', 'crm.notes:write'],
+          sourceFamily: 'crm',
+          sourceTextArgument: 'raw_text',
+        },
+      ),
+    ),
+    crmDeleteTool('note'),
+  ];
+  h.changeDefinitions(definitions);
+  const steps = [
+    {
+      tool: 'create_crm_note',
+      request: 'Add a Fire NOC requirement note to Test Logistics: They want fire NOC.',
+      args: { deal_id: dealId, title: 'Fire NOC requirement', body: 'They want fire NOC.' },
+      outcome: 'created',
+      note: { title: 'Fire NOC requirement', body: 'They want fire NOC.' },
+      version: createdVersion,
+    },
+    {
+      tool: 'update_crm_note',
+      request: 'Change both title and body to Fire advisory.',
+      args: {
+        deal_id: dealId,
+        note_id: noteId,
+        title: 'Fire advisory',
+        body: 'Fire advisory',
+        expected_updated_at: createdVersion,
+      },
+      outcome: 'updated',
+      note: { title: 'Fire advisory', body: 'Fire advisory' },
+      version: editedVersion,
+    },
+    {
+      tool: 'delete_crm_note',
+      request: 'Alright delete this note.',
+      args: { deal_id: dealId, note_id: noteId, expected_updated_at: editedVersion },
+      outcome: 'deleted',
+      note: { title: 'Fire advisory', body: 'Fire advisory' },
+      version: editedVersion,
+    },
+  ] as const;
+  for (const [index, step] of steps.entries()) {
+    h.useResult({
+      outcome: step.outcome,
+      code: 'OK',
+      message: 'Verified receipt',
+      data: {
+        id: noteId,
+        deal: {
+          id: dealId,
+          name: 'Test Logistics',
+          url: `https://crm.wareongo.com/object/opportunity/${dealId}`,
+        },
+        note: step.note,
+        updated_at: step.version,
+        undo_available: step.outcome !== 'deleted',
+        ...(step.outcome === 'deleted' ? { deletion_kind: 'note' } : {}),
+      },
+    });
+    const request = h.trusted(step.request);
+    const run = (await h.service.open(request, signal()))!;
+    assert.equal(
+      ((await run.execute(step.tool, JSON.stringify(step.args), signal())) as { ok: boolean }).ok,
+      true,
+    );
+    assert.equal(h.calls.length, index);
+    const receipt = (await run.finalize(signal()))!;
+    assert.equal(h.calls.length, index + 1);
+    assert.equal(h.calls[index]!.tool, step.tool);
+    assert.match(receipt.text, /Test Logistics/);
+    assert.doesNotMatch(receipt.text, /confirm ABCDEF12/);
+    if (step.outcome === 'deleted') {
+      assert.match(receipt.text, /Moved this note to CRM trash/);
+      assert.match(receipt.text, /Title: Fire advisory\n\nDeleted note:\nFire advisory/);
+      assert.doesNotMatch(receipt.text, /Fire NOC|ask me|undo/);
+      assert.equal(h.calls[index]!.args.expected_updated_at, editedVersion);
+      assert.equal(h.calls[index]!.args.original_operation_id, undefined);
+    }
+  }
+  assert.equal(h.counts().publishCount, 0);
+  assert.equal(h.counts().approveCount, 3);
+  assert.equal(new Set(h.calls.map((call) => call.operationId)).size, 3);
 });

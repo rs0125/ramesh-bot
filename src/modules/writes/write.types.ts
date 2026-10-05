@@ -44,6 +44,7 @@ export interface WriteAttemptResult {
   outcome:
     | 'created'
     | 'updated'
+    | 'deleted'
     | 'replayed'
     | 'not_dispatched'
     | 'rejected'

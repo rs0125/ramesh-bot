@@ -79,6 +79,7 @@ export const writeResultSchema = z
     outcome: z.enum([
       'created',
       'updated',
+      'deleted',
       'replayed',
       'rolled_back',
       'not_dispatched',
