@@ -1,4 +1,5 @@
 import { MEMORY_INSTRUCTIONS, historyForStage } from './chat-context.js';
+import { toolDiscovery, planningToolDefinitions } from '../context-engine/tool-discovery.js';
 /** Bounded native tool loop in LangGraph, with style formatting and fresh evidence review. */
 import { END, START, StateGraph, StateSchema } from '@langchain/langgraph';
 import { z } from 'zod';
@@ -286,10 +287,11 @@ export function buildSalesGraph(
       recall = businessRecall(value.history, run, requestTime);
       modelHistory = recall.messages;
       tools = [
-        ...(run?.tools.map(({ name, description, inputSchema }) => ({
-          name,
-          description,
-          inputSchema,
+        ...(run?.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          ...(toolDiscovery(tool) ? { discovery: toolDiscovery(tool) } : {}),
         })) ?? []),
         ...(recall.available ? [recallDefinition] : []),
         ...(utilities?.tools ?? []),
@@ -362,7 +364,7 @@ export function buildSalesGraph(
                   request: value.input,
                   objective: value.objective,
                   history: modelHistory,
-                  tool_definitions: tools,
+                  tool_definitions: planningToolDefinitions(tools, model.toolLoadingMode),
                   ...(value.feedback
                     ? { review_feedback: value.feedback, previous_reply: value.reply }
                     : {}),
@@ -579,7 +581,10 @@ export function buildSalesGraph(
                 business_write_result: writePreview,
                 business_write_execution_mode: writes?.pendingExecutionMode,
                 business_write_failures: writes?.failures ?? [],
-                business_write_tool_definitions: writes?.tools ?? [],
+                business_write_tool_definitions: planningToolDefinitions(
+                  writes?.tools ?? [],
+                  model.toolLoadingMode,
+                ),
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],

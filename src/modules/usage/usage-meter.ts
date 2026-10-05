@@ -14,6 +14,25 @@ import { UsageBudgetError, UsageConflictError } from './usage.types.js';
 export type UsageEvent =
   | { type: 'reserved'; reservation: UsageReservation }
   | { type: 'settled'; id: string; runId: string; settlement: UsageSettlement };
+
+function tokenPricedTool(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const tool = value as { type?: unknown; execution?: unknown; tools?: unknown };
+  if (tool.type === 'function') return true;
+  // Hosted tool search uses model tokens. Other hosted tools have separate fees.
+  // Reviewed against https://developers.openai.com/api/docs/pricing on 2026-10-05.
+  if (tool.type === 'tool_search')
+    return tool.execution === undefined || tool.execution === 'server';
+  return (
+    tool.type === 'namespace' &&
+    Array.isArray(tool.tools) &&
+    tool.tools.every(
+      (child: unknown) =>
+        child !== null && typeof child === 'object' && 'type' in child && child.type === 'function',
+    )
+  );
+}
+
 export class UsageMeter {
   private failure?: string;
   constructor(
@@ -80,7 +99,7 @@ export class UsageMeter {
           value.background === true ||
           value.stream === true ||
           (Array.isArray(value.tools) &&
-            value.tools.some((tool: { type?: string } | null) => tool?.type !== 'function'));
+            value.tools.some((tool: unknown) => !tokenPricedTool(tool)));
         if (unsupportedPricing && this.options.policy.mode === 'enforce')
           throw new Error('USAGE_REQUEST_PRICING_UNSUPPORTED');
         if (Number.isSafeInteger(value.max_output_tokens) && value.max_output_tokens > 0)

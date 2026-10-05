@@ -135,6 +135,7 @@ const metadata = {
   startedAt: new Date(startedAt).toISOString(),
   syntheticClock: '2026-10-02T09:00:00Z; +1 minute per user turn',
   model: config.model,
+  toolLoadingMode: provider.toolLoadingMode,
   judgeModel: judgeLoaded.model,
   reasoningEfforts: {
     toolLoop: config.toolReasoningEffort ?? 'medium',
@@ -194,11 +195,12 @@ const usageBudget = await settleEvalWorkers(
         judgeUsage: emptyUsage(),
       };
       const model: TextModel = {
+        toolLoadingMode: provider.toolLoadingMode,
         startToolSession(request) {
           const session = provider.startToolSession(request);
           return {
-            async next(remaining, signal) {
-              const next = await session.next(remaining, signal);
+            async next(remaining, signal, allowedTools) {
+              const next = await session.next(remaining, signal, allowedTools);
               addUsage(record.usage, next);
               addUsage(record.agentUsage, next);
               record.proposedTools.push(

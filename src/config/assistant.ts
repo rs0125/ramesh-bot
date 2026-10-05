@@ -11,6 +11,7 @@ export interface AssistantConfig {
   timeoutMs: number;
   maxOutputTokens: number;
   toolReasoningEffort?: 'low' | 'medium' | 'high';
+  toolLoadingMode?: 'eager' | 'deferred';
   usagePolicy?: UsagePolicy;
   /** Runtime dependency shared by text, judges and media; never serialized into provider requests. */
   usageMeter?: UsageMeter;
@@ -35,6 +36,9 @@ export function loadAssistantConfig(
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(transcriptionModel))
     throw new Error('Invalid OPENAI_TRANSCRIBE_MODEL');
   const toolReasoningEffort = env.AGENT_TOOL_REASONING_EFFORT?.trim() || 'medium';
+  const toolLoadingMode = env.AGENT_TOOL_LOADING?.trim() || 'eager';
+  if (!['eager', 'deferred'].includes(toolLoadingMode))
+    throw new Error('AGENT_TOOL_LOADING must be eager or deferred');
   const tavilyApiKey = env.TAVILY_API_KEY?.trim() || undefined;
   if (tavilyApiKey && (tavilyApiKey.length > 512 || /\s/.test(tavilyApiKey)))
     throw new Error('Invalid TAVILY_API_KEY');
@@ -65,6 +69,7 @@ export function loadAssistantConfig(
     tavilyApiKey,
     model,
     context,
+    toolLoadingMode: toolLoadingMode as 'eager' | 'deferred',
     usagePolicy: loadUsagePolicy(env),
     toolReasoningEffort: toolReasoningEffort as 'low' | 'medium' | 'high',
     timeoutMs: integer('AGENT_TIMEOUT_MS', 45_000, 1000, 300_000),

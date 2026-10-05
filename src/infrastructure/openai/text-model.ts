@@ -1,5 +1,6 @@
 /** OpenAI Responses adapter: bounded tokens/retries, cancellation, and redacted errors. */
 import OpenAI from 'openai';
+import { OpenAIToolCatalog } from './tool-catalog.js';
 import { replayModelResponse } from '../../modules/assistant/model-replay.js';
 import { CheckpointError } from '../../modules/assistant/checkpoint.types.js';
 import { effectiveReasoningEffort, type AssistantConfig } from '../../config/assistant.js';
@@ -15,6 +16,9 @@ import type {
 
 export class OpenAITextModel implements TextModel {
   private readonly client: OpenAI;
+  get toolLoadingMode() {
+    return this.config.toolLoadingMode ?? 'eager';
+  }
   constructor(
     private readonly config: AssistantConfig,
     fetcher?: typeof fetch,
@@ -83,100 +87,128 @@ export class OpenAITextModel implements TextModel {
         content,
       }),
     );
-    const tools: OpenAI.Responses.FunctionTool[] = request.tools.map((tool) => ({
-      type: 'function',
-      name: tool.name,
-      description: tool.description,
-      parameters: structuredClone(tool.inputSchema),
-      strict: false,
-    }));
-    const pending = new Set<string>();
+    const catalog = new OpenAIToolCatalog(request.tools, this.toolLoadingMode);
+    const pending = new Map<string, string | undefined>();
+    let searchCalls = 0;
     return {
       next: async (remainingCalls, signal, allowedToolNames) => {
         signal.throwIfAborted();
         if (pending.size) throw new Error('Tool outputs required before continuation');
         try {
-          // Retain the catalogue for prompt caching, but restrict calls on every continuation.
-          // Intersect with the original catalogue so this parameter cannot grant a new tool.
-          const allowed = tools.filter((tool) => allowedToolNames?.includes(tool.name) ?? true);
-          const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
-            model: this.config.model,
-            service_tier: 'default',
-            instructions: this.instructions(request.instructions),
-            // Stable instructions/tools are the cache prefix. Per-step budget belongs at the end.
-            input: [
-              ...input,
-              {
-                role: 'developer',
-                content: `Remaining tool-call budget: ${remainingCalls}. If zero, answer from retrieved evidence and state any remaining limitation.`,
-              },
-            ],
-            tools,
-            tool_choice:
-              remainingCalls <= 0 || !allowed.length
-                ? 'none'
-                : allowed.length === tools.length
-                  ? 'auto'
-                  : {
-                      type: 'allowed_tools',
-                      mode: 'auto',
-                      tools: allowed.map(({ name }) => ({ type: 'function', name })),
-                    },
-            parallel_tool_calls: false,
-            store: false,
-            reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },
-            include: ['reasoning.encrypted_content'],
-            max_output_tokens: this.config.maxOutputTokens,
-            ...(this.config.context
-              ? {
-                  context_management: [
-                    { type: 'compaction', compact_threshold: this.config.context.compactThreshold },
-                  ],
-                }
-              : {}),
-          };
-          const { response, replayed } = await replayModelResponse(body, async () => {
-            await this.checkInput(body, 'worker', signal);
-            const value = await withUsageStage('worker', () =>
-              this.client.responses.create(body, { signal }),
-            );
+          const totals: Pick<
+            ModelResult,
+            'inputTokens' | 'outputTokens' | 'cachedInputTokens' | 'reasoningTokens'
+          > = { inputTokens: 0, outputTokens: 0 };
+          // Hosted search may return only search items; continue internally, with a session bound.
+          for (let round = 0; round < 9; round++) {
             signal.throwIfAborted();
-            if (value.status !== 'completed') throw new Error('Incomplete model response');
-            validateToolResponse(value);
-            return value;
-          });
-          signal.throwIfAborted();
-          if (response.status !== 'completed') throw new Error('Incomplete model response');
-          validateToolResponse(response);
-          const calls = response.output.filter((item) => item.type === 'function_call');
-          if (calls.length > 1 || (!calls.length && !response.output_text?.trim()))
-            throw new Error('Invalid tool response');
-          // Keep all continuation items, including encrypted reasoning, with store:false.
-          // Durable replay encrypts these items; they are never logged or shared across runs.
-          for (const item of response.output) {
-            if (
-              item.type !== 'message' &&
-              item.type !== 'reasoning' &&
-              item.type !== 'compaction' &&
-              item.type !== 'function_call'
-            )
-              throw new Error('Unexpected model output item');
-            input.push(item);
+            const allowed =
+              remainingCalls <= 0
+                ? []
+                : catalog.bindings.filter((tool) => allowedToolNames?.includes(tool.name) ?? true);
+            const allowedNames = allowed.map((tool) => tool.name);
+            const tools = catalog.render(allowedNames);
+            const searchEnabled = tools.some((tool) => tool.type === 'tool_search');
+            if (searchEnabled && searchCalls >= 8) throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
+            const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
+              model: this.config.model,
+              service_tier: 'default',
+              instructions: this.instructions(
+                `${request.instructions}${catalog.mode === 'deferred' ? '\nSearch for the relevant capability to load its tools before using them. Tool search grants no additional permissions.' : ''}`,
+              ),
+              // Keep instructions stable for caching; append each step's budget after the evidence.
+              input: [
+                ...input,
+                {
+                  role: 'developer',
+                  content: `Remaining tool-call budget: ${remainingCalls}. If zero, answer from retrieved evidence and state any remaining limitation.`,
+                },
+              ],
+              tools,
+              tool_choice:
+                remainingCalls <= 0 || !allowed.length
+                  ? 'none'
+                  : catalog.mode === 'deferred' || allowed.length === catalog.bindings.length
+                    ? 'auto'
+                    : {
+                        type: 'allowed_tools',
+                        mode: 'auto',
+                        tools: allowed.map(({ name }) => ({ type: 'function', name })),
+                      },
+              parallel_tool_calls: false,
+              store: false,
+              reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },
+              include: ['reasoning.encrypted_content'],
+              max_output_tokens: this.config.maxOutputTokens,
+              ...(searchEnabled ? { max_tool_calls: 8 - searchCalls } : {}),
+              ...(this.config.context
+                ? {
+                    context_management: [
+                      {
+                        type: 'compaction',
+                        compact_threshold: this.config.context.compactThreshold,
+                      },
+                    ],
+                  }
+                : {}),
+            };
+            const { response, replayed } = await replayModelResponse(body, async () => {
+              await this.checkInput(body, 'worker', signal);
+              const value = await withUsageStage('worker', () =>
+                this.client.responses.create(body, { signal }),
+              );
+              signal.throwIfAborted();
+              if (value.status !== 'completed') throw new Error('Incomplete model response');
+              validateToolResponse(value, searchEnabled);
+              return value;
+            });
+            signal.throwIfAborted();
+            if (response.status !== 'completed') throw new Error('Incomplete model response');
+            validateToolResponse(response, searchEnabled);
+            const calls = response.output.filter((item) => item.type === 'function_call');
+            // Keep all continuation items, including encrypted reasoning, with store:false.
+            // Durable replay encrypts these items; they are never logged or shared across runs.
+            for (const item of response.output) {
+              if (
+                item.type !== 'message' &&
+                item.type !== 'reasoning' &&
+                item.type !== 'compaction' &&
+                item.type !== 'function_call' &&
+                item.type !== 'tool_search_call' &&
+                item.type !== 'tool_search_output'
+              )
+                throw new Error('Unexpected model output item');
+              if (item.type === 'tool_search_output')
+                catalog.validateSearchTools(item.tools, allowedNames);
+              if (item.type === 'tool_search_call' && ++searchCalls > 8)
+                throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
+              input.push(item);
+            }
+            for (const call of calls) {
+              catalog.resolve(call.name, call.namespace, allowedNames);
+              pending.set(call.call_id, call.namespace);
+            }
+            pruneCompactedInput(input);
+            const usage = replayed ? undefined : response.usage;
+            totals.inputTokens += usage?.input_tokens ?? 0;
+            totals.outputTokens += usage?.output_tokens ?? 0;
+            for (const [key, value] of Object.entries(usageDetails(usage))) {
+              const field = key as 'cachedInputTokens' | 'reasoningTokens';
+              if (value !== undefined) totals[field] = (totals[field] ?? 0) + value;
+            }
+            if (!calls.length && !response.output_text?.trim()) continue;
+            return {
+              text: response.output_text?.trim() ?? '',
+              calls: calls.map((call) => ({
+                id: call.call_id,
+                name: call.name,
+                arguments: call.arguments,
+              })),
+              ...totals,
+              responseId: response.id,
+            };
           }
-          for (const call of calls) pending.add(call.call_id);
-          pruneCompactedInput(input);
-          return {
-            text: response.output_text?.trim() ?? '',
-            calls: calls.map((call) => ({
-              id: call.call_id,
-              name: call.name,
-              arguments: call.arguments,
-            })),
-            inputTokens: replayed ? 0 : (response.usage?.input_tokens ?? 0),
-            outputTokens: replayed ? 0 : (response.usage?.output_tokens ?? 0),
-            ...usageDetails(replayed ? undefined : response.usage),
-            responseId: response.id,
-          };
+          throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
         } catch (error) {
           if (error instanceof CheckpointError || error instanceof ContextBudgetError) throw error;
           signal.throwIfAborted();
@@ -187,11 +219,18 @@ export class OpenAITextModel implements TextModel {
         }
       },
       accept(callId, output) {
-        if (!pending.delete(callId)) throw new Error('Unexpected tool result');
+        if (!pending.has(callId)) throw new Error('Unexpected tool result');
+        const namespace = pending.get(callId);
         const serialized = JSON.stringify(output);
         if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > 100_000)
           throw new Error('Tool result exceeds context budget');
-        input.push({ type: 'function_call_output', call_id: callId, output: serialized });
+        pending.delete(callId);
+        input.push({
+          type: 'function_call_output',
+          call_id: callId,
+          output: serialized,
+          ...(namespace ? { namespace } : {}),
+        });
       },
       revise(feedback) {
         if (pending.size || feedback.length > 16000) throw new Error('Invalid review continuation');
@@ -259,14 +298,29 @@ export class OpenAITextModel implements TextModel {
   }
 }
 
-function validateToolResponse(response: OpenAI.Responses.Response) {
+function validateToolResponse(response: OpenAI.Responses.Response, searchEnabled = false) {
   const calls = response.output.filter((item) => item.type === 'function_call');
+  const searches = response.output.filter(
+    (item) => item.type === 'tool_search_call' || item.type === 'tool_search_output',
+  );
   if (
     calls.length > 1 ||
-    (!calls.length && !response.output_text?.trim()) ||
+    (!calls.length &&
+      !response.output_text?.trim() &&
+      !searches.some((item) => item.type === 'tool_search_output')) ||
+    searches.some(
+      (item) => !searchEnabled || item.execution !== 'server' || item.status !== 'completed',
+    ) ||
     response.output.some(
       (item) =>
-        !['message', 'reasoning', 'function_call', 'compaction'].includes(item.type) ||
+        ![
+          'message',
+          'reasoning',
+          'compaction',
+          'function_call',
+          'tool_search_call',
+          'tool_search_output',
+        ].includes(item.type) ||
         (item.type === 'compaction' && !item.encrypted_content),
     )
   )

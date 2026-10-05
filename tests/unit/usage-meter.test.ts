@@ -583,6 +583,86 @@ test('observer and reservation/settlement storage failures stop subsequent fetch
   }
 });
 
+test('deferred discovery and continuation are metered through the real SDK', async () => {
+  const { meter } = setup();
+  let calls = 0;
+  const model = new OpenAITextModel(
+    { ...config, usageMeter: meter, toolLoadingMode: 'deferred' },
+    async (_input, init) => {
+      calls++;
+      const body = JSON.parse(String(init?.body));
+      assert.deepEqual(
+        body.tools.map((tool: { type: string }) => tool.type),
+        ['namespace', 'tool_search'],
+      );
+      if (calls === 1)
+        return Response.json({
+          id: 'search_response',
+          status: 'completed',
+          usage,
+          output: [
+            {
+              type: 'tool_search_call',
+              id: 'search',
+              execution: 'server',
+              status: 'completed',
+              call_id: null,
+              arguments: { query: 'inventory' },
+            },
+            {
+              type: 'tool_search_output',
+              id: 'search_result',
+              execution: 'server',
+              status: 'completed',
+              call_id: null,
+              tools: body.tools.filter((tool: { type: string }) => tool.type === 'namespace'),
+            },
+          ],
+        });
+      assert.ok(body.input.some((item: { type: string }) => item.type === 'tool_search_output'));
+      return Response.json({
+        id: 'function_response',
+        status: 'completed',
+        usage,
+        output: [
+          {
+            type: 'function_call',
+            call_id: 'read',
+            name: 'inventory',
+            namespace: 'ce_inventory_1',
+            arguments: '{}',
+          },
+        ],
+      });
+    },
+  );
+  const result = await meter.run(scope, () =>
+    model
+      .startToolSession({
+        instructions: 'Read inventory.',
+        messages: [{ role: 'user', content: 'Inventory?' }],
+        tools: [
+          {
+            name: 'inventory',
+            inputSchema: { type: 'object', properties: {} },
+            discovery: {
+              capability: 'inventory',
+              description: 'Inventory counts.',
+              loading: 'deferred',
+            },
+          },
+        ],
+      })
+      .next(1, AbortSignal.timeout(5000)),
+  );
+  assert.equal(result.calls[0]?.name, 'inventory');
+  assert.equal(calls, 2);
+  const summary = await meter.summarize(scope.runId);
+  assert.equal(summary.knownActualMicros, 36);
+  assert.equal(summary.unknownRequests, 0);
+  assert.equal(summary.costComplete, true);
+});
+
 test('unpriced provider features and tiers are rejected before fetch; unexpected response tiers remain unknown', async () => {
   const { meter } = setup();
   let calls = 0;
@@ -597,6 +677,11 @@ test('unpriced provider features and tiers are rejected before fetch; unexpected
     { stream: true },
     { tools: [{ type: 'web_search' }] },
     { tools: [{ type: 'code_interpreter' }] },
+    { tools: [{ type: 'namespace', tools: [{ type: 'web_search' }] }] },
+    { tools: [{ type: 'namespace', tools: [{ type: 'namespace', tools: [] }] }] },
+    { tools: [{ type: 'namespace', tools: [null] }] },
+    { tools: [{ type: 'namespace' }] },
+    { tools: [{ type: 'tool_search', execution: 'client' }] },
   ])
     await assert.rejects(
       meter.run(scope, () =>

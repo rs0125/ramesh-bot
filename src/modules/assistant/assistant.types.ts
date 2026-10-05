@@ -38,6 +38,7 @@ export interface ModelResult {
 }
 
 export interface TextModel {
+  readonly toolLoadingMode?: 'eager' | 'deferred';
   complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResult>;
   startToolSession?(request: ToolSessionRequest): ToolModelSession;
 }
@@ -49,6 +50,12 @@ export interface ToolSessionRequest {
     name: string;
     description?: string;
     inputSchema: Record<string, unknown>;
+    /** Presentation hint from the authenticated catalogue, never an authorization grant. */
+    discovery?: {
+      capability: string;
+      description: string;
+      loading: 'eager' | 'deferred';
+    };
     annotations?: {
       readOnlyHint: boolean;
       destructiveHint?: boolean;

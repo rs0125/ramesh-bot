@@ -154,5 +154,6 @@ See the [2 October production capability review](../capability-review-2026-10-02
 - [51. Reminder migration and evaluation](51-reminder-migration-and-evaluation.md): shared-table assessment, optional legacy import, outcome tests and phased rollout. New schema implemented; legacy import deferred.
 - [52. Native locations and GIS writes](52-gis-poi-writes.md): native coordinate capture, the Context Engine GIS tool and signed dashboard endpoint; generic audited execution and compensation are described in [business writes](../business-writes.md); production activation is recorded separately.
 - [53. Answer preservation and scoped recall](53-answer-preservation-and-scoped-recall.md): deterministic formatting for completed read answers, source-bound repairs with independent re-review, materiality, current working briefs and grouped selection recall. Implemented in this checkout; no new migration or paid evaluation.
+- [54. Eager and deferred tool loading](54-tool-loading.md): shared Context Engine metadata, native OpenAI search, catalogue validation and a focused Luna evaluation. Eager remains the default.
 
 - [Business write runbook](../business-writes.md): shared journal, confirmation, unknown-result recovery, GIS compensation and the future CRM contract.

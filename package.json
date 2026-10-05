@@ -12,6 +12,7 @@
     "dev:chat:live": "tsx scripts/playground-live.ts",
     "db:playground": "tsx scripts/setup-playground.ts",
     "smoke:chat:live": "tsx scripts/smoke-playground.ts",
+    "eval:tool-loading": "tsx evals/tool-loading-run.ts",
     "eval:agent": "tsx evals/run.ts",
     "eval:business": "tsx evals/business-run.ts",
     "eval:sales": "tsx evals/sales-run.ts",
