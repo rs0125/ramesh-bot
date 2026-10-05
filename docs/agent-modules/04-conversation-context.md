@@ -1,8 +1,10 @@
 # Conversation context
 
-Status: **Implemented, opt-in for verified employee DMs. Migration and enablement are separate deployment steps.**
+Status: **Implemented, opt-in for verified employee DMs. Production migration applied and verified on 5 October 2026; runtime enablement is separate.**
 
 ## Enablement and storage
+
+Production migration `202610050001_conversation_context.sql` was applied on 5 October 2026 through the ordered provisioner after its rollback validation passed. Read-only verification matched all 17 migration checksums and confirmed the context table's primary/retention indexes, forced account-scoped RLS, restricted worker grants, denied browser/service/capture-role access, and queue/context health through the actual `ramesh_worker` connection. Existing runtime credentials and TLS settings were preserved. This migration did not change the host environment or enable durable memory.
 
 Apply message migrations through `202610050001_conversation_context.sql`, then set `AGENT_CONTEXT_ENABLED=true`. It defaults to false. Use `AGENT_TIMEOUT_MS=240000` and `AGENT_MAX_OUTPUT_TOKENS=6000` for summarization plus research/review. Startup checks the new table when enabled; it does not auto-migrate.
 
