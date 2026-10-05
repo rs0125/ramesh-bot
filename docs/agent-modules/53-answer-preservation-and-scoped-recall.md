@@ -137,3 +137,43 @@ caveats and bounded brief reads; separately saved prompt overrides remain
 unchanged. Existing authorization, delivery checks, write grants and migrations
 remain prerequisites. This document makes no claim that the checkout has been
 deployed.
+
+## 5 October follow-up fixes
+
+The follow-up change adds a regression fix for native WhatsApp
+client headings. Recognized client sections preserve their selected properties,
+positions and repeated options after formatting. Unknown emphasized or standalone
+headings prevent a preceding client from inheriting those properties. Ambiguous
+sections retain warehouse identities/order but omit unproven CRM subject links.
+Normal property fields and Pro/Con lines remain content rather than new clients.
+
+Context Engine guidance now consistently allows provisional recommendations from
+the full available brief, preserving material conflicts and uncertainty without
+requiring every optional specification to be known. This applies to assessment
+results, REST context/default instructions, discovery context and OpenAPI field
+notes. The synthetic assessment fixture carries the same guidance, and its helper
+files are now included in evaluation provenance hashes.
+
+Whole-note deletion is recovery-only because the upstream note row and deal links
+cannot be guarded atomically. Existing exact operation receipts remain readable;
+new note-trash calls stop before source reads, reservation or mutation. RFQ trash
+and eligible note creation undo retain their existing contracts. See
+[business writes](../business-writes.md) for the boundary. No migration is needed.
+
+The bounded Luna screen and its limits are recorded in
+[the review-fix evaluation](../../evals/results/2026-10-05-review-fixes-luna.md).
+It ran version `ramesh-chief-of-staff-v34` and passed one of three scenarios. The
+failed traces exposed an additional repair-path issue: a fresh worker correction
+could be replaced with the old rejected answer when a model formatter added dates.
+The graph now consumes each fresh completed draft through deterministic formatting
+and independent review; retries without a fresh draft still use synthesis. A
+research deadline clears readiness rather than restoring stale draft text.
+
+Version `ramesh-chief-of-staff-v35` also requests actual comparative synthesis
+without assuming that larger metrics prove suitability, and allows related checks
+within one practical next action. These post-screen changes were checked locally
+with deterministic regressions; the paid screen was not repeated or relabelled as
+a pass. The existing review cap and scalar/entity patch guards remain in force.
+These changes require no migration or new environment settings. Deploy through the
+normal main-branch pipeline; the evaluation report does not assert a live health
+check.

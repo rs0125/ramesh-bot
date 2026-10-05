@@ -386,7 +386,7 @@ export function buildSalesGraph(
         (signal) => session!.next(remainingTools(), signal, callableTools()),
         config.signal,
       );
-      if (attempt.limited) return { calls: [], researchExhausted: true };
+      if (attempt.limited) return { calls: [], draftReady: false, researchExhausted: true };
       const result = attempt.result;
       return {
         draft: result.text,
@@ -513,21 +513,18 @@ export function buildSalesGraph(
     .addNode('formatter', async (value, config) => {
       const preview = personal?.preview();
       const writePreview = writes?.preview();
-      if (value.personalOnly && preview && !writePreview) return { reply: preview, supplement: '' };
+      if (value.personalOnly && preview && !writePreview)
+        return { reply: preview, supplement: '', draftReady: false };
       const started = Date.now();
       const composed = !!preview || !!writePreview;
-      // Preserve a completed worker answer; an unconstrained rewrite can change its decisions.
-      if (
-        !composed &&
-        !value.feedback &&
-        value.draftReady &&
-        run?.evidence.length &&
-        value.draft.length <= 12000
-      ) {
+      // Consume each completed worker answer once, including independent review repairs.
+      // Formatter-only retries must not reuse a draft already rejected by the verifier.
+      if (!composed && value.draftReady && run?.evidence.length && value.draft.length <= 12000) {
         const reply = withDealDates(finishReply(value.draft), run.evidence);
         return {
           reply,
           supplement: '',
+          draftReady: false,
           stages: [
             ...value.stages,
             recordMetric({
@@ -622,6 +619,7 @@ export function buildSalesGraph(
       return {
         reply,
         supplement: composed ? supplement : '',
+        draftReady: false,
         stages: [
           ...value.stages,
           recordMetric({

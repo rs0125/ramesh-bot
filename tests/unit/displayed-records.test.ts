@@ -6,12 +6,27 @@ import {
 } from '../../src/modules/assistant/displayed-records.js';
 import type { ToolEvidence } from '../../src/modules/assistant/tool-evidence.js';
 import { salesEvidence } from '../../scripts/lib/sales-fixture.js';
+import { finishReply } from '../../src/modules/assistant/style.js';
 
 const search: ToolEvidence = {
   id: 'search',
   tool: 'search_warehouses',
   arguments: { limit: 5 },
   result: salesEvidence('search_warehouses', { limit: 5 }),
+};
+const crm: ToolEvidence = {
+  id: 'crm',
+  tool: 'search_crm_leads',
+  arguments: {},
+  result: {
+    ...search.result,
+    data: {
+      items: [
+        { id: '00000000-0000-4000-8000-000000000101', name: 'First client' },
+        { id: '00000000-0000-4000-8000-000000000102', name: 'Second client' },
+      ],
+    },
+  },
 };
 
 test('separate ranked groups retain local positions and stable structural group identities', () => {
@@ -30,20 +45,6 @@ test('separate ranked groups retain local positions and stable structural group 
 });
 
 test('source-backed CRM headings bind separate lists without trusting heading text as facts', () => {
-  const crm: ToolEvidence = {
-    id: 'crm',
-    tool: 'search_crm_leads',
-    arguments: {},
-    result: {
-      ...search.result,
-      data: {
-        items: [
-          { id: '00000000-0000-4000-8000-000000000101', name: 'First client' },
-          { id: '00000000-0000-4000-8000-000000000102', name: 'Second client' },
-        ],
-      },
-    },
-  };
   const records = displayedWarehouseRecords(
     '**First client**\n- ID 101\n- ID 103\n**Second client**\n- ID 103\n- ID 104',
     [search, crm],
@@ -71,6 +72,87 @@ test('source-backed CRM headings bind separate lists without trusting heading te
     assert.ok(ambiguous.some((record) => record.id === 104));
     assert.ok(ambiguous.some((record) => record.id === 101));
     assert.ok(ambiguous.every((record) => !record.subject));
+  }
+});
+
+test('unknown client headings cannot inherit the preceding CRM subject after WhatsApp formatting', () => {
+  for (const heading of [
+    '*Unknown client*',
+    '**Unknown client**',
+    '_Unknown client_',
+    '__Unknown client__',
+    '## Unknown client',
+    'Unknown client:',
+    'Unknown client',
+    'Unknown client\nLocation: Hyderabad',
+    '- *Unknown client*',
+    '2. *Unknown client*',
+    '*Second client - revised requirement*',
+  ]) {
+    const draft = `**First client**\n- ID 101\n${heading}\n\n- ID 104`;
+    for (const reply of [draft, finishReply(draft)]) {
+      const records = displayedWarehouseRecords(reply, [search, crm]);
+      assert.deepEqual(
+        records.map(({ id }) => id),
+        [101, 104],
+        heading,
+      );
+      assert.ok(
+        records.every((record) => !record.subject),
+        heading,
+      );
+    }
+  }
+});
+
+test('recognized client groups preserve subjects and repeated warehouses after WhatsApp formatting', () => {
+  const reply = finishReply(
+    '**First client**\n- ID 101\n- ID 103\n**Second client**\n- ID 103\n- ID 104',
+  );
+  assert.deepEqual(
+    displayedWarehouseRecords(reply, [search, crm]).map(({ id, position, group, subject }) => [
+      id,
+      position,
+      group,
+      subject?.id,
+    ]),
+    [
+      [101, 1, 'group-1', '00000000-0000-4000-8000-000000000101'],
+      [103, 2, 'group-1', '00000000-0000-4000-8000-000000000101'],
+      [103, 1, 'group-2', '00000000-0000-4000-8000-000000000102'],
+      [104, 2, 'group-2', '00000000-0000-4000-8000-000000000102'],
+    ],
+  );
+});
+
+test('property fields and Pro/Con content do not become unrelated client headings', () => {
+  for (const field of [
+    '*Pro: Recorded loading area*',
+    '**Con: Availability unconfirmed**',
+    '*Pro:* Recorded loading area',
+    '- *Con:* Availability unconfirmed',
+    '*Pro:*\nRecorded loading area.',
+    '*Pro:*\nRecorded loading area',
+    'Location:\nHoskote',
+    '_Con:_\nAvailability to confirm',
+    '## Location: Hoskote',
+    '*Location: Hoskote*',
+    '**Area: 26,000 sq ft**',
+    'Rent: Unit to confirm',
+    '*Fire NOC: Recorded available*',
+    'Size:\n26,000 sq ft',
+  ]) {
+    const reply = finishReply(`**First client**\n- ID 101\n${field}\n- ID 103`);
+    const records = displayedWarehouseRecords(reply, [search, crm]);
+    assert.deepEqual(
+      records.map(({ id }) => id),
+      [101, 103],
+      field,
+    );
+    assert.ok(
+      records.every((record) => record.subject?.id === '00000000-0000-4000-8000-000000000101'),
+      field,
+    );
   }
 });
 

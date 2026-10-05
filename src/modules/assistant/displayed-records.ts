@@ -73,6 +73,39 @@ export function displayedWarehousePositions(reply: string, evidence: readonly To
   return displayedWarehouseLabels(reply).filter((record) => permitted.has(record.id));
 }
 
+const propertyField =
+  /^(?:pros?|cons?|location|area|size|rent|asking rent|availability|clear height|docks?|dock count|power|fire(?: noc| safety)?|budget|notes?|verification)\s*:\s*/iu;
+const plainLabel = (line: string) =>
+  line
+    .trim()
+    .replace(/^(?:[-+•]|\d{1,3}[.)])\s+/, '')
+    .replace(/[*_]/g, '')
+    .replace(/^#{1,6}\s+/, '')
+    .trim();
+
+/** Formatting identifies a possible boundary, never a client's identity. */
+function unrecognizedHeading(
+  line: string,
+  propertyFollows: boolean,
+  previousLine: string | undefined,
+): boolean {
+  const content = line.trim().replace(/^(?:[-+•]|\d{1,3}[.)])\s+/, '');
+  if (!content || displayedWarehouseLabels(line).length) return false;
+  const plain = plainLabel(content);
+  // A whole emphasized field is still property content, including an empty
+  // label whose value follows on the next line. Unknown labels fail closed.
+  if (propertyField.test(plain)) return false;
+  if (/^#{1,6}\s+\S/u.test(content)) return true;
+  if (/^(\*{1,2}|_{1,2})\S(?:.*\S)?\1\s*:?$/u.test(content)) return true;
+  if (/^[^.!?:]{1,100}:$/u.test(content)) return true;
+  // Plain client labels have no formatting signal. Treat a short standalone
+  // label before another property as ambiguous rather than carrying the previous
+  // client through it. A continued field value is not a client heading.
+  const previous = previousLine === undefined ? '' : plainLabel(previousLine);
+  if (propertyField.test(previous) && !previous.replace(propertyField, '')) return false;
+  return /^[\p{L}][^.!?:]{0,99}$/u.test(plain) && propertyFollows;
+}
+
 export function displayedWarehouseRecords(
   reply: string,
   evidence: readonly ToolEvidence[],
@@ -128,11 +161,17 @@ export function displayedWarehouseRecords(
     return records;
   const sections = headings.map((heading, index) => {
     const section = lines.slice(heading.index + 1, headings[index + 1]?.index);
-    const ambiguousHeading = section.some(
-      (line) =>
-        /^\s*(?:#{1,6}\s+.+|\*\*[^*]+\*\*\s*:?|__[^_]+__\s*:?|[^.!?:]{1,100}:)\s*$/.test(line) &&
-        displayedWarehouseLabels(line).length === 0,
-    );
+    const contentLines = section.filter((line) => line.trim());
+    let propertyFollows = false;
+    let ambiguousHeading = false;
+    for (let lineIndex = contentLines.length - 1; lineIndex >= 0; lineIndex--) {
+      const line = contentLines[lineIndex]!;
+      if (unrecognizedHeading(line, propertyFollows, contentLines[lineIndex - 1])) {
+        ambiguousHeading = true;
+        break;
+      }
+      if (displayedWarehouseLabels(line).length) propertyFollows = true;
+    }
     return {
       heading,
       ambiguousHeading,

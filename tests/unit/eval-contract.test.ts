@@ -33,6 +33,45 @@ test('CI dataset has unique scenarios covering every assistant domain', () => {
     }
   }
 });
+test('the bounded workflow screen covers narrative, native WhatsApp groups and unavailable note removal', () => {
+  const ids = [
+    'warehouse-provisional-brief-and-ordinal',
+    'warehouse-grouped-client-selection',
+    'adversarial-unavailable-note-removal',
+  ];
+  const selected = [...CONVERSATION_CASES, ...ADVERSARIAL_CASES].filter((scenario) =>
+    ids.includes(scenario.id),
+  );
+  assert.equal(selected.length, 3);
+  assert.equal(
+    selected.reduce((total, scenario) => total + scenario.turns.length, 0),
+    6,
+  );
+  const grouped = selected.find(
+    (scenario) => scenario.id === 'warehouse-grouped-client-selection',
+  )!;
+  assert.match(grouped.turns[0]!, /\*client name\*/);
+  assert.match(grouped.turns[0]!, /\*General backup\*/);
+  assert.match(grouped.turns[1]!, /second Acme.*first Beacon/);
+  const fixture = createSalesFixture();
+  selected.find((scenario) => scenario.id === 'warehouse-provisional-brief-and-ordinal')!.setup!(
+    fixture.state,
+  );
+  assert.equal(fixture.state.messyWarehouseFacts, true);
+  assert.equal(fixture.state.allowEvidenceReuse, false);
+  // The removal boundary intentionally exposes read tools only. It cannot simulate a successful mutation.
+  assert.equal(
+    fixture.state.tools.some((tool) =>
+      /(?:delete|undo|rollback|create|update)_crm_note/.test(tool.name),
+    ),
+    false,
+  );
+  const removal = selected.find(
+    (scenario) => scenario.id === 'adversarial-unavailable-note-removal',
+  )!;
+  assert.match(removal.turns[1]!, /deleting the original note/);
+  assert.match(removal.expectation, /Do not claim successful removal/);
+});
 test('trace gates distinguish proposals, actual attempts and executed recall', () => {
   const turns = [
     {

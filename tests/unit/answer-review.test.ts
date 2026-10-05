@@ -85,6 +85,52 @@ test('review cannot transfer a field between records or use retired evidence', (
   }
 });
 
+test('area references need scalar leaves and cannot patch an unlabelled aggregate claim', () => {
+  const quote = 'ID 101: 67000 sq ft.';
+  const correction = {
+    ...finding(),
+    quote,
+    replacement: 'ID 101: 67500 sq ft.',
+    references: [
+      {
+        evidence_id: 'source-1',
+        pointer: '/data/items/0/total_space_sqft',
+        value_json: '[67500]',
+        record_id: '101',
+      },
+    ],
+  };
+  assert.equal(
+    resolveAnswerReview(review([correction]), quote, evidence, execution, true).patchedAnswer,
+    undefined,
+  );
+  Object.assign(correction.references[0]!, {
+    pointer: '/data/items/0/total_space_sqft/0',
+    value_json: '67500',
+  });
+  const scalar = resolveAnswerReview(review([correction]), quote, evidence, execution, true);
+  assert.equal(scalar.patchedAnswer, correction.replacement);
+  assert.equal(scalar.supported, false);
+
+  correction.quote = 'These are the closest candidates.';
+  correction.replacement = 'These are provisional candidates.';
+  const aggregate = resolveAnswerReview(
+    review([correction]),
+    correction.quote,
+    evidence,
+    execution,
+    true,
+  );
+  assert.equal(aggregate.patchedAnswer, undefined);
+  assert.equal(aggregate.repair, 'tools');
+  const independent = review([{ ...correction, replacement: null }]);
+  independent.repair = 'tools';
+  const revision = resolveAnswerReview(independent, correction.quote, evidence, execution, true);
+  assert.equal(revision.patchedAnswer, undefined);
+  assert.equal(revision.supported, false);
+  assert.equal(revision.repair, 'tools');
+});
+
 test('ambiguous, overlapping, missing and entity-free spans do not get patched', () => {
   assert.equal(
     resolveAnswerReview(review(), answer + '\n' + finding().quote, evidence, execution, true)

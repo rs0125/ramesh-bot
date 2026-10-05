@@ -73,11 +73,11 @@ export const CONVERSATION_CASES: ConversationCase[] = [
       state.messyWarehouseFacts = true;
     },
     turns: [
-      'Give me two provisional warehouse options each for Fixture Acme Storage and Fixture Beacon Retail. Keep their CRM briefs and shortlists separate and number each list.',
+      'Give me two provisional warehouse options each for Fixture Acme Storage and Fixture Beacon Retail. Keep their CRM briefs and shortlists separate and number each list. Use native WhatsApp *client name* headings. Then put one additional candidate under *General backup*, without assigning that backup to either client.',
       'Compare the second Acme option with the first Beacon option for their respective needs. Give one next action for each.',
     ],
     expectation:
-      'Complete a separate two-item group per client, then preserve the exact historical group and ordinal bindings even if the same warehouse appears in both groups. Do not silently merge client narratives or substitute records by current search order. Use supported fields and label material unknowns. If a detail/assessment was never called, do not say it timed out; report only recorded execution limitations. Preserve useful partial evidence rather than replacing it with a generic verification failure.',
+      'Complete a separate two-item group per client, plus an unassigned General backup section using native WhatsApp headings. The backup must not inherit the preceding client binding. Then preserve the exact historical group and ordinal bindings even if the same warehouse appears in both client groups. Do not silently merge client narratives or substitute records by current search order. Use supported fields and label material unknowns. If a detail/assessment was never called, do not say it timed out; report only recorded execution limitations. Preserve useful partial evidence rather than replacing it with a generic verification failure.',
   },
   {
     id: 'deal-cards',
