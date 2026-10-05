@@ -152,7 +152,7 @@ async function main() {
           store: new LocalChatContextStore(storePath, encryptionKey),
           source: conversation,
           model,
-          resolve: async (_message, _trusted, signal) => {
+          resolve: async (_key, signal) => {
             const current = await identities.resolveEmployee(actor.employeeId, signal);
             return current && current.phoneE164 === actor.phoneE164 && current.email === actor.email
               ? owner

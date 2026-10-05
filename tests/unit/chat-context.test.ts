@@ -136,7 +136,7 @@ test('explicit pins replace by key, persist across restart and forget cannot res
   const again = await f.create().prepare(...f.turn(2, '/pin size: 50000 sq ft'));
   assert.match(again!.reply!, /Pinned/);
   assert.equal((await f.store.load(scope))!.revision, saved!.revision);
-  f.entries.push({ id: id(3), role: 'user', content: 'Old preference' });
+  f.entries.push({ id: id(3), at: Date.now(), role: 'user', content: 'Old preference' });
   await f.create().prepare(...f.turn(4, '/forget context'));
   const next = await f.create().prepare(...f.turn(5, 'What do you remember?'));
   assert.deepEqual(next?.history, []);
@@ -149,6 +149,7 @@ test('compaction validates provenance and atomically advances a cursor while ret
   for (let i = 2; i <= 46; i++)
     f.entries.push({
       id: id(i),
+      at: Date.now(),
       role: i % 2 ? 'assistant' : 'user',
       content: i === 10 ? 'Correction: use 50000 sq ft, not 20000.' : `Context ${i}`,
     });
@@ -169,7 +170,8 @@ test('bad summary provenance leaves cursor and old summary intact', async () => 
   const f = setup();
   await f.create().prepare(...f.turn(1, '/pins'));
   const before = await f.store.load(scope);
-  for (let i = 2; i < 40; i++) f.entries.push({ id: id(i), role: 'user', content: 'source' });
+  for (let i = 2; i < 40; i++)
+    f.entries.push({ id: id(i), at: Date.now(), role: 'user', content: 'source' });
   f.invalid();
   await assert.rejects(f.create().prepare(...f.turn(40, 'Continue')), /CONTEXT_SUMMARY_INVALID/);
   assert.deepEqual(await f.store.load(scope), before);

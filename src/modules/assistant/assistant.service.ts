@@ -14,7 +14,12 @@ import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
 import type { BusinessReadService } from './business-reads.js';
 import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js';
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
-import { getBusinessReply, writeDeliveryBundle } from '../messaging/delivery-evidence.js';
+import {
+  contextDeliveryBundle,
+  getBusinessReply,
+  writeDeliveryBundle,
+} from '../messaging/delivery-evidence.js';
+import type { ContextDelivery } from '../messaging/context-delivery.js';
 import { bindUsageEmployee, currentUsageScope, withUsageScope } from '../usage/usage-scope.js';
 import type { UsageMeter } from '../usage/usage-meter.js';
 import { UtilityToolRun } from './utility-tools.js';
@@ -131,7 +136,12 @@ export class AssistantService {
       stages: [],
       outcome: 'completed',
     };
+    if (this.runtime.conversationContext) trace.promptVersion += '+memory-v2';
+    let contextDelivery: ContextDelivery | undefined;
+    const protect = (evidence?: unknown) =>
+      contextDelivery ? contextDeliveryBundle(contextDelivery, evidence) : evidence;
     const finish = async (reply: Omit<AssistantReply, 'trace'>): Promise<AssistantReply> => {
+      const evidence = protect(reply.businessEvidence);
       trace.durationMs = Date.now() - started;
       const reused = replayedModelSteps();
       if (reused) trace.replayedSteps = reused;
@@ -144,7 +154,7 @@ export class AssistantService {
         }
       }
       this.observe(trace);
-      return { ...reply, trace };
+      return { ...reply, ...(evidence ? { businessEvidence: evidence } : {}), trace };
     };
     const input = message.text?.trim() ?? '';
     if (!input || input.length > (message.batchMessageIds ? 32000 : 6000)) {
@@ -206,6 +216,7 @@ export class AssistantService {
           (stage) => trace.stages.push(stage),
         );
         contextHistory = prepared?.history;
+        contextDelivery = prepared?.delivery;
         durableContextEnabled = prepared?.enabled === true;
         if (prepared?.reply !== undefined) return finish({ text: prepared.reply });
       }
@@ -350,6 +361,7 @@ export class AssistantService {
         if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
         if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
         let remembered = false;
+        const protectedEvidence = protect(evidence);
         return finish({
           text: result.reply,
           draft: result.draft,
@@ -359,8 +371,10 @@ export class AssistantService {
               this.memory.remember(
                 key,
                 this.input(message),
-                evidence ? PRIVATE_HISTORY_REPLY : result.reply,
-                evidence ? getBusinessReply({ text: result.reply, receipt: evidence }) : undefined,
+                protectedEvidence ? PRIVATE_HISTORY_REPLY : result.reply,
+                protectedEvidence
+                  ? getBusinessReply({ text: result.reply, receipt: protectedEvidence })
+                  : undefined,
               );
               remembered = true;
             }

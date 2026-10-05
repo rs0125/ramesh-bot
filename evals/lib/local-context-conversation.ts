@@ -13,7 +13,7 @@ export class LocalContextConversation implements ContextSource {
   constructor(readonly chatId: string) {}
   add(message: ChatMessage) {
     const id = String(++this.sequence).padStart(12, '0');
-    this.entries.push({ ...structuredClone(message), id });
+    this.entries.push({ ...structuredClone(message), id, at: Date.now() });
     return id;
   }
   request(text: string) {

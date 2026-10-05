@@ -254,6 +254,7 @@ export class InboxRepository implements ContextSource {
         const data = this.content(row);
         return {
           id: row.context_cursor,
+          at: row.created_at.getTime(),
           role: 'user',
           content:
             data.forwarded || data.hasQuotedMessage
@@ -264,6 +265,7 @@ export class InboxRepository implements ContextSource {
       const business = row.reply_kind === 'business';
       return {
         id: row.context_cursor,
+        at: row.finished_at!.getTime(),
         role: 'assistant',
         content: business
           ? PRIVATE_HISTORY_REPLY

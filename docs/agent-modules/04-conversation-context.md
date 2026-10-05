@@ -10,13 +10,15 @@ Apply message migrations through `202610050001_conversation_context.sql`, then s
 
 The source cursor independently orders inbound admission and **sent** outbound events, preserving PostgreSQL microseconds. Future replies and unsent drafts are excluded. Late replies remain eligible after an earlier inbound event was summarized, but their originating request must be inside the current owner/forget boundary. Summary and cursor commit atomically with a revision check; production reads and saves require the current inbound lease. No transaction stays open during inference. Summarization runs before the turn's checkpoint replay sequence.
 
+Memory commands and model replies carry an encrypted owner binding through the existing protected outbox. Delivery freshly resolves that binding; revocation, reassignment, changed owner attributes or disabled memory authorization suppress the private reply. Mixed responses retain their business, personal and committed-write checks, with another memory identity check after remote preflight. Memory-only historical reply text is restored only after the current context owner matches the saved binding. Legacy history readers cannot unwrap these replies.
+
 ## User commands
 
 | Command             | Behavior                                                                                                                              |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `/pin name: text`   | Creates or replaces a named pin in this chat.                                                                                         |
 | `remember that ...` | Creates a note and returns its name.                                                                                                  |
-| `/pins`             | Lists stored notes.                                                                                                                   |
+| `/pins`, `/pins 2`  | Lists stored notes in pages that fit the 16,000-character reply limit; the reply gives the next-page command.                         |
 | `/unpin name`       | Removes that pin and resets generated working notes/history so the preference cannot reappear from old history. Other pins remain.    |
 | `/forget context`   | Clears pins, summary and remembered selections and advances the history boundary. Inbox/action records retain their normal retention. |
 
@@ -26,9 +28,11 @@ Commands must match the original unquoted, unforwarded single message. Batches a
 
 Compaction starts above 32 unsummarized messages or 10,000 estimated history tokens. It keeps a recent verbatim tail, normally 16 messages, and summarizes bounded older chunks. Notes track objectives, constraints, corrections, decisions, pending questions and completed work with source IDs. Output must pass the schema, use supplied source IDs and fit 3,000 estimated tokens. Invalid output leaves the last saved cursor intact; it does not silently discard messages. Summarization excludes protected business reply bodies and attachment extracts.
 
+Each historical entry has an application-owned event timestamp and a 4,000-token selection ceiling. Entries above 6,000 characters or that token ceiling use explicitly marked head/tail excerpts; historical user input above the 32,000-character maximum supported input size is represented by an omission notice. The original inbox text is retained under its existing policy. The assistant must ask for missing passages when needed and cannot infer omitted requirements. This applies only to old history, not the current request or fresh tool evidence. Literal tokenizer markers are counted as ordinary text. One historical entry cannot prevent all later turns from advancing.
+
 Up to four warehouse lists retain at most 32 IDs and original positions each, independently of the recent-message window. They contain no cached record facts. `recall_business_context` checks the current employee and freshly reads those records. Unavailable positions are not replaced or renumbered. Old prose receipts keep their existing 24-hour/96KB limits. Named CRM selections and grouped-list disambiguation remain extensions.
 
-Summaries and reference lists expire after 30 days. Maintenance deletes unpinned idle rows and clears old generated state from pinned idle rows. Only explicit pins are indefinite. Unknown ownership, unavailable storage and invalid summary output fail closed.
+Generated notes expire 30 days after their oldest cited source, rather than 30 days after the latest merge. The application assigns expiry from source timestamps and carries the earliest prior expiry forward; models cannot extend it. Expired recent messages are also withheld. Legacy notes without expiry metadata are discarded on load into a turn, while pins and the history boundary remain. Reference lists keep their original 30-day expiry. Minute-by-minute maintenance deletes unpinned idle rows and clears old generated state from pinned idle rows. Only explicit pins are indefinite. Unknown ownership, unavailable storage and invalid summary output fail closed.
 
 Memory is historical source data, not authorization, current business evidence or proof of a completed write. Current corrections supersede older notes. Current requests and the existing personal/business journals remain authoritative for actions; `ramesh-write-events` is unchanged. Prompt caching does not replace memory.
 
@@ -43,6 +47,8 @@ The usage meter allows the non-generating input-count endpoint and meters genera
 ## Verification
 
 Deterministic coverage includes pin replacement and forgetting, forwarded commands, owner changes, expiry, summary provenance failure, encrypted restarts, concurrent revisions, SQL lease fencing/RLS, microsecond ordering, token admission, encrypted compaction continuations and fresh reference reads. Native compaction uses fake provider responses in tests; short live conversations do not exercise a 64k worker threshold.
+
+Adversarial regressions cover send-time identity changes, mixed-receipt authorization, encrypted outbox restart, literal special-token strings, rejected oversized history, token-dense excerpts, expiry across repeated summary merges, legacy undated notes and multi-page pin listings. These checks use synthetic data and fake models/transports; PostgreSQL tests use only an isolated local test database.
 
 [Local context evaluations](../../evals/README.md#local-context-evaluation-with-real-reads) use real read tools with local state and private transcripts. Deployment, migration and runtime enablement remain separate from implementation.
 

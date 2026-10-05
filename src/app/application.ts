@@ -36,12 +36,7 @@ import { PersonalToolService } from '../modules/scheduling/personal-tools.js';
 import { PersonalSchedulerService } from '../modules/scheduling/scheduler.service.js';
 import { WriteRepository } from '../infrastructure/database/write.repository.js';
 import { BusinessWriteService } from '../modules/writes/write-tools.js';
-import {
-  compositeDeliverySchema,
-  getPersonalDelivery,
-  getWriteDelivery,
-  withoutWriteDelivery,
-} from '../modules/messaging/delivery-evidence.js';
+import { authorizeDelivery } from '../modules/messaging/delivery-evidence.js';
 
 export interface Application {
   start(): Promise<void>;
@@ -208,10 +203,10 @@ export function createApplication(
           store: contextRepository,
           source: inboxRepository,
           model: assistantModel,
-          resolve: async (message, trusted, signal) => {
-            const resolved = await schedulingSender.resolve({ key: trusted.key }, signal);
+          resolve: async (key, signal) => {
+            const resolved = await schedulingSender.resolve({ key }, signal);
             return resolved?.sender.audience === 'dm' && resolved.employee.active
-              ? contextScope(config.messageDatabase!.accountId, message.chatId, resolved.employee)
+              ? contextScope(config.messageDatabase!.accountId, key.remoteJid!, resolved.employee)
               : null;
           },
         })
@@ -246,7 +241,8 @@ export function createApplication(
           pollMs: config.messageDatabase.pollMs,
           waitBeforeReply: createReplyDelay(config.whatsapp.replyDelay),
           prepareReply,
-          agentRuns: !!businessReads || !!personalTools || !!businessWrites,
+          agentRuns:
+            !!businessReads || !!personalTools || !!businessWrites || !!conversationContext,
           media,
           accountId: config.messageDatabase.accountId,
           usageMode: usagePolicy?.mode ?? 'off',
@@ -258,38 +254,29 @@ export function createApplication(
           onUsageAttributionFailure: (reason) =>
             logger.warn({ reason }, 'Usage attribution unavailable'),
           businessPreflight:
-            businessReads || personalTools || businessWrites
+            businessReads || personalTools || businessWrites || conversationContext
               ? async (message, evidence, signal) => {
                   const bounded = AbortSignal.any([
                     signal,
                     AbortSignal.timeout(config.businessReads?.context.timeoutMs ?? 10000),
                   ]);
-                  const write = getWriteDelivery(evidence);
-                  if (write) {
-                    if (
-                      !businessWrites ||
-                      !(await businessWrites.canDeliver(message.key, write, bounded))
-                    )
-                      return false;
-                    evidence = withoutWriteDelivery(evidence);
-                    if (!evidence) return true;
-                  }
-                  const personal = getPersonalDelivery(evidence);
-                  if (personal) {
-                    if (
-                      !personalTools ||
-                      !(await personalTools.canDeliver(message.key, personal, bounded))
-                    )
-                      return false;
-                    const composite = compositeDeliverySchema.safeParse(evidence);
-                    if (!composite.success) return true;
-                    evidence = composite.data.business;
-                  }
-                  return businessReads
-                    ? businessReads.canDeliver(message.key, evidence, bounded, (reason, tool) =>
-                        logger.warn({ reason, tool }, 'Business delivery check failed'),
-                      )
-                    : false;
+                  return authorizeDelivery(evidence, {
+                    context: conversationContext
+                      ? (receipt) => conversationContext.canDeliver(message.key, receipt, bounded)
+                      : undefined,
+                    write: businessWrites
+                      ? (receipt) => businessWrites.canDeliver(message.key, receipt, bounded)
+                      : undefined,
+                    personal: personalTools
+                      ? (receipt) => personalTools.canDeliver(message.key, receipt, bounded)
+                      : undefined,
+                    business: businessReads
+                      ? (receipt) =>
+                          businessReads.canDeliver(message.key, receipt, bounded, (reason, tool) =>
+                            logger.warn({ reason, tool }, 'Business delivery check failed'),
+                          )
+                      : undefined,
+                  });
                 }
               : undefined,
         })
@@ -439,6 +426,7 @@ export function createApplication(
             .then(() => adminAccess.clean())
             .then(() => messageRepository?.clean())
             .then(() => checkpoints?.clean())
+            .then(() => contextRepository?.clean())
             .then(() => media?.clean())
             .then(() => personalRepository?.clean())
             .catch((error) => logger.error({ err: error }, 'State cleanup failed'));

@@ -26,6 +26,7 @@ import { cancellable } from '../../lib/cancellable.js';
 import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
 import { reminderEvidenceMatches } from '../../modules/scheduling/scheduler.service.js';
 import {
+  contextDeliveryBundleSchema,
   getPersonalDelivery,
   getWriteDelivery,
 } from '../../modules/messaging/delivery-evidence.js';
@@ -871,8 +872,9 @@ export class DurableMessages {
             report('error');
             return;
           }
-          const notice =
-            "I couldn't verify the business data before sending this reply. Please try again.";
+          const notice = contextDeliveryBundleSchema.safeParse(evidence).success
+            ? "I couldn't verify access to this saved reply. Please try again."
+            : "I couldn't verify the business data before sending this reply. Please try again.";
           const saved =
             !manual &&
             message &&
