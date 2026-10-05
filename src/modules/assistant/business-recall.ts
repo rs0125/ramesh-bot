@@ -7,6 +7,7 @@ import { paginationContinuations, paginationCoverage } from './pagination.js';
 import { recordIdentity } from './record-identity.js';
 import { getBusinessReply } from '../messaging/delivery-evidence.js';
 import { displayedWarehouseLabels } from './displayed-records.js';
+import type { RememberedSelection } from './chat-context.js';
 
 export const RECALL_TOOL = 'recall_business_context';
 const input = z.object({ turn: z.number().int().positive().optional() }).strict();
@@ -22,9 +23,23 @@ export function businessRecall(
   run: ContextToolRun | undefined,
   now = Date.now(),
 ) {
-  const selected = new Map<number, { text: string; receipt: z.infer<typeof toolDeliverySchema> }>();
+  const selected = new Map<
+    number,
+    { text: string; receipt?: z.infer<typeof toolDeliverySchema>; references?: RememberedSelection }
+  >();
   let bytes = 0;
   for (let index = history.length - 1; index >= 0; index--) {
+    const reference = history[index]?.businessReferences;
+    if (
+      reference &&
+      run &&
+      reference.employeeId === run.employeeId &&
+      reference.expiresAt > now &&
+      reference.expiresAt <= now + 30 * 86400000 + 60000
+    ) {
+      selected.set(index, { text: '', references: reference });
+      continue;
+    }
     const stored = history[index]?.protectedReply;
     if (!stored || !run) continue;
     const value = getBusinessReply(stored);
@@ -71,9 +86,11 @@ export function businessRecall(
         return { ok: false, code: 'ALREADY_RECALLED', guidance: 'Use the earlier recall result.' };
       attempted.set(turn, attempt);
       retryable.delete(turn);
-      const displayedReferences = stored.receipt.displayedRecords?.length
-        ? stored.receipt.displayedRecords
-        : displayedWarehouseLabels(stored.text);
+      const displayedReferences =
+        stored.references?.records ??
+        (stored.receipt?.displayedRecords?.length
+          ? stored.receipt.displayedRecords
+          : displayedWarehouseLabels(stored.text));
       if (displayedReferences.length) {
         const selectionCount = Math.max(
           ...displayedReferences.map((reference, index) => reference.position ?? index + 1),
@@ -125,9 +142,11 @@ export function businessRecall(
           displayed_selection: displayed,
           selection_count: selectionCount,
           retry_available: retryAvailable,
-          selection_source: stored.receipt.displayedRecords?.length
-            ? 'receipt'
-            : 'legacy_explicit_labels',
+          selection_source: stored.references
+            ? 'remembered_selection'
+            : stored.receipt?.displayedRecords?.length
+              ? 'receipt'
+              : 'legacy_explicit_labels',
           refresh_status: unavailable.length ? 'partial' : 'selection_refreshed',
           refreshed_checks: refreshed.length,
           requested_checks: displayedReferences.length,
@@ -151,6 +170,7 @@ export function businessRecall(
             'displayed_selection preserves the historical warehouse IDs and original positions after fresh authorized detail reads. Current facts come only from fresh_evidence and its evidence_id; previous_reply_verified=false withholds stale prose, not the displayed identities. Do not rerun the old search pool, replace a missing option or renumber surviving positions. Explain only unavailable requested positions when material. Previous CRM assessments and public research are not refreshed by these warehouse reads; use current tools if the new question needs them.',
         };
       }
+      if (!stored.receipt) return { ok: false, code: 'CONTEXT_UNAVAILABLE' };
       let unchanged = stored.receipt.publicWebUsed !== true;
       const ids: string[] = [];
       const unavailable: Array<{ tool: string; code: string }> = [];

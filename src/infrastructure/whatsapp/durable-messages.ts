@@ -223,6 +223,8 @@ export class DurableMessages {
       senderName: candidate.senderName || candidate.senderId?.split('@')[0] || 'Unknown sender',
       chatName: candidate.chatName ?? null,
       kind: candidate.kind ?? 'text',
+      forwarded: candidate.forwarded ?? false,
+      hasQuotedMessage: candidate.hasQuotedMessage ?? !!candidate.quotedMessageId,
       ...(candidate.location ? { location: candidate.location } : {}),
     });
     if (replyEligible && isInvestigationStop(candidate) && this.repository.stopInvestigations) {

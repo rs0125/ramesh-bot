@@ -1,3 +1,5 @@
+import { ChatContext, contextScope } from '../modules/assistant/chat-context.js';
+import { ChatContextRepository } from '../infrastructure/database/chat-context.repository.js';
 /** Composition root: constructs adapters and controls their startup/shutdown order. */
 import qrcode from 'qrcode-terminal';
 import type { Logger } from 'pino';
@@ -187,10 +189,37 @@ export function createApplication(
           new OpenAIMediaProcessor(assistantConfig),
         )
       : undefined;
+  const assistantModel = assistantConfig
+    ? (overrides.model ?? new OpenAITextModel(assistantConfig))
+    : undefined;
+  const contextRepository =
+    assistantConfig?.context && messagePool && config.messageDatabase
+      ? new ChatContextRepository(
+          messagePool,
+          config.messageDatabase.accountId,
+          config.encryptionKey,
+        )
+      : undefined;
+  if (assistantConfig?.context && (!contextRepository || !inboxRepository || !schedulingSender))
+    throw new Error('CONTEXT_DURABLE_DATABASE_REQUIRED');
+  const conversationContext =
+    contextRepository && inboxRepository && assistantModel && schedulingSender
+      ? new ChatContext({
+          store: contextRepository,
+          source: inboxRepository,
+          model: assistantModel,
+          resolve: async (message, trusted, signal) => {
+            const resolved = await schedulingSender.resolve({ key: trusted.key }, signal);
+            return resolved?.sender.audience === 'dm' && resolved.employee.active
+              ? contextScope(config.messageDatabase!.accountId, message.chatId, resolved.employee)
+              : null;
+          },
+        })
+      : undefined;
   const assistant = assistantConfig
     ? new AssistantService(
         assistantConfig,
-        overrides.model ?? new OpenAITextModel(assistantConfig),
+        assistantModel!,
         undefined,
         (trace) => logger.info({ agent: trace }, 'Assistant run finished'),
         inboxRepository ? (message) => inboxRepository.context(message) : undefined,
@@ -198,6 +227,7 @@ export function createApplication(
         {
           usageMeter,
           checkpoints,
+          conversationContext,
           personalTools: config.scheduling?.toolsEnabled ? personalTools : undefined,
           businessWrites: config.businessWrites ? businessWrites : undefined,
         },
@@ -362,6 +392,7 @@ export function createApplication(
         if (!ready) throw new Error('Worker not ready');
         await db.$queryRaw`SELECT 1`;
         await messageRepository?.health();
+        await contextRepository?.health();
         return { release: config.release };
       },
     },
@@ -383,11 +414,13 @@ export function createApplication(
           );
         if (messageRepository) {
           await messageRepository.health();
+          await contextRepository?.health();
           await usageMeter?.summarize('startup-readiness');
           // Existing local claims suppress replies after the storage transition too.
           await messageRepository.importLegacy(await db.greeting.findMany());
           await messageRepository.clean();
           await checkpoints?.clean();
+          await contextRepository?.clean();
           await media?.clean();
           await personalRepository?.clean();
           await db.botSetting.upsert({

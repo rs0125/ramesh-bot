@@ -20,6 +20,7 @@ import type { UsageMeter } from '../usage/usage-meter.js';
 import { UtilityToolRun } from './utility-tools.js';
 import { CheckpointError, type AgentCheckpointStore } from './checkpoint.types.js';
 import { withModelReplay, replayedModelSteps } from './model-replay.js';
+import type { ChatContext } from './chat-context.js';
 import type { PersonalToolRun, PersonalToolService } from '../scheduling/personal-tools.js';
 import type {
   BusinessWriteReply,
@@ -53,6 +54,7 @@ export class AssistantService {
       checkpoints?: AgentCheckpointStore;
       personalTools?: PersonalToolService;
       businessWrites?: BusinessWriteService;
+      conversationContext?: ChatContext;
     } = {},
   ) {
     this.graph = buildAssistantGraph(model);
@@ -154,6 +156,8 @@ export class AssistantService {
       });
     }
     let personal: PersonalToolRun | undefined;
+    let contextHistory: ChatMessage[] | undefined;
+    let durableContextEnabled = false;
     let writes: BusinessWriteRun | undefined;
     let recoveredWrite: BusinessWriteReply | undefined;
     try {
@@ -191,6 +195,20 @@ export class AssistantService {
       const quickReply = await personal?.quickReply(recoverySignal);
       if (quickReply)
         return finish({ text: quickReply.text, businessEvidence: quickReply.delivery });
+      if (this.runtime.conversationContext) {
+        const contextDeadline = AbortSignal.timeout(
+          Math.max(1, started + this.modelConfig.timeoutMs - Date.now()),
+        );
+        const prepared = await this.runtime.conversationContext.prepare(
+          message,
+          trusted,
+          signal ? AbortSignal.any([signal, contextDeadline]) : contextDeadline,
+          (stage) => trace.stages.push(stage),
+        );
+        contextHistory = prepared?.history;
+        durableContextEnabled = prepared?.enabled === true;
+        if (prepared?.reply !== undefined) return finish({ text: prepared.reply });
+      }
       if (writeSignal && trusted) {
         try {
           writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
@@ -252,11 +270,9 @@ export class AssistantService {
       const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
       const key = this.key(message);
       try {
-        const history = this.readHistory
-          ? await this.readHistory(message)
-          : key
-            ? this.memory.get(key)
-            : [];
+        const history =
+          contextHistory ??
+          (this.readHistory ? await this.readHistory(message) : key ? this.memory.get(key) : []);
         combined.throwIfAborted();
         const inputState = {
           input:
@@ -284,6 +300,7 @@ export class AssistantService {
                   now: checkpoint ? () => checkpoint.metadata.requestTimeMs : this.runtime.now,
                   researchDeadlineMs:
                     deadlineAtMs - Math.min(60000, this.modelConfig.timeoutMs / 4),
+                  durableContextEnabled,
                   onStage: (stage) => trace.stages.push(stage),
                   onContext: this.runtime.observeContext,
                   onToolActivity,
@@ -308,7 +325,10 @@ export class AssistantService {
                 ).invoke(inputState, graphConfig)
               : await this.graph.invoke(inputState, graphConfig);
         combined.throwIfAborted();
-        trace.stages = result.stages;
+        trace.stages = [
+          ...trace.stages.filter((stage) => stage.stage === 'context'),
+          ...result.stages,
+        ];
         if ('researchExhausted' in result && result.researchExhausted)
           trace.limitedBy = 'research_deadline';
         const business = 'business' in result ? result.business : undefined;

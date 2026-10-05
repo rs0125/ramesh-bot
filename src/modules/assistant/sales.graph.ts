@@ -1,3 +1,4 @@
+import { MEMORY_INSTRUCTIONS, historyForStage } from './chat-context.js';
 /** Bounded native tool loop in LangGraph, with style formatting and fresh evidence review. */
 import { END, START, StateGraph, StateSchema } from '@langchain/langgraph';
 import { z } from 'zod';
@@ -78,6 +79,7 @@ export interface GraphContextObservation {
   tools: Parameters<NonNullable<TextModel['startToolSession']>>[0]['tools'];
 }
 export interface SalesGraphOptions {
+  durableContextEnabled?: boolean;
   now?: () => number;
   researchDeadlineMs?: number;
   onStage?: (stage: StageMetric) => void;
@@ -189,6 +191,7 @@ export function buildSalesGraph(
     "I can't access business data for this account here. You can still chat with me.";
   const applicationContext = () => ({
     assistant: 'Ramesh',
+    durable_chat_memory_enabled: options.durableContextEnabled === true,
     organization: 'WareOnGo',
     sender_is_verified_employee: accessStatus === 'available' || !!personal || !!writes,
     crm_identifiers: 'Internal tool references only; use client names in replies, never CRM UUIDs.',
@@ -200,7 +203,7 @@ export function buildSalesGraph(
   ) => {
     sessionTools = personalOnly ? [...(personal?.tools ?? [])] : tools;
     session = model.startToolSession!({
-      instructions: `${WORKER_PROMPT}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}\nValidated task_plan: ${JSON.stringify(plan)}`,
+      instructions: `${WORKER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}\nValidated task_plan: ${JSON.stringify(plan)}`,
       messages: [...modelHistory, { role: 'user', content: input }],
       tools: sessionTools,
     });
@@ -251,7 +254,7 @@ export function buildSalesGraph(
       if (new Set(tools.map((tool) => tool.name)).size !== tools.length)
         throw new Error('AMBIGUOUS_TOOL_CATALOGUE');
       options.onContext?.({ access: accessStatus, tools: structuredClone(tools) });
-      runtime = `Runtime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available, utilities?.tools, personal?.tools, writes?.tools))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Business tool access: ${accessStatus}. ${value.audience === 'group' ? 'No private tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The business tool service is temporarily unavailable. Do not treat that as missing records.' : ''}\n${personal ? personal.context : 'Personal persistence tools are unavailable; do not claim a task or reminder was saved.'}\n${writes?.context ?? 'Business write proposals are unavailable unless explicitly advertised in the current tool catalogue.'}`;
+      runtime = `durable_chat_memory_enabled: ${options.durableContextEnabled === true}.\nRuntime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available, utilities?.tools, personal?.tools, writes?.tools))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Business tool access: ${accessStatus}. ${value.audience === 'group' ? 'No private tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The business tool service is temporarily unavailable. Do not treat that as missing records.' : ''}\n${personal ? personal.context : 'Personal persistence tools are unavailable; do not claim a task or reminder was saved.'}\n${writes?.context ?? 'Business write proposals are unavailable unless explicitly advertised in the current tool catalogue.'}`;
       return {};
     })
     .addNode('converser', async (value, config) => {
@@ -260,7 +263,7 @@ export function buildSalesGraph(
         {
           stage: 'converser',
           reasoningEffort: 'low',
-          instructions: `${ROUTER_PROMPT}\n${runtime}\n${engineOrientation()}`,
+          instructions: `${ROUTER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${engineOrientation()}`,
           messages: [...modelHistory, { role: 'user', content: value.input }],
           jsonSchema: { name: 'ramesh_route', schema: z.toJSONSchema(routeSchema) },
         },
@@ -306,7 +309,7 @@ export function buildSalesGraph(
           {
             stage: 'planner',
             reasoningEffort: 'medium',
-            instructions: `${PLANNER_PROMPT}\n${runtime}\n${engineOrientation()}`,
+            instructions: `${PLANNER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${engineOrientation()}`,
             messages: [
               {
                 role: 'user',
@@ -437,7 +440,7 @@ export function buildSalesGraph(
           stage: 'formatter',
           reasoningEffort:
             run?.evidence.length || utilities?.evidence.length || value.feedback ? 'low' : 'none',
-          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies personal_result and business_write_result separately. It appends authoritative personal receipts/lists and the application-owned business write response. The internal write preview has not executed yet: after review, the runtime either executes direct_request and substitutes the saved outcome, or publishes a confirmation step. Do not repeat those receipts, independently claim success, invent confirmation codes, or ask for confirmation for direct_request. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Correct every identified issue without inventing replacements, and independently check every candidate against its actual fields; clearly state any unresolved limitation.' : ''}`,
+          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies personal_result and business_write_result separately. It appends authoritative personal receipts/lists and the application-owned business write response. The internal write preview has not executed yet: after review, the runtime either executes direct_request and substitutes the saved outcome, or publishes a confirmation step. Do not repeat those receipts, independently claim success, invent confirmation codes, or ask for confirmation for direct_request. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Correct every identified issue without inventing replacements, and independently check every candidate against its actual fields; clearly state any unresolved limitation.' : ''}`,
           messages: [
             {
               role: 'user',
@@ -446,7 +449,7 @@ export function buildSalesGraph(
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
                 tool_budget: toolBudget(),
-                history: modelHistory,
+                history: historyForStage(modelHistory, 'formatter'),
                 request_clock: requestClock,
                 application_context: applicationContext(),
                 audience: value.audience,
@@ -528,7 +531,7 @@ export function buildSalesGraph(
         {
           stage: 'verifier',
           reasoningEffort: 'medium',
-          instructions: `${SALES_VERIFIER_PROMPT}\n${engineOrientation()}`,
+          instructions: `${SALES_VERIFIER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${engineOrientation()}`,
           messages: [
             {
               role: 'user',
@@ -537,7 +540,7 @@ export function buildSalesGraph(
                 task_plan: value.plan,
                 research_limited: value.researchExhausted,
                 tool_budget: toolBudget(),
-                history: modelHistory,
+                history: historyForStage(modelHistory, 'verifier'),
                 recalled: currentRecalls(),
                 deal_display: dealDisplayFacts(run?.evidence ?? []),
                 request_clock: requestClock,

@@ -45,6 +45,12 @@ export class UsageMeter {
       if (this.failure) throw new Error(this.failure);
       const url = new URL(input instanceof Request ? input.url : String(input));
       if (url.origin !== 'https://api.openai.com') throw new Error('USAGE_PROVIDER_NOT_SUPPORTED');
+      // Exact input counting does not generate tokens. Keep all generating endpoints metered.
+      if (
+        url.pathname === '/v1/responses/input_tokens' &&
+        (init?.method ?? (input instanceof Request ? input.method : 'GET')) === 'POST'
+      )
+        return fetcher(input, init);
       const operation: UsageOperation =
         url.pathname === '/v1/responses'
           ? 'responses'

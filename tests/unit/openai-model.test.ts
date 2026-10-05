@@ -209,11 +209,133 @@ test('native tool sessions preserve continuation, optional arguments and correla
   }
   assert.equal(bodies[0].tool_choice, 'auto');
   assert.equal(bodies[1].tool_choice, 'none');
-  assert.deepEqual(bodies[1].input.slice(-3), [
+  assert.equal(bodies[0].instructions, bodies[1].instructions);
+  assert.match(bodies[1].input.at(-1).content, /Remaining tool-call budget: 0/);
+  assert.deepEqual(bodies[1].input.slice(-4, -1), [
     reasoning,
     functionCall,
     { type: 'function_call_output', call_id: 'call-1', output: '{"total":17}' },
   ]);
+});
+
+test('full rendered input is counted before generation and an oversized schema stops spending', async () => {
+  let counts = 0,
+    generations = 0;
+  const model = new OpenAITextModel(
+    { ...config, context: { maxInputTokens: 96000, compactThreshold: 64000 } },
+    async (url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (String(url).endsWith('/input_tokens')) {
+        counts++;
+        assert.ok(body.instructions.includes('Conversation memory'));
+        assert.equal(body.text.format.name, 'test_schema');
+        assert.deepEqual(body.input, request.messages);
+        return Response.json({ object: 'response.input_tokens', input_tokens: 24001 });
+      }
+      generations++;
+      assert.fail('over-budget input must not reach a generating endpoint');
+    },
+  );
+  await assert.rejects(
+    model.complete({ ...request, jsonSchema: { name: 'test_schema', schema: { type: 'object' } } }),
+    /OPENAI_CONTEXT_BUDGET_EXCEEDED/,
+  );
+  assert.equal(counts, 1);
+  assert.equal(generations, 0);
+});
+
+test('automatic compaction preserves encrypted state, drops covered history and retains function pairs', async () => {
+  const bodies: any[] = [],
+    counts: any[] = [];
+  const compact = { type: 'compaction', id: 'compact-1', encrypted_content: 'opaque-compaction' };
+  const call = {
+    type: 'function_call',
+    id: 'fc-compact',
+    call_id: 'call-compact',
+    name: 'read',
+    arguments: '{}',
+  };
+  const model = new OpenAITextModel(
+    { ...config, context: { maxInputTokens: 96000, compactThreshold: 64000 } },
+    async (url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (String(url).endsWith('/input_tokens')) {
+        counts.push(body);
+        return Response.json({ object: 'response.input_tokens', input_tokens: 900 });
+      }
+      bodies.push(body);
+      return Response.json({
+        id: `r${bodies.length}`,
+        object: 'response',
+        status: 'completed',
+        output:
+          bodies.length === 1
+            ? [compact, call]
+            : [
+                {
+                  type: 'message',
+                  role: 'assistant',
+                  content: [{ type: 'output_text', text: 'Done.' }],
+                },
+              ],
+      });
+    },
+  );
+  const session = model.startToolSession({
+    ...request,
+    tools: [{ name: 'read', inputSchema: { type: 'object' } }],
+  });
+  await session.next(2, AbortSignal.timeout(1000));
+  session.accept('call-compact', { fresh: true });
+  await session.next(0, AbortSignal.timeout(1000));
+  assert.equal(counts.length, 2);
+  assert.deepEqual(counts[0].tools, bodies[0].tools);
+  assert.deepEqual(bodies[0].context_management, [
+    { type: 'compaction', compact_threshold: 64000 },
+  ]);
+  assert.equal(bodies[1].store, false);
+  assert.deepEqual(bodies[1].input.slice(0, 3), [
+    compact,
+    call,
+    { type: 'function_call_output', call_id: 'call-compact', output: '{"fresh":true}' },
+  ]);
+  assert.ok(!JSON.stringify(bodies[1].input).includes('hello'));
+});
+
+test('compaction after a pending call cannot orphan its result', async () => {
+  const bodies: any[] = [];
+  const model = new OpenAITextModel(config, async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({
+      id: 'r',
+      object: 'response',
+      status: 'completed',
+      output:
+        bodies.length === 1
+          ? [
+              { type: 'function_call', call_id: 'c', name: 'read', arguments: '{}' },
+              { type: 'compaction', id: 'compact', encrypted_content: 'opaque' },
+            ]
+          : [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Done.' }],
+              },
+            ],
+    });
+  });
+  const session = model.startToolSession({
+    ...request,
+    tools: [{ name: 'read', inputSchema: { type: 'object' } }],
+  });
+  await session.next(1, AbortSignal.timeout(1000));
+  session.accept('c', {});
+  await session.next(0, AbortSignal.timeout(1000));
+  assert.deepEqual(
+    bodies[1].input.slice(0, 3).map((item: any) => item.type),
+    ['function_call', 'compaction', 'function_call_output'],
+  );
 });
 
 test('native tool sessions redact provider failures and reject parallel proposals', async () => {

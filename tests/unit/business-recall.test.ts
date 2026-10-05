@@ -16,6 +16,130 @@ import { displayedWarehouseRecords } from '../../src/modules/assistant/displayed
 const trusted = { key: { remoteJid: FIXTURE_JID }, runId: 'test' };
 const signal = () => AbortSignal.timeout(5000);
 
+test('compacted user requirements survive the complete planning, worker, formatter and review handoff', async () => {
+  const fixture = createSalesFixture();
+  const memory: ChatMessage = {
+    role: 'user',
+    content:
+      '[Conversation memory source data]\n' +
+      JSON.stringify({
+        pinned_context: [],
+        summary: {
+          notes: [
+            {
+              kind: 'correction',
+              text: 'The user corrected their required minimum to 50000 sq ft.',
+              sources: ['earlier-user-turn'],
+            },
+          ],
+        },
+      }),
+  };
+  const history: ChatMessage[] = [
+    memory,
+    ...Array.from({ length: 20 }, (_, i) => ({
+      role: 'user' as const,
+      content: `Unrelated chat ${i}`,
+    })),
+  ];
+  const stages = new Set<string>();
+  const model: TextModel = {
+    startToolSession(request) {
+      stages.add('worker');
+      assert.ok(request.messages.some((message) => message.content === memory.content));
+      assert.match(request.instructions, /do not demand a CRM field/);
+      return {
+        async next() {
+          return {
+            text: 'You corrected your minimum to 50000 sq ft.',
+            calls: [],
+            inputTokens: 1,
+            outputTokens: 1,
+          };
+        },
+        accept() {},
+      };
+    },
+    async complete(request) {
+      stages.add(request.stage);
+      assert.match(request.instructions, /what the user requested or preferred/);
+      assert.ok(request.messages.some((message) => message.content.includes('50000')));
+      if (request.stage === 'formatter' || request.stage === 'verifier') {
+        const payload = JSON.parse(request.messages[0]!.content);
+        assert.equal(payload.history.length, 9);
+        assert.equal(payload.history[0].content, memory.content);
+      }
+      return (
+        planningResult(request) ?? {
+          text:
+            request.stage === 'verifier'
+              ? '{"supported":true,"feedback":""}'
+              : 'You corrected your minimum to 50000 sq ft.',
+          inputTokens: 1,
+          outputTokens: 1,
+        }
+      );
+    },
+  };
+  const assistant = new AssistantService(
+    { model: 'fixture', timeoutMs: 5000 },
+    model,
+    undefined,
+    undefined,
+    async () => history,
+    fixture.service,
+  );
+  const result = await assistant.prepare(
+    {
+      chatId: FIXTURE_JID,
+      messageId: 'context',
+      sentAtMs: Date.now(),
+      text: 'What minimum did I correct my requirement to?',
+      isGroup: false,
+      fromMe: false,
+      mentionsBot: false,
+    },
+    signal(),
+    trusted,
+  );
+  assert.equal(result.trace.outcome, 'completed');
+  assert.match(result.text, /50000/);
+  assert.deepEqual([...stages].sort(), ['converser', 'formatter', 'planner', 'verifier', 'worker']);
+  assert.equal(
+    fixture.state.calls.length,
+    0,
+    'a user requirement is not a current business fact needing a business read',
+  );
+});
+
+test('remembered selections survive prose expiry but always require fresh permissions and reads', async () => {
+  const { fixture, run } = await warehouseHistory();
+  const now = Date.now();
+  const history: ChatMessage[] = [
+    {
+      role: 'assistant',
+      content: PRIVATE_HISTORY_REPLY,
+      businessReferences: {
+        employeeId: run.employeeId,
+        expiresAt: now + 86400000,
+        records: [{ kind: 'warehouse', id: 105, position: 2 }],
+      },
+    },
+  ];
+  const recall = businessRecall(history, run, now);
+  assert.ok(recall.available);
+  assert.ok(!JSON.stringify(recall.messages).includes('105'));
+  const result = await recall.execute('{}', signal());
+  assert.equal(result.selection_source, 'remembered_selection');
+  assert.equal(result.previous_reply, undefined);
+  assert.equal((result.displayed_selection as any[])[0].position, 2);
+  assert.equal(fixture.state.calls.at(-1)?.tool, 'read_warehouse');
+  assert.equal(businessRecall(history, undefined, now).available, false);
+  assert.equal(businessRecall(history, run, now + 2 * 86400000).available, false);
+  history[0]!.businessReferences!.employeeId++;
+  assert.equal(businessRecall(history, run, now).available, false);
+});
+
 async function setup() {
   const fixture = createSalesFixture();
   const original = (await fixture.service.openTools(trusted, signal())).run!;

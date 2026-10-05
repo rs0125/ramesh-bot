@@ -6,9 +6,12 @@ export interface ChatMessage {
   content: string;
   /** Server-only envelope. Never serialize into model history; recall requires fresh scoped reads. */
   protectedReply?: { text: string; receipt: unknown };
+  /** Identities only, never serialized; recall reauthorizes and refreshes every record. */
+  businessReferences?: import('./chat-context.js').RememberedSelection;
 }
 
 export type AgentStage =
+  | 'context'
   | 'converser'
   | 'planner'
   | 'formatter'
