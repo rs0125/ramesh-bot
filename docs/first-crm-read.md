@@ -60,7 +60,7 @@ This journal is **not a LangGraph checkpointer**. It implements durable task adm
 
 The restricted `ramesh_worker` role receives only the necessary explicit grants on the new tables. RLS is enabled and browser/API roles receive none. Existing shared PostgreSQL `PUBLIC` extension grants remain as documented in the queue runbook; this migration does not claim to remove them.
 
-Business replies appear as **[Private CRM reply]** in the admin inbox, including conversation previews. They are excluded from Supabase model history and the process-local memory fallback. Operator authentication is not employee CRM authorization. Encrypted receipts and protected content follow the existing 30-day message retention cascade, accessible to trusted database/host operators holding the encryption key. No raw business content or credentials enter normal trace logs. Delivery-time reads are not added to the finalized execution receipt log; their failure reason is recorded on the message.
+The authenticated admin inbox and conversation previews display the stored business reply text. `InboxRepository.messages` and `conversations` retain an explicit `redacted` visibility option for future role rules; the admin default is `full`. Ordinary Supabase model history and the process-local memory fallback still use protected reply markers, with fresh authorization required for business recall. Encrypted receipts and protected content follow the existing 30-day message retention cascade, accessible to trusted database/host operators holding the encryption key. No raw business content or credentials enter normal trace logs. Delivery-time reads are not added to the finalized execution receipt log; their failure reason is recorded on the message.
 
 ## Enablement
 

@@ -261,7 +261,11 @@ test(
           const page = await inbox.messages(chat);
           assert.equal(page.messages.length, 1);
           assert.equal(page.messages[0]?.source, 'assistant', 'v1 admin source stays compatible');
-          assert.equal(page.messages[0]?.text.includes('Synthetic private'), false);
+          assert.equal(page.messages[0]?.text.includes('Synthetic private'), true);
+          assert.equal(
+            (await inbox.messages(chat, null, 'redacted')).messages[0]?.text,
+            '[Private CRM reply]',
+          );
           await finish(f.queue, job);
           assert.equal(
             (

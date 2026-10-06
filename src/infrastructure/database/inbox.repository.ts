@@ -74,6 +74,9 @@ function cursorFor(row: InboxRow, key: 'created_at' | 'updated_at'): string {
   ).toString('base64url');
 }
 
+/** Admin replies are visible by default; keep redaction available for future role rules. */
+export type InboxReplyVisibility = 'full' | 'redacted';
+
 export class InboxRepository implements ContextSource {
   private readonly cipher;
   constructor(
@@ -91,7 +94,7 @@ export class InboxRepository implements ContextSource {
     return data;
   }
 
-  private messagesFor(row: InboxRow): InboxMessage[] {
+  private messagesFor(row: InboxRow, visibility: InboxReplyVisibility): InboxMessage[] {
     const content = this.content(row);
     const messages: InboxMessage[] =
       row.origin !== 'whatsapp'
@@ -112,13 +115,12 @@ export class InboxRepository implements ContextSource {
             },
           ];
     if (row.reply_encrypted) {
-      // The operational admin session grants no employee CRM authority.
       let text =
-        row.reply_kind === 'business'
+        row.reply_kind === 'business' && visibility === 'redacted'
           ? '[Private CRM reply]'
           : decodeReply(
               this.cipher.open('outbound-reply', row.id, row.reply_encrypted),
-              'conversation',
+              row.reply_kind ?? 'conversation',
             ).text;
       if (typeof text !== 'string') throw new Error('Invalid inbox reply');
       if (row.origin === 'automation' && !text.trim())
@@ -152,7 +154,10 @@ export class InboxRepository implements ContextSource {
     return messages;
   }
 
-  async conversations(cursor?: string | null): Promise<ConversationPage> {
+  async conversations(
+    cursor?: string | null,
+    visibility: InboxReplyVisibility = 'full',
+  ): Promise<ConversationPage> {
     const before = decodeInboxCursor(cursor);
     const rows = (
       await this.pool.query<InboxRow & { name_id: string | null; name_content: string | null }>(
@@ -177,7 +182,7 @@ export class InboxRepository implements ContextSource {
           row.name_id && row.name_content
             ? this.content({ id: row.name_id, content_encrypted: row.name_content })
             : this.content(row);
-        const latest = this.messagesFor(row).at(-1)!;
+        const latest = this.messagesFor(row, visibility).at(-1)!;
         const isGroup = row.chat_id.endsWith('@g.us');
         return {
           chatId: row.chat_id,
@@ -198,7 +203,11 @@ export class InboxRepository implements ContextSource {
     };
   }
 
-  async messages(chatId: string, cursor?: string | null): Promise<InboxPage> {
+  async messages(
+    chatId: string,
+    cursor?: string | null,
+    visibility: InboxReplyVisibility = 'full',
+  ): Promise<InboxPage> {
     const before = decodeInboxCursor(cursor);
     const rows = (
       await this.pool.query<InboxRow>(
@@ -212,7 +221,7 @@ export class InboxRepository implements ContextSource {
       messages: rows
         .slice(0, 25)
         .reverse()
-        .flatMap((row) => this.messagesFor(row))
+        .flatMap((row) => this.messagesFor(row, visibility))
         .sort((a, b) => a.at.localeCompare(b.at)),
       nextCursor: rows.length > 25 ? cursorFor(rows[24]!, 'created_at') : null,
     };
@@ -312,7 +321,7 @@ export class InboxRepository implements ContextSource {
     const history = rows
       .reverse()
       .flatMap((row) =>
-        this.messagesFor(row)
+        this.messagesFor(row, 'redacted')
           .filter((item) => item.direction === 'inbound' || item.status === 'SENT')
           .map((item) =>
             row.reply_kind === 'business' && item.direction === 'outbound'

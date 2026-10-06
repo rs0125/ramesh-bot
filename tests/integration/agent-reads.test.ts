@@ -201,9 +201,18 @@ test(
           );
 
           const inbox = new InboxRepository(database.runtime, account, key);
-          assert.ok(!JSON.stringify(await inbox.messages(chatId)).includes('Fixture Acme'));
+          const adminReply = (await inbox.messages(chatId)).messages.find(
+            (item) => item.direction === 'outbound',
+          );
+          assert.equal(adminReply?.text, sent[0]);
+          assert.equal(
+            (await inbox.conversations()).conversations[0]?.lastMessage,
+            sent[0]!.slice(0, 200),
+          );
+          const redacted = await inbox.messages(chatId, null, 'redacted');
+          assert.ok(!JSON.stringify(redacted).includes('Fixture Acme'));
           assert.match(
-            JSON.stringify(await inbox.messages(chatId)),
+            JSON.stringify(redacted),
             mode === 'send' ? /Private CRM reply/ : /couldn't verify the business data/,
           );
           const next = message();
