@@ -632,6 +632,7 @@ export function buildSalesGraph(
     })
     .addNode('lookup_plan', async (value, config) => {
       config.signal?.throwIfAborted();
+      notifyToolActivity(options.onToolActivity);
       const plan = value.lookup!;
       startSession(plan, value.input, false);
       return { plan };

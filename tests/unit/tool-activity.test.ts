@@ -51,7 +51,7 @@ function model(call?: { name: string; arguments: string }): TextModel {
   };
 }
 
-for (const kind of ['read', 'utility', 'recall'] as const) {
+for (const kind of ['read', 'utility', 'recall', 'lookup'] as const) {
   test(`dynamic ${kind} activity starts before planning and execution; feedback failure cannot stop the answer`, async () => {
     const now = Date.now();
     const fixture = createSalesFixture(() => now);
@@ -101,9 +101,26 @@ for (const kind of ['read', 'utility', 'recall'] as const) {
     const scripted = model(call);
     const complete = scripted.complete.bind(scripted);
     scripted.complete = async (request, signal) => {
+      if (kind === 'lookup' && request.stage === 'converser') {
+        assert.equal(activity, 0, 'Routing must remain silent until tool work is selected');
+        return output(
+          JSON.stringify({
+            route: 'work',
+            workflow: 'lookup',
+            lookupTools: ['read_warehouse'],
+            objective: 'Read the requested warehouse.',
+            reply: '',
+          }),
+        );
+      }
       if (request.stage === 'planner')
         assert.equal(activity, 1, 'Signal precedes planner inference');
       return complete(request, signal);
+    };
+    const startToolSession = scripted.startToolSession!.bind(scripted);
+    scripted.startToolSession = (...args) => {
+      assert.equal(activity, 1, 'Signal precedes the first worker inference');
+      return startToolSession(...args);
     };
     const response = await buildSalesGraph(
       scripted,
@@ -111,6 +128,7 @@ for (const kind of ['read', 'utility', 'recall'] as const) {
         fixture.service.openTools({ key: { remoteJid: FIXTURE_JID }, runId: 'activity' }, signal),
       {
         now: () => now,
+        optimizeLatency: kind === 'lookup',
         utilities,
         onContext: () => assert.equal(activity, 0, 'Discovery must remain silent'),
         onToolActivity: (...args) => {
