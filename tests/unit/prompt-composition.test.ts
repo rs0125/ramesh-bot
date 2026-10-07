@@ -35,6 +35,15 @@ test('every assembled role receives the same evidence contract exactly once', ()
   for (const prompt of [PLANNER_PROMPT, WORKER_PROMPT, SALES_MANAGER_PROMPT]) {
     assert.equal(prompt.split('## CRM brief to warehouse shortlist').length - 1, 1);
   }
+  for (const prompt of [
+    PLANNER_PROMPT,
+    WORKER_PROMPT,
+    SALES_MANAGER_PROMPT,
+    SALES_VERIFIER_PROMPT,
+    EVIDENCE_REPAIR_PROMPT,
+  ]) {
+    assert.equal(prompt.split(loadPrompt('requirement-interpretation')).length - 1, 1);
+  }
   assert.ok(WORKER_PROMPT.includes(loadPrompt('chief-of-staff')));
   assert.ok(WORKER_PROMPT.includes(loadPrompt('planning-reference')));
 });

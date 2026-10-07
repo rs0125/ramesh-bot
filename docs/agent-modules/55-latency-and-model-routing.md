@@ -740,3 +740,139 @@ are under the same private v44 directory. `build-combined-summary.py` reproducib
 produces `combined-summary.json`, which includes the original interrupted attempt,
 both usage ledgers, per-turn dispositions, latency comparisons and history checks.
 No live CRM writes, WhatsApp sends or production deployment were performed.
+
+## v45 requirement handoff and material clarification, 2026-10-07
+
+The v44 working tree was committed and pushed as `c6898be` before this follow-up.
+These changes are local; the new paid corpus evaluation is recorded below. No
+production deployment has been performed.
+The Luna/Sol stage split, tool allowances and output-token limits are unchanged.
+
+The T2-1 trace showed a router paraphrase moving “max” from the budget to the area.
+The planner copied that interpretation, and the worker received it inside its
+instruction block as a “Validated task_plan.” Validation checked tool names and
+dependencies, not the meaning of the user request. The assessment then described
+caller-supplied arguments as employee overrides, reinforcing the mistake until
+final review caught it.
+
+The router's objective is now a routing label and is discarded downstream, including
+lookup and personal fast paths. The planner reads the original request and history.
+Generated plans are assistant-role working data, followed by the original user
+message, rather than worker instructions. A shared interpretation prompt distinguishes
+targets, bounds, units, recorded facts and user corrections. It requires checking
+numeric filters against the source clause and keeps exploratory search bounds
+separate from user requirements; this is a model instruction, not a deterministic
+natural-language proof.
+
+The planner can return `clarification: {question, missingDecision}` with zero steps.
+This sends one necessary question through independent review without starting a
+worker or finalizing any staged action. The normal plan requires at least one step
+and no clarification. A bounded read can still resolve a choice before asking;
+independent useful work can proceed. Clear creates and optional missing fields do
+not require another confirmation. Review can reject a needless question and resume
+planning within the existing allowance. A question returned after a rejected write
+replaces the old draft and leaves the proposal uncommitted.
+
+The companion Context Engine assessment change uses `caller_override` and
+`meets_effective_requirement`, with a `requirement_source` on each comparison.
+Its schema and counts use the new names. They describe the argument actually
+evaluated without claiming that the API verified the employee's wording. Clients
+enumerating the former response strings need a coordinated update. Ramesh accepts
+both old and new source payloads; the shared prompt explains the legacy labels too.
+
+Offline validation: the complete Ramesh `npm run check` passed with 869 tests and
+22 skipped, followed by 22 passing write-graph checks including the additional
+replanning regression. The Context Engine suite passed 3,080 tests and skipped 101;
+its only two failures were sandbox `spawnSync EPERM` errors, and all five tests in
+that file passed outside the sandbox. The focused assessment/API/MCP checks passed
+213 tests and both repositories passed typechecking. Failed sandbox logs remain
+preserved. These checks establish orchestration and source semantics, not a new
+measurement of model interpretation accuracy or latency.
+
+### Paid v45 corpus and two integration fixes, 7 October 2026
+
+The user authorized the same six conversations once, with the same Luna/Sol split
+and a fresh **$5 combined cap**. All **24 turns were attempted exactly once** using
+real CRM and warehouse reads. The local Context Engine bridge used a frozen copy
+of its current authorization and read handlers, including the new assessment
+labels. No CRM writes, WhatsApp sends or production deployment occurred.
+
+**20/24 answers passed manual source-backed review.** Luna's unchanged grader
+accepted **18/24**. Its two additional flags were R2-1, applying the old mandatory
+date rule to an analytical comparison, and R2-3, mistaking retained historical
+tool activity for fresh calls. R2-3's live-call capture was empty. Raw judgments
+and explicit manual disagreements are preserved; there were no paid regrades.
+
+The four genuine delivered-answer failures came from two integration bugs:
+
+1. **Strict planner schema:** T2-1, T2-3 and T2-4 returned unavailable before CRM
+   reads. The new nullable `clarification` property was optional in JSON Schema,
+   which strict Responses validation rejects. T2-2 succeeded through the lookup
+   path. Native input-token counting reproduced `invalid_json_schema` on the
+   original definition and accepted the repaired required/nullable definition,
+   without generating responses. Local parsing now defaults omitted legacy values
+   to null. The first case and its **$0.110711** cost remain intact. The other five
+   cases continued from a separate frozen snapshot, charged against **$4.889289**
+   remaining. T2 was not rerun.
+2. **Date check crossed sections:** R3-1 produced a supported partial answer after
+   the injected notes failure. Both Sol reviews approved it, but the deterministic
+   checker treated a repeated company field as another CRM entry, scanned into
+   the warehouse section and attributed that warehouse's creation date to the
+   lead. It overrode both approvals and returned unavailable. The local fix ends
+   legacy date attribution at another section or unrelated paragraph. An offline
+   replay of both exact rejected inputs now passes, while a deliberately wrong
+   CRM date still fails. The paid snapshot stayed unchanged, and this failed turn
+   was not repeated.
+
+After the schema repair, **19 of the remaining 20 turns** were acceptable; R3-1
+was the sole failure. The hypothetical minimum applied to only its intended deal,
+overlap corrections retained the original sample, client switching and the count
+interruption preserved the active brief, and the final stage-history retry returned
+to the original records after the multi-city detour. Recorded ownership was kept
+separate from assignment requests in descriptions. Missing historical timestamps
+remained unknown rather than being replaced with creation/update intervals.
+
+**All six persistence/compaction inspections preserved their stored content.**
+Across **14 retained replies**, exact reply text and all **49 tool-attempt metadata
+entries** matched the original receipts, including **four failed attempts**. Full
+tool-result bodies remain intentionally bounded. Four history-only turns made no
+fresh source calls; two other compaction turns performed their explicitly requested
+fresh reads. The revoked-access turn disclosed no private record details. T2-4's
+storage check passed even though its user-facing answer failed the planner schema;
+storage integrity is not counted as answer success.
+
+Captured handoffs confirmed the unchanged original request in all **14 planner
+calls** and **16 native worker sessions**, with provisional plans in assistant-role
+context and no router objective promoted into requirements. These cases did not
+exercise a paid clarification question. The original Express 3PL quantity/budget
+misreading remains **unvalidated after the fix**, because its one authorized
+attempt hit the schema fault. Deterministic clarification tests remain the evidence
+for question handling and clear-write usability; this corpus performs no live
+insertions.
+
+Total spend was **$3.072374 across 167 settled requests**, including graders and
+failed turns. There were no unknown charges, pending requests or held reservations.
+This campaign reserved against the adapter's enforced **96,000 input-token bound**,
+not the provider's full 1.05-million-token window. Every generation retained the
+native exact-input preflight and existing stage limits; output remained 6,000
+tokens. This bounded the largest Sol reservation at **$0.30** without increasing
+the $5 cap. The largest observed worker input was **50,125/96,000 tokens** and
+largest worker output **1,051/6,000**; neither observed failure was a token shortage.
+
+The 20 attempts after the schema repair had median latency **83.536 s**, nearest-
+rank p95 **157.435 s** and maximum **194.630 s**. These are descriptive timings,
+not a new controlled speedup estimate: HTTP hosting differed from the earlier
+Vercel runs, source snapshots changed, and failed answers remain in the sample.
+
+Both fixes passed the full local `npm run check`: **873 tests passed, 22 skipped**,
+with typecheck, build and formatting successful. The date-boundary regression
+failed before the fix and passed afterwards; both original paid review inputs were
+also replayed offline. The date fix has no new paid confirmation.
+
+Approvals, unchanged corpus, both frozen bot snapshots, frozen Context Engine,
+native schema checks, source/model captures, usage ledgers, failed regression logs,
+offline replay and manual dispositions are retained under
+`.local/private-evals/live-messy-20261007/post-handoff-5usd-v45/`.
+`build-combined-summary.py` reproduces `combined-summary.json` and checks snapshot
+integrity, all attempted turns, spending and retained history. The temporary local
+source server was shut down after completion.

@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateTaskPlan } from '../../src/modules/assistant/task-plan.js';
+import { z } from 'zod';
+import { taskPlanSchema, validateTaskPlan } from '../../src/modules/assistant/task-plan.js';
 import { AssistantService } from '../../src/modules/assistant/assistant.service.js';
 import { createSalesFixture, FIXTURE_JID } from '../../scripts/lib/sales-fixture.js';
 import type { TextModel, ModelRequest } from '../../src/modules/assistant/assistant.types.js';
 const plan = {
   objective: 'Prepare a follow-up brief',
   successCriteria: ['Identify priorities with supported next steps'],
+  clarification: null,
   steps: [
     { id: 'find', goal: 'Read assigned work', dependsOn: [], toolNames: ['search_crm_leads'] },
   ],
@@ -21,6 +23,33 @@ test('plans reject unknown tools, duplicate IDs and forward/circular dependencie
   );
   assert.throws(() =>
     validateTaskPlan({ ...plan, steps: [{ ...plan.steps[0], dependsOn: ['later'] }] }, [
+      { name: 'search_crm_leads' },
+    ]),
+  );
+});
+
+test('planner strict response schema requires its nullable clarification field', () => {
+  const schema = z.toJSONSchema(taskPlanSchema);
+  assert.deepEqual(new Set(schema.required), new Set(Object.keys(schema.properties!)));
+  assert.deepEqual(
+    validateTaskPlan({ ...plan, clarification: undefined }, [{ name: 'search_crm_leads' }]),
+    plan,
+  );
+});
+
+test('clarification is an exclusive outcome with no executable steps', () => {
+  const question = {
+    ...plan,
+    steps: [],
+    clarification: {
+      question: 'Should the area be a minimum or a maximum?',
+      missingDecision: 'The direction of the area bound.',
+    },
+  };
+  assert.deepEqual(validateTaskPlan(question, []), question);
+  assert.throws(() => validateTaskPlan({ ...plan, steps: [] }, []));
+  assert.throws(() =>
+    validateTaskPlan({ ...plan, clarification: question.clarification }, [
       { name: 'search_crm_leads' },
     ]),
   );
@@ -82,6 +111,7 @@ test('plan validation accepts newly registered capabilities without CRM-specific
   const documentPlan = {
     objective: 'Compare the renewal clauses in the supplied documents',
     successCriteria: ['Cite conflicting clauses and identify unread sections'],
+    clarification: null,
     steps: [
       {
         id: 'sections',

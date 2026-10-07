@@ -252,6 +252,26 @@ test('a warehouse caveat mentioning the client does not acquire the CRM dates', 
   }
 });
 
+test('legacy CRM date claims stop at another section or an unrelated paragraph', async () => {
+  const evidence = await dealEvidence();
+  for (const separator of [
+    '\n\nSeparate warehouse ID 101',
+    '\n*Separate warehouse ID 101*',
+    '\n### Warehouse ID 101',
+    '\n2. Warehouse ID 101',
+  ]) {
+    for (const metadata of ['', '\nCreated: 1 Sept 2026\nLast updated: 29 Sept 2026']) {
+      const reply = `*Fixture Acme Storage*${metadata}\n• Company: Fixture Acme Storage. POC needs verification.${separator}\nCreated: 10 Aug 2025`;
+      assert.deepEqual(dealDisplayIssues(reply, evidence), [], reply);
+      if (metadata)
+        assert.ok(dealDisplayIssues(reply.replace('1 Sept 2026', '2 Sept 2026'), evidence).length);
+    }
+  }
+  const spacedDates = '*Fixture Acme Storage*\n\nCreated: 1 Sept 2026\nLast updated: 29 Sept 2026';
+  assert.deepEqual(dealDisplayIssues(spacedDates, evidence), []);
+  assert.ok(dealDisplayIssues(spacedDates.replace('1 Sept 2026', '2 Sept 2026'), evidence).length);
+});
+
 test('CRM dates accept both bare and parenthesized IST without accepting a wrong day', async () => {
   const evidence = await dealEvidence();
   for (const timezone of [' IST', ' (IST)']) {

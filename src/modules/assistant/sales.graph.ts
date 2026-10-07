@@ -62,7 +62,6 @@ const state = new StateSchema({
   history: z.array(z.custom<ChatMessage>()),
   audience: z.enum(['dm', 'group']),
   route: z.enum(['direct', 'work']).default('direct'),
-  objective: z.string().default(''),
   personalOnly: z.boolean().default(false),
   lookup: taskPlanSchema.optional(),
   casual: z.boolean().default(false),
@@ -267,8 +266,12 @@ export function buildSalesGraph(
   ) => {
     sessionTools = personalOnly ? [...(personal?.tools ?? [])] : tools;
     session = model.startToolSession!({
-      instructions: `${WORKER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}\nValidated task_plan: ${JSON.stringify(plan)}`,
-      messages: [...modelHistory, { role: 'user', content: input }],
+      instructions: `${WORKER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}`,
+      messages: [
+        ...modelHistory,
+        { role: 'assistant', content: JSON.stringify({ provisional_task_plan: plan }) },
+        { role: 'user', content: input },
+      ],
       tools: sessionTools,
     });
   };
@@ -302,8 +305,18 @@ export function buildSalesGraph(
     }
     const researchExhausted =
       value.researchExhausted || Date.now() >= (options.researchDeadlineMs ?? Infinity);
-    const preview = personal?.preview();
-    const writePreview = writes?.preview();
+    if (!evidenceRepair && value.plan?.clarification && value.draftReady) {
+      return {
+        reply: finishReply(value.plan.clarification.question),
+        supplement: '',
+        draftReady: false,
+        renderIssues: [],
+        renderedRecords: [],
+        researchExhausted,
+      };
+    }
+    const preview = value.plan?.clarification ? undefined : personal?.preview();
+    const writePreview = value.plan?.clarification ? undefined : writes?.preview();
     if (!evidenceRepair && value.personalOnly && preview && !writePreview)
       return { reply: preview, supplement: '', draftReady: false };
     const started = Date.now();
@@ -599,7 +612,6 @@ export function buildSalesGraph(
       const route = routeSchema.parse(JSON.parse(result.text));
       return {
         route: route.route,
-        objective: route.objective,
         personalOnly: route.route === 'work' && route.workflow === 'personal' && !!personal,
         draft: route.reply,
         draftReady:
@@ -609,7 +621,11 @@ export function buildSalesGraph(
           route.route === 'work' &&
           route.workflow === 'lookup' &&
           accessStatus === 'available'
-            ? lookupPlan(route.objective, route.lookupTools, run?.tools ?? [])
+            ? lookupPlan(
+                'Answer the original user request using the relevant conversation and current evidence.',
+                route.lookupTools,
+                run?.tools ?? [],
+              )
             : undefined,
         stages: [...value.stages, recordMetric(metric('converser', started, result))],
       };
@@ -625,14 +641,14 @@ export function buildSalesGraph(
       notifyToolActivity(options.onToolActivity);
       const plan = validateTaskPlan(
         {
-          objective: value.objective,
+          objective: 'Complete the original personal request using the relevant conversation.',
           successCriteria: [
             'Satisfy the complete explicit personal request with the correct owner, target, and IST time; clarify missing details before saving.',
           ],
           steps: [
             {
               id: 'personal',
-              goal: value.objective,
+              goal: 'Resolve and complete the original personal request; ask about material ambiguity.',
               dependsOn: [],
               toolNames: personal!.tools.map((tool) => tool.name),
             },
@@ -657,7 +673,6 @@ export function buildSalesGraph(
                 role: 'user',
                 content: JSON.stringify({
                   request: value.input,
-                  objective: value.objective,
                   history: modelHistory,
                   tool_definitions: planningToolDefinitions(tools, model.toolLoadingMode),
                   ...(value.feedback
@@ -674,8 +689,12 @@ export function buildSalesGraph(
       if (attempt.limited) return { researchExhausted: true };
       const result = attempt.result;
       const plan = validateTaskPlan(JSON.parse(result.text), tools);
-      startSession(plan, value.input, false);
-      return { plan, stages: [...value.stages, recordMetric(metric('planner', started, result))] };
+      if (!plan.clarification) startSession(plan, value.input, false);
+      return {
+        plan,
+        ...(plan.clarification ? { draft: plan.clarification.question, draftReady: true } : {}),
+        stages: [...value.stages, recordMetric(metric('planner', started, result))],
+      };
     })
     .addNode('worker', async (value, config) => {
       const started = Date.now();
@@ -834,7 +853,10 @@ export function buildSalesGraph(
       const started = Date.now();
       // Exact user-authored personal records and application-owned write previews are
       // data, not generated prose. Review their semantics below without rewriting literals.
-      const prose = personal?.preview() || writes?.preview() ? value.supplement : value.reply;
+      const prose =
+        !value.plan?.clarification && (personal?.preview() || writes?.preview())
+          ? value.supplement
+          : value.reply;
       const factualIssues = [
         ...value.renderIssues,
         ...dealDisplayIssues(prose, run?.evidence ?? [], run?.internalCrmIds),
@@ -853,6 +875,7 @@ export function buildSalesGraph(
               content: JSON.stringify({
                 request: value.input,
                 task_plan: value.plan,
+                awaiting_clarification: !!value.plan?.clarification,
                 research_limited: value.researchExhausted,
                 execution_status: executionReport(value.researchExhausted),
                 tool_budget: budget,
@@ -881,13 +904,17 @@ export function buildSalesGraph(
                 utility_evidence: utilities?.evidence ?? [],
                 utility_failures: utilities?.failures ?? [],
                 personal_evidence: personal?.evidence ?? [],
-                personal_proposal: personal?.pendingOperations ?? [],
-                personal_result: personal?.preview(),
+                personal_proposal: value.plan?.clarification
+                  ? []
+                  : (personal?.pendingOperations ?? []),
+                personal_result: value.plan?.clarification ? undefined : personal?.preview(),
                 additional_reply: value.supplement,
                 personal_failures: personal?.failures ?? [],
                 business_write_evidence: writes?.evidence ?? [],
-                business_write_result: writes?.preview(),
-                business_write_execution_mode: writes?.pendingExecutionMode,
+                business_write_result: value.plan?.clarification ? undefined : writes?.preview(),
+                business_write_execution_mode: value.plan?.clarification
+                  ? undefined
+                  : writes?.pendingExecutionMode,
                 business_write_failures: writes?.failures ?? [],
                 retired_evidence_ids: run?.retiredEvidenceIds ?? [],
                 pagination: run?.pagination ?? [],
@@ -1005,13 +1032,13 @@ export function buildSalesGraph(
           unavailable: true,
         };
       const signal = config.signal ?? new AbortController().signal;
-      const writePreview = writes?.preview();
+      const writePreview = value.plan?.clarification ? undefined : writes?.preview();
       const otherDraft = writePreview
         ? [value.supplement, personal?.preview()].filter(Boolean).join('\n\n')
         : value.reply;
       // Save only server-owned user provenance. It becomes recallable only once this reply is sent.
       await personal?.saveContext(signal);
-      const personalResult = await personal?.finish(signal);
+      const personalResult = value.plan?.clarification ? undefined : await personal?.finish(signal);
       const personalReply =
         personalResult ??
         (personal?.usedPrivateData
@@ -1050,7 +1077,7 @@ export function buildSalesGraph(
       // The verifier has approved the exact request and arguments. The runtime now
       // follows the persisted tool policy: dispatch direct writes or publish confirmation.
       // Model prose, evidence replay and delivery checks cannot dispatch a mutation.
-      const publishedWrite = await writes?.finalize(signal);
+      const publishedWrite = value.plan?.clarification ? undefined : await writes?.finalize(signal);
       if (writePreview && !publishedWrite) throw new Error('WRITE_PROPOSAL_UNAVAILABLE');
       const writeReply =
         publishedWrite ??
@@ -1090,7 +1117,9 @@ export function buildSalesGraph(
     )
     .addEdge('personal_plan', 'worker')
     .addEdge('lookup_plan', 'worker')
-    .addConditionalEdges('planner', (value) => (value.researchExhausted ? 'formatter' : 'worker'))
+    .addConditionalEdges('planner', (value) =>
+      value.researchExhausted || value.plan?.clarification ? 'formatter' : 'worker',
+    )
     .addConditionalEdges('worker', (value) => (value.calls.length ? 'executor' : 'formatter'))
     .addConditionalEdges('executor', (value) =>
       value.blocked
@@ -1127,7 +1156,7 @@ export function buildSalesGraph(
                 value.repairKind !== 'format' &&
                 remainingTools() > 0 &&
                 toolSteps < 28
-              ? session?.revise
+              ? !value.plan?.clarification && session?.revise
                 ? 'revise'
                 : 'planner'
               : value.repairKind === 'format'

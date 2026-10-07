@@ -4,6 +4,8 @@ Status: **Separate native worker model session and deterministic executor implem
 
 The converser routes intent, the planner creates an outcome contract, and the worker chooses native function calls to fulfil it. A distinct executor node validates and performs those calls. The worker may adapt to actual results without resetting its 24-source/28-total proposal budgets. The independent verifier receives the task plan and current evidence; one bounded repair can continue the same worker session. See [module 29](29-planner-worker-verifier.md). Generic durable multi-worker task handoffs below remain future design.
 
+The generated plan is an assistant message named `provisional_task_plan`, followed by the unchanged current user request. It is not interpolated into worker instructions or called a validated requirement. The shared [interpretation contract](../../src/prompts/requirement-interpretation.md) keeps targets, minima, maxima, units, source claims and user corrections distinct. Genuine material ambiguity warrants one focused question after relevant context or a bounded read; it does not authorize a guessed write or require routine requests to go through extra confirmation.
+
 The worker's callable subset is refreshed on every continuation from the remaining
 business, personal and write allowances, bounded by the same 28 total proposals.
 Exhausted families cannot borrow another family's allowance. A stale exhausted

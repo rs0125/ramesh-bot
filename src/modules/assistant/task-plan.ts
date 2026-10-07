@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const routeSchema = z
   .object({
     route: z.enum(['direct', 'work']),
+    // Routing label only. Never forward a router paraphrase as a requirements brief.
     objective: z.string().min(1).max(2000),
     reply: z.string().max(12000),
     workflow: z.enum(['general', 'personal', 'lookup']).default('general'),
@@ -13,6 +14,14 @@ export const taskPlanSchema = z
   .object({
     objective: z.string().min(1).max(2000),
     successCriteria: z.array(z.string().min(1).max(600)).min(1).max(8),
+    clarification: z
+      .object({
+        question: z.string().trim().min(1).max(600),
+        missingDecision: z.string().trim().min(1).max(600),
+      })
+      .strict()
+      .nullable()
+      .default(null),
     steps: z
       .array(
         z
@@ -24,7 +33,6 @@ export const taskPlanSchema = z
           })
           .strict(),
       )
-      .min(1)
       .max(8),
   })
   .strict();
@@ -55,6 +63,9 @@ export function lookupPlan(
 }
 export function validateTaskPlan(value: unknown, tools: readonly { name: string }[]): TaskPlan {
   const plan = taskPlanSchema.parse(value);
+  // A question is a complete planning outcome, never permission to execute a guess.
+  if (plan.clarification ? plan.steps.length !== 0 : plan.steps.length === 0)
+    throw new Error('INVALID_TASK_PLAN');
   const allowed = new Set(tools.map((t) => t.name));
   const prior = new Set<string>();
   for (const step of plan.steps) {

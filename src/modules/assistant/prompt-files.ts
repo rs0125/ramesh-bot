@@ -12,6 +12,7 @@ export const PROMPT_NAMES = [
   'legacy-read-converser',
   'evidence-policy',
   'planning-reference',
+  'requirement-interpretation',
   'router',
   'planner',
   'worker',

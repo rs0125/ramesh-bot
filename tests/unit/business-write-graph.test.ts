@@ -336,6 +336,124 @@ test('direct writes dispatch after independent review and replace the unexecuted
   assert.match(payload(fake.requests, 'verifier').answer, /Not yet saved/);
 });
 
+test('a reviewed clarification never finalizes an earlier staged business or personal proposal', async () => {
+  for (const executionMode of ['direct_request', 'confirmation'] as const) {
+    const writes = writeRun({ executionMode });
+    await writes.run.execute(
+      writeDefinition.name,
+      JSON.stringify(exact),
+      AbortSignal.timeout(5000),
+    );
+    const reads = readRun();
+    let personalFinalized = 0;
+    const personal = {
+      employeeId: 7,
+      tools: [],
+      remaining: 0,
+      blocked: false,
+      context: '',
+      evidence: [],
+      failures: [],
+      pendingOperations: [],
+      usedPrivateData: false,
+      usedPrivateReads: false,
+      hasTool: () => false,
+      preview: () => 'A staged personal action.',
+      saveContext: async () => {},
+      finish: async () => {
+        personalFinalized++;
+      },
+    } as unknown as PersonalToolRun;
+    const fake = model([]);
+    const original = fake.fake.complete;
+    fake.fake.complete = async (request, signal) => {
+      if (request.stage === 'planner')
+        return output(
+          JSON.stringify({
+            objective: 'Resolve the target before creating a record.',
+            successCriteria: ['Identify the intended record.'],
+            steps: [],
+            clarification: {
+              question: 'Should this be for Acme or Beta?',
+              missingDecision: 'Two possible targets.',
+            },
+          }),
+        );
+      return original(request, signal);
+    };
+    const result = await buildSalesGraph(
+      fake.fake,
+      async () => ({ status: 'available', run: reads.run }),
+      {
+        writes: writes.run,
+        personal,
+      },
+    ).invoke(input);
+    assert.equal(result.reply, 'Should this be for Acme or Beta?');
+    assert.equal(result.approved, true);
+    assert.equal(writes.finalized(), 0);
+    assert.equal(personalFinalized, 0);
+    assert.equal(fake.sessions.length, 0);
+    assert.deepEqual(reads.readCalls, []);
+    assert.equal(result.write, undefined);
+  }
+});
+
+test('replanning after a rejected write delivers the new question and leaves the proposal uncommitted', async () => {
+  const writes = writeRun({ executionMode: 'direct_request' });
+  const reads = readRun();
+  const fake = model([{ name: writeDefinition.name, args: exact }]);
+  const complete = fake.fake.complete;
+  let plans = 0,
+    reviews = 0;
+  fake.fake.complete = async (request, signal) => {
+    if (request.stage === 'planner' && plans++ > 0)
+      return output(
+        JSON.stringify({
+          objective: 'Resolve the ambiguous target.',
+          successCriteria: ['Identify the intended company.'],
+          steps: [],
+          clarification: {
+            question: 'Should this be for Acme or Beta?',
+            missingDecision: 'Two possible companies.',
+          },
+        }),
+      );
+    if (request.stage === 'verifier' && reviews++ === 0)
+      return output(
+        JSON.stringify({
+          supported: false,
+          repair: 'tools',
+          reason: 'other',
+          feedback: 'The target is ambiguous. Resolve which company before staging.',
+        }),
+      );
+    if (request.stage === 'verifier') {
+      const review = JSON.parse(request.messages[0]!.content);
+      assert.equal(review.awaiting_clarification, true);
+      assert.equal(review.business_write_result, undefined);
+      assert.equal(review.personal_result, undefined);
+    }
+    return complete(request, signal);
+  };
+  const start = fake.fake.startToolSession!;
+  fake.fake.startToolSession = (request) => ({ ...start(request), revise: undefined });
+  const result = await buildSalesGraph(
+    fake.fake,
+    async () => ({ status: 'available', run: reads.run }),
+    {
+      writes: writes.run,
+    },
+  ).invoke(input);
+  assert.equal(plans, 2);
+  assert.equal(reviews, 2);
+  assert.equal(writes.invocations.length, 1);
+  assert.equal(writes.finalized(), 0);
+  assert.equal(result.reply, 'Should this be for Acme or Beta?');
+  assert.equal(result.approved, true);
+  assert.equal(result.write, undefined);
+});
+
 test('a separate read answer accompanying a direct write retains its full freshness checks', async () => {
   const writes = writeRun({ executionMode: 'direct_request' });
   const reads = readRun();

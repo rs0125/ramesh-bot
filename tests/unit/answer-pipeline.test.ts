@@ -120,6 +120,29 @@ test('explicit CRM record rendering cannot attach dates to a warehouse caveat na
   assert.equal(observed.requests.filter((r) => r.stage === 'formatter').length, 0);
 });
 
+test('a repeated company field cannot bind separate note and warehouse dates to the CRM card', async () => {
+  const observed = await run({
+    draft: JSON.stringify({
+      answer_blocks: [
+        card('• Company: Fixture Acme Storage. POC requires verification.\n• Stage: RFQ received.'),
+        { kind: 'text', text: '*2. Recent notes*\nThe notes lookup was unavailable.' },
+        {
+          kind: 'text',
+          text: '*3. Separate warehouse: ID 101*\n• Created: 10 Aug 2025, 6:53 pm IST.',
+        },
+      ],
+    }),
+    review: (payload) => {
+      assert.deepEqual(payload.factual_issues, []);
+      assert.match(payload.answer, /Created: 1 Sept 2026/);
+      assert.match(payload.answer, /Created: 10 Aug 2025/);
+      return approved;
+    },
+  });
+  assert.equal(observed.reply.approved, true);
+  assert.equal(observed.requests.filter((request) => request.stage === 'verifier').length, 1);
+});
+
 test('literal CRM names survive style rules while generated stock phrasing still needs repair', async () => {
   for (const stockBody of [false, true]) {
     const observed = await run({

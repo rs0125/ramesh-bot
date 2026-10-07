@@ -346,7 +346,12 @@ test('LangGraph supports dependent tools and all-date follow-ups, then formatter
   assert.deepEqual(review.task_plan.successCriteria, ['Give a supported useful answer.']);
   assert.equal(review.application_context.organization, 'WareOnGo');
   assert.equal(review.application_context.sender_is_verified_employee, true);
-  assert.ok(fake.sessions[0]!.instructions.includes(JSON.stringify(review.task_plan)));
+  assert.ok(!fake.sessions[0]!.instructions.includes(JSON.stringify(review.task_plan)));
+  assert.deepEqual(JSON.parse(fake.sessions[0]!.messages.at(-2)!.content), {
+    provisional_task_plan: review.task_plan,
+  });
+  assert.equal(fake.sessions[0]!.messages.at(-2)!.role, 'assistant');
+  assert.equal(fake.sessions[0]!.messages.at(-1)!.content, 'show all follow ups');
   assert.equal(fixture.state.calls[0]?.args.follow_up_status, undefined);
   assert.equal(fake.outputs.length, 2);
   assert.equal(

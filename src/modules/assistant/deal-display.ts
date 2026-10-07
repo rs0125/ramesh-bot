@@ -112,12 +112,38 @@ function recordBlocks(reply: string, evidence: readonly ToolEvidence[]) {
     );
     if ((isList && startsWithRecord) || isHeading) entries.push({ index, row });
   }
+  const metadataLine = (line: string) =>
+    /^(?:[-•]\s+|\d+[.)]\s+)?(?:Created|Last updated)\s*[:·]/i.test(
+      line.replace(/[*_]/g, '').trim(),
+    );
+  const sectionHeading = (line: string) =>
+    !metadataLine(line) &&
+    (/^\s*(?:#{1,6}\s+|\d+[.)]\s+)/.test(line) ||
+      /^\s*(?:\*{1,2}[^*]+\*{1,2}|_{1,2}[^_]+_{1,2})\s*$/.test(line));
   return {
     lines,
-    entries: entries.map((entry, index) => ({
-      ...entry,
-      body: lines.slice(entry.index, entries[index + 1]?.index ?? lines.length).join('\n'),
-    })),
+    entries: entries.map((entry, index) => {
+      let end = entries[index + 1]?.index ?? lines.length;
+      // Legacy prose does not carry record IDs or block boundaries. Never bind a
+      // date from another section/paragraph to the last mentioned CRM company.
+      // Blank space immediately before explicit date metadata still belongs to
+      // this record; ambiguous distant dates remain for evidence-based review.
+      for (let cursor = entry.index + 1; cursor < end; cursor++) {
+        const line = lines[cursor]!;
+        if (sectionHeading(line)) {
+          end = cursor;
+          break;
+        }
+        if (!line.trim()) {
+          const next = lines.slice(cursor + 1, end).find((value) => value.trim());
+          if (!next || !metadataLine(next)) {
+            end = cursor;
+            break;
+          }
+        }
+      }
+      return { ...entry, body: lines.slice(entry.index, end).join('\n') };
+    }),
   };
 }
 function displayedDate(body: string, field: string) {

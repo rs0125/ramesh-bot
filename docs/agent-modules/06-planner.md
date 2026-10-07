@@ -4,11 +4,11 @@ Status: **Separate planner model node implemented locally.** Ordinary chat bypas
 
 ## Current planning implementation
 
-The graph has distinct converser, planner, worker, executor, formatter and verifier nodes. The planner returns a validated `TaskPlan` containing the objective, observable success criteria and at most eight dependency-ordered steps. The current implementation is specified in [module 29](29-planner-worker-verifier.md); the richer durable contract below remains a future target.
+The graph has distinct converser, planner, worker, executor, formatter and verifier nodes. The planner returns a structurally checked `TaskPlan` containing the objective, observable success criteria and at most eight dependency-ordered steps, or a material clarification with zero steps. Validation does not verify its interpretation of the user. The current implementation is specified in [module 29](29-planner-worker-verifier.md); the richer durable contract below remains a future target.
 
 The current planning role receives:
 
-- The latest objective, relevant audience-safe conversation history and trusted request clock.
+- The original latest user request, relevant audience-safe conversation history and trusted request clock. The router's paraphrased objective is not passed downstream.
 - All permitted live function definitions, including schemas and descriptions, plus bounded Context Engine instructions for source semantics.
 - An application-owned `planning_context` derived from the actual employee catalogue and audience: available source families, tool names, remaining source-proposal budget and whether protected selection recall exists. The source map never grants a missing capability.
 - The editable [planning reference](../../src/prompts/planning-reference.md), which explains source responsibilities, retrieval dependencies, completion criteria and valid recovery paths.
@@ -17,6 +17,10 @@ The current planning role receives:
 Company context is retrieved when the objective needs it: employee/source context, relevant knowledge pages, then scoped records and dependent reads. Do not load a stale CRM/wiki dump into the planning prompt or require company research for ordinary personal help. Current capabilities are reads; a plan cannot manufacture a scheduler, sender, HRMS endpoint or write tool.
 
 The implemented planner receives full live schemas. Code rejects unadvertised tools, duplicate step IDs and forward/cyclic dependencies. It cannot choose the employee identity.
+
+`clarification: { question, missingDecision }` with `steps: []` is an exclusive outcome. The graph reviews the question without starting a worker, and never finalizes business or personal proposals while awaiting it. Ordinary plans set `clarification: null` and retain one or more steps. A bounded read that can resolve the choice should still run; clear instructions and missing optional enrichment do not require a question. A rejected unnecessary question can return to planning within the same repair allowance.
+
+The provider's strict output schema requires the `clarification` property even when its value is null. Local parsing defaults omitted legacy values to null; making the schema property optional causes the native input-token preflight to reject every planner request before generation. A regression checks the emitted JSON schema, not just successful local parsing.
 
 ## Responsibility
 
