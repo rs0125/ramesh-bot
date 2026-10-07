@@ -345,6 +345,86 @@ test(
         },
       );
       await t.test(
+        'bare RFQ retry resumes the same definite unsent operation, with fresh source fencing',
+        async () => {
+          const f = fixture();
+          const c = await command(f, 'Create a separate RFQ for the supplied requirement');
+          const op = await f.repo.propose(c.ctx, {
+            ...payload(),
+            executionMode: 'direct_request',
+            sourceFamily: 'crm',
+            toolMeta: {
+              'wareongo/context-write-v1': {
+                requiredScopes: ['crm:write'],
+                sourceFamily: 'crm',
+                effect: 'create',
+                idempotencyArgument: 'operation_id',
+                executionMode: 'direct_request',
+              },
+            },
+          });
+          const approved = await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+          const first = (await f.repo.claim(c.ctx, op.operationId, approved.version))!;
+          await f.repo.finish(c.ctx, op.operationId, first.dispatchToken, {
+            operation_id: op.operationId,
+            outcome: 'not_dispatched',
+            code: 'CRM_RFQ_INCOMPLETE',
+            message: 'Synthetic validation rejection',
+          });
+          await deliver(f, c.job);
+          const retry = await command(f, 'retry');
+          const found = (await f.repo.findDirectRecovery(retry.ctx))!;
+          assert.equal(found.operationId, op.operationId);
+          assert.equal(found.hasUncertainAttempt, false);
+          assert.deepEqual(found.payload.arguments, op.payload.arguments);
+          const resumed = (await f.repo.claim(retry.ctx, found.operationId, found.version))!;
+          await f.repo.finish(retry.ctx, op.operationId, resumed.dispatchToken, {
+            operation_id: op.operationId,
+            outcome: 'created',
+            code: 'CREATED',
+            message: 'Synthetic saved RFQ',
+          });
+          assert.equal((await f.repo.findByRun(retry.ctx))!.state, 'SUCCEEDED');
+          assert.equal(
+            (
+              await db.admin.query(
+                'SELECT count(*)::int AS n FROM public."ramesh-write-operations" WHERE account_id=$1',
+                [f.account],
+              )
+            ).rows[0].n,
+            1,
+          );
+        },
+      );
+      await t.test(
+        'a retry after an unrelated request cannot resume an older approved write',
+        async () => {
+          const f = fixture();
+          const c = await command(f, 'Create a requested record');
+          const op = await f.repo.propose(c.ctx, {
+            ...payload(),
+            executionMode: 'direct_request',
+            sourceFamily: 'crm',
+            toolMeta: {
+              'wareongo/context-write-v1': {
+                requiredScopes: ['crm:write'],
+                sourceFamily: 'crm',
+                effect: 'create',
+                idempotencyArgument: 'operation_id',
+                executionMode: 'direct_request',
+              },
+            },
+          });
+          await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+          await deliver(f, c.job);
+          const unrelated = await command(f, 'Find warehouse options for a different client');
+          await deliver(f, unrelated.job);
+          const retry = await command(f, 'Retry');
+          assert.equal(await f.repo.findDirectRecovery(retry.ctx), null);
+          assert.equal((await f.repo.receiptLookup(actor, op.operationId))!.dispatchAttempts, 0);
+        },
+      );
+      await t.test(
         'expired direct requests remain definite while expired uncertain mail cannot redispatch',
         async () => {
           for (const uncertain of [false, true]) {
@@ -449,10 +529,7 @@ test(
           assert.equal((await f.repo.receiptLookup(actor, unknown.operationId))!.state, 'UNKNOWN');
           const other = fixture(),
             loose = await command(other, 'try again');
-          await assert.rejects(
-            other.repo.findDirectRecovery(loose.ctx),
-            hasCode('WRITE_DIRECT_RECOVERY_REQUIRED'),
-          );
+          assert.equal(await other.repo.findDirectRecovery(loose.ctx), null);
           const forwarded = fixture(),
             forward = await command(forwarded, 'try that draft again', { forwarded: true });
           await assert.rejects(

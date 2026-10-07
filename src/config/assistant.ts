@@ -8,6 +8,8 @@ export interface AssistantConfig {
   /** Optional server-only credential for public web search and page reading. */
   tavilyApiKey?: string;
   model: string;
+  /** Split uses Luna for routing, wording and extraction; reasoning/review keep model. */
+  modelRouting?: 'single' | 'split';
   timeoutMs: number;
   maxOutputTokens: number;
   toolReasoningEffort?: 'low' | 'medium' | 'high';
@@ -20,6 +22,19 @@ export interface AssistantConfig {
 }
 
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
+export function modelForStage(
+  config: Pick<AssistantConfig, 'model' | 'modelRouting'>,
+  stage: string,
+) {
+  return config.modelRouting === 'split' &&
+    ['converser', 'formatter', 'media-extractor'].includes(stage)
+    ? 'gpt-6-luna'
+    : config.model;
+}
+
+export function assistantModels(config: Pick<AssistantConfig, 'model' | 'modelRouting'>) {
+  return [...new Set([config.model, modelForStage(config, 'converser')])];
+}
 /** GPT-6.1 Sol requires at least low, including simple formatting. */
 export function effectiveReasoningEffort(model: string, requested: ReasoningEffort) {
   return /^gpt-6\.1-sol(?:-|$)/.test(model) && requested === 'none' ? 'low' : requested;
@@ -32,6 +47,8 @@ export function loadAssistantConfig(
   if (!apiKey) return undefined;
   const model = env.OPENAI_MODEL?.trim() || 'gpt-5.6-terra';
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(model)) throw new Error('Invalid OPENAI_MODEL');
+  const modelRouting = env.AGENT_MODEL_ROUTING?.trim() || 'split';
+  if (!['single', 'split'].includes(modelRouting)) throw new Error('Invalid AGENT_MODEL_ROUTING');
   const transcriptionModel = env.OPENAI_TRANSCRIBE_MODEL?.trim() || 'gpt-4o-transcribe';
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(transcriptionModel))
     throw new Error('Invalid OPENAI_TRANSCRIBE_MODEL');
@@ -68,6 +85,7 @@ export function loadAssistantConfig(
     transcriptionModel,
     tavilyApiKey,
     model,
+    modelRouting: modelRouting as 'single' | 'split',
     context,
     toolLoadingMode: toolLoadingMode as 'eager' | 'deferred',
     usagePolicy: loadUsagePolicy(env),

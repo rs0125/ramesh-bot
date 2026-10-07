@@ -140,3 +140,23 @@ test('caller cancellation remains cancellation rather than a partial answer', as
     /Caller cancelled/,
   );
 });
+
+test('queue age bounds generation and leaves the transport its delivery reserve', async () => {
+  const model = modelForDeadline();
+  model.complete = async (request, signal) =>
+    request.stage === 'converser'
+      ? result('{"route":"direct","objective":"Reply","reply":"Hi"}')
+      : waitForAbort(signal!);
+  const start = Date.now();
+  const reply = await new AssistantService(
+    { model: 'fixture', timeoutMs: 240000 },
+    model,
+    undefined,
+    undefined,
+    undefined,
+    createSalesFixture().service,
+  ).prepare(message, undefined, { ...trusted, replyDeadlineAtMs: start + 300 });
+  assert.equal(reply.trace.failureCode, 'DEADLINE_EXCEEDED');
+  assert.ok(Date.now() - start < 2000, 'does not start a new four-minute budget after queueing');
+  assert.equal(reply.businessEvidence, undefined);
+});

@@ -1,11 +1,12 @@
 /** Local fallback: bounded incoming context and replies accepted by the transport. */
 import type { ChatMessage } from './assistant.types.js';
+import { historyRequest } from './business-history.js';
 export const MAX_HISTORY_MESSAGES = 32;
 export const MAX_HISTORY_CHARACTERS = 48000;
 
-/** Preserve turn completion without caching private source facts or granting ongoing access. */
+/** Keep a neutral marker until protected history passes current owner authorization. */
 export const PRIVATE_HISTORY_REPLY =
-  '[A business reply was delivered for this request. Private content is omitted from history. Only reread relevant records if the current request needs them.]';
+  '[A protected reply was delivered for this request. Its historical text and tool activity require current owner authorization.]';
 
 export class ConversationMemory {
   private readonly entries = new Map<string, { messages: ChatMessage[]; expiresAt: number }>();
@@ -33,7 +34,11 @@ export class ConversationMemory {
   ) {
     this.append(key, [
       { role: 'user' as const, content: input },
-      { role: 'assistant' as const, content: reply, ...(protectedReply ? { protectedReply } : {}) },
+      {
+        role: 'assistant' as const,
+        content: reply,
+        ...(protectedReply ? { protectedReply, businessRequest: historyRequest(input) } : {}),
+      },
     ]);
   }
 

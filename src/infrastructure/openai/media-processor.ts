@@ -1,6 +1,6 @@
 /** Inline private uploads; no public URLs or persistent provider Files objects. */
 import OpenAI, { toFile } from 'openai';
-import type { AssistantConfig } from '../../config/assistant.js';
+import { modelForStage, type AssistantConfig } from '../../config/assistant.js';
 import { withUsageStage } from '../../modules/usage/usage-scope.js';
 import { loadPrompt } from '../../modules/assistant/prompt-files.js';
 import {
@@ -65,7 +65,7 @@ export class OpenAIMediaProcessor implements MediaProcessor {
     const result = await withUsageStage('media-extractor', () =>
       this.client.responses.create(
         {
-          model: this.config.model,
+          model: modelForStage(this.config, 'media-extractor'),
           service_tier: 'default',
           store: false,
           reasoning: { effort: 'low' },

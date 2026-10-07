@@ -622,14 +622,42 @@ export class WriteRepository implements WriteRepositoryPort {
         [this.accountId, ctx.employeeId, ctx.phoneE164, ctx.chatId],
       )
     ).rows;
+    if (!rows.length) return null;
+    if (/^(?:please )?(?:retry|try again)[.!]?$/i.test(source.text.trim())) {
+      const previous = (
+        await db.query(
+          `SELECT coalesce(q.batch_parent,m.id) AS run_id FROM public."ramesh-messages" m
+         JOIN public."ramesh-messages" current ON current.id=$3 AND current.account_id=m.account_id
+         LEFT JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
+         WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp'
+           AND (m.created_at,m.id)<(current.created_at,current.id)
+         ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
+          [this.accountId, ctx.chatId, ctx.runId],
+        )
+      ).rows[0];
+      const related =
+        previous &&
+        (rows.some(
+          (row) =>
+            previous.run_id === row.proposal_run_id || previous.run_id === row.approval_run_id,
+        ) ||
+          (
+            await db.query(
+              `SELECT 1 FROM public."ramesh-write-events" WHERE account_id=$1 AND operation_id=ANY($2::uuid[]) AND run_id=$3 LIMIT 1`,
+              [this.accountId, rows.map((row) => row.id), previous.run_id],
+            )
+          ).rowCount);
+      if (!related) return null;
+    }
     if (rows.length > 1) throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
-    const row = rows[0];
-    if (!row) return null;
+    const row = rows[0]!;
     const payload = this.operation(row).payload;
     return row.approval_run_id &&
       row.approval_source_message_id &&
       payload.executionMode === 'direct_request' &&
-      payload.sourceFamily === 'mail'
+      (!/\bdraft\b/i.test(source.text) || payload.sourceFamily === 'mail') &&
+      (!/\brfq\b/i.test(source.text) ||
+        (payload.sourceFamily === 'crm' && /_crm_rfq$/.test(payload.toolName)))
       ? row
       : null;
   }

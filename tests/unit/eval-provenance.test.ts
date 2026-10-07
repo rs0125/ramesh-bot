@@ -15,18 +15,25 @@ test('changes to nested warehouse fixture contracts invalidate the evaluated sou
       'src/agent.ts',
       'evals/cases.ts',
       'scripts/lib/sales-fixture.ts',
+      'scripts/lib/transcript-fixture.ts',
       'scripts/lib/analytics-fixture.ts',
       'scripts/lib/shortlist-fixture-contract.ts',
       'scripts/lib/warehouse-fixture-contract.ts',
       'tests/fixtures/context-tool-catalogue.json',
+      'tests/fixtures/transcript-tool-catalogue.json',
       'tests/fixtures/context-guidance.md',
       'package-lock.json',
     ])
       await writeFile(join(directory, path), '{}');
     const root = pathToFileURL(`${directory}/`);
     const original = await captureEvalProvenance(root);
-    for (const file of ['shortlist-fixture-contract.ts', 'warehouse-fixture-contract.ts']) {
-      const path = join(directory, 'scripts/lib', file);
+    for (const file of [
+      'scripts/lib/shortlist-fixture-contract.ts',
+      'scripts/lib/warehouse-fixture-contract.ts',
+      'scripts/lib/transcript-fixture.ts',
+      'tests/fixtures/transcript-tool-catalogue.json',
+    ]) {
+      const path = join(directory, file);
       await writeFile(path, 'changed fixture semantics');
       const changed = await captureEvalProvenance(root);
       assert.notEqual(changed.inputHash, original.inputHash);

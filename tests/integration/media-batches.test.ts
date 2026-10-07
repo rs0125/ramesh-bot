@@ -65,12 +65,7 @@ test(
             processor,
           );
           assert.match(
-            await restored.context(
-              owner,
-              [],
-              'summarize the voice note',
-              AbortSignal.timeout(1000),
-            ),
+            await restored.context(owner, [], 'summarize the pdf', AbortSignal.timeout(1000)),
             /site visit/,
           );
           assert.equal(await restored.context(owner, [], 'hello', AbortSignal.timeout(1000)), '');
@@ -339,7 +334,7 @@ test(
             );
             assert.deepEqual(
               later.attachments.map((a: { text: string }) => a.text),
-              ['Voice note 1', 'Voice note 2', 'Voice note 3'],
+              ['Voice note 2'],
             );
             await media.stop();
           },

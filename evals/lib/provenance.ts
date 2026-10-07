@@ -20,10 +20,12 @@ export async function captureEvalProvenance(root: URL) {
     ...(await sources(root, 'src/')),
     ...(await sources(root, 'evals/')),
     'scripts/lib/sales-fixture.ts',
+    'scripts/lib/transcript-fixture.ts',
     'scripts/lib/analytics-fixture.ts',
     'scripts/lib/shortlist-fixture-contract.ts',
     'scripts/lib/warehouse-fixture-contract.ts',
     'tests/fixtures/context-tool-catalogue.json',
+    'tests/fixtures/transcript-tool-catalogue.json',
     'tests/fixtures/context-guidance.md',
     'package-lock.json',
   ].sort();

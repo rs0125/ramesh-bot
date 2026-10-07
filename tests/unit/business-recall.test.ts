@@ -1,3 +1,4 @@
+import { executeRecall } from '../fixtures/business-recall.js';
 import { planningResult } from '../fixtures/planning-model.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -113,6 +114,31 @@ test('compacted user requirements survive the complete planning, worker, formatt
   );
 });
 
+test('stable recall handles do not rebind when an older task is evicted', async () => {
+  const { fixture, history, run } = await warehouseHistory();
+  const older = structuredClone(history[1]!);
+  older.protectedReply!.text = 'Client A: 1. ID 105';
+  const later = structuredClone(history[1]!);
+  later.protectedReply!.text = 'Client B: 1. ID 103';
+  const both = businessRecall([older, later], run);
+  const oldId = both.targets[0]!.turn_id,
+    laterId = both.targets[1]!.turn_id;
+  const remaining = businessRecall([later], run);
+  assert.deepEqual(remaining.targets, [{ turn_id: laterId }]);
+  const calls = fixture.state.calls.length;
+  assert.equal(
+    (await remaining.execute(JSON.stringify({ turn_id: oldId }), signal())).code,
+    'CONTEXT_UNAVAILABLE',
+  );
+  assert.equal((await remaining.execute('{"turn":1}', signal())).code, 'INVALID_ARGUMENTS');
+  assert.equal((await remaining.execute('{}', signal())).code, 'INVALID_ARGUMENTS');
+  assert.equal(
+    fixture.state.calls.length,
+    calls,
+    'missing historical task must never refresh the surviving client',
+  );
+});
+
 test('remembered selections survive prose expiry but always require fresh permissions and reads', async () => {
   const { fixture, run } = await warehouseHistory();
   const now = Date.now();
@@ -130,7 +156,7 @@ test('remembered selections survive prose expiry but always require fresh permis
   const recall = businessRecall(history, run, now);
   assert.ok(recall.available);
   assert.ok(!JSON.stringify(recall.messages).includes('105'));
-  const result = await recall.execute('{}', signal());
+  const result = await executeRecall(recall, '{}', signal());
   assert.equal(result.selection_source, 'remembered_selection');
   assert.equal(result.previous_reply, undefined);
   assert.equal((result.displayed_selection as any[])[0].position, 2);
@@ -213,17 +239,18 @@ test('compaction and restart retain grouped selections for scoped, freshly autho
   memory.advance(2);
   const restarted = await memory.create().prepare(...memory.turn(42, 'Compare the second option'));
   assert.ok(restarted);
-  assert.ok(restarted.history.every((entry) => !entry.protectedReply));
-  const references = restarted.history.find(
-    (entry) => entry.businessReferences,
-  )?.businessReferences;
-  assert.deepEqual(references?.records, receipt.displayedRecords);
+  const restored = restarted.history.find((entry) => entry.protectedReply)?.protectedReply;
+  assert.ok(restored);
+  assert.deepEqual((restored.receipt as any).displayedRecords, receipt.displayedRecords);
   const recall = businessRecall(restarted.history, run, memory.now());
-  assert.doesNotMatch(JSON.stringify(recall.messages), /00000000-0000-4000|OLD PRIVATE/);
-  assert.equal((await recall.execute('{"positions":[2]}', signal())).code, 'AMBIGUOUS_SELECTION');
+  assert.match(JSON.stringify(recall.messages), /OLD PRIVATE/);
+  assert.equal(
+    (await executeRecall(recall, '{"positions":[2]}', signal())).code,
+    'AMBIGUOUS_SELECTION',
+  );
   assert.equal(fixture.state.calls.length, 0);
-  const output = await recall.execute('{"group":"group-2","positions":[2]}', signal());
-  assert.equal(output.selection_source, 'remembered_selection');
+  const output = await executeRecall(recall, '{"group":"group-2","positions":[2]}', signal());
+  assert.equal(output.selection_source, 'receipt');
   assert.equal(output.selection_status, 'complete');
   assert.equal(output.previous_reply, undefined);
   assert.deepEqual(
@@ -247,7 +274,7 @@ test('ranked displayed IDs refresh directly despite changed search ordering and 
   fixture.state.mutate = (result, tool, args) => {
     if (tool === 'read_warehouse') result.data.area_sqft = 50000 + Number(args.id);
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.selection_status, 'complete');
   assert.equal(output.previous_reply_verified, false);
   assert.equal(output.previous_reply, undefined);
@@ -280,7 +307,7 @@ test('legacy explicit display labels avoid old pool replay and restore authorize
   fixture.state.mutate = (result, tool) => {
     if (tool === 'read_warehouse') result.data.source_updated_at = '2026-10-03T00:00:00Z';
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.selection_source, 'legacy_explicit_labels');
   assert.equal(output.selection_status, 'complete');
   assert.equal(output.selection_count, 3);
@@ -298,7 +325,7 @@ test('unavailable displayed warehouse is hidden without replacing or renumbering
     if (tool === 'read_warehouse' && args.id === 103)
       throw new ContextEngineError('TOOL_UNAVAILABLE');
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.selection_status, 'partial');
   assert.equal(output.retry_available, true);
   assert.deepEqual(
@@ -322,7 +349,7 @@ test('stored display positions survive omitted references rather than collapsing
     { kind: 'warehouse', id: 103, position: 2 },
     { kind: 'warehouse', id: 101, position: 4 },
   ];
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.selection_count, 4);
   assert.equal(output.selection_status, 'partial');
   assert.deepEqual(
@@ -345,10 +372,10 @@ test('partial exact selection permits one bounded retry and reuses successful fr
     }
   };
   const recall = businessRecall(history, run);
-  const first = await recall.execute('{}', signal());
+  const first = await executeRecall(recall, '{}', signal());
   assert.equal(first.selection_status, 'partial');
   assert.equal(first.retry_available, true);
-  const second = await recall.execute('{}', signal());
+  const second = await executeRecall(recall, '{}', signal());
   assert.equal(second.selection_status, 'complete');
   assert.equal(second.retry_available, false);
   assert.deepEqual(
@@ -359,7 +386,7 @@ test('partial exact selection permits one bounded retry and reuses successful fr
     fixture.state.calls.map(({ args }) => args.id),
     [105, 103, 101, 103],
   );
-  assert.equal((await recall.execute('{}', signal())).code, 'ALREADY_RECALLED');
+  assert.equal((await executeRecall(recall, '{}', signal())).code, 'ALREADY_RECALLED');
 });
 
 test('revoked identity cannot reveal displayed ID metadata or successful earlier reads', async () => {
@@ -367,18 +394,19 @@ test('revoked identity cannot reveal displayed ID metadata or successful earlier
   fixture.state.mutate = () => {
     fixture.state.active = false;
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.deepEqual(output, { ok: false, code: 'ACCESS_DENIED' });
 });
 
-test('recall restores selection/order only after fresh registered reads; metadata never enters messages', async () => {
+test('history retains the delivered answer before recall; current evidence still requires fresh reads', async () => {
   const { fixture, history, run } = await setup();
   const recall = businessRecall(history, run);
   assert.equal(recall.available, true);
-  assert.ok(!JSON.stringify(recall.messages).includes('Fixture Acme'));
+  assert.ok(JSON.stringify(recall.messages).includes('Fixture Acme'));
   assert.ok(!JSON.stringify(recall.messages).includes('protectedReply'));
-  assert.match(recall.messages[1]!.content, /business turn 1/);
-  const output = await recall.execute('{}', signal());
+  assert.ok(recall.messages[1]!.content.includes(recall.targets[0]!.turn_id));
+  assert.match(recall.messages[1]!.content, /original_request.*Show our current deals/);
+  const output = await executeRecall(recall, '{}', signal());
   assert.equal(output.previous_reply_verified, true);
   assert.equal(output.refresh_status, 'unchanged');
   assert.equal(output.refreshed_checks, 1);
@@ -394,7 +422,7 @@ test('changed results and revoked access cannot reveal the old answer', async ()
   fixture.state.mutate = (result, tool) => {
     if (tool === 'search_crm_leads') (result.data.items as any[])[0].name = 'New permitted label';
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.previous_reply_verified, false);
   assert.equal(output.refresh_status, 'changed');
   assert.deepEqual(output.source_record_checks, [
@@ -408,7 +436,7 @@ test('changed results and revoked access cannot reveal the old answer', async ()
     false,
   );
   fixture.state.active = false;
-  const denied = await businessRecall(history, run).execute('{}', signal());
+  const denied = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(denied.code, 'ACCESS_DENIED');
   assert.ok(!JSON.stringify(denied).includes('Fixture Acme'));
 });
@@ -421,7 +449,7 @@ test('legacy receipts refresh without inventing membership or order verification
     if (tool === 'search_crm_leads')
       (result.data.items as any[])[0].source_updated_at = '2026-10-01T08:30:00Z';
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.refresh_status, 'changed');
   assert.equal(output.previous_reply, undefined);
   assert.deepEqual(output.source_record_checks, [
@@ -434,7 +462,7 @@ test('reordered current results do not imply changed membership or permit histor
   fixture.state.mutate = (result, tool) => {
     if (tool === 'search_crm_leads') (result.data.items as any[]).reverse();
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.previous_reply, undefined);
   assert.deepEqual(output.source_record_checks, [
     { evidence_id: run.evidence[0]!.id, same_records: true, same_order: false },
@@ -452,7 +480,7 @@ test('changed recall exposes genuine continuation without leaking stale prose or
       Object.assign(result.data.query_context as object, { returned_count: 1, has_more: true });
     }
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.refresh_status, 'changed');
   assert.equal(output.previous_reply_verified, false);
   assert.ok(!JSON.stringify(output).includes(privateText));
@@ -469,7 +497,7 @@ test('changed recall exposes genuine continuation without leaking stale prose or
 test('exhausted changed recall exposes the complete smaller result without a fabricated continuation', async () => {
   const { fixture, history, run } = await setup();
   fixture.state.visibleLeadIds = ['00000000-0000-4000-8000-000000000102'];
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.refresh_status, 'changed');
   assert.deepEqual(output.continuations, []);
   assert.equal((output.source_record_checks as any[])[0].same_records, false);
@@ -484,7 +512,7 @@ test('partial recall retains successful current evidence and reports failed chec
   await original.execute('warehouse_summary', '{"city":"Bengaluru"}', signal());
   history[1]!.protectedReply!.receipt = original.delivery();
   fixture.state.failures.set('search_crm_leads', new ContextEngineError('TOOL_UNAVAILABLE'));
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.refresh_status, 'partial');
   assert.equal(output.refreshed_checks, 1);
   assert.equal(output.requested_checks, 2);
@@ -503,7 +531,7 @@ test('cross-employee, expired-window and legacy receipts never become recallable
   const changed = structuredClone(history);
   (changed[1]!.protectedReply!.receipt as any).employeeId++;
   assert.equal(businessRecall(changed, run).available, false);
-  assert.equal(businessRecall(history, run, Date.now() + 86401000).available, false);
+  assert.equal(businessRecall(history, run, Date.now() + 30 * 86400000 + 1000).available, false);
   changed[1]!.protectedReply!.receipt = { kind: 'legacy' };
   assert.equal(businessRecall(changed, run).available, false);
 });
@@ -514,16 +542,19 @@ test('recall reuses current evidence and does not let tool arguments choose an i
   await run.execute('search_crm_leads', '{"view":"accessible","limit":10}', signal());
   const before = fixture.state.calls.length;
   const recall = businessRecall(history, run);
-  assert.equal((await recall.execute('{"employeeId":1}', signal())).code, 'INVALID_ARGUMENTS');
-  assert.equal((await recall.execute('{}', signal())).previous_reply_verified, true);
+  assert.equal(
+    (await executeRecall(recall, '{"employeeId":1}', signal())).code,
+    'INVALID_ARGUMENTS',
+  );
+  assert.equal((await executeRecall(recall, '{}', signal())).previous_reply_verified, true);
   assert.equal(fixture.state.calls.length, before);
-  assert.equal((await recall.execute('{}', signal())).code, 'ALREADY_RECALLED');
+  assert.equal((await executeRecall(recall, '{}', signal())).code, 'ALREADY_RECALLED');
 });
 
 test('targeted recall refreshes only requested positions and preserves their original ordinals', async () => {
   const { fixture, history, run } = await warehouseHistory();
   const recall = businessRecall(history, run);
-  const output = await recall.execute('{"positions":[3,2]}', signal());
+  const output = await executeRecall(recall, '{"positions":[3,2]}', signal());
   assert.deepEqual(
     fixture.state.calls.map(({ args }) => args.id),
     [103, 101],
@@ -539,7 +570,7 @@ test('targeted recall refreshes only requested positions and preserves their ori
   assert.equal(output.selection_status, 'complete');
   assert.equal(output.selection_targeted, true);
   assert.equal(
-    (await recall.execute('{"warehouse_ids":[999]}', signal())).code,
+    (await executeRecall(recall, '{"warehouse_ids":[999]}', signal())).code,
     'SELECTION_NOT_FOUND',
   );
   assert.equal(fixture.state.calls.length, 2);
@@ -573,12 +604,15 @@ test('grouped recall requires an ordinal scope and refreshes its source-backed s
     },
   ];
   const recall = businessRecall(history, run);
-  const ambiguous = await recall.execute('{"positions":[2]}', signal());
+  const ambiguous = await executeRecall(recall, '{"positions":[2]}', signal());
   assert.equal(ambiguous.code, 'AMBIGUOUS_SELECTION');
-  assert.match(String(ambiguous.guidance), /only turn.*latest turn/);
-  assert.match(String(ambiguous.guidance), /Do not ask the user to resupply IDs/);
+  assert.match(String(ambiguous.guidance), /same turn_id/);
+  assert.match(
+    String(ambiguous.guidance),
+    /Do not substitute another turn, ask the user to resupply IDs/,
+  );
   assert.equal(fixture.state.calls.length, 0);
-  const output = await recall.execute('{"group":"group-2","positions":[2]}', signal());
+  const output = await executeRecall(recall, '{"group":"group-2","positions":[2]}', signal());
   assert.deepEqual(
     fixture.state.calls.map(({ tool, args }) => [tool, args.id]),
     [
@@ -608,7 +642,7 @@ test('failed subject authorization withholds its identity but preserves independ
     },
   ];
   fixture.state.failures.set('read_crm_lead', new ContextEngineError('TOOL_UNAVAILABLE'));
-  const output = await businessRecall(history, run).execute('{"positions":[1]}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{"positions":[1]}', signal());
   assert.equal((output.displayed_selection as any[])[0].id, 105);
   assert.equal((output.displayed_selection as any[])[0].group, 'group-1');
   assert.equal((output.displayed_selection as any[])[0].subject, undefined);
@@ -617,7 +651,7 @@ test('failed subject authorization withholds its identity but preserves independ
   fixture.state.failures.set('read_crm_lead', new ContextEngineError('ACCESS_DENIED'));
   const deniedRun = (await fixture.service.openTools(trusted, signal())).run!;
   assert.deepEqual(
-    await businessRecall(history, deniedRun).execute('{"positions":[1]}', signal()),
+    await executeRecall(businessRecall(history, deniedRun), '{"positions":[1]}', signal()),
     {
       ok: false,
       code: 'ACCESS_DENIED',
@@ -633,7 +667,7 @@ test('shared warehouses refresh once while preserving each displayed group posit
     { kind: 'warehouse', id: 103, position: 1, group: 'group-2' },
     { kind: 'warehouse', id: 101, position: 2, group: 'group-2' },
   ];
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.deepEqual(
     fixture.state.calls.map(({ args }) => args.id),
     [105, 103, 101],
@@ -660,7 +694,7 @@ test('large refreshed selections retain useful values for every record with expl
   fixture.state.mutate = (result, tool) => {
     if (tool === 'read_warehouse') result.data.large_unused_field = 'x'.repeat(30000);
   };
-  const output = await businessRecall(history, run).execute('{}', signal());
+  const output = await executeRecall(businessRecall(history, run), '{}', signal());
   assert.equal(output.selection_status, 'complete');
   assert.ok(Buffer.byteLength(JSON.stringify(output)) < 80000);
   const fresh = output.fresh_evidence as any[];
@@ -715,7 +749,7 @@ test('graph keeps protected metadata out of every model request and exposes reca
     async complete(request) {
       const planning = planningResult(request);
       if (planning) return planning;
-      assert.ok(!JSON.stringify(request).includes('Fixture Acme'));
+      assert.equal(JSON.stringify(request).includes('Fixture Acme'), fixture.state.active);
       assert.ok(!JSON.stringify(request).includes('protectedReply'));
       return {
         text: request.stage === 'verifier' ? '{"supported":true,"feedback":""}' : 'Hey!',
@@ -745,8 +779,9 @@ test('graph keeps protected metadata out of every model request and exposes reca
   await assistant.prepare(message, signal(), trusted);
   assert.equal(fixture.state.calls.length, before);
   assert.ok(sessions[0]?.tools.some((t) => t.name === RECALL_TOOL));
-  assert.ok(!JSON.stringify(sessions[0]?.messages).includes('Fixture Acme'));
+  assert.ok(JSON.stringify(sessions[0]?.messages).includes('Fixture Acme'));
   fixture.state.active = false;
   await assistant.prepare(message, signal(), trusted);
   assert.deepEqual(sessions[1]?.tools, []);
+  assert.ok(!JSON.stringify(sessions[1]?.messages).includes('Fixture Acme'));
 });

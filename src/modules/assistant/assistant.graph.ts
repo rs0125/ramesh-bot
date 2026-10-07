@@ -18,6 +18,8 @@ export const AssistantState = new StateSchema({
         durationMs: z.number(),
         inputTokens: z.number(),
         outputTokens: z.number(),
+        model: z.string().optional(),
+        responseCalls: z.number().optional(),
       }),
     )
     .default([]),
@@ -42,6 +44,8 @@ export function buildAssistantGraph(model: TextModel) {
           durationMs: Date.now() - started,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
+          model: result.model,
+          responseCalls: result.responseCalls,
         } satisfies StageMetric,
       ],
     };
@@ -69,6 +73,8 @@ export function buildAssistantGraph(model: TextModel) {
           durationMs: Date.now() - started,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
+          model: result.model,
+          responseCalls: result.responseCalls,
         } satisfies StageMetric,
       ],
     };

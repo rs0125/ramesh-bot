@@ -257,7 +257,8 @@ test('production cache requests replay row authorization and replace accepted ev
   state.scopes = [];
   assert.equal(await run.executeCached(name, {}, signal()), undefined);
   assert.equal(run.evidence.length, 0);
-  assert.equal(run.delivery(), undefined);
+  assert.equal(run.delivery()?.historicalOnly, true);
+  assert.deepEqual(run.delivery()?.checks, []);
   assert.equal(sourceCalls(state.calls).length, 2);
 });
 

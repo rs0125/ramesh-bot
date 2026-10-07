@@ -6,7 +6,7 @@ import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { config as loadEnvironment } from 'dotenv';
-import { loadAssistantConfig } from '../src/config/assistant.js';
+import { assistantModels, loadAssistantConfig } from '../src/config/assistant.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { AssistantService } from '../src/modules/assistant/assistant.service.js';
 import { SALES_PROMPT_VERSION } from '../src/modules/assistant/sales-prompts.js';
@@ -43,7 +43,7 @@ await mkdir(directory, { recursive: true, mode: 0o700 });
 const usageMeter = await createEvalUsageMeter(
   { ...values, campaignId: runId, directory },
   process.env,
-  [selectedModel],
+  assistantModels(loaded),
 );
 const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000, usageMeter };
 const model = new OpenAITextModel(config);

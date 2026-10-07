@@ -200,7 +200,7 @@ test('real LangGraph routes the preset, never passes source facts to a formatter
   reply.onSent?.();
   await agent.prepare({ ...candidate, messageId: 'next' }, signal(), trusted());
   assert.equal(calls[1]!.messages.length, 3);
-  assert.match(calls[1]!.messages[1]!.content, /Private content is omitted/);
+  assert.match(calls[1]!.messages[1]!.content, /current owner authorization/);
   assert.ok(!JSON.stringify(calls[1]!.messages).includes('Fixture Acme Storage'));
   const group = await agent.prepare({ ...candidate, chatId: '123@g.us', isGroup: true }, signal(), {
     ...trusted(),

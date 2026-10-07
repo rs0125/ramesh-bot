@@ -117,7 +117,7 @@ function setup() {
       };
     },
   };
-  const run = () =>
+  const run = (replyDeadlineMs?: number) =>
     withModelReplay(checkpoint, () =>
       buildSalesGraph(
         model,
@@ -129,6 +129,7 @@ function setup() {
         {
           now: () => checkpoint.metadata.requestTimeMs,
           researchDeadlineMs: checkpoint.metadata.deadlineAtMs,
+          replyDeadlineMs,
         },
       ).invoke(
         { input: 'Show one warehouse.', audience: 'dm', history: [] },
@@ -219,4 +220,23 @@ test('a stale positive checkpoint hint never extends the actual research deadlin
   assert.equal(input.tool_budget.research_remaining_ms_at_observation, 45_000);
   assert.deepEqual(input.evidence, []);
   assert.match(resumed.reply, /deadline/);
+});
+
+test('a late restart refreshes completed read selectors before finalizing under the original reply deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: START });
+  const fixture = setup();
+  await fixture.run();
+  t.mock.timers.setTime(START + 60001);
+  fixture.requests.length = 0;
+  const resumed = await fixture.run(START + 120000);
+  assert.equal(resumed.researchExhausted, true);
+  assert.equal(fixture.fixture.state.calls.length, 2);
+  const formatter = fixture.requests.find((request) => request.stage === 'formatter')!;
+  const input = JSON.parse(formatter.messages[0]!.content);
+  assert.equal(input.evidence.length, 1, 'freshly rebuilt evidence reaches final review');
+  assert.equal(
+    fixture.requests.some((request) => request.stage === 'planner'),
+    false,
+  );
+  assert.ok(resumed.business);
 });

@@ -519,6 +519,58 @@ test('durable source call and received-byte limits survive restart and reject ev
   assert.equal(fixture.state.calls.length, 1);
 });
 
+test('restart recovery journals read selectors and refreshes facts instead of caching old private results', async () => {
+  const checkpoint = new FixtureCheckpoint();
+  const fixture = createSalesFixture(() => Date.parse('2026-10-03T08:00:00Z'));
+  await withModelReplay(checkpoint, async () => {
+    const run = (await fixture.service.openTools(sourceTrusted, freshSignal())).run!;
+    assert.equal(
+      (await run.execute('search_crm_leads', JSON.stringify(sourceQuery), freshSignal())).ok,
+      true,
+    );
+  });
+  const policy = [...checkpoint.policies.values()].find((value: any) => value.reads) as any;
+  assert.deepEqual(policy.reads, [{ name: 'search_crm_leads', arguments: sourceQuery }]);
+  assert.equal(policy.reads[0].result, undefined);
+  await withModelReplay(checkpoint, async () => {
+    const run = (await fixture.service.openTools(sourceTrusted, freshSignal())).run!;
+    assert.equal(run.evidence.length, 0);
+    assert.deepEqual(await run.recoverReads(freshSignal()), [
+      { name: 'search_crm_leads', ok: true },
+    ]);
+    assert.equal(run.evidence.length, 1);
+  });
+  assert.equal(fixture.state.calls.length, 2);
+  assert.equal(checkpoint.consumed.tool, 2);
+});
+
+test('recovery cannot bypass an exhausted read budget or restore stale evidence after denial', async () => {
+  const checkpoint = new FixtureCheckpoint();
+  const fixture = createSalesFixture(() => Date.parse('2026-10-03T08:00:00Z'));
+  await withModelReplay(checkpoint, async () => {
+    const run = (await fixture.service.openTools(sourceTrusted, freshSignal())).run!;
+    await run.execute('search_crm_leads', JSON.stringify(sourceQuery), freshSignal());
+  });
+  checkpoint.limits.tool = checkpoint.consumed.tool;
+  await withModelReplay(checkpoint, async () => {
+    const run = (await fixture.service.openTools(sourceTrusted, freshSignal())).run!;
+    assert.deepEqual(await run.recoverReads(freshSignal()), [
+      { name: 'search_crm_leads', ok: false },
+    ]);
+    assert.equal(run.evidence.length, 0);
+  });
+  assert.equal(fixture.state.calls.length, 1);
+  checkpoint.limits.tool = 72;
+  await withModelReplay(checkpoint, async () => {
+    const run = (await fixture.service.openTools(sourceTrusted, freshSignal())).run!;
+    fixture.state.active = false;
+    await run.recoverReads(freshSignal());
+    assert.equal(run.blocked, true);
+    assert.equal(run.evidence.length, 0);
+  });
+  assert.equal(fixture.state.calls.length, 1);
+});
+
 test('web calls keep a durable four-call ceiling and deterministic evidence IDs across restart', async () => {
   const checkpoint = new FixtureCheckpoint();
   let calls = 0;

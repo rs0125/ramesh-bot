@@ -10,6 +10,7 @@ import { JOURNEY_CASES } from './journey-cases.js';
 import { ADVERSARIAL_CASES } from './adversarial-cases.js';
 import { PAGINATION_CASES } from './pagination-cases.js';
 import { RECOVERY_CASES } from './recovery-cases.js';
+import { LATENCY_CASES } from './latency-cases.js';
 import { CRITERIA } from './lib/judge.js';
 import { judgeTurns } from './lib/turn-judge.js';
 import { satisfiesToolCheck } from './lib/tool-contracts.js';
@@ -18,7 +19,12 @@ import { emptyUsage, addUsage } from './lib/usage.js';
 import { writeEvalReports } from './lib/report.js';
 import { captureEvalProvenance } from './lib/provenance.js';
 import { config as dotenv } from 'dotenv';
-import { loadAssistantConfig, effectiveReasoningEffort } from '../src/config/assistant.js';
+import {
+  assistantModels,
+  modelForStage,
+  loadAssistantConfig,
+  effectiveReasoningEffort,
+} from '../src/config/assistant.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { AssistantService } from '../src/modules/assistant/assistant.service.js';
 import { PRIVATE_HISTORY_REPLY } from '../src/modules/assistant/conversation-memory.js';
@@ -61,29 +67,32 @@ const concurrency = Number(values.concurrency);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
   throw new Error('Use concurrency 1–4');
 if (
-  !['all', 'conversation', 'journeys', 'adversarial', 'pagination', 'recovery'].includes(
+  !['all', 'conversation', 'journeys', 'adversarial', 'pagination', 'recovery', 'latency'].includes(
     values.suite!,
   )
 )
   throw new Error('Unknown suite');
 const poolCases =
-  values.suite === 'conversation'
-    ? CONVERSATION_CASES
-    : values.suite === 'journeys'
-      ? JOURNEY_CASES
-      : values.suite === 'adversarial'
-        ? ADVERSARIAL_CASES
-        : values.suite === 'pagination'
-          ? PAGINATION_CASES
-          : values.suite === 'recovery'
-            ? RECOVERY_CASES
-            : [
-                ...CONVERSATION_CASES,
-                ...JOURNEY_CASES,
-                ...ADVERSARIAL_CASES,
-                ...PAGINATION_CASES,
-                ...RECOVERY_CASES,
-              ];
+  values.suite === 'latency'
+    ? LATENCY_CASES
+    : values.suite === 'conversation'
+      ? CONVERSATION_CASES
+      : values.suite === 'journeys'
+        ? JOURNEY_CASES
+        : values.suite === 'adversarial'
+          ? ADVERSARIAL_CASES
+          : values.suite === 'pagination'
+            ? PAGINATION_CASES
+            : values.suite === 'recovery'
+              ? RECOVERY_CASES
+              : [
+                  ...CONVERSATION_CASES,
+                  ...JOURNEY_CASES,
+                  ...ADVERSARIAL_CASES,
+                  ...PAGINATION_CASES,
+                  ...RECOVERY_CASES,
+                  ...LATENCY_CASES,
+                ];
 const filters = values.case?.split(',').map((value) => value.trim());
 const cases = poolCases.filter(
   (c) => !filters || filters.includes(c.id) || filters.includes(c.category ?? ''),
@@ -115,7 +124,7 @@ await mkdir(directory, { recursive: true, mode: 0o700 });
 const usageMeter = await createEvalUsageMeter(
   { ...values, campaignId: runId, directory },
   process.env,
-  [selectedModel, values['judge-model']!],
+  [...assistantModels(loaded), values['judge-model']!],
 );
 const config = { ...loaded, timeoutMs: 240000, maxOutputTokens: 6000, usageMeter };
 const provider = new OpenAITextModel(config);
@@ -135,13 +144,15 @@ const metadata = {
   startedAt: new Date(startedAt).toISOString(),
   syntheticClock: '2026-10-02T09:00:00Z; +1 minute per user turn',
   model: config.model,
+  modelRouting: config.modelRouting,
+  models: assistantModels(config),
   toolLoadingMode: provider.toolLoadingMode,
   judgeModel: judgeLoaded.model,
   reasoningEfforts: {
     toolLoop: config.toolReasoningEffort ?? 'medium',
     verifier: 'medium',
     businessFormatter: 'low',
-    ordinaryFormatter: effectiveReasoningEffort(config.model, 'none'),
+    ordinaryFormatter: effectiveReasoningEffort(modelForStage(config, 'formatter'), 'none'),
     judge: 'medium',
   },
   promptVersion: SALES_PROMPT_VERSION,

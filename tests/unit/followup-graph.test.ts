@@ -11,6 +11,7 @@ import type {
   ModelRequest,
 } from '../../src/modules/assistant/assistant.types.js';
 import { planningResult } from '../fixtures/planning-model.js';
+import { recallTurnId } from '../fixtures/business-recall.js';
 import { ContextEngineError } from '../../src/modules/context-engine/context.types.js';
 
 const result = (text: string) => ({ text, inputTokens: 1, outputTokens: 1 });
@@ -92,7 +93,15 @@ for (const transient of [false, true])
               ...result('Use the current source labels.'),
               calls:
                 next++ < (transient ? 2 : 1)
-                  ? [{ id: `recall-${next}`, name: RECALL_TOOL, arguments: '{}' }]
+                  ? [
+                      {
+                        id: `recall-${next}`,
+                        name: RECALL_TOOL,
+                        arguments: JSON.stringify({
+                          turn_id: recallTurnId(history[0]!.protectedReply!),
+                        }),
+                      },
+                    ]
                   : [],
             };
           },
@@ -183,7 +192,11 @@ test('successive targeted recalls retain both groups from the same historical tu
                   {
                     id: `recall-${group}`,
                     name: RECALL_TOOL,
-                    arguments: JSON.stringify({ turn: 1, group, positions: [2] }),
+                    arguments: JSON.stringify({
+                      turn_id: recallTurnId(history[0]!.protectedReply!),
+                      group,
+                      positions: [2],
+                    }),
                   },
                 ]
               : [],
@@ -200,7 +213,7 @@ test('successive targeted recalls retain both groups from the same historical tu
       assert.equal(input.recalled.length, 2);
       assert.deepEqual(
         input.recalled.map((recall: any) => [
-          recall.turn,
+          recall.turn_id,
           recall.selection_status,
           ...recall.displayed_selection.map((record: any) => [
             record.id,
@@ -209,8 +222,8 @@ test('successive targeted recalls retain both groups from the same historical tu
           ]),
         ]),
         [
-          [1, 'complete', [103, 2, 'group-1']],
-          [1, 'complete', [101, 2, 'group-2']],
+          [recallTurnId(history[0]!.protectedReply!), 'complete', [103, 2, 'group-1']],
+          [recallTurnId(history[0]!.protectedReply!), 'complete', [101, 2, 'group-2']],
         ],
       );
       assert.ok(input.recalled.every((recall: any) => recall.previous_reply === undefined));
@@ -270,7 +283,13 @@ test('review exhaustion reports sanitized reasons without sending rejected claim
     onStage: (m) => metrics.push(m),
   }).invoke({ input: 'Explain this option.', history: [], audience: 'dm' }, { recursionLimit: 30 });
   assert.equal(reply.unavailable, true);
-  assert.equal(reply.business, undefined);
+  assert.equal(reply.business?.outcome, 'verified');
+  assert.equal(
+    reply.business?.outcome === 'verified' && reply.business.delivery.historicalOnly,
+    true,
+  );
+  assert.deepEqual(reply.business?.outcome === 'verified' && reply.business.delivery.checks, []);
+  assert.ok(!JSON.stringify(reply.business).includes('UNSUPPORTED_DRAFT'));
   assert.match(reply.reply, /retrieved information.*couldn't verify/i);
   assert.doesNotMatch(reply.reply, /UNSUPPORTED_DRAFT|PRIVATE_REVIEW_DETAIL|narrow/i);
   const reviews = (metrics as Array<{ review?: unknown }>).flatMap((m) =>

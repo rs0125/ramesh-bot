@@ -23,6 +23,7 @@ import {
 } from '../../modules/media/voice-reply.js';
 import { currentUsageScope, withUsageScope } from '../../modules/usage/usage-scope.js';
 import { cancellable } from '../../lib/cancellable.js';
+import { CheckpointError } from '../../modules/assistant/checkpoint.types.js';
 import type { EmployeeIdentity } from '../../modules/identity/employee-identity.js';
 import { reminderEvidenceMatches } from '../../modules/scheduling/scheduler.service.js';
 import {
@@ -48,6 +49,12 @@ export interface DurableMessageOptions {
   agentRuns?: boolean;
   media?: MediaService;
   accountId?: string;
+  onProcessingError?: (failure: {
+    runId: string;
+    direction: string;
+    phase: string;
+    code: string;
+  }) => void;
   usageMode?: 'off' | 'observe' | 'enforce';
   onUsageAttributionFailure?: (
     reason: 'USAGE_IDENTITY_UNAVAILABLE' | 'USAGE_RUN_ATTRIBUTION_UNAVAILABLE',
@@ -491,6 +498,7 @@ export class DurableMessages {
     report: (outcome: 'sent' | 'error') => void,
   ): Promise<void> {
     let sendInvoked = false;
+    let phase = 'admission';
     let stopTyping: (() => void) | undefined;
     try {
       if (signal.aborted) {
@@ -541,6 +549,7 @@ export class DurableMessages {
             !(await this.repository.beginAgentRun(job)))
         )
           throw new Error('Agent run could not be claimed');
+        phase = 'media';
         const originals = [{ id: job.id, message, candidate, receivedAt: job.receivedAt }];
         for (const member of job.members ?? []) {
           const wire = this.cipher.open('message', member.id, member.payload);
@@ -603,6 +612,7 @@ export class DurableMessages {
                 mediaIds,
                 candidate.text ?? '',
                 signal,
+                Math.max(1, (candidate.sentAtMs + this.options.maxAgeMs - 15000 - Date.now()) / 3),
               )
             : '') + (failures.length ? `\n${failures.join('\n')}` : '');
         const commandAudio =
@@ -666,11 +676,13 @@ export class DurableMessages {
           [...originals].reverse().find((item) => !item.candidate.forwarded) ?? originals.at(-1)!;
         let toolAcknowledged = false;
         const feedbackFinished = new AbortController();
+        phase = 'assistant';
         const prepared = this.options.prepareReply
           ? await this.options
               .prepareReply(candidate, signal, {
                 runId: job.id,
                 checkpointLease: { leaseToken: job.token },
+                replyDeadlineAtMs: candidate.sentAtMs + this.options.maxAgeMs - 15000,
                 commandMessages,
                 locationMessages,
                 mediaContext,
@@ -751,6 +763,7 @@ export class DurableMessages {
           ? this.cipher.seal('business-delivery', job.id, prepared.businessEvidence)
           : undefined;
         const personalCommandId = getPersonalDelivery(prepared.businessEvidence)?.commandId;
+        phase = 'handoff';
         if (
           await this.repository.handoff(
             job,
@@ -774,6 +787,7 @@ export class DurableMessages {
         report('error');
         return;
       }
+      phase = 'delivery';
       let reply: unknown;
       let voice: VoiceReplyReference | undefined;
       let reminderQuote: WAMessage | undefined;
@@ -955,9 +969,24 @@ export class DurableMessages {
       if (completed) this.sentCallbacks.get(job.id)?.run();
       this.sentCallbacks.delete(job.id);
       report(completed ? 'sent' : 'error');
-    } catch {
+    } catch (error) {
       // After the callback is invoked, a network/DB error cannot prove non-delivery.
       // If even this write fails, SENDING is recovered as UNCERTAIN when its lease expires.
+      try {
+        this.options.onProcessingError?.({
+          runId: job.id,
+          direction: job.direction,
+          phase,
+          code:
+            error instanceof CheckpointError
+              ? error.code
+              : signal.aborted
+                ? 'PROCESSING_ABORTED'
+                : 'PROCESSING_FAILED',
+        });
+      } catch {
+        /* Diagnostics cannot alter queue recovery. */
+      }
       try {
         if (sendInvoked) {
           this.sentCallbacks.delete(job.id);

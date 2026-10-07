@@ -8,6 +8,7 @@ import { InboxRepository } from '../../src/infrastructure/database/inbox.reposit
 import { MessageQueueRepository } from '../../src/infrastructure/database/message-queue.repository.js';
 import { authCipher } from '../../src/infrastructure/database/auth-store.js';
 import { contextScope, type ContextState } from '../../src/modules/assistant/chat-context.js';
+import { toolDelivery } from '../../src/modules/assistant/tool-evidence.js';
 
 test(
   'context SQL isolates accounts, enforces leases/CAS and orders inbox events without future replies',
@@ -65,6 +66,81 @@ test(
           { key: 'goal', text: 'Private fixture pin', source: message.messageId, at: Date.now() },
         ],
         selections: [],
+        businessReplies: [
+          {
+            source: start.start,
+            expiresAt: Date.now() + 30 * 86400000,
+            text: 'Private fixture RFQ: 30,000 sq ft, market rate.',
+            receipt: toolDelivery(23, [], Date.now(), {
+              historicalOnly: true,
+              activity: [
+                {
+                  tool: 'read_crm_lead',
+                  arguments: { id: '00000000-0000-4000-8000-000000000101' },
+                  at: new Date().toISOString(),
+                  status: 'failed',
+                  code: 'UNAVAILABLE',
+                },
+              ],
+            }),
+          },
+          {
+            source: start.start + '-personal',
+            expiresAt: Date.now() + 30 * 86400000,
+            text: 'Private fixture task was saved.',
+            receipt: {
+              kind: 'personal',
+              version: 1,
+              employeeId: 23,
+              phoneE164: '+20000000000',
+              runId: 'personal-history',
+              history: {
+                at: new Date().toISOString(),
+                activity: [
+                  {
+                    tool: 'personal_apply',
+                    at: new Date().toISOString(),
+                    status: 'committed',
+                    phase: 'commit',
+                    arguments: { text: 'Private fixture task' },
+                  },
+                ],
+              },
+            },
+          },
+          {
+            source: start.start + '-write',
+            expiresAt: Date.now() + 30 * 86400000,
+            text: 'Private fixture write is uncertain.',
+            receipt: {
+              kind: 'write_bundle',
+              version: 1,
+              write: {
+                kind: 'business_write',
+                version: 1,
+                employeeId: 23,
+                phoneE164: '+20000000000',
+                chatId: message.chatId,
+                runId: 'write-history',
+                tools: ['create_example'],
+                operations: [{ id: randomUUID(), version: 3 }],
+                expiresAt: new Date(Date.now() + 300000).toISOString(),
+                history: {
+                  at: new Date().toISOString(),
+                  activity: [
+                    {
+                      tool: 'create_example',
+                      at: new Date().toISOString(),
+                      status: 'uncertain',
+                      phase: 'commit',
+                      arguments: { name: 'Private fixture write' },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
         command: null,
       };
       await assert.rejects(store.save(scope, 0, state));
@@ -84,6 +160,10 @@ test(
       );
       const raw = (await db.admin.query('SELECT * FROM public."ramesh-conversation-context"')).rows;
       assert.ok(!JSON.stringify(raw).includes('Private fixture pin'));
+      assert.ok(!JSON.stringify(raw).includes('Private fixture RFQ'));
+      assert.ok(!JSON.stringify(raw).includes('read_crm_lead'));
+      assert.ok(!JSON.stringify(raw).includes('Private fixture task'));
+      assert.ok(!JSON.stringify(raw).includes('Private fixture write'));
       const reassigned = contextScope(account, message.chatId, {
         employeeId: 24,
         phoneE164: '+20000000000',

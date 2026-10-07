@@ -98,7 +98,9 @@ export function workingContext(
     .slice(-4);
   const selections = recalled.flatMap((item) => {
     const selection = item.working_selection ?? item.displayed_selection;
-    return selection ? [{ turn: item.turn, selection }] : [];
+    return selection
+      ? [{ turn_id: item.turn_id, original_request: item.original_request, selection }]
+      : [];
   });
   const result = {
     policy:

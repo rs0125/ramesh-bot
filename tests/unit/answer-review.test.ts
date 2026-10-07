@@ -151,6 +151,29 @@ test('ambiguous, overlapping, missing and entity-free spans do not get patched',
   }
 });
 
+test('rejected factual presentation patches retain diagnostics without applying their replacement', () => {
+  const diagnostic = 'Both CRM entries are missing their native Created and Last updated dates.';
+  const value = review([
+    {
+      severity: 'blocking',
+      kind: 'presentation',
+      message: diagnostic,
+      quote: 'Client A',
+      replacement: 'Client A\nCreated: 7 Oct 2026. Last updated: 8 Oct 2026.',
+      references: [],
+    },
+  ]);
+  value.feedback = 'Use the native dates already present in the evidence.';
+  const resolved = resolveAnswerReview(value, 'Client A', evidence, execution, true);
+  assert.equal(resolved.supported, false);
+  assert.equal(resolved.repair, 'tools');
+  assert.equal(resolved.patchedAnswer, undefined);
+  assert.ok(resolved.feedback.includes(diagnostic));
+  assert.ok(resolved.feedback.includes(value.feedback));
+  assert.match(resolved.feedback, /Unvalidated review diagnostics/);
+  assert.doesNotMatch(resolved.feedback, /Created: 7 Oct|Last updated: 8 Oct/);
+});
+
 test('repair cannot introduce an unsupported number or replace a selected identity', () => {
   for (const replacement of ['ID 101: Fire NOC available; 9 docks.', 'ID 202: Fire NOC available.'])
     assert.equal(

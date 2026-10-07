@@ -186,7 +186,12 @@ test(
           assert.equal(definition.version, 1);
           assert.deepEqual(definition.schedule, first.schedule);
           assert.ok(definition.next_due_at);
-          assert.deepEqual(await c.run.recover(AbortSignal.timeout(5000)), reply);
+          const recovered = (await c.run.recover(AbortSignal.timeout(5000)))!;
+          assert.deepEqual(
+            { ...recovered, delivery: { ...recovered.delivery, history: reply!.delivery.history } },
+            reply,
+          );
+          assert.equal(recovered.delivery.history!.activity.at(-1)!.phase, 'recovery');
           const listed = await f.repo.list(actor, 'reminder', c.ctx.runId, { state: 'all' });
           assert.ok(
             listed.records.find((record) => record.id === first.reminder)?.occurrenceAcknowledgedAt,
@@ -281,7 +286,12 @@ test(
             ),
             source,
           );
-          assert.deepEqual(await c.run.recover(AbortSignal.timeout(5000)), reply);
+          const recovered = (await c.run.recover(AbortSignal.timeout(5000)))!;
+          assert.deepEqual(
+            { ...recovered, delivery: { ...recovered.delivery, history: reply!.delivery.history } },
+            reply,
+          );
+          assert.equal(recovered.delivery.history!.activity.at(-1)!.phase, 'recovery');
           await end(f, c);
           for (const text of ['done', 'snooze 30m']) {
             const stale = await command(f, text, first.nativeKey);

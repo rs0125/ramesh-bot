@@ -2,6 +2,19 @@
 
 Status: implementation specification, 2 October 2026. Extends modules 04 and 22.
 
+Update, 7 October 2026: the original protected-prose design below is superseded by
+[the current conversation-context contract](04-conversation-context.md#summaries-and-references).
+Same-owner delivered answers and bounded read parameters/outcomes now remain visible
+as historical context, independently of source refresh. Fresh reads still establish
+current facts. The original 24-hour prose window and unchanged-fingerprint requirement
+no longer control whether the model can remember what it already showed the user.
+
+The numbered-turn selector described in the original design is also retired.
+`recall_business_context` requires a stable `turn_id` copied from the matching
+historical answer and its `original_request`. There is no numeric or implicit-latest
+fallback. Old result bodies compact before answers and attempt metadata are evicted.
+See [the follow-up fixes and manual prompt audit](55-latency-and-model-routing.md#follow-up-fixes-and-manual-prompt-audit-7-october-2026).
+
 ## Problem and expected behavior
 
 A CRM answer followed by “give me five appropriate warehouses for each, with pros and cons” must retain the preceding deal selection. A content-free completion marker prevents accidental private-data reuse but discards that selection. Repeating generic intake questions after returning the requirements is a regression. A deal list must identify deals by company/name and requirement, not internal UUID, and show native CRM creation and update dates.
@@ -10,7 +23,7 @@ A CRM answer followed by “give me five appropriate warehouses for each, with p
 
 Keep the ordinary history marker. Attach the encrypted stored reply and its validated delivery receipt to a server-only history field. Never serialize this field directly into an OpenAI request. It is limited to recent delivered/captured replies in the same account, employee, chat and audience; no unsent/suppressed or operator-visible private bodies.
 
-Offer a local `recall_business_context` read tool only when the current authenticated run has eligible history. Its argument is a numbered prior business turn (latest by default), not an employee, destination, arbitrary query or credential. Numbered markers let the model select the actual earlier answer even after intervening chat. Casual chat need not recall anything.
+Offer a local `recall_business_context` read tool only when the current authenticated run has eligible history. Its required argument is the matching stable `turn_id`, not an employee, destination, arbitrary query or credential. Match the original request and delivered answer before choosing a historical selection. Casual chat need not recall anything.
 
 The application checks the stored receipt's employee against the current binding and reruns its registered read queries through the existing scoped executor. Successful new results enter the current evidence ledger, delivery receipt and encrypted audit events. Reuse an identical query already executed in this run. Old receipt expiry does not authorize a replay: fresh reads do. Keep the last 32 conversation messages, with a 48,000-character text budget. Recallable business envelopes within that window are bounded to 24 hours and 96 KB combined; older replies remain completion markers if that private budget is exhausted. These envelopes are not extra model-visible history.
 
@@ -25,6 +38,13 @@ The user's `../claudeconvo.md` is the response-quality reference: retain the sel
 For references to an earlier list, recall it before searching new records or asking for IDs. Resolve “per warehouse ID” in the context of the preceding CRM deals; state the interpretation briefly and proceed with candidates per deal when clear. Search using recorded location and area, read narratives only if needed, and compare available properties. Missing budget or technical criteria limit confidence; they do not prevent a provisional shortlist. Supply concrete advantages and drawbacks/unknowns for each candidate. Never manufacture five matches or claim an ID-sorted search ranks the entire inventory. Label the reviewed pool and explain fewer matches or broadened geography.
 
 Deal cards contain a human-readable heading, requirement/location, useful stage/next follow-up, and `Created` / `Last updated` dates. Dates use `source_created_at` and `source_updated_at`, rendered in Asia/Kolkata; never substitute mirror polling or meaningful-activity clocks. A missing date is `Not recorded`. Last updated can include automation changes. Preserve uncertainty without repeating a long generic disclaimer for every field.
+
+Date insertion recognizes an exact unique company label or full requirement name,
+including quoted headings. Shared company names cannot bind dates to an arbitrary
+RFQ. Existing incorrect dates still fail validation; drafts and action lists do not
+become CRM cards. Reviewer additions of dates are factual changes, never pure
+presentation patches. If a patch cannot be safely bound, its diagnostic survives for
+independent revision from existing evidence; the unvalidated replacement is not applied.
 
 Formatter receives current evidence on its first pass. Prompts and verifier disallow raw deal UUIDs/API paths, require date labels when listing individual deals, and preserve warehouse IDs for actionable shortlists. A deterministic UUID guard triggers the bounded repair path, even if the model reviewer approves. Unknown deal names get a grounded requirement/location label, not their UUID.
 

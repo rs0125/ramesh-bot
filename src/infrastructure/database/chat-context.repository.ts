@@ -154,6 +154,7 @@ export class ChatContextRepository implements ContextStore {
         state.summary = { notes: [] };
         state.summaryAt = Date.now();
         state.selections = [];
+        state.businessReplies = [];
         state.command = null;
         await db.query(
           `UPDATE public."ramesh-conversation-context" SET revision=revision+1,payload_encrypted=$4,updated_at=clock_timestamp() WHERE account_id=$1 AND scope_key=$2 AND revision=$3 AND owner_binding=$5`,

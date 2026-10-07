@@ -67,6 +67,41 @@ export const contextDeliveryBundleSchema = z
             : value.other.employeeId),
   );
 
+/** Owner-unwrapped receipts only. Context envelopes must be checked by ChatContext first. */
+export const historicalDeliverySchema = z.union([
+  toolDeliverySchema,
+  personalDeliverySchema,
+  compositeDeliverySchema,
+  writeDeliveryBundleSchema,
+  followupsDeliverySchema,
+]);
+export type HistoricalDelivery = z.infer<typeof historicalDeliverySchema>;
+export function historicalDeliveryParts(value: HistoricalDelivery) {
+  const other = value.kind === 'write_bundle' ? value.other : value;
+  return {
+    write: value.kind === 'write_bundle' ? value.write : undefined,
+    personal:
+      other?.kind === 'composite' ? other.personal : other?.kind === 'personal' ? other : undefined,
+    business:
+      other?.kind === 'composite'
+        ? other.business
+        : other?.kind === 'context_tools' || other?.kind === 'assigned_followups_today'
+          ? other
+          : undefined,
+  };
+}
+export function historicalDeliveryOwner(value: HistoricalDelivery) {
+  const parts = historicalDeliveryParts(value);
+  return (parts.write ?? parts.personal ?? parts.business)!.employeeId;
+}
+export function historicalDeliveryAt(value: HistoricalDelivery): string | undefined {
+  const parts = historicalDeliveryParts(value);
+  return [parts.write?.history?.at, parts.personal?.history?.at, parts.business?.preparedAt]
+    .filter((at): at is string => !!at)
+    .sort((a, b) => Date.parse(a) - Date.parse(b))
+    .at(-1);
+}
+
 export function contextDeliveryBundle(context: ContextDelivery, other?: unknown) {
   return contextDeliveryBundleSchema.parse({
     kind: 'context_bundle',

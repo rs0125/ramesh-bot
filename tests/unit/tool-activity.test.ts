@@ -11,6 +11,7 @@ import { RECALL_TOOL } from '../../src/modules/assistant/business-recall.js';
 import { PRIVATE_HISTORY_REPLY } from '../../src/modules/assistant/conversation-memory.js';
 import type { ChatMessage, TextModel } from '../../src/modules/assistant/assistant.types.js';
 import { planningResult } from '../fixtures/planning-model.js';
+import { recallTurnId } from '../fixtures/business-recall.js';
 
 const output = (text: string) => ({ text, inputTokens: 0, outputTokens: 0 });
 const answer = 'The requested check is complete.';
@@ -92,7 +93,10 @@ for (const kind of ['read', 'utility', 'recall'] as const) {
       kind === 'utility'
         ? { name: 'calculate', arguments: '{"expression":"2+2"}' }
         : kind === 'recall'
-          ? { name: RECALL_TOOL, arguments: '{}' }
+          ? {
+              name: RECALL_TOOL,
+              arguments: JSON.stringify({ turn_id: recallTurnId(history[0]!.protectedReply!) }),
+            }
           : { name: 'read_warehouse', arguments: '{"id":101}' };
     const scripted = model(call);
     const complete = scripted.complete.bind(scripted);

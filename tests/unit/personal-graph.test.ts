@@ -295,7 +295,7 @@ async function scenario(options: {
     signal(),
     trusted,
   );
-  return { reply, requests, sessions, applied, events, business, trusted };
+  return { reply, requests, sessions, applied, events, business, trusted, personalTools };
 }
 
 test('personal workflow saves the requested IST reminder using only router, worker and verifier inference', async () => {
@@ -403,7 +403,7 @@ test('mixed business answer has both authorities and business recall reveals onl
     now,
   );
   assert.equal(recall.available, true);
-  const recalled = await recall.execute('{}', signal());
+  const recalled = await recall.execute(JSON.stringify(recall.targets[0]), signal());
   assert.equal(recalled.previous_reply_verified, true);
   assert.equal(recalled.previous_reply, businessText);
   assert.doesNotMatch(JSON.stringify(recalled), /review the synthetic proposal|Saved reminder/);
@@ -473,6 +473,27 @@ test('unsegmented personal recall and business prose needs both authorities and 
   );
   assert.equal(recalled.available, false);
   assert.doesNotMatch(JSON.stringify(recalled.messages), /synthetic proposal|office opens/);
+  const freshPersonal = (await h.personalTools.open(
+    { ...h.trusted, runId: randomUUID() },
+    signal(),
+  ))!;
+  const visible = businessRecall(
+    [
+      {
+        role: 'assistant',
+        content: '[Private reply]',
+        protectedReply: { text: h.reply.text, receipt: evidence },
+      },
+    ],
+    access.run,
+    now,
+    freshPersonal,
+  );
+  assert.match(visible.messages[0]!.content, /synthetic proposal/);
+  assert.match(visible.messages[0]!.content, /office opens/);
+  assert.match(visible.messages[0]!.content, /personal_recall/);
+  assert.equal(freshPersonal.usedPrivateData, true);
+  assert.equal(freshPersonal.usedPrivateReads, true);
 });
 
 test('a committed result does not make recalled personal facts eligible for business-only recall', async () => {

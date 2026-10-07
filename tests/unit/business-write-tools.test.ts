@@ -22,6 +22,9 @@ import type {
   ContextWriteResult,
 } from '../../src/modules/context-engine/context.types.js';
 import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.types.js';
+import { businessRecall } from '../../src/modules/assistant/business-recall.js';
+import { writeDeliveryBundle } from '../../src/modules/messaging/delivery-evidence.js';
+import { PRIVATE_HISTORY_REPLY } from '../../src/modules/assistant/conversation-memory.js';
 
 const now = Date.parse('2026-10-03T06:00:00Z');
 const actor: WriteActor = {
@@ -210,14 +213,15 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
       return transition(id, 'APPROVED');
     },
     async findDirectRecovery(ctx) {
-      assert.ok(directRecoveryAction((await repository.authorizeSource(ctx)).text));
+      const text = (await repository.authorizeSource(ctx)).text;
+      assert.ok(directRecoveryAction(text));
       const pending = [...operations.values()].filter((op) =>
         ['APPROVED', 'DISPATCHING', 'UNKNOWN'].includes(op.state),
       );
       if (pending.length > 1) throw new WriteStorageError('WRITE_RECOVERY_AMBIGUOUS');
       const op = pending[0];
       return op?.payload.executionMode === 'direct_request' &&
-        op.payload.sourceFamily === 'mail' &&
+        (!/\bdraft\b/i.test(text) || op.payload.sourceFamily === 'mail') &&
         op.approvalRunId
         ? structuredClone(op)
         : null;
@@ -924,7 +928,8 @@ for (const unavailable of ['empty catalogue', 'discovery outage'] as const) {
     assert.deepEqual(reply.delivery.operations, [
       { id: operation.operationId, version: h.operations.get(operation.operationId)!.version },
     ]);
-    assert.doesNotMatch(JSON.stringify(reply), /Example|create_example|arguments|summary/);
+    assert.doesNotMatch(JSON.stringify(reply), /Example|create_example|summary/);
+    assert.ok(reply!.delivery.history!.activity.every((entry) => entry.arguments === undefined));
     assert.equal(await h.service.canDeliver(command.key, reply.delivery, signal()), true);
     const repeated = await h.service.recover(command, signal());
     assert.match(repeated!.text, /cancelled/i);
@@ -1379,6 +1384,91 @@ async function stageDirect(
   return { request, run, operation: [...h.operations.values()].at(-1)! };
 }
 
+test('business history distinguishes staging, confirmation, commit, uncertainty and a safe retry', async () => {
+  const h = harness();
+  const { run, operation } = await stageDirect(h);
+  assert.equal(run.historyDelivery()!.history!.activity[0]!.status, 'staged');
+  h.useUnknown(true);
+  const first = (await run.finalize(signal()))!;
+  assert.deepEqual(
+    run.historyDelivery()!.operations,
+    first.delivery.operations,
+    'an outcome from this turn retains its journal authorization if later reply generation fails',
+  );
+  assert.deepEqual(
+    first.delivery.history!.activity.map((entry) => entry.status),
+    ['staged', 'uncertain'],
+  );
+  assert.equal(first.delivery.history!.activity.at(-1)!.operationId, operation.operationId);
+  const next = (await h.service.open(
+    h.trusted('What happened to the earlier request?'),
+    signal(),
+  ))!;
+  const history = businessRecall(
+    [
+      {
+        role: 'assistant',
+        content: PRIVATE_HISTORY_REPLY,
+        protectedReply: { text: first.text, receipt: writeDeliveryBundle(first.delivery) },
+      },
+    ],
+    undefined,
+    now,
+    undefined,
+    next,
+  );
+  assert.match(history.messages[0]!.content, /uncertain/);
+  assert.equal(h.calls.length, 1, 'recalling the outcome cannot redispatch a write');
+  assert.equal(
+    next.historyDelivery()!.operations.length,
+    0,
+    'historical delivery uses current authority without replaying old operation versions',
+  );
+  h.useUnknown(false);
+  const retry = await h.service.recover(h.trusted('retry'), signal());
+  assert.equal(retry!.delivery.history!.activity.at(-1)!.status, 'committed');
+  assert.equal(retry!.delivery.history!.activity.at(-1)!.phase, 'recovery');
+  assert.equal(h.calls.length, 2);
+  assert.deepEqual(
+    h.calls[1],
+    h.calls[0],
+    'a genuine retry uses the original identity and frozen arguments',
+  );
+
+  const confirmation = harness();
+  const proposal = await confirmation.proposed();
+  assert.deepEqual(
+    proposal.reply!.delivery.history!.activity.map((entry) => entry.status),
+    ['staged', 'awaiting_confirmation'],
+  );
+  const cancelled = await confirmation.service.recover(
+    confirmation.trusted('cancel ABCDEF12'),
+    signal(),
+  );
+  assert.equal(cancelled!.delivery.history!.activity.at(-1)!.status, 'cancelled');
+  assert.equal(confirmation.calls.length, 0);
+});
+
+test('write history retains definite non-dispatch and omits private recovery fields', async () => {
+  const h = harness();
+  const { run } = await stageDirect(h);
+  h.useResult({ outcome: 'not_dispatched', code: 'UNAVAILABLE', message: 'PRIVATE_UPSTREAM_BODY' });
+  const reply = (await run.finalize(signal()))!;
+  assert.equal(reply.delivery.history!.activity.at(-1)!.status, 'not_dispatched');
+  assert.doesNotMatch(JSON.stringify(reply.delivery.history), /PRIVATE_UPSTREAM_BODY/);
+  const rfq = harness();
+  rfq.changeDefinitions([rfqCreate]);
+  const crmRun = (await rfq.service.open(
+    rfq.trusted('Save an RFQ for the PRIVATE_RECOVERY_CITY'),
+    signal(),
+  ))!;
+  await crmRun.execute(rfqCreate.name, '{}', signal());
+  await crmRun.finalize(signal());
+  const recovered = (await rfq.service.recover(rfq.trusted('confirm ABCDEF12'), signal()))!;
+  assert.equal(recovered.delivery.history!.activity[0]!.argumentsOmitted, true);
+  assert.doesNotMatch(JSON.stringify(recovered.delivery.history), /PRIVATE_RECOVERY_CITY/);
+});
+
 test('execution policy is authenticated metadata, never a heuristic or a model argument', async () => {
   assert.equal(writeContract(create)?.executionMode, 'confirmation');
   const direct = directTool(create);
@@ -1468,14 +1558,14 @@ test('revoked identity and a forwarded-only source cannot authorize direct write
   );
 });
 
-test('explicit draft recovery preserves the original direct operation while generic retry stays conversational', async () => {
+test('explicit draft recovery preserves its operation and a retry without a pending write stays conversational', async () => {
   const h = harness();
+  for (const text of ['try again', 'retry', 'cancel that attempt'])
+    assert.equal(await h.service.recover(h.trusted(text), signal()), undefined);
   const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
   h.useUnknown(true);
   await run.finalize(signal());
   assert.equal(h.operations.get(operation.operationId)!.state, 'UNKNOWN');
-  for (const text of ['try again', 'retry', 'cancel that attempt'])
-    assert.equal(await h.service.recover(h.trusted(text), signal()), undefined);
   assert.equal(h.calls.length, 1);
   const retry = h.trusted('try that draft again');
   h.useUnknown(false);
@@ -1512,7 +1602,7 @@ test('code-free draft recovery rejects ambiguity, altered batches, forwarded com
   h.operations.delete(copy.operationId);
   h.operations.get(operation.operationId)!.payload.executionMode = 'confirmation';
   const legacy = await h.service.recover(h.trusted('try that draft again'), signal());
-  assert.match(legacy!.text, /no single unresolved direct draft/);
+  assert.match(legacy!.text, /no single unresolved direct action/);
   assert.equal(h.calls.length, 1);
 });
 

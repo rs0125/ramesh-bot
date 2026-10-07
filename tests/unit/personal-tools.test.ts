@@ -25,6 +25,10 @@ import {
 } from '../../src/modules/scheduling/scheduling.types.js';
 import { planningResult } from '../fixtures/planning-model.js';
 import type { AgentCheckpointStore } from '../../src/modules/assistant/checkpoint.types.js';
+import { businessRecall } from '../../src/modules/assistant/business-recall.js';
+import { PRIVATE_HISTORY_REPLY } from '../../src/modules/assistant/conversation-memory.js';
+import { getPersonalDelivery } from '../../src/modules/messaging/delivery-evidence.js';
+import { contextFixture } from '../fixtures/chat-context.js';
 
 const now = Date.parse('2026-10-03T04:00:00Z');
 const jid = '919999000111@s.whatsapp.net';
@@ -251,6 +255,72 @@ function harness(events: string[] = []) {
     },
   };
 }
+
+test('personal call, committed result and delivered text survive compaction without rerunning the mutation', async () => {
+  const h = harness();
+  const assistant = h.assistant(fakeModel([{ name: 'personal_apply', args: batch }]).model);
+  const reply = await assistant.prepare(message, signal(), trusted);
+  const receipt = getPersonalDelivery(reply.businessEvidence)!;
+  assert.deepEqual(
+    receipt.history?.activity.map((item) => item.status),
+    ['staged', 'committed'],
+  );
+  assert.deepEqual(receipt.history?.activity[0]?.arguments, batch);
+  const memory = contextFixture();
+  memory.reassign(actor.employeeId);
+  await memory.context.prepare(...memory.turn(1, '/pins'));
+  memory.add(2, {
+    role: 'assistant',
+    content: PRIVATE_HISTORY_REPLY,
+    protectedReply: { text: reply.text, receipt: reply.businessEvidence },
+  });
+  for (let n = 3; n < 44; n++) memory.add(n, { role: 'user', content: `Unrelated ${n}` });
+  await memory.context.prepare(...memory.turn(44, 'Continue'));
+  const restored = await memory.create().prepare(...memory.turn(45, 'What did you save earlier?'));
+  const fresh = (await h.service.open({ ...trusted, runId: 'follow-up' }, signal()))!;
+  const history = businessRecall(restored!.history, undefined, memory.now(), fresh);
+  assert.ok(
+    history.messages.some(
+      (entry) => entry.content.includes('committed') && entry.content.includes('review the lease'),
+    ),
+  );
+  assert.equal(h.applied.length, 1);
+  assert.equal(fresh.usedPrivateData, true);
+  assert.equal(await h.service.canDeliver(trusted.key, fresh.deliveryReference, signal()), true);
+  assert.ok(
+    !JSON.stringify(businessRecall(restored!.history, undefined, memory.now()).messages).includes(
+      'saved-0',
+    ),
+  );
+  await memory.context.prepare(...memory.turn(46, '/forget context'));
+  assert.ok(
+    !(await memory.create().prepare(...memory.turn(47, 'Continue')))!.history.some(
+      (entry) => entry.protectedReply,
+    ),
+  );
+});
+
+test('an uncertain personal commit is retained without a false success and recovery is a separate outcome', async () => {
+  const failed = harness();
+  failed.failApply();
+  const answer = await failed
+    .assistant(fakeModel([{ name: 'personal_apply', args: batch }]).model)
+    .prepare(message, signal(), trusted);
+  const trail = getPersonalDelivery(answer.businessEvidence)!.history!.activity;
+  assert.deepEqual(
+    trail.map((item) => item.status),
+    ['staged', 'uncertain'],
+  );
+  assert.doesNotMatch(JSON.stringify(trail), /synthetic DB unavailable/);
+  const h = harness();
+  const run = (await h.service.open(trusted, signal()))!;
+  await run.execute('personal_apply', JSON.stringify(batch), signal());
+  await run.finish(signal());
+  const recovery = await (await h.service.open(trusted, signal()))!.recover(signal());
+  assert.equal(recovery!.delivery.history!.activity[0]!.phase, 'recovery');
+  assert.equal(recovery!.delivery.history!.activity[0]!.status, 'committed');
+  assert.equal(h.applied.length, 1);
+});
 
 test('personal tools work without CRM; task and long-future reminder commit once after verification', async () => {
   const events: string[] = [];
@@ -713,7 +783,12 @@ test('a mixed personal receipt retains its transaction-reconciled list and selec
   assert.deepEqual(h.appliedSelections, [['saved-selection']]);
   assert.deepEqual(h.finalized, [], 'mutation transaction owns selection finalization');
   const recovered = (await h.service.open(trusted, signal()))!;
-  assert.deepEqual(await recovered.recover(signal()), reply);
+  const replay = (await recovered.recover(signal()))!;
+  assert.deepEqual(
+    { ...replay, delivery: { ...replay.delivery, history: reply.delivery.history } },
+    reply,
+  );
+  assert.equal(replay.delivery.history?.activity[0]?.phase, 'recovery');
   assert.equal(h.applied.length, 1);
 });
 
@@ -1011,6 +1086,52 @@ test('a direct clarification recalls earlier owned text while current source con
   assert.equal(result.code, 'UNTRUSTED_COMMAND_SOURCE');
   await forged.finish(signal());
   assert.equal(h.applied.length, 1);
+});
+
+test('a list-only follow-up cannot recreate an old task even if a model stages it', async () => {
+  const h = harness();
+  h.setRecall({
+    kind: 'instructions',
+    members: [
+      {
+        runId: 'previous',
+        id: 'old',
+        text: 'Add task: fix owner display',
+        receivedAtMs: now - 60000,
+      },
+    ],
+  });
+  for (const text of [
+    'after this, show my task list',
+    'Show my tasks',
+    'please list my reminders',
+  ]) {
+    const run = (await h.service.open(
+      {
+        ...trusted,
+        commandMessages: [{ id: 'current', text, receivedAtMs: now, forwarded: false }],
+      },
+      signal(),
+    ))!;
+    await run.execute('personal_recall', '{"kind":"instructions"}', signal());
+    const outcome = await run.execute(
+      'personal_apply',
+      JSON.stringify({
+        operations: [
+          {
+            kind: 'task_create',
+            source: { messageId: 'current', quote: text },
+            text: 'fix owner display',
+          },
+        ],
+      }),
+      signal(),
+    );
+    assert.equal(outcome.code, 'PERSONAL_READ_ONLY_REQUEST');
+    await run.execute('personal_list', '{"kind":"task"}', signal());
+    await run.finish(signal());
+  }
+  assert.equal(h.applied.length, 0);
 });
 
 test('unrecalled or expired prior text cannot create personal records, and only direct members are saved', async () => {

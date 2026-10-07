@@ -5,6 +5,7 @@ import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import type { ToolSessionRequest } from '../assistant/assistant.types.js';
 import { CheckpointError } from '../assistant/checkpoint.types.js';
 import { currentCheckpoint } from '../assistant/model-replay.js';
+import { ToolHistory, toolHistorySchema } from '../assistant/business-history.js';
 import { formatIst, resolveSchedule, validateTaskDeadline } from './schedule-time.js';
 import { renderList, renderReceipt } from './personal-presentation.js';
 export { renderList, renderReceipt } from './personal-presentation.js';
@@ -71,6 +72,7 @@ export const personalDeliverySchema = z
     runId: z.string().min(1),
     commandId: z.string().optional(),
     selectionId: z.string().optional(),
+    history: toolHistorySchema.optional(),
   })
   .strict();
 export type PersonalDelivery = z.infer<typeof personalDeliverySchema>;
@@ -197,6 +199,12 @@ const listSchema = z
   .strict()
   .refine((value) => !(value.cursor && value.continuation), 'Use cursor or continuation, not both');
 const recallSchema = z.object({ kind: z.enum(['instructions', 'task', 'reminder']) }).strict();
+/** Narrow read commands cannot inherit mutation authority from an earlier turn. */
+function isListOnly(text: string): boolean {
+  return /^(?:(?:please|then|after (?:this|that)|and then)[,\s]+)*(?:(?:show|list|display|view)(?: me)?(?: all)?(?: my| the)? (?:tasks?|reminders?)(?: list)?|(?:what are|what's|what is) my (?:tasks?|reminders?)(?: list)?)(?: please)?[.!?\s]*$/i.test(
+    text.trim(),
+  );
+}
 const definitions: ToolSessionRequest['tools'] = [
   {
     name: 'personal_list',
@@ -307,6 +315,9 @@ export class PersonalToolService {
 }
 
 export class PersonalToolRun {
+  readonly toolHistory = new ToolHistory(() => this.now());
+  private usedHistoricalReply = false;
+  private committedReceipt?: PersonalCommandReceipt;
   readonly tools = structuredClone(definitions);
   readonly evidence: unknown[] = [];
   readonly failures: Array<{ tool: string; code: string }> = [];
@@ -348,16 +359,29 @@ export class PersonalToolRun {
     );
   }
   get usedPrivateData() {
-    return this.evidence.length > 0;
+    return this.evidence.length > 0 || this.toolHistory.used || this.usedHistoricalReply;
   }
   get usedPrivateReads() {
-    return this.evidence.some((entry) => {
-      const value = entry as { ok?: boolean; status?: string };
-      return value.ok === true && value.status !== 'staged_not_committed';
-    });
+    return (
+      this.usedHistoricalReply ||
+      this.evidence.some((entry) => {
+        const value = entry as { ok?: boolean; status?: string };
+        return value.ok === true && value.status !== 'staged_not_committed';
+      })
+    );
   }
   get deliveryReference(): PersonalDelivery {
-    return this.delivery();
+    return this.committedReceipt ? this.receiptDelivery(this.committedReceipt) : this.delivery();
+  }
+  canRecall(receipt: PersonalDelivery) {
+    return (
+      !this.blocked &&
+      receipt.employeeId === this.actor.employeeId &&
+      receipt.phoneE164 === this.actor.phoneE164
+    );
+  }
+  rememberHistoricalReply() {
+    this.usedHistoricalReply = true;
   }
   /** Deterministic material for review. Persistence is never claimed before finish commits. */
   preview(): string | undefined {
@@ -409,6 +433,7 @@ export class PersonalToolRun {
       employeeId: this.actor.employeeId,
       phoneE164: this.actor.phoneE164,
       runId: this.trusted.runId,
+      history: this.toolHistory.snapshot(),
       ...extra,
     };
   }
@@ -439,7 +464,15 @@ export class PersonalToolRun {
   async recover(signal: AbortSignal): Promise<PersonalReply | undefined> {
     await this.authorize(signal);
     const receipt = await this.repository.getReceipt(this.command);
+    if (receipt) this.committedReceipt = receipt;
     await this.authorize(signal);
+    if (receipt)
+      this.toolHistory.record(
+        'personal_apply',
+        undefined,
+        { ok: true, records: receipt.records },
+        { phase: 'recovery', status: 'committed', operationId: receipt.commandId },
+      );
     return receipt
       ? { text: renderReceipt(receipt), delivery: this.receiptDelivery(receipt) }
       : undefined;
@@ -455,10 +488,13 @@ export class PersonalToolRun {
     );
     if (!command) return undefined;
     await this.authorize(signal);
-    const failure = (code: string): PersonalReply => ({
-      text: renderFailure(code),
-      delivery: this.delivery(),
-    });
+    const failure = (code: string): PersonalReply => {
+      this.toolHistory.record('personal_quick_reply', JSON.stringify({ text: command.text }), {
+        ok: false,
+        code,
+      });
+      return { text: renderFailure(code), delivery: this.delivery() };
+    };
     if (members.length !== 1 || !command.quotedMessageId)
       return failure('PERSONAL_QUOTED_REMINDER_REQUIRED');
     const action = parseReminderQuickReply(command.text)!;
@@ -485,7 +521,7 @@ export class PersonalToolRun {
           };
     let receipt: PersonalCommandReceipt;
     try {
-      receipt = await this.repository.applyBatch(context, [operation]);
+      receipt = await this.commit(context, [operation]);
     } catch (error) {
       if (!(error instanceof SchedulingError)) throw error;
       await this.authorize(signal);
@@ -496,6 +532,15 @@ export class PersonalToolRun {
     return { text: renderReceipt(receipt), delivery: this.receiptDelivery(receipt) };
   }
   async execute(
+    name: string,
+    argumentsText: string,
+    signal: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    return this.toolHistory.track(name, argumentsText, () =>
+      this.executeTool(name, argumentsText, signal),
+    );
+  }
+  private async executeTool(
     name: string,
     argumentsText: string,
     signal: AbortSignal,
@@ -562,6 +607,11 @@ export class PersonalToolRun {
         return output;
       }
       const parsed = applySchema.parse(raw);
+      const direct = this.trusted.commandMessages!.filter(
+        (member) => !member.forwarded && member.text.trim(),
+      );
+      if (direct.length && direct.every((member) => isListOnly(member.text)))
+        throw new SchedulingError('PERSONAL_READ_ONLY_REQUEST');
       const operations: PersonalOperation[] = [];
       for (const proposal of parsed.operations) {
         const member = this.trusted.commandMessages!.find(
@@ -731,7 +781,7 @@ export class PersonalToolRun {
       // The repository fences the original inbound lease and commits every mutation with its receipt.
       let receipt: PersonalCommandReceipt | undefined;
       try {
-        receipt = await this.repository.applyBatch(
+        receipt = await this.commit(
           this.command,
           this.staged.operations,
           [...this.lists.values()].map((result) => result.selectionId),
@@ -776,6 +826,31 @@ export class PersonalToolRun {
   private receiptDelivery(receipt: PersonalCommandReceipt): PersonalDelivery {
     const selectionId = receipt.lists?.at(-1)?.result.selectionId;
     return this.delivery({ commandId: receipt.commandId, ...(selectionId ? { selectionId } : {}) });
+  }
+  private async commit(
+    context: PersonalCommandContext,
+    operations: PersonalOperation[],
+    selectionIds?: string[],
+  ) {
+    try {
+      const receipt = await this.repository.applyBatch(context, operations, selectionIds);
+      this.committedReceipt = receipt;
+      this.toolHistory.record(
+        'personal_apply',
+        JSON.stringify({ operations }),
+        { ok: true, records: receipt.records },
+        { phase: 'commit', status: 'committed', operationId: receipt.commandId },
+      );
+      return receipt;
+    } catch (error) {
+      this.toolHistory.record(
+        'personal_apply',
+        JSON.stringify({ operations }),
+        { ok: false, ...(error instanceof SchedulingError ? { code: error.code } : {}) },
+        { phase: 'commit', status: error instanceof SchedulingError ? 'failed' : 'uncertain' },
+      );
+      throw error;
+    }
   }
 }
 
@@ -855,6 +930,7 @@ function hasReminderCondition(message: string, reminderText?: string): boolean {
 
 function renderFailure(code: string): string {
   const reason: Record<string, string> = {
+    PERSONAL_READ_ONLY_REQUEST: 'You asked to view your list, so no task or reminder was changed.',
     PERSONAL_QUOTED_REMINDER_REQUIRED:
       'Reply directly to the reminder notification with "done" or "snooze 30m", as a separate message, so I change exactly that occurrence.',
     PERSONAL_QUOTED_REMINDER_UNAVAILABLE:

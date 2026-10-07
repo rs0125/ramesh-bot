@@ -100,16 +100,22 @@ export class MediaService {
     ids: string[],
     request: string,
     signal: AbortSignal,
+    maxWaitMs = this.contextWaitMs,
   ): Promise<string> {
     if (ids.length > MAX_MEDIA_ITEMS || ids.some((id) => !/^[0-9a-f-]{36}$/i.test(id)))
       throw new Error('INVALID_MEDIA_REFERENCES');
+    // A date, a CRM note, or a generic summarization request is not an attachment
+    // reference. Voice follow-ups are supplied in chronological conversation history.
     const referBack =
-      /\b(attachment|file|pdf|image|photo|picture|voice|audio|note|recording|forward|yesterday|earlier|these|those|summari[sz]e)\b/i.test(
+      /\b(attachments?|pdfs?|images?|photos?|pictures?|voice(?:\s+notes?)?|audio|recordings?)\b/i.test(
         request,
-      );
+      ) || /\b(?:attached|uploaded|shared|sent|previous|last)\s+files?\b/i.test(request);
     if (!ids.length && !referBack) return '';
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), this.contextWaitMs);
+    const timer = setTimeout(
+      () => deadline.abort(),
+      Math.max(1, Math.min(this.contextWaitMs, maxWaitMs)),
+    );
     const waiting = AbortSignal.any([signal, deadline.signal, this.stopping.signal]);
     let records: Awaited<ReturnType<MediaStore['get']>> = [];
     try {
@@ -117,6 +123,47 @@ export class MediaService {
         () => this.store.get(owner, ids.length ? ids : undefined),
         waiting,
       );
+      // An implicit singular reference never brings every unrelated recent upload
+      // into the current request. Explicit IDs still preserve the whole current burst.
+      if (!ids.length) {
+        const kind = /\b(voice|audio|recordings?)\b/i.test(request)
+          ? 'audio'
+          : /\b(images?|photos?|pictures?)\b/i.test(request)
+            ? 'image'
+            : /\bpdfs?\b/i.test(request)
+              ? 'document'
+              : undefined;
+        records = records
+          .filter((record) => !kind || record.kind === kind)
+          .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        const ordinal =
+          /\b(first|second|third|fourth|fifth|sixth|seventh|eighth)\s+(?:voice(?:\s+note)?|audio|recording|attachment|file|pdf|image|photo|picture)\b/i.exec(
+            request,
+          );
+        if (ordinal) {
+          // Ordinals refer to the latest upload burst, not every attachment retained
+          // during the day. Do not silently substitute the last item for "second".
+          const end = records.at(-1)?.createdAt.getTime() ?? 0;
+          const burst = records.filter((record) => end - record.createdAt.getTime() <= 60000);
+          const index = [
+            'first',
+            'second',
+            'third',
+            'fourth',
+            'fifth',
+            'sixth',
+            'seventh',
+            'eighth',
+          ].indexOf(ordinal[1]!.toLowerCase());
+          records = burst.slice(index, index + 1);
+        } else if (
+          !/\b(attachments|files|pdfs|images|photos|pictures|recordings|voice notes)\b/i.test(
+            request,
+          )
+        ) {
+          records = records.slice(-1);
+        }
+      }
       while (records.some((r) => r.state === 'pending' || r.state === 'processing')) {
         waiting.throwIfAborted();
         const work: Promise<void>[] = [];

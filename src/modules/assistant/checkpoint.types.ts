@@ -15,7 +15,7 @@ export interface AgentCheckpointSession {
 
 /** Caller must retry/release its queue job instead of converting failed persistence into a reply. */
 export class CheckpointError extends Error {
-  constructor() {
+  constructor(readonly code = 'CHECKPOINT_OPERATION_FAILED') {
     super('CHECKPOINT_OPERATION_FAILED');
     this.name = 'CheckpointError';
   }

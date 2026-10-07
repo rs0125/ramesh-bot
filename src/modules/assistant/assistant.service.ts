@@ -16,7 +16,7 @@ import { buildSalesGraph, type GraphContextObservation } from './sales.graph.js'
 import { SALES_PROMPT_VERSION } from './sales-prompts.js';
 import {
   contextDeliveryBundle,
-  getBusinessReply,
+  compositeDeliverySchema,
   writeDeliveryBundle,
 } from '../messaging/delivery-evidence.js';
 import type { ContextDelivery } from '../messaging/context-delivery.js';
@@ -26,6 +26,7 @@ import { UtilityToolRun } from './utility-tools.js';
 import { CheckpointError, type AgentCheckpointStore } from './checkpoint.types.js';
 import { withModelReplay, replayedModelSteps } from './model-replay.js';
 import type { ChatContext } from './chat-context.js';
+import type { ContextToolRun } from './tool-executor.js';
 import type { PersonalToolRun, PersonalToolService } from '../scheduling/personal-tools.js';
 import type {
   BusinessWriteReply,
@@ -44,7 +45,7 @@ export class AssistantService {
   constructor(
     private readonly modelConfig: Pick<
       AssistantConfig,
-      'model' | 'timeoutMs' | 'usageMeter' | 'tavilyApiKey'
+      'model' | 'modelRouting' | 'timeoutMs' | 'usageMeter' | 'tavilyApiKey'
     >,
     private readonly model: TextModel,
     private readonly memory = new ConversationMemory(),
@@ -123,9 +124,14 @@ export class AssistantService {
     const onToolActivity =
       trusted?.key.remoteJid === message.chatId ? trusted.onToolActivity : undefined;
     const started = Date.now();
+    const replyDeadlineAtMs = Math.min(
+      started + this.modelConfig.timeoutMs,
+      trusted?.replyDeadlineAtMs ?? Infinity,
+    );
     const trace: AgentTrace = {
       runId,
       model: this.modelConfig.model,
+      modelRouting: this.modelConfig.modelRouting ?? 'single',
       promptVersion:
         this.businessReads?.toolLoop || this.runtime.personalTools || this.runtime.businessWrites
           ? SALES_PROMPT_VERSION
@@ -142,6 +148,8 @@ export class AssistantService {
       contextDelivery ? contextDeliveryBundle(contextDelivery, evidence) : evidence;
     const finish = async (reply: Omit<AssistantReply, 'trace'>): Promise<AssistantReply> => {
       const evidence = protect(reply.businessEvidence);
+      let remembered = false;
+      const key = this.key(message);
       trace.durationMs = Date.now() - started;
       const reused = replayedModelSteps();
       if (reused) trace.replayedSteps = reused;
@@ -154,7 +162,27 @@ export class AssistantService {
         }
       }
       this.observe(trace);
-      return { ...reply, ...(evidence ? { businessEvidence: evidence } : {}), trace };
+      return {
+        ...reply,
+        ...(evidence ? { businessEvidence: evidence } : {}),
+        ...(reply.onSent || evidence
+          ? {
+              onSent: () => {
+                if (remembered) return;
+                reply.onSent?.();
+                if (key)
+                  this.memory.remember(
+                    key,
+                    this.input(message),
+                    evidence ? PRIVATE_HISTORY_REPLY : reply.text,
+                    evidence ? { text: reply.text, receipt: evidence } : undefined,
+                  );
+                remembered = true;
+              },
+            }
+          : {}),
+        trace,
+      };
     };
     const input = message.text?.trim() ?? '';
     if (!input || input.length > (message.batchMessageIds ? 32000 : 6000)) {
@@ -174,7 +202,10 @@ export class AssistantService {
       let writeSignal: AbortSignal | undefined;
       if (!message.isGroup && trusted?.key.remoteJid === message.chatId) {
         // Confirmation and receipt recovery are application commands, never model tool calls.
-        const writeDeadline = AbortSignal.timeout(this.modelConfig.timeoutMs);
+        const remaining = replyDeadlineAtMs - Date.now();
+        const writeDeadline = AbortSignal.timeout(
+          remaining > 0 ? remaining : Math.min(5000, this.modelConfig.timeoutMs),
+        );
         writeSignal = signal ? AbortSignal.any([signal, writeDeadline]) : writeDeadline;
         recoveredWrite = await this.runtime.businessWrites?.recover(trusted, writeSignal);
       }
@@ -202,13 +233,16 @@ export class AssistantService {
           ),
         });
       if (recovered) return finish({ text: recovered.text, businessEvidence: recovered.delivery });
+      if (replyDeadlineAtMs <= Date.now()) {
+        trace.outcome = 'unavailable';
+        trace.failureCode = 'DEADLINE_EXCEEDED';
+        return finish({ text: UNAVAILABLE_REPLY });
+      }
       const quickReply = await personal?.quickReply(recoverySignal);
       if (quickReply)
         return finish({ text: quickReply.text, businessEvidence: quickReply.delivery });
       if (this.runtime.conversationContext) {
-        const contextDeadline = AbortSignal.timeout(
-          Math.max(1, started + this.modelConfig.timeoutMs - Date.now()),
-        );
+        const contextDeadline = AbortSignal.timeout(Math.max(1, replyDeadlineAtMs - Date.now()));
         const prepared = await this.runtime.conversationContext.prepare(
           message,
           trusted,
@@ -243,7 +277,12 @@ export class AssistantService {
         });
       trace.outcome = 'unavailable';
       trace.failureCode = 'RUN_FAILED';
-      return finish({ text: UNAVAILABLE_REPLY });
+      return finish({
+        text: UNAVAILABLE_REPLY,
+        ...(personal?.usedPrivateData && !personal.blocked
+          ? { businessEvidence: personal.deliveryReference }
+          : {}),
+      });
     }
     const checkpoint =
       trusted?.checkpointLease && this.runtime.checkpoints
@@ -253,6 +292,7 @@ export class AssistantService {
             binding: {
               version: 1,
               model: this.modelConfig.model,
+              modelRouting: this.modelConfig.modelRouting ?? 'single',
               promptVersion: trace.promptVersion,
               key: trusted.key,
               chatId: message.chatId,
@@ -262,12 +302,14 @@ export class AssistantService {
             },
             requestTimeMs: (this.runtime.now ?? Date.now)(),
             startedAtMs: started,
-            deadlineAtMs: started + this.modelConfig.timeoutMs,
+            deadlineAtMs: replyDeadlineAtMs,
           })
         : undefined;
     return withModelReplay(checkpoint, async () => {
-      const deadlineAtMs =
-        checkpoint?.metadata.deadlineAtMs ?? started + this.modelConfig.timeoutMs;
+      const deadlineAtMs = Math.min(
+        checkpoint?.metadata.deadlineAtMs ?? replyDeadlineAtMs,
+        replyDeadlineAtMs,
+      );
       if (deadlineAtMs <= Date.now()) {
         trace.outcome = 'unavailable';
         trace.failureCode = 'DEADLINE_EXCEEDED';
@@ -280,6 +322,7 @@ export class AssistantService {
       );
       const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
       const key = this.key(message);
+      let contextRun: ContextToolRun | undefined;
       try {
         const history =
           contextHistory ??
@@ -305,12 +348,19 @@ export class AssistantService {
                       )
                     : { status: 'denied' as const };
                   if (tools.run) bindUsageEmployee(tools.run.employeeId);
+                  contextRun = tools.run;
                   return tools;
                 },
                 {
+                  optimizeLatency: this.modelConfig.modelRouting === 'split',
                   now: checkpoint ? () => checkpoint.metadata.requestTimeMs : this.runtime.now,
                   researchDeadlineMs:
-                    deadlineAtMs - Math.min(60000, this.modelConfig.timeoutMs / 4),
+                    deadlineAtMs -
+                    Math.min(
+                      60000,
+                      (deadlineAtMs - (checkpoint?.metadata.startedAtMs ?? started)) / 2,
+                    ),
+                  replyDeadlineMs: deadlineAtMs,
                   durableContextEnabled,
                   onStage: (stage) => trace.stages.push(stage),
                   onContext: this.runtime.observeContext,
@@ -347,7 +397,17 @@ export class AssistantService {
         const composite = 'composite' in result ? result.composite : undefined;
         const writeReply = 'write' in result ? result.write : undefined;
         const otherEvidence = personalReply
-          ? (composite ?? personalReply.delivery)
+          ? (composite ??
+            (business?.outcome === 'verified'
+              ? compositeDeliverySchema.parse({
+                  kind: 'composite',
+                  version: 1,
+                  personal: personalReply.delivery,
+                  business: business.delivery,
+                  businessText: result.reply,
+                  businessRecallAllowed: false,
+                })
+              : personalReply.delivery))
           : business?.outcome === 'verified'
             ? business.delivery
             : undefined;
@@ -360,32 +420,41 @@ export class AssistantService {
           : otherEvidence;
         if (business?.outcome === 'unavailable') trace.outcome = 'unavailable';
         if ('unavailable' in result && result.unavailable) trace.outcome = 'unavailable';
-        let remembered = false;
-        const protectedEvidence = protect(evidence);
         return finish({
           text: result.reply,
           draft: result.draft,
           ...(evidence ? { businessEvidence: evidence } : {}),
-          onSent: () => {
-            if (!remembered && key) {
-              this.memory.remember(
-                key,
-                this.input(message),
-                protectedEvidence ? PRIVATE_HISTORY_REPLY : result.reply,
-                protectedEvidence
-                  ? getBusinessReply({ text: result.reply, receipt: protectedEvidence })
-                  : undefined,
-              );
-              remembered = true;
-            }
-          },
+          onSent: () => {},
         });
       } catch (error) {
         if (error instanceof CheckpointError) throw error;
         signal?.throwIfAborted();
         trace.outcome = 'unavailable';
         trace.failureCode = deadline.signal.aborted ? 'DEADLINE_EXCEEDED' : 'RUN_FAILED';
-        return finish({ text: UNAVAILABLE_REPLY });
+        const business = contextRun?.historyDelivery();
+        const personalDelivery =
+          personal?.usedPrivateData && !personal.blocked ? personal.deliveryReference : undefined;
+        const other =
+          personalDelivery && business
+            ? compositeDeliverySchema.parse({
+                kind: 'composite',
+                version: 1,
+                personal: personalDelivery,
+                business,
+                businessText: UNAVAILABLE_REPLY,
+                businessRecallAllowed: false,
+              })
+            : (personalDelivery ?? business);
+        const write = writes?.historyDelivery();
+        const evidence = write ? writeDeliveryBundle(write, other, UNAVAILABLE_REPLY) : other;
+        return finish({
+          text: UNAVAILABLE_REPLY,
+          ...(evidence
+            ? {
+                businessEvidence: evidence,
+              }
+            : {}),
+        });
       } finally {
         clearTimeout(timer);
       }

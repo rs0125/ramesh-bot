@@ -4,6 +4,11 @@ import { z } from 'zod';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import type { ToolSessionRequest } from '../assistant/assistant.types.js';
 import { notifyToolActivity } from '../assistant/tool-activity.js';
+import {
+  ToolHistory,
+  toolHistorySchema,
+  type ToolActivity,
+} from '../assistant/business-history.js';
 import type {
   BoundContextWriter,
   ContextToolDefinition,
@@ -47,6 +52,7 @@ export const writeDeliverySchema = z
     /** Local cancellation replies contain no stored business details or remote tool authority. */
     localCancellation: z.literal(true).optional(),
     expiresAt: z.string().datetime(),
+    history: toolHistorySchema.optional(),
   })
   .strict()
   .refine((value) =>
@@ -233,6 +239,49 @@ function receipt(
     operations: operations.map((op) => ({ id: op.operationId, version: op.version })),
     expiresAt: new Date(now + 300_000).toISOString(),
   };
+}
+function rememberWrite(
+  history: ToolHistory,
+  operation: WriteOperation,
+  phase: 'commit' | 'recovery',
+  includeDetails = true,
+) {
+  const status: ToolActivity['status'] =
+    operation.state === 'SUCCEEDED'
+      ? 'committed'
+      : operation.state === 'PROPOSED'
+        ? 'awaiting_confirmation'
+        : operation.state === 'DRAFT'
+          ? 'staged'
+          : operation.state === 'REJECTED'
+            ? 'failed'
+            : operation.state === 'CANCELLED'
+              ? 'cancelled'
+              : operation.state === 'EXPIRED'
+                ? 'expired'
+                : operation.result?.outcome === 'not_dispatched' && !operation.hasUncertainAttempt
+                  ? 'not_dispatched'
+                  : operation.hasUncertainAttempt ||
+                      operation.state === 'UNKNOWN' ||
+                      operation.state === 'DISPATCHING'
+                    ? 'uncertain'
+                    : 'not_dispatched';
+  history.record(
+    operation.payload.toolName,
+    includeDetails ? JSON.stringify(visibleArguments(operation)) : undefined,
+    {
+      ok: status !== 'failed',
+      state: operation.state,
+      ...(operation.result
+        ? {
+            outcome: operation.result.outcome,
+            code: operation.result.code,
+            ...(includeDetails && status === 'committed' ? { data: operation.result.data } : {}),
+          }
+        : {}),
+    },
+    { status, phase, operationId: operation.operationId },
+  );
 }
 function publicFailure(error: unknown) {
   return error instanceof WriteStorageError ? error.code : 'WRITE_UNAVAILABLE';
@@ -425,19 +474,47 @@ export class BusinessWriteService {
       ? []
       : (await access.writer.describe(signal)).tools.filter(contextWriteDescriptor);
     if (!localCancellation && !definitions.length) return undefined;
-    const reply = (text: string, operations: WriteOperation[] = []): BusinessWriteReply => ({
-      text,
-      delivery: {
-        ...receipt(
-          access.actor,
-          command.runId,
-          definitions,
-          localCancellation ? operations.filter((op) => op.state === 'CANCELLED') : operations,
-          this.now(),
-        ),
-        ...(localCancellation ? { localCancellation: true as const } : {}),
-      },
-    });
+    const reply = (text: string, operations: WriteOperation[] = []): BusinessWriteReply => {
+      const history = new ToolHistory(this.now);
+      for (const operation of operations) {
+        if (localCancellation) {
+          history.record(
+            'cancel_business_write',
+            undefined,
+            { ok: true, state: operation.state },
+            {
+              status: operation.state === 'CANCELLED' ? 'cancelled' : 'failed',
+              phase: 'recovery',
+              operationId: operation.operationId,
+            },
+          );
+          continue;
+        }
+        const definition = definitions.find((tool) => tool.name === operation.payload.toolName);
+        rememberWrite(
+          history,
+          operation,
+          'recovery',
+          !localCancellation &&
+            !!definition &&
+            writeContract(definition)?.auditHistory === 'actor_scoped',
+        );
+      }
+      return {
+        text,
+        delivery: {
+          ...receipt(
+            access.actor,
+            command.runId,
+            definitions,
+            localCancellation ? operations.filter((op) => op.state === 'CANCELLED') : operations,
+            this.now(),
+          ),
+          ...(localCancellation ? { localCancellation: true as const } : {}),
+          history: history.snapshot(),
+        },
+      };
+    };
     if (!match && existing) {
       const tool = definitions.find((item) => item.name === existing.payload.toolName);
       if (
@@ -481,14 +558,17 @@ export class BusinessWriteService {
       if (!(error instanceof WriteStorageError)) throw error;
       return reply(
         error.code === 'WRITE_RECOVERY_AMBIGUOUS'
-          ? 'There is more than one unresolved action in this conversation. I have not retried or cancelled any of them. Please identify which draft you mean.'
+          ? 'There is more than one unresolved action in this conversation. Please use the retry code for the change you mean; no new attempt was made.'
           : 'I could not safely match that recovery request. No new attempt was made.',
       );
     }
+    // A bare retry can refer to a failed read or voice request, not a business write.
+    if (!operation && /^(?:please )?(?:retry|try again)[.!]?$/i.test(source.text.trim()))
+      return undefined;
     if (!operation)
       return reply(
         natural
-          ? 'There is no single unresolved direct draft action to recover in this conversation. I have not created or changed a draft.'
+          ? 'There is no single unresolved direct action to recover in this conversation. No new attempt was made.'
           : 'I could not find an active proposal with that code in this conversation. Ask me to prepare the change again.',
       );
     try {
@@ -623,6 +703,8 @@ function contractMatches(tool: ContextToolDefinition, operation: WriteOperation)
 }
 
 export class BusinessWriteRun {
+  readonly toolHistory = new ToolHistory(() => this.now());
+  private usedHistoricalReply = false;
   readonly tools: ToolSessionRequest['tools'];
   readonly evidence: unknown[] = [];
   readonly failures: Array<{ tool: string; code: string }> = [];
@@ -668,18 +750,52 @@ export class BusinessWriteRun {
     return Math.max(0, 8 - this.calls);
   }
   get usedPrivateData() {
-    return this.privateRead;
+    return this.privateRead || this.usedHistoricalReply;
+  }
+  canRecall(value: WriteDelivery) {
+    return (
+      !this.blocked &&
+      sameActor(value, this.actor) &&
+      (value.localCancellation === true ||
+        value.tools.every((name) =>
+          this.definitions.some(
+            (tool) =>
+              tool.name === name &&
+              (!value.toolContracts?.[name] || value.toolContracts[name] === descriptorHash(tool)),
+          ),
+        ))
+    );
+  }
+  rememberHistoricalReply() {
+    this.usedHistoricalReply = true;
+  }
+  historyDelivery(): WriteDelivery | undefined {
+    return !this.blocked && (this.toolHistory.used || this.usedHistoricalReply)
+      ? {
+          ...receipt(
+            this.actor,
+            this.command.runId,
+            this.definitions,
+            this.staged && this.staged.state !== 'DRAFT' ? [this.staged] : [],
+            this.now(),
+          ),
+          history: this.toolHistory.snapshot(),
+        }
+      : undefined;
   }
   get deliveryReference(): WriteDelivery {
     const operations = new Map(this.history.map((op) => [op.operationId, op]));
     if (this.staged) operations.set(this.staged.operationId, this.staged);
-    return receipt(
-      this.actor,
-      this.command.runId,
-      this.definitions,
-      [...operations.values()],
-      this.now(),
-    );
+    return {
+      ...receipt(
+        this.actor,
+        this.command.runId,
+        this.definitions,
+        [...operations.values()],
+        this.now(),
+      ),
+      history: this.toolHistory.snapshot(),
+    };
   }
   get context() {
     return JSON.stringify({
@@ -705,6 +821,9 @@ export class BusinessWriteRun {
   }
 
   async execute(name: string, rawArgs: string, signal: AbortSignal): Promise<unknown> {
+    return this.toolHistory.track(name, rawArgs, () => this.executeTool(name, rawArgs, signal));
+  }
+  private async executeTool(name: string, rawArgs: string, signal: AbortSignal): Promise<unknown> {
     try {
       if (!this.remaining || !this.hasTool(name))
         throw new WriteStorageError('WRITE_TOOL_UNAVAILABLE');
@@ -928,6 +1047,25 @@ export class BusinessWriteRun {
     signal.throwIfAborted();
   }
   async finalize(signal: AbortSignal): Promise<BusinessWriteReply | undefined> {
+    try {
+      const result = await this.finalizeWrite(signal);
+      if (this.staged && result) rememberWrite(this.toolHistory, this.staged, 'commit');
+      return result
+        ? { ...result, delivery: { ...result.delivery, history: this.toolHistory.snapshot() } }
+        : undefined;
+    } catch (error) {
+      if (this.staged)
+        this.toolHistory.record(this.staged.payload.toolName, undefined, undefined, {
+          phase: 'commit',
+          operationId: this.staged.operationId,
+          status: ['APPROVED', 'DISPATCHING', 'UNKNOWN'].includes(this.staged.state)
+            ? 'uncertain'
+            : 'interrupted',
+        });
+      throw error;
+    }
+  }
+  private async finalizeWrite(signal: AbortSignal): Promise<BusinessWriteReply | undefined> {
     if (!this.staged) return undefined;
     await this.authorize(signal);
     if (this.staged.payload.executionMode === 'direct_request') {

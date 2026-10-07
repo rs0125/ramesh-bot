@@ -192,6 +192,18 @@ export class BusinessReadService {
       )
         return deny('INVALID_OR_EXPIRED_RECEIPT');
       try {
+        const sameOwner = async () => {
+          const reader = await this.resolve(key, signal);
+          signal.throwIfAborted();
+          return (
+            !!reader?.tools &&
+            reader.employeeId === receipt.employeeId &&
+            reader.tools.employeeId === receipt.employeeId
+          );
+        };
+        // History-only receipts have no source snapshots. They still require the
+        // same current employee before and after all other delivery checks.
+        if (!(await sameOwner())) return deny('IDENTITY_CHANGED');
         const pending = [...receipt.checks];
         const verify = async (check: (typeof receipt.checks)[number]) => {
           const reader = await this.resolve(key, signal);
@@ -222,8 +234,10 @@ export class BusinessReadService {
         );
         // Source and identity checks can cross the original receipt's deadline or midnight.
         // Fresh evidence does not renew permission to send an already prepared answer.
+        if (!workers.every(Boolean)) return false;
+        if (!(await sameOwner())) return deny('IDENTITY_CHANGED');
         if (!receiptIsFresh(receipt, this.now())) return deny('INVALID_OR_EXPIRED_RECEIPT');
-        return workers.every(Boolean) && !signal.aborted;
+        return !signal.aborted;
       } catch (error) {
         return deny(
           signal.aborted

@@ -10,6 +10,7 @@ import {
 import {
   getWriteDelivery,
   getPersonalDelivery,
+  getBusinessReply,
 } from '../../src/modules/messaging/delivery-evidence.js';
 import type { BusinessReadService } from '../../src/modules/assistant/business-reads.js';
 import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.types.js';
@@ -90,6 +91,7 @@ function writeRun(
       return usedPrivateData;
     },
     deliveryReference: receipt,
+    historyDelivery: () => undefined,
     hasTool(name: string) {
       return this.tools.some((tool) => tool.name === name);
     },
@@ -168,6 +170,7 @@ function readRun(employeeId = 7) {
       return result;
     },
     delivery: () => (evidence.length ? delivery : undefined),
+    historyDelivery: () => undefined,
   };
   return { run: run as unknown as ContextToolRun, readCalls, delivery };
 }
@@ -639,8 +642,10 @@ test('assistant protects proposal text while recalling only the separate verifie
   await reply.onSent?.();
   const saved = memory.get(createHash('sha256').update(message.chatId).digest('hex')).at(-1)!;
   assert.equal(saved.content, PRIVATE_HISTORY_REPLY);
-  assert.equal(saved.protectedReply?.text, 'The reference is available.');
-  assert.doesNotMatch(JSON.stringify(saved), /ABC123|78\.125|Proposed create/);
+  assert.equal(saved.protectedReply?.text, reply.text);
+  const businessOnly = getBusinessReply(saved.protectedReply!);
+  assert.equal(businessOnly?.text, 'The reference is available.');
+  assert.doesNotMatch(JSON.stringify(businessOnly), /ABC123|78\.125|Proposed create/);
 });
 
 test('assistant never recalls private write-history prose using business read permission alone', async () => {
@@ -679,7 +684,8 @@ test('assistant never recalls private write-history prose using business read pe
   await reply.onSent?.();
   const saved = memory.get(createHash('sha256').update(message.chatId).digest('hex')).at(-1)!;
   assert.equal(saved.content, PRIVATE_HISTORY_REPLY);
-  assert.equal(saved.protectedReply, undefined);
+  assert.equal(saved.protectedReply?.text, reply.text);
+  assert.equal(getBusinessReply(saved.protectedReply!), undefined);
 });
 
 test('mixed crash recovery retains both authoritative receipts before checkpoint or model work', async () => {

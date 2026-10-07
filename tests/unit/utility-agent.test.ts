@@ -109,7 +109,33 @@ test('search, read and calculate are advertised and independently grounded throu
   );
   const reply = await assistant.prepare(message, signal(), trusted);
   assert.equal(reply.trace.outcome, 'completed');
-  assert.equal(reply.businessEvidence, undefined);
+  const receipt = toolDeliverySchema.parse(reply.businessEvidence);
+  assert.equal(receipt.historicalOnly, true);
+  assert.deepEqual(receipt.checks, []);
+  assert.deepEqual(
+    receipt.history?.activity.map((item) => item.tool),
+    ['web_search', 'read_webpage', 'calculate'],
+  );
+  assert.deepEqual(receipt.history?.activity[2]?.arguments, { expression: '20000*22' });
+  assert.equal((receipt.history?.activity[2]?.result as { value: string }).value, '440000');
+  const fresh = (await fixture.service.openTools(trusted, signal())).run!;
+  const history = businessRecall(
+    [
+      {
+        role: 'assistant',
+        content: '[protected]',
+        protectedReply: {
+          text: reply.text,
+          receipt,
+        },
+      },
+    ],
+    fresh,
+    now,
+  );
+  assert.match(history.messages[0]!.content, /440000/);
+  assert.match(history.messages[0]!.content, /Public company details/);
+  assert.ok(!JSON.stringify(receipt).includes('fixture-secret'));
   assert.equal(providerCalls, 2);
   assert.equal(fixture.state.calls.length, 0);
   assert.equal(fake.sessions[0]!.tools.length, 20);
@@ -233,7 +259,7 @@ test('mixed answers retain business receipts and recall never certifies stale pu
     run,
     now,
   );
-  const recalled = await recall.execute('{}', signal());
+  const recalled = await recall.execute(JSON.stringify(recall.targets[0]), signal());
   assert.equal(recalled.ok, true);
   assert.equal(recalled.public_web_requires_refresh, true);
   assert.equal(recalled.previous_reply_verified, false);

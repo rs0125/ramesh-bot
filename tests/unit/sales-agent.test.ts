@@ -1,4 +1,5 @@
 import { planningResult } from '../fixtures/planning-model.js';
+import { historyTurnId } from '../../src/modules/assistant/tool-history-recall.js';
 /** Contracts for the general tool loop. No paid model calls, network or WhatsApp delivery. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -358,10 +359,15 @@ test('review can recover a mistaken direct route and sees the actual protected-r
   const fixture = createSalesFixture();
   const previous = (await fixture.service.openTools(trusted, signal())).run!;
   await previous.execute('search_crm_leads', '{"view":"assigned"}', signal());
-  const fake = scriptedModel([{ name: 'recall_business_context', args: {} }], undefined, [
-    false,
-    true,
-  ]);
+  const protectedReply = {
+    text: '1. Fixture Acme Storage\n2. Fixture Beacon Retail',
+    receipt: previous.delivery()!,
+  };
+  const fake = scriptedModel(
+    [{ name: 'recall_business_context', args: { turn_id: historyTurnId(protectedReply) } }],
+    undefined,
+    [false, true],
+  );
   const complete = fake.model.complete;
   fake.model.complete = async (request, abort) =>
     request.stage === 'converser'
@@ -383,10 +389,7 @@ test('review can recover a mistaken direct route and sees the actual protected-r
       {
         role: 'assistant',
         content: '[Private business result]',
-        protectedReply: {
-          text: '1. Fixture Acme Storage\n2. Fixture Beacon Retail',
-          receipt: previous.delivery(),
-        },
+        protectedReply,
       },
     ],
     fixture.service,
@@ -474,8 +477,12 @@ test('failed review permits one repair then suppresses unsupported business clai
     // Each completed worker draft is styled deterministically, including its repair.
     assert.equal(fake.requests.filter((r) => r.stage === 'formatter').length, 0);
     assert.equal(reply.trace.stages.filter((s) => s.stage === 'formatter').length, 2);
-    assert.equal(reply.businessEvidence !== undefined, reviews[1]);
-    if (!reviews[1]) assert.ok(!reply.text.includes('Fixture Acme'));
+    const receipt = toolDeliverySchema.parse(reply.businessEvidence);
+    assert.equal(receipt.historicalOnly === true, !reviews[1]);
+    if (!reviews[1]) {
+      assert.deepEqual(receipt.checks, []);
+      assert.ok(!reply.text.includes('Fixture Acme'));
+    }
   }
 });
 

@@ -1,11 +1,15 @@
 /** Small model port: the graph knows nothing about OpenAI credentials or WhatsApp sends. */
 import type { ReviewMetric } from './review-diagnostics.js';
+/** One model response can propose a small batch of independent authenticated reads. */
+export const MAX_READ_BATCH = 3;
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
-  /** Server-only envelope. Never serialize into model history; recall requires fresh scoped reads. */
+  /** Server-only receipt. Same-employee business history projects text/activity separately from live evidence. */
   protectedReply?: { text: string; receipt: unknown };
+  /** Server-owned association with the user request that produced this protected answer. */
+  businessRequest?: string;
   /** Identities only, never serialized; recall reauthorizes and refreshes every record. */
   businessReferences?: import('./chat-context.js').RememberedSelection;
 }
@@ -29,6 +33,9 @@ export interface ModelRequest {
 }
 
 export interface ModelResult {
+  model?: string;
+  /** Successful Responses calls, including search continuations; excludes replay and SDK retries. */
+  responseCalls?: number;
   text: string;
   inputTokens: number;
   outputTokens: number;
@@ -83,6 +90,8 @@ export interface ToolModelSession {
 }
 
 export interface StageMetric {
+  model?: string;
+  responseCalls?: number;
   stage: AgentStage;
   durationMs: number;
   inputTokens: number;
@@ -96,6 +105,7 @@ export interface StageMetric {
 export interface AgentTrace {
   runId: string;
   model: string;
+  modelRouting?: 'single' | 'split';
   promptVersion: string;
   durationMs: number;
   stages: StageMetric[];

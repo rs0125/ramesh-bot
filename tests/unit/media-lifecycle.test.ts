@@ -64,6 +64,61 @@ class MemoryMedia implements MediaStore {
   async clean() {}
 }
 
+test('CRM dates, notes and summaries do not select unrelated historical attachments', async () => {
+  const store = new MemoryMedia();
+  const media = new MediaService(store, {
+    async extract() {
+      return 'What is a CMS schema?';
+    },
+  });
+  await media.ingest('owner', 'earlier-audio', upload);
+  await media.drain();
+  for (const request of [
+    'CRM entries of yesterday',
+    'Summarize these deals',
+    'show the earlier notes',
+    'Retry',
+  ])
+    assert.equal(await media.context('owner', [], request, AbortSignal.timeout(1000)), '', request);
+  await media.stop();
+});
+
+test('an explicit singular voice reference selects the latest matching attachment only', async () => {
+  const store = new MemoryMedia();
+  const media = new MediaService(store, {
+    async extract() {
+      return 'Latest warehouse brief';
+    },
+  });
+  const old = await media.ingest('owner', 'old-audio', upload);
+  const current = await media.ingest('owner', 'new-audio', upload);
+  await media.drain();
+  store.rows.get(old)!.createdAt = new Date(Date.now() - 60000);
+  const result = JSON.parse(
+    await media.context('owner', [], 'use my previous voice note', AbortSignal.timeout(1000)),
+  );
+  assert.deepEqual(
+    result.attachments.map((item: { attachment: string }) => item.attachment),
+    [current],
+  );
+  assert.equal(
+    await media.context('another-owner', [], 'use my voice note', AbortSignal.timeout(1000)),
+    '',
+  );
+  const second = await media.ingest('owner', 'second-in-burst', upload);
+  await media.drain();
+  store.rows.get(old)!.createdAt = new Date(Date.now() - 3600000);
+  store.rows.get(current)!.createdAt = new Date(Date.now() - 1000);
+  const ordinal = JSON.parse(
+    await media.context('owner', [], 'the second voice note', AbortSignal.timeout(1000)),
+  );
+  assert.deepEqual(
+    ordinal.attachments.map((item: { attachment: string }) => item.attachment),
+    [second],
+  );
+  await media.stop();
+});
+
 test('reader abort returns promptly without cancelling another reader or duplicating shared extraction', async () => {
   const store = new MemoryMedia();
   const started = gate(),

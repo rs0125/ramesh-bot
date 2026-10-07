@@ -3,9 +3,14 @@ import OpenAI from 'openai';
 import { OpenAIToolCatalog } from './tool-catalog.js';
 import { replayModelResponse } from '../../modules/assistant/model-replay.js';
 import { CheckpointError } from '../../modules/assistant/checkpoint.types.js';
-import { effectiveReasoningEffort, type AssistantConfig } from '../../config/assistant.js';
+import {
+  effectiveReasoningEffort,
+  modelForStage,
+  type AssistantConfig,
+} from '../../config/assistant.js';
 import { withUsageStage } from '../../modules/usage/usage-scope.js';
 import { MEMORY_INSTRUCTIONS } from '../../modules/assistant/chat-context.js';
+import { MAX_READ_BATCH } from '../../modules/assistant/assistant.types.js';
 import type {
   ModelRequest,
   ModelResult,
@@ -89,6 +94,16 @@ export class OpenAITextModel implements TextModel {
     );
     const catalog = new OpenAIToolCatalog(request.tools, this.toolLoadingMode);
     const pending = new Map<string, string | undefined>();
+    const batchReadNames =
+      this.config.modelRouting === 'split'
+        ? request.tools
+            .filter(
+              (tool) =>
+                tool.annotations?.readOnlyHint === true &&
+                tool.annotations.destructiveHint !== true,
+            )
+            .map((tool) => tool.name)
+        : [];
     let searchCalls = 0;
     return {
       next: async (remainingCalls, signal, allowedToolNames) => {
@@ -99,6 +114,7 @@ export class OpenAITextModel implements TextModel {
             ModelResult,
             'inputTokens' | 'outputTokens' | 'cachedInputTokens' | 'reasoningTokens'
           > = { inputTokens: 0, outputTokens: 0 };
+          let responseCalls = 0;
           // Hosted search may return only search items; continue internally, with a session bound.
           for (let round = 0; round < 9; round++) {
             signal.throwIfAborted();
@@ -109,12 +125,15 @@ export class OpenAITextModel implements TextModel {
             const allowedNames = allowed.map((tool) => tool.name);
             const tools = catalog.render(allowedNames);
             const searchEnabled = tools.some((tool) => tool.type === 'tool_search');
+            const parallelReads = batchReadNames.filter((name) => allowedNames.includes(name));
+            const batchLimit =
+              parallelReads.length > 1 ? Math.min(MAX_READ_BATCH, remainingCalls) : 1;
             if (searchEnabled && searchCalls >= 8) throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
             const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
               model: this.config.model,
               service_tier: 'default',
               instructions: this.instructions(
-                `${request.instructions}${catalog.mode === 'deferred' ? '\nSearch for the relevant capability to load its tools before using them. Tool search grants no additional permissions.' : ''}`,
+                `${request.instructions}${batchReadNames.length > 1 ? `\nYou may propose up to ${MAX_READ_BATCH} independent read-only business calls together when all arguments are already known. Wait for results before proposing dependent reads. Personal actions, write proposals, history recall and utility tools must each be the only function call in their response. Never mix them with a read batch.` : ''}${catalog.mode === 'deferred' ? '\nSearch for the relevant capability to load its tools before using them. Tool search grants no additional permissions.' : ''}`,
               ),
               // Keep instructions stable for caching; append each step's budget after the evidence.
               input: [
@@ -135,7 +154,7 @@ export class OpenAITextModel implements TextModel {
                         mode: 'auto',
                         tools: allowed.map(({ name }) => ({ type: 'function', name })),
                       },
-              parallel_tool_calls: false,
+              parallel_tool_calls: batchLimit > 1,
               store: false,
               reasoning: { effort: this.config.toolReasoningEffort ?? 'medium' },
               include: ['reasoning.encrypted_content'],
@@ -159,12 +178,13 @@ export class OpenAITextModel implements TextModel {
               );
               signal.throwIfAborted();
               if (value.status !== 'completed') throw new Error('Incomplete model response');
-              validateToolResponse(value, searchEnabled);
+              validateToolResponse(value, searchEnabled, parallelReads, batchLimit);
               return value;
             });
+            if (!replayed) responseCalls++;
             signal.throwIfAborted();
             if (response.status !== 'completed') throw new Error('Incomplete model response');
-            validateToolResponse(response, searchEnabled);
+            validateToolResponse(response, searchEnabled, parallelReads, batchLimit);
             const calls = response.output.filter((item) => item.type === 'function_call');
             // Keep all continuation items, including encrypted reasoning, with store:false.
             // Durable replay encrypts these items; they are never logged or shared across runs.
@@ -205,6 +225,8 @@ export class OpenAITextModel implements TextModel {
                 arguments: call.arguments,
               })),
               ...totals,
+              model: this.config.model,
+              responseCalls,
               responseId: response.id,
             };
           }
@@ -246,13 +268,16 @@ export class OpenAITextModel implements TextModel {
     signal?.throwIfAborted();
     try {
       const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
-        model: this.config.model,
+        model: modelForStage(this.config, request.stage),
         service_tier: 'default',
         instructions: this.instructions(request.instructions),
         input: request.messages.map(({ role, content }) => ({ role, content })),
         store: false,
         reasoning: {
-          effort: effectiveReasoningEffort(this.config.model, request.reasoningEffort ?? 'none'),
+          effort: effectiveReasoningEffort(
+            modelForStage(this.config, request.stage),
+            request.reasoningEffort ?? 'none',
+          ),
         },
         max_output_tokens: this.config.maxOutputTokens,
         ...(request.jsonSchema
@@ -283,6 +308,8 @@ export class OpenAITextModel implements TextModel {
         throw new Error('OpenAI returned no complete text response');
       return {
         text: response.output_text.trim(),
+        model: body.model,
+        responseCalls: replayed ? 0 : 1,
         inputTokens: replayed ? 0 : (response.usage?.input_tokens ?? 0),
         outputTokens: replayed ? 0 : (response.usage?.output_tokens ?? 0),
         ...usageDetails(replayed ? undefined : response.usage),
@@ -298,13 +325,20 @@ export class OpenAITextModel implements TextModel {
   }
 }
 
-function validateToolResponse(response: OpenAI.Responses.Response, searchEnabled = false) {
+function validateToolResponse(
+  response: OpenAI.Responses.Response,
+  searchEnabled = false,
+  readNames: readonly string[] = [],
+  batchLimit = 1,
+) {
   const calls = response.output.filter((item) => item.type === 'function_call');
   const searches = response.output.filter(
     (item) => item.type === 'tool_search_call' || item.type === 'tool_search_output',
   );
   if (
-    calls.length > 1 ||
+    calls.length > batchLimit ||
+    new Set(calls.map((call) => call.call_id)).size !== calls.length ||
+    (calls.length > 1 && calls.some((call) => !readNames.includes(call.name))) ||
     (!calls.length &&
       !response.output_text?.trim() &&
       !searches.some((item) => item.type === 'tool_search_output')) ||

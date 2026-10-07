@@ -83,7 +83,8 @@ test('failed refresh drops expired grounding and receipts instead of leaking the
   const fresh = await run.executeCached('search_crm_leads', query, signal());
   assert.equal(fresh, undefined);
   assert.equal(run.evidence.length, 0);
-  assert.equal(run.delivery(), undefined);
+  assert.equal(run.delivery()?.historicalOnly, true);
+  assert.deepEqual(run.delivery()?.checks, []);
   assert.deepEqual(run.retiredEvidenceIds, [first.evidence_id]);
   assert.equal(run.failures.at(-1)?.code, 'UNAVAILABLE');
   assert.ok(
@@ -138,7 +139,8 @@ test('refresh cancellation after the source call neither publishes replacement n
   await assert.rejects(run.executeCached('search_crm_leads', query, controller.signal));
   assert.equal(run.evidence.length, 0);
   assert.deepEqual(run.retiredEvidenceIds, [first.evidence_id]);
-  assert.equal(run.delivery(), undefined);
+  assert.equal(run.delivery()?.historicalOnly, true);
+  assert.deepEqual(run.delivery()?.checks, []);
 });
 
 test('current identity remains required before an expired cache can refresh', async () => {
@@ -161,7 +163,7 @@ test('recall handles an expired in-run snapshot as a fresh source read instead o
     },
   ];
   advance();
-  const result = await businessRecall(history, run, now()).execute('{}', signal());
+  const result = await executeRecall(businessRecall(history, run, now()), '{}', signal());
   assert.equal(result.ok, true);
   assert.equal(result.previous_reply_verified, true);
   assert.equal(fixture.state.calls.length, 2);
@@ -251,8 +253,8 @@ test('an identical refreshed source preserves joint recall under its new evidenc
     },
   ];
   const calls = [
-    { name: RECALL_TOOL, args: { turn: 1 } },
-    { name: RECALL_TOOL, args: { turn: 2 } },
+    { name: RECALL_TOOL, args: { turn_id: recallTurnId(history[0]!.protectedReply!) } },
+    { name: RECALL_TOOL, args: { turn_id: recallTurnId(history[1]!.protectedReply!) } },
     { name: 'search_crm_leads', args: query },
   ];
   let next = 0;
@@ -309,3 +311,4 @@ test('an identical refreshed source preserves joint recall under its new evidenc
   assert.equal(result.reply, 'Current fixture result.');
   assert.equal(fixture.state.calls.length, 3);
 });
+import { executeRecall, recallTurnId } from '../fixtures/business-recall.js';

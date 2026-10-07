@@ -160,6 +160,12 @@ export class WriteStorageError extends Error {
 export function directRecoveryAction(text: string): 'retry' | 'cancel' | undefined {
   const value = text.trim().toLowerCase().replace(/[.!]$/, '').trim();
   if (
+    /^(?:please )?(?:retry|try again|retry (?:that|the last) (?:rfq|change|action)|try (?:that|the last) (?:rfq|change|action) again)$/.test(
+      value,
+    )
+  )
+    return 'retry';
+  if (
     /^(?:please )?(?:retry (?:that|the last) draft|try (?:that|the last) draft again)$/.test(value)
   )
     return 'retry';

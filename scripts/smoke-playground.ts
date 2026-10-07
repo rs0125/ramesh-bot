@@ -6,6 +6,7 @@ import { parseArgs } from 'node:util';
 import { parse } from 'dotenv';
 import { Pool } from 'pg';
 import { loadLivePlaygroundConfig } from '../src/config/playground.js';
+import { assistantModels } from '../src/config/assistant.js';
 import { messagePoolOptions } from '../src/infrastructure/database/message-pool.js';
 import { PlaygroundRepository } from '../src/infrastructure/database/playground.repository.js';
 import { authCipher } from '../src/infrastructure/database/auth-store.js';
@@ -22,7 +23,7 @@ async function main() {
     parse(await readFile(resolve(process.env.PLAYGROUND_ENV_FILE ?? '.local/live-playground.env'))),
   );
   assertEvalRun([config.model.model], 5, values);
-  const usageMeter = await createEvalUsageMeter(values, process.env, [config.model.model]);
+  const usageMeter = await createEvalUsageMeter(values, process.env, assistantModels(config.model));
   const modelConfig = { ...config.model, usageMeter };
   const pool = new Pool(messagePoolOptions(config.databaseUrl, config.ca));
   pool.on('error', () => {});

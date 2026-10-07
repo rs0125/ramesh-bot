@@ -25,7 +25,9 @@ import { finishReply, chatLayoutIssues } from './style.js';
 import { businessRecall, recallDefinition, RECALL_TOOL } from './business-recall.js';
 import { dealDisplayFacts, dealDisplayIssues, withDealDates } from './deal-display.js';
 import { planningContext } from './planning-context.js';
-import { routeSchema, taskPlanSchema, validateTaskPlan } from './task-plan.js';
+import { routeSchema, taskPlanSchema, validateTaskPlan, lookupPlan } from './task-plan.js';
+import { MAX_READ_BATCH } from './assistant.types.js';
+import { quickChatReply } from './quick-chat.js';
 import { isUtilityTool, type UtilityToolName, type UtilityToolRun } from './utility-tools.js';
 import { bindReplayAuthority, currentCheckpoint } from './model-replay.js';
 import { CheckpointError } from './checkpoint.types.js';
@@ -54,6 +56,8 @@ const state = new StateSchema({
   route: z.enum(['direct', 'work']).default('direct'),
   objective: z.string().default(''),
   personalOnly: z.boolean().default(false),
+  lookup: taskPlanSchema.optional(),
+  casual: z.boolean().default(false),
   plan: taskPlanSchema.optional(),
   draft: z.string().default(''),
   draftReady: z.boolean().default(false),
@@ -82,9 +86,11 @@ export interface GraphContextObservation {
   tools: Parameters<NonNullable<TextModel['startToolSession']>>[0]['tools'];
 }
 export interface SalesGraphOptions {
+  optimizeLatency?: boolean;
   durableContextEnabled?: boolean;
   now?: () => number;
   researchDeadlineMs?: number;
+  replyDeadlineMs?: number;
   onStage?: (stage: StageMetric) => void;
   onContext?: (context: GraphContextObservation) => void;
   /** Best-effort progress when substantial planning or tool execution starts. */
@@ -284,13 +290,15 @@ export function buildSalesGraph(
         value.audience === 'dm' && accessStatus === 'available' && run
           ? options.utilities
           : undefined;
-      recall = businessRecall(value.history, run, requestTime);
+      recall = businessRecall(value.history, run, requestTime, personal, writes);
       modelHistory = recall.messages;
       tools = [
         ...(run?.tools.map((tool) => ({
           name: tool.name,
           description: tool.description,
           inputSchema: tool.inputSchema,
+          // ContextToolRun exposes authenticated read contracts only.
+          annotations: { readOnlyHint: true, destructiveHint: false },
           ...(toolDiscovery(tool) ? { discovery: toolDiscovery(tool) } : {}),
         })) ?? []),
         ...(recall.available ? [recallDefinition] : []),
@@ -301,10 +309,64 @@ export function buildSalesGraph(
       if (new Set(tools.map((tool) => tool.name)).size !== tools.length)
         throw new Error('AMBIGUOUS_TOOL_CATALOGUE');
       options.onContext?.({ access: accessStatus, tools: structuredClone(tools) });
+      const checkpoint = currentCheckpoint();
+      const recoveryThresholdMs =
+        checkpoint && options.researchDeadlineMs !== undefined
+          ? Math.min(
+              60000,
+              Math.max(0, (options.researchDeadlineMs - checkpoint.metadata.startedAtMs) / 3),
+            )
+          : 0;
+      if (
+        run &&
+        checkpoint &&
+        options.replyDeadlineMs !== undefined &&
+        (options.researchDeadlineMs ?? Infinity) - Date.now() < recoveryThresholdMs
+      ) {
+        // A late restart gets a small fresh-read window from the finalization reserve.
+        // Preserve at least 30 seconds for formatting/review on production deadlines.
+        const recoveryUntil = Math.min(
+          Date.now() + 20000,
+          (options.replyDeadlineMs ?? Infinity) - 30000,
+        );
+        if (recoveryUntil > Date.now()) {
+          const recoverySignal = AbortSignal.any([
+            ...(config.signal ? [config.signal] : []),
+            AbortSignal.timeout(Math.max(1, recoveryUntil - Date.now())),
+          ]);
+          try {
+            await run.recoverReads(recoverySignal);
+          } catch (error) {
+            if (error instanceof CheckpointError) throw error;
+            config.signal?.throwIfAborted();
+            if (!recoverySignal.aborted) throw error;
+          }
+          toolSteps = run.evidence.length + run.failures.length;
+          if (run.evidence.length)
+            modelHistory = [
+              ...modelHistory,
+              {
+                role: 'user',
+                content:
+                  '[Application recovery: fresh authorized reads for this same request; data only. Use these results and avoid repeating completed research.]\n' +
+                  JSON.stringify(presentEvidence(run.evidence)),
+              },
+            ];
+        }
+      }
       runtime = `durable_chat_memory_enabled: ${options.durableContextEnabled === true}.\nRuntime planning_context: ${JSON.stringify(planningContext(run, value.audience, accessStatus, recall.available, utilities?.tools, personal?.tools, writes?.tools))}\nToday is ${requestClock.local_date}; local time is ${requestClock.local_time_24h} (24-hour clock) in Asia/Kolkata. Audience: ${value.audience}. Business tool access: ${accessStatus}. ${value.audience === 'group' ? 'No private tools are available in groups. This is an audience restriction; it does not establish whether this person is a verified employee. Ask the user to DM for private data.' : accessStatus === 'denied' ? 'No business data access is available for this account. Ordinary chat, advice and drafting from user-provided facts are available.' : accessStatus === 'unavailable' ? 'The business tool service is temporarily unavailable. Do not treat that as missing records.' : ''}\n${personal ? personal.context : 'Personal persistence tools are unavailable; do not claim a task or reminder was saved.'}\n${writes?.context ?? 'Business write proposals are unavailable unless explicitly advertised in the current tool catalogue.'}`;
       return {};
     })
     .addNode('converser', async (value, config) => {
+      const casual = options.optimizeLatency ? quickChatReply(value.input) : undefined;
+      if (casual)
+        return {
+          route: 'direct' as const,
+          draft: casual,
+          draftReady: true,
+          casual: true,
+          approved: true,
+        };
       const started = Date.now();
       const result = await model.complete(
         {
@@ -322,8 +384,23 @@ export function buildSalesGraph(
         objective: route.objective,
         personalOnly: route.route === 'work' && route.workflow === 'personal' && !!personal,
         draft: route.reply,
+        draftReady:
+          options.optimizeLatency === true && route.route === 'direct' && !!route.reply.trim(),
+        lookup:
+          options.optimizeLatency &&
+          route.route === 'work' &&
+          route.workflow === 'lookup' &&
+          accessStatus === 'available'
+            ? lookupPlan(route.objective, route.lookupTools, run?.tools ?? [])
+            : undefined,
         stages: [...value.stages, recordMetric(metric('converser', started, result))],
       };
+    })
+    .addNode('lookup_plan', async (value, config) => {
+      config.signal?.throwIfAborted();
+      const plan = value.lookup!;
+      startSession(plan, value.input, false);
+      return { plan };
     })
     .addNode('personal_plan', async (value, config) => {
       config.signal?.throwIfAborted();
@@ -403,114 +480,135 @@ export function buildSalesGraph(
             outputTokens: result.outputTokens,
             reasoningTokens: result.reasoningTokens ?? 0,
             cachedInputTokens: result.cachedInputTokens ?? 0,
+            model: result.model,
+            responseCalls: result.responseCalls,
           }),
         ],
       };
     })
     .addNode('executor', async (value, config) => {
-      const started = Date.now();
-      if (value.calls.length !== 1) throw new Error('Invalid model tool proposal');
-      const call = value.calls[0]!;
-      if (!sessionTools.some((tool) => tool.name === call.name))
-        throw new Error('UNAVAILABLE_TOOL');
-      toolSteps++;
-      const attempt = await research((signal) => {
-        if (toolSteps > 28 || familyBudgets()[toolFamily(call.name)] <= 0)
-          return Promise.resolve({
-            ok: false,
-            code: 'TOOL_BUDGET_EXHAUSTED',
-            family: toolFamily(call.name),
-            remaining: toolBudget(),
-            message:
-              'This tool family has no remaining calls. Preserve the evidence already gathered, complete other requested work with callable tools, and state any unfinished coverage.',
-          });
-        signal.throwIfAborted();
-        notifyToolActivity(options.onToolActivity);
-        const prior = execution[call.name];
-        execution[call.name] = {
-          status: 'interrupted',
-          attempts: (prior?.attempts ?? 0) + 1,
-          successes: prior?.successes ?? 0,
-        };
-        return personal?.hasTool(call.name)
-          ? personal.execute(call.name, call.arguments, signal)
-          : writes?.hasTool(call.name)
-            ? writes.execute(call.name, call.arguments, signal)
-            : call.name === RECALL_TOOL && run
-              ? recall.execute(call.arguments, signal)
-              : isUtilityTool(call.name) && utilities && run
-                ? run!.executeUtility(
-                    (authorizeResult) =>
-                      utilities!.execute(
-                        call.name as UtilityToolName,
-                        call.arguments,
-                        signal,
-                        authorizeResult,
-                      ),
-                    signal,
+      // Validate the entire batch before any dispatch. Models cannot batch writes or recall.
+      if (
+        !value.calls.length ||
+        value.calls.length > MAX_READ_BATCH ||
+        new Set(value.calls.map((call) => call.id)).size !== value.calls.length ||
+        value.calls.some((call) => !sessionTools.some((tool) => tool.name === call.name)) ||
+        (value.calls.length > 1 &&
+          value.calls.some((call) => !run?.tools.some((tool) => tool.name === call.name)))
+      )
+        throw new Error('Invalid model tool proposal');
+      const stages = [...value.stages];
+      // Reads share a model turn but dispatch in order, retaining lease, budget and journal fences.
+      for (const call of value.calls) {
+        const started = Date.now();
+        toolSteps++;
+        const attempt = await research((signal) => {
+          if (toolSteps > 28 || familyBudgets()[toolFamily(call.name)] <= 0) {
+            const output = {
+              ok: false,
+              code: 'TOOL_BUDGET_EXHAUSTED',
+              family: toolFamily(call.name),
+              remaining: toolBudget(),
+              message:
+                'This tool family has no remaining calls. Preserve the evidence already gathered, complete other requested work with callable tools, and state any unfinished coverage.',
+            };
+            const history = personal?.hasTool(call.name)
+              ? personal.toolHistory
+              : writes?.hasTool(call.name)
+                ? writes.toolHistory
+                : run?.toolHistory;
+            history?.record(call.name, call.arguments, output);
+            return Promise.resolve(output);
+          }
+          signal.throwIfAborted();
+          notifyToolActivity(options.onToolActivity);
+          const prior = execution[call.name];
+          execution[call.name] = {
+            status: 'interrupted',
+            attempts: (prior?.attempts ?? 0) + 1,
+            successes: prior?.successes ?? 0,
+          };
+          return personal?.hasTool(call.name)
+            ? personal.execute(call.name, call.arguments, signal)
+            : writes?.hasTool(call.name)
+              ? writes.execute(call.name, call.arguments, signal)
+              : call.name === RECALL_TOOL && run
+                ? run.toolHistory.track(call.name, call.arguments, () =>
+                    recall.execute(call.arguments, signal),
                   )
-                : run
-                  ? run.execute(call.name, call.arguments, signal)
-                  : Promise.reject(new Error('UNAVAILABLE_TOOL'));
-      }, config.signal);
-      if (attempt.limited) return { calls: [], researchExhausted: true };
-      if (!attempt.result || typeof attempt.result !== 'object' || Array.isArray(attempt.result))
-        throw new Error('INVALID_TOOL_OUTPUT');
-      const output = attempt.result as Record<string, unknown>;
-      const attemptStatus = execution[call.name];
-      if (attemptStatus) {
-        attemptStatus.status =
-          output.ok === true ? 'completed' : output.code === 'TIMEOUT' ? 'timed_out' : 'failed';
-        if (output.ok === true) attemptStatus.successes++;
-      }
-      if (call.name === RECALL_TOOL) {
-        const selectors = output.ok === true ? JSON.parse(call.arguments) : {};
-        const scope =
-          output.ok === true
-            ? JSON.stringify({
-                turn: output.turn,
-                group: selectors.group,
-                positions: selectors.positions?.slice().sort((a: number, b: number) => a - b),
-                warehouse_ids: selectors.warehouse_ids
-                  ?.slice()
-                  .sort((a: number, b: number) => a - b),
-              })
-            : undefined;
-        const snapshot = { value: output, sources: structuredClone(run?.evidence ?? []), scope };
-        const prior =
-          output.ok === true
-            ? recalled.findIndex((entry) => entry.value.ok === true && entry.scope === scope)
-            : -1;
-        if (prior >= 0) recalled.splice(prior, 1, snapshot);
-        else recalled.push(snapshot);
-      }
-      session!.accept(call.id, {
-        ...presentToolOutput(output, call.name),
-        runtime_budget: await observedBudget(`tool-${toolSteps}`),
-        ...(['read_crm_lead', 'assess_shortlist', RECALL_TOOL].includes(call.name)
-          ? {
-              working_context: workingContext(
-                run?.evidence ?? [],
-                modelHistory,
-                value.input,
-                currentRecalls(),
-              ),
-            }
-          : {}),
-      });
-      return {
-        calls: [],
-        blocked: !!run?.blocked || !!personal?.blocked || !!writes?.blocked,
-        stages: [
-          ...value.stages,
+                : isUtilityTool(call.name) && utilities && run
+                  ? run!.executeUtility(
+                      (authorizeResult) =>
+                        utilities!.execute(
+                          call.name as UtilityToolName,
+                          call.arguments,
+                          signal,
+                          authorizeResult,
+                        ),
+                      signal,
+                      call,
+                    )
+                  : run
+                    ? run.execute(call.name, call.arguments, signal)
+                    : Promise.reject(new Error('UNAVAILABLE_TOOL'));
+        }, config.signal);
+        if (attempt.limited) return { calls: [], researchExhausted: true, stages };
+        if (!attempt.result || typeof attempt.result !== 'object' || Array.isArray(attempt.result))
+          throw new Error('INVALID_TOOL_OUTPUT');
+        const output = attempt.result as Record<string, unknown>;
+        const attemptStatus = execution[call.name];
+        if (attemptStatus) {
+          attemptStatus.status =
+            output.ok === true ? 'completed' : output.code === 'TIMEOUT' ? 'timed_out' : 'failed';
+          if (output.ok === true) attemptStatus.successes++;
+        }
+        if (call.name === RECALL_TOOL) {
+          const selectors = output.ok === true ? JSON.parse(call.arguments) : {};
+          const scope =
+            output.ok === true
+              ? JSON.stringify({
+                  turn_id: output.turn_id,
+                  group: selectors.group,
+                  positions: selectors.positions?.slice().sort((a: number, b: number) => a - b),
+                  warehouse_ids: selectors.warehouse_ids
+                    ?.slice()
+                    .sort((a: number, b: number) => a - b),
+                })
+              : undefined;
+          const snapshot = { value: output, sources: structuredClone(run?.evidence ?? []), scope };
+          const prior =
+            output.ok === true
+              ? recalled.findIndex((entry) => entry.value.ok === true && entry.scope === scope)
+              : -1;
+          if (prior >= 0) recalled.splice(prior, 1, snapshot);
+          else recalled.push(snapshot);
+        }
+        session!.accept(call.id, {
+          ...presentToolOutput(output, call.name),
+          runtime_budget: await observedBudget(`tool-${toolSteps}`),
+          ...(['read_crm_lead', 'assess_shortlist', RECALL_TOOL].includes(call.name)
+            ? {
+                working_context: workingContext(
+                  run?.evidence ?? [],
+                  modelHistory,
+                  value.input,
+                  currentRecalls(),
+                ),
+              }
+            : {}),
+        });
+        stages.push(
           recordMetric({
-            stage: 'executor' as const,
+            stage: 'executor',
             durationMs: Date.now() - started,
             inputTokens: 0,
             outputTokens: 0,
           }),
-        ],
-      };
+        );
+        if (run?.blocked || personal?.blocked || writes?.blocked)
+          return { calls: [], blocked: true, stages };
+      }
+      return { calls: [], stages };
     })
     .addNode('formatter', async (value, config) => {
       const preview = personal?.preview();
@@ -521,8 +619,13 @@ export function buildSalesGraph(
       const composed = !!preview || !!writePreview;
       // Consume each completed worker answer once, including independent review repairs.
       // Formatter-only retries must not reuse a draft already rejected by the verifier.
-      if (!composed && value.draftReady && run?.evidence.length && value.draft.length <= 12000) {
-        const reply = withDealDates(finishReply(value.draft), run.evidence);
+      if (
+        !composed &&
+        value.draftReady &&
+        (value.route === 'direct' || run?.evidence.length) &&
+        value.draft.length <= 12000
+      ) {
+        const reply = withDealDates(finishReply(value.draft), run?.evidence ?? []);
         return {
           reply,
           supplement: '',
@@ -634,6 +737,8 @@ export function buildSalesGraph(
             outputTokens: result.outputTokens,
             reasoningTokens: result.reasoningTokens ?? 0,
             cachedInputTokens: result.cachedInputTokens ?? 0,
+            model: result.model,
+            responseCalls: result.responseCalls,
           }),
         ],
       };
@@ -751,6 +856,8 @@ export function buildSalesGraph(
             outputTokens: result.outputTokens,
             reasoningTokens: result.reasoningTokens ?? 0,
             cachedInputTokens: result.cachedInputTokens ?? 0,
+            model: result.model,
+            responseCalls: result.responseCalls,
             review: diagnostic,
           }),
         ],
@@ -764,6 +871,15 @@ export function buildSalesGraph(
       if (value.blocked) return { reply: deniedReply, unavailable: true };
       if (!value.approved)
         return {
+          ...(run?.historyDelivery()
+            ? { business: { outcome: 'verified' as const, delivery: run.historyDelivery()! } }
+            : {}),
+          ...(personal?.usedPrivateData && !personal.blocked
+            ? { personal: { text: '', delivery: personal.deliveryReference } }
+            : {}),
+          ...(writes?.historyDelivery()
+            ? { write: { text: '', delivery: writes.historyDelivery()! } }
+            : {}),
           reply: reviewFailureReply({
             hasEvidence: !!(
               run?.evidence.length ||
@@ -805,16 +921,18 @@ export function buildSalesGraph(
       // mutation may invalidate their versions (for example editing that draft).
       // A receipt-only reply is authorized by its write receipt, not stale input
       // evidence. Any separately rendered answer retains every read check.
-      if (writePreview && !otherReply && !personalReply) delivery = undefined;
+      if (writePreview && !otherReply && !personalReply) delivery = run?.historyDelivery();
       const composite =
-        personalReply && delivery && (value.supplement || !personalResult)
+        personalReply && delivery
           ? compositeDeliverySchema.parse({
               kind: 'composite',
               version: 1,
               personal: personalReply.delivery,
               business: delivery,
-              businessText: personalResult ? value.supplement : otherDraft,
-              ...(personal?.usedPrivateReads ? { businessRecallAllowed: false } : {}),
+              businessText: (personalResult ? value.supplement : otherDraft) || otherReply,
+              ...(personal?.usedPrivateReads || (personalResult && !value.supplement)
+                ? { businessRecallAllowed: false }
+                : {}),
             })
           : undefined;
       // The verifier has approved the exact request and arguments. The runtime now
@@ -824,7 +942,11 @@ export function buildSalesGraph(
       if (writePreview && !publishedWrite) throw new Error('WRITE_PROPOSAL_UNAVAILABLE');
       const writeReply =
         publishedWrite ??
-        (writes?.usedPrivateData ? { text: '', delivery: writes.deliveryReference } : undefined);
+        (writes?.usedPrivateData
+          ? { text: '', delivery: writes.deliveryReference }
+          : writes?.historyDelivery()
+            ? { text: '', delivery: writes.historyDelivery()! }
+            : undefined);
       const reply = [otherReply, writeReply?.text].filter(Boolean).join('\n\n');
       if (!reply || reply.length > 16000) throw new Error('Invalid composed reply');
       return {
@@ -846,9 +968,16 @@ export function buildSalesGraph(
     .addEdge(START, 'context')
     .addEdge('context', 'converser')
     .addConditionalEdges('converser', (value) =>
-      value.route === 'work' ? (value.personalOnly ? 'personal_plan' : 'planner') : 'formatter',
+      value.route === 'work'
+        ? value.personalOnly
+          ? 'personal_plan'
+          : value.lookup
+            ? 'lookup_plan'
+            : 'planner'
+        : 'formatter',
     )
     .addEdge('personal_plan', 'worker')
+    .addEdge('lookup_plan', 'worker')
     .addConditionalEdges('planner', (value) => (value.researchExhausted ? 'formatter' : 'worker'))
     .addConditionalEdges('worker', (value) => (value.calls.length ? 'executor' : 'formatter'))
     .addConditionalEdges('executor', (value) =>
@@ -858,7 +987,7 @@ export function buildSalesGraph(
           ? 'formatter'
           : 'worker',
     )
-    .addEdge('formatter', 'verifier')
+    .addConditionalEdges('formatter', (value) => (value.casual ? 'finish' : 'verifier'))
     .addConditionalEdges('verifier', (value) =>
       value.approved || value.repairs >= 2
         ? 'finish'
@@ -887,6 +1016,8 @@ function metric(
     outputTokens: number;
     reasoningTokens?: number;
     cachedInputTokens?: number;
+    model?: string;
+    responseCalls?: number;
   },
 ): StageMetric {
   return {
@@ -896,5 +1027,7 @@ function metric(
     outputTokens: result.outputTokens,
     reasoningTokens: result.reasoningTokens ?? 0,
     cachedInputTokens: result.cachedInputTokens ?? 0,
+    model: result.model,
+    responseCalls: result.responseCalls,
   };
 }

@@ -129,7 +129,12 @@ test('done acknowledges exactly the quoted occurrence and explains recurring/tas
   assert.match(reply!.text, /Future reminders are unchanged/);
   assert.match(reply!.text, /linked task is unchanged/);
   assert.equal(reply!.delivery.commandId, 'saved-command');
-  assert.deepEqual(await run.recover(AbortSignal.timeout(5000)), reply);
+  const recovered = (await run.recover(AbortSignal.timeout(5000)))!;
+  assert.deepEqual(
+    { ...recovered, delivery: { ...recovered.delivery, history: reply!.delivery.history } },
+    reply,
+  );
+  assert.equal(recovered.delivery.history!.activity.at(-1)!.phase, 'recovery');
   assert.equal(f.operations.length, 1);
 });
 

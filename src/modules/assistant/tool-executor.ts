@@ -5,6 +5,7 @@ import { currentCheckpoint } from './model-replay.js';
 import { CheckpointError } from './checkpoint.types.js';
 import { cyclicCursor, paginationCoverage } from './pagination.js';
 import { internalCrmReferences } from './record-identity.js';
+import { historicalRecords, ToolHistory } from './business-history.js';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import {
   ContextEngineError,
@@ -62,6 +63,8 @@ interface RetryPolicy {
   attempted: Array<[string, QueryAttempt]>;
   unavailable: Array<[string, Record<string, unknown>]>;
   cooldowns: Array<[string, { until: number; failure: Record<string, unknown> }]>;
+  /** Read selectors only. Results, grants, evidence IDs and pagination state never survive. */
+  reads?: Array<{ name: string; arguments: Record<string, unknown> }>;
 }
 /** Only retry decisions survive; old pagination, evidence IDs and source bodies do not. */
 function failurePolicy(value: Record<string, unknown>): Record<string, unknown> {
@@ -108,6 +111,9 @@ export class ContextToolRun {
   private bytes = 0;
   private denied = false;
   private policyRestored = false;
+  private recoveryReads: NonNullable<RetryPolicy['reads']> = [];
+  readonly toolHistory = new ToolHistory(() => this.now());
+  private usedHistoricalReply = false;
   private constructor(
     readonly employeeId: number,
     readonly tools: readonly ContextToolDefinition[],
@@ -173,6 +179,7 @@ export class ContextToolRun {
     for (const [key, attempt] of saved?.attempted ?? []) this.attempted.set(key, attempt);
     for (const [key, failure] of saved?.unavailable ?? []) this.unavailableTools.set(key, failure);
     for (const [key, cooldown] of saved?.cooldowns ?? []) this.cooldowns.set(key, cooldown);
+    this.recoveryReads = saved?.reads ?? [];
     this.policyRestored = true;
   }
   private async savePolicy() {
@@ -191,7 +198,24 @@ export class ContextToolRun {
         key,
         { ...cooldown, failure: failurePolicy(cooldown.failure) },
       ]),
+      reads: this.recoveryReads,
     }));
+  }
+  /** Rebuild successful reads after restart using live authorization and the original budget. */
+  async recoverReads(signal: AbortSignal) {
+    await this.restorePolicy();
+    const pending = structuredClone(this.recoveryReads);
+    const attempts: Array<{ name: string; ok: boolean }> = [];
+    for (const call of pending) {
+      signal.throwIfAborted();
+      if (!this.remaining || this.blocked) break;
+      // Only freshly discovered read tools enter this executor; writes and utilities
+      // are deliberately absent from this journal and never replayed here.
+      if (!this.tools.some((tool) => tool.name === call.name)) continue;
+      const result = await this.execute(call.name, JSON.stringify(call.arguments), signal);
+      attempts.push({ name: call.name, ok: result.ok === true });
+    }
+    return attempts;
   }
   /** Harness utilities share the source proposal budget and live employee binding.
    * Their results are reviewed separately; they are never replayed as MCP reads.
@@ -199,7 +223,12 @@ export class ContextToolRun {
   async executeUtility(
     call: (authorizeResult: () => Promise<void>) => Promise<Record<string, unknown>>,
     signal: AbortSignal,
-  ) {
+    historyCall?: { name: string; arguments: string },
+  ): Promise<Record<string, unknown>> {
+    if (historyCall)
+      return this.toolHistory.track(historyCall.name, historyCall.arguments, () =>
+        this.executeUtility(call, signal),
+      );
     signal.throwIfAborted();
     if (this.remaining <= 0)
       return { ok: false, code: this.denied ? 'ACCESS_DENIED' : 'TOOL_BUDGET_EXHAUSTED' };
@@ -278,6 +307,27 @@ export class ContextToolRun {
     return result.ok ? this.evidence.find((e) => e.id === result.evidence_id) : undefined;
   }
   async execute(
+    name: string,
+    argumentsJson: string,
+    signal: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    let output: Record<string, unknown> | undefined;
+    try {
+      output = await this.executeRead(name, argumentsJson, signal);
+      return output;
+    } finally {
+      if (this.tools.some((tool) => tool.name === name)) {
+        const evidence = this.evidence.find((entry) => entry.id === output?.evidence_id);
+        this.toolHistory.record(
+          name,
+          argumentsJson,
+          output,
+          evidence ? historicalRecords(name, evidence.result.data) : {},
+        );
+      }
+    }
+  }
+  private async executeRead(
     name: string,
     argumentsJson: string,
     signal: AbortSignal,
@@ -420,6 +470,14 @@ export class ContextToolRun {
       // A verified successful replay must not spend the next failure's retry allowance.
       this.attempted.delete(fingerprint);
       this.cooldowns.delete(name);
+      const read = { name, arguments: structuredClone(args) };
+      if (!this.recoveryReads.some((item) => queryKey(item.name, item.arguments) === fingerprint)) {
+        const next = [...this.recoveryReads, read];
+        // Keep the journal comfortably within the checkpoint policy limit. Oversized
+        // selectors may be researched normally but must not crash a successful run.
+        if (next.length <= MAX_TOOL_CALLS && Buffer.byteLength(JSON.stringify(next)) <= 8000)
+          this.recoveryReads = next;
+      }
       await this.savePolicy();
       signal.throwIfAborted();
       this.bytes += size;
@@ -503,7 +561,24 @@ export class ContextToolRun {
   delivery() {
     if (this.denied) throw new ContextEngineError('ACCESS_DENIED');
     return this.evidence.length
-      ? toolDelivery(this.employeeId, this.evidence, this.now())
+      ? toolDelivery(this.employeeId, this.evidence, this.now(), {
+          activity: this.toolHistory.activity,
+          history: this.toolHistory.snapshot(),
+        })
+      : this.historyDelivery();
+  }
+  rememberHistoricalReply() {
+    this.usedHistoricalReply = true;
+  }
+  /** A failure or history-only answer still needs fresh identity checks before delivery. */
+  historyDelivery() {
+    if (this.denied) return undefined;
+    return this.usedHistoricalReply || this.toolHistory.used
+      ? toolDelivery(this.employeeId, [], this.now(), {
+          historicalOnly: true,
+          activity: this.toolHistory.activity,
+          history: this.toolHistory.snapshot(),
+        })
       : undefined;
   }
 }

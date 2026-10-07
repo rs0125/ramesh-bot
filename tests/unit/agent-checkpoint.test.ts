@@ -51,3 +51,59 @@ test('checkpoint persistence failures are typed and do not leak database diagnos
     return true;
   });
 });
+
+test('rolled-back database contention retries persistence without restarting research', async () => {
+  let attempts = 0;
+  const client = {
+    async query() {
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repository = new AgentCheckpointRepository(
+    {
+      async connect() {
+        if (++attempts < 3)
+          throw Object.assign(new Error('private database detail'), { code: '55P03' });
+        return client;
+      },
+    } as unknown as Pool,
+    {
+      namespace: 'production',
+      accountId: 'fixture',
+      encryptionKey: randomBytes(32).toString('base64url'),
+    },
+  );
+  await repository.clean();
+  assert.equal(attempts, 3);
+});
+
+test('exhausted database contention reports a fixed diagnostic, and ambiguous connection failures are not retried', async () => {
+  for (const [code, expectedAttempts, expectedCode] of [
+    ['40P01', 3, 'CHECKPOINT_DB_40P01'],
+    ['08006', 1, 'CHECKPOINT_OPERATION_FAILED'],
+  ] as const) {
+    let attempts = 0;
+    const repository = new AgentCheckpointRepository(
+      {
+        async connect() {
+          attempts++;
+          throw Object.assign(new Error('secret server diagnostic'), { code });
+        },
+      } as unknown as Pool,
+      {
+        namespace: 'production',
+        accountId: 'fixture',
+        encryptionKey: randomBytes(32).toString('base64url'),
+      },
+    );
+    await assert.rejects(repository.clean(), (error: unknown) => {
+      assert.ok(error instanceof CheckpointError);
+      assert.equal(error.code, expectedCode);
+      assert.equal(error.cause, undefined);
+      assert.ok(!JSON.stringify(error).includes('secret'));
+      return true;
+    });
+    assert.equal(attempts, expectedAttempts);
+  }
+});

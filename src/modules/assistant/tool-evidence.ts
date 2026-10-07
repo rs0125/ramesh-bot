@@ -17,6 +17,7 @@ import {
 } from '../context-engine/read-contract.js';
 import { indiaDate } from './followups.js';
 import { recordIdentity, recordIdentitySchema } from './record-identity.js';
+import { toolActivitySchema, toolHistorySchema, type ToolActivity } from './business-history.js';
 import {
   ANALYTICS_CITATION_FIELDS,
   verifyAnalyticsEvidence,
@@ -37,6 +38,10 @@ export const toolDeliverySchema = z
     expiresAt: instant,
     /** Recall refreshes private reads, not public web research used in the same answer. */
     publicWebUsed: z.literal(true).optional(),
+    /** Owner-authorized conversation context; never proof that a source is current. */
+    historicalOnly: z.literal(true).optional(),
+    activity: z.array(toolActivitySchema).max(MAX_TOOL_CALLS).optional(),
+    history: toolHistorySchema.optional(),
     /** Identifiers actually displayed, in presentation order; never cached record facts. */
     displayedRecords: z
       .array(
@@ -82,10 +87,11 @@ export const toolDeliverySchema = z
           })
           .strict(),
       )
-      .min(1)
+      .min(0)
       .max(MAX_TOOL_CALLS),
   })
-  .strict();
+  .strict()
+  .refine((value) => value.checks.length > 0 || value.historicalOnly === true);
 export type ToolDelivery = z.infer<typeof toolDeliverySchema>;
 export interface ToolEvidence {
   id: string;
@@ -322,6 +328,11 @@ export function toolDelivery(
   employeeId: number,
   evidence: readonly ToolEvidence[],
   now = Date.now(),
+  history?: {
+    historicalOnly?: true;
+    activity?: ToolActivity[];
+    history?: z.infer<typeof toolHistorySchema>;
+  },
 ): ToolDelivery {
   const localDate = indiaDate(now);
   const midnight = Date.parse(`${localDate}T00:00:00+05:30`) + 86_400_000;
@@ -332,6 +343,7 @@ export function toolDelivery(
     localDate,
     preparedAt: new Date(now).toISOString(),
     expiresAt: new Date(Math.min(now + 300_000, midnight)).toISOString(),
+    ...history,
     checks: evidence.map((item) => {
       const records = recordIdentity(item.tool, item.result);
       return {

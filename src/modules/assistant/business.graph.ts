@@ -57,6 +57,8 @@ export function buildBusinessGraph(
             durationMs: Date.now() - started,
             inputTokens: generated.inputTokens,
             outputTokens: generated.outputTokens,
+            model: generated.model,
+            responseCalls: generated.responseCalls,
           },
         ],
       };
@@ -140,6 +142,8 @@ export function buildBusinessGraph(
             durationMs: Date.now() - started,
             inputTokens: generated.inputTokens,
             outputTokens: generated.outputTokens,
+            model: generated.model,
+            responseCalls: generated.responseCalls,
           },
         ],
       };

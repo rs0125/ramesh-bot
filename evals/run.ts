@@ -6,7 +6,7 @@ import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { config as loadEnvironment } from 'dotenv';
-import { loadAssistantConfig } from '../src/config/assistant.js';
+import { assistantModels, loadAssistantConfig } from '../src/config/assistant.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { LocalChat, openLocalChatDatabase } from '../scripts/lib/local-chat.js';
 import { styleViolations } from '../src/modules/assistant/style.js';
@@ -51,7 +51,7 @@ await mkdir(directory, { recursive: true, mode: 0o700 });
 const usageMeter = await createEvalUsageMeter(
   { ...values, campaignId: runId, directory },
   process.env,
-  [selectedModel],
+  assistantModels(loaded),
 );
 const config = { ...loaded, usageMeter };
 const db = await openLocalChatDatabase(join(directory, 'evaluation.db'));

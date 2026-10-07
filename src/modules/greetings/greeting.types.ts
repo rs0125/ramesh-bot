@@ -41,6 +41,8 @@ export interface TrustedReplyContext {
   readonly onToolActivity?: () => void;
   /** Transport-owned lease; never accepted from chat input or a model argument. */
   readonly checkpointLease?: { readonly leaseToken: string };
+  /** Transport expiry less the time reserved for durable handoff and delivery. */
+  readonly replyDeadlineAtMs?: number;
   /** Immutable original message members; only their own text/direct voice may authorize commands. */
   readonly commandMessages?: readonly {
     readonly id: string;

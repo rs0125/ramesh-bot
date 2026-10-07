@@ -4,6 +4,7 @@ import { paginationContinuations, paginationCoverage } from './pagination.js';
 import { recordIdentity } from './record-identity.js';
 import { toolEvidenceFingerprint, type ToolEvidence } from './tool-evidence.js';
 import { recallEvidenceView } from './recall-payload.js';
+import { HISTORY_TURN_ID } from './business-history.js';
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -184,6 +185,12 @@ export function currentRecall(
   return {
     ok: true,
     ...(count(value.turn) !== undefined ? { turn: value.turn } : {}),
+    ...(typeof value.turn_id === 'string' && HISTORY_TURN_ID.test(value.turn_id)
+      ? { turn_id: value.turn_id }
+      : {}),
+    ...(typeof value.original_request === 'string'
+      ? { original_request: value.original_request.slice(0, 2000) }
+      : {}),
     previous_reply_verified: previousVerified,
     ...(value.retry_available === true ? { retry_available: true } : {}),
     ...(previousVerified && typeof value.previous_reply === 'string'

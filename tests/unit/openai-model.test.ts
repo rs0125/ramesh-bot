@@ -89,6 +89,8 @@ test('Responses request uses Terra, no tools, no response storage, and bounded t
   });
   assert.deepEqual(await model.complete(request), {
     text: 'Hey!',
+    model: 'gpt-5.6-terra',
+    responseCalls: 1,
     inputTokens: 12,
     outputTokens: 3,
     responseId: 'test-response',

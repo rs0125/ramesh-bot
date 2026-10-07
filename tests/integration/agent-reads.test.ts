@@ -229,7 +229,7 @@ test(
               .every((item) =>
                 item.content.includes(
                   mode === 'send'
-                    ? 'Private content is omitted'
+                    ? 'current owner authorization'
                     : "couldn't verify the business data",
                 ),
               ),

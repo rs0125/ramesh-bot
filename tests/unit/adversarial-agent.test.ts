@@ -185,6 +185,42 @@ test('wrong displayed dates are rejected, not silently overwritten', async () =>
   assert.deepEqual(dealDisplayIssues(valid, evidence), []);
 });
 
+test('quoted full RFQ names receive their own dates even when company labels overlap', async () => {
+  const evidence = await dealEvidence();
+  const rows = evidence[0]!.result.data.items as any[];
+  for (const row of rows) row.company_name = 'Fixture Shared Client';
+  rows[0].name = '20,000 sft requirement in Fixture North';
+  rows[1].name = '50k sqft requirement in Fixture South';
+  for (const [open, close] of [
+    ['“', '”'],
+    ['"', '"'],
+    ["'", "'"],
+  ]) {
+    const reply = `*${open}${rows[0].name}${close}*\nStage: RFQ received\n\n*${open}${rows[1].name}${close}*\nStage: RFQ received`;
+    const enriched = withDealDates(reply, evidence);
+    assert.equal((enriched.match(/Created:/g) ?? []).length, 2);
+    assert.deepEqual(dealDisplayIssues(enriched, evidence), []);
+    assert.equal(withDealDates(enriched, evidence), enriched);
+    const firstBlock = enriched.split(rows[1].name)[0]!;
+    assert.match(firstBlock, /Created: 13 Sept 2026/);
+    assert.doesNotMatch(firstBlock, /Created: 1 Sept 2026/);
+    assert.ok(dealDisplayIssues(enriched.replace('13 Sept 2026', '14 Sept 2026'), evidence).length);
+    const labelled = `*Deal: ${open}${rows[0].name}${close}*\nRecorded requirement\n\n*Deal: ${open}${rows[1].name}${close}*\nRecorded requirement`;
+    const labelledDates = withDealDates(labelled, evidence);
+    assert.equal((labelledDates.match(/Created:/g) ?? []).length, 2);
+    assert.deepEqual(dealDisplayIssues(labelledDates, evidence), []);
+  }
+  for (const text of [
+    '*Fixture Shared Client*',
+    `Message draft:\n*“${rows[0].name}”*`,
+    `1. Call ${rows[0].name} about the requirement.`,
+  ])
+    assert.equal(withDealDates(text, evidence), text);
+  rows[1].name = rows[0].name;
+  const ambiguous = `*“${rows[0].name}”*`;
+  assert.equal(withDealDates(ambiguous, evidence), ambiguous);
+});
+
 test('inline native dates accept common chat separators without dropping correctness checks', async () => {
   const evidence = await dealEvidence();
   for (const separator of [' • ', ' · ', ' | ', '; ', ', ']) {
@@ -211,6 +247,18 @@ test('ordinary action lists and drafts do not become CRM inventory cards', async
   }
 });
 
+test('a warehouse caveat mentioning the client does not acquire the CRM dates', async () => {
+  const evidence = await dealEvidence();
+  const reply =
+    '*Fixture Acme Storage*\nCreated: 1 Sep 2026\nLast updated: 29 Sep 2026\n\n*Separate warehouse*\n- ID 101\n- Recorded area: 51,000 sq ft.\n- The listing is not verified. Its area is unrelated to Fixture Acme Storage’s requirement.';
+  assert.equal(withDealDates(reply, evidence), reply);
+  assert.deepEqual(dealDisplayIssues(reply, evidence), []);
+  for (const prefix of ['1. ', '- 3 Oct: ', '### 1. ', '- Company: ']) {
+    const card = prefix + 'Fixture Acme Storage, Bengaluru';
+    assert.match(withDealDates(card, evidence), /Created: 1 Sept 2026/);
+  }
+});
+
 test('CRM dates accept both bare and parenthesized IST without accepting a wrong day', async () => {
   const evidence = await dealEvidence();
   for (const timezone of [' IST', ' (IST)']) {
@@ -219,6 +267,51 @@ test('CRM dates accept both bare and parenthesized IST without accepting a wrong
     assert.equal(withDealDates(reply, evidence), reply);
     assert.ok(dealDisplayIssues(reply.replace('1 Sept 2026', '2 Sept 2026'), evidence).length);
   }
+});
+
+test('captured lookup dates accept accurate native IST times without masking false times', async () => {
+  const evidence = await dealEvidence();
+  const reply =
+    '*Fixture Acme Storage*\nStage: RFQ Received\nCreated: 1 Sep 2026, 2:00 pm IST\nLast updated: 29 Sep 2026, 7:00 pm IST';
+  for (const valid of [
+    reply,
+    reply
+      .replaceAll('Sep', 'Sept')
+      .replace('2:00 pm IST', '14:00 (IST)')
+      .replace('7:00 pm IST', '19:00:00 (IST)'),
+  ]) {
+    assert.deepEqual(dealDisplayIssues(valid, evidence), []);
+    assert.equal(withDealDates(valid, evidence), valid);
+  }
+  for (const invalid of [
+    reply.replace('2:00 pm', '2:00 am'),
+    reply.replace('2:00 pm', '2:01 pm'),
+    reply.replace('7:00 pm', '19:00:01'),
+    reply.replace('7:00 pm', '19:60'),
+    reply.replace('2:00 pm', '14:00 pm'),
+    reply.replace('1 Sep', '2 Sep'),
+    reply.replace('IST', 'UTC'),
+  ])
+    assert.ok(dealDisplayIssues(invalid, evidence).length, invalid);
+  const row = (evidence[0]!.result.data.items as any[]).find((r) => r.name.includes('Acme'));
+  row.source_created_at = null;
+  row.last_polled_at = '2026-09-01T08:30:00Z';
+  assert.ok(
+    dealDisplayIssues(reply, evidence).some((issue) => issue.includes('Created: Not recorded')),
+  );
+});
+
+test('native IST times respect midnight rollover and noon rather than the host timezone', async () => {
+  const evidence = await dealEvidence();
+  const row = (evidence[0]!.result.data.items as any[]).find((r) => r.name.includes('Acme'));
+  row.source_created_at = '2026-09-01T18:30:42Z';
+  row.source_updated_at = '2026-09-29T06:30:00Z';
+  const reply =
+    '*Fixture Acme Storage*\nCreated: 2 Sep 2026, 12:00 am IST\nLast updated: 29 Sep 2026, 12:00 pm IST';
+  assert.deepEqual(dealDisplayIssues(reply, evidence), []);
+  assert.deepEqual(dealDisplayIssues(reply.replace('12:00 am', '00:00:42'), evidence), []);
+  assert.ok(dealDisplayIssues(reply.replace('12:00 am', '00:00:41'), evidence).length);
+  assert.ok(dealDisplayIssues(reply.replace('2 Sep', '1 Sep'), evidence).length);
 });
 
 test('duplicate company labels cannot receive dates from a guessed record', async () => {

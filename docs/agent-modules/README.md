@@ -155,5 +155,6 @@ See the [2 October production capability review](../capability-review-2026-10-02
 - [52. Native locations and GIS writes](52-gis-poi-writes.md): native coordinate capture, the Context Engine GIS tool and signed dashboard endpoint; generic audited execution and compensation are described in [business writes](../business-writes.md); production activation is recorded separately.
 - [53. Answer preservation and scoped recall](53-answer-preservation-and-scoped-recall.md): deterministic formatting for completed read answers, source-bound repairs with independent re-review, materiality, current working briefs and grouped selection recall. Implemented in this checkout; no new migration or paid evaluation.
 - [54. Eager and deferred tool loading](54-tool-loading.md): shared Context Engine metadata, native OpenAI search, catalogue validation and a focused Luna evaluation. Eager remains the default.
+- [55. Latency and model routing](55-latency-and-model-routing.md): Luna routing/formatting/extraction, reviewed lookup shortcuts, bounded read batches and adversarial regression findings.
 
 - [Business write runbook](../business-writes.md): shared journal, confirmation, unknown-result recovery, GIS compensation and the future CRM contract.

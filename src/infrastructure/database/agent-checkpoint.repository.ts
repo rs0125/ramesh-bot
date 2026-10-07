@@ -1,5 +1,6 @@
 /** Encrypted model-response replay with queue ownership checked on every operation. */
 import { createHmac } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool, PoolClient } from 'pg';
 import {
   CheckpointError,
@@ -129,10 +130,30 @@ export class AgentCheckpointRepository implements AgentCheckpointStore {
   }
 
   private async guard<T>(work: () => Promise<T>): Promise<T> {
-    try {
-      return await work();
-    } catch {
-      throw new CheckpointError();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await work();
+      } catch (error) {
+        const pgCode =
+          error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+        // These PostgreSQL failures roll back the transaction. Retry the checkpoint,
+        // retaining live evidence; never replay an ambiguous commit or remote action.
+        const transient = ['55P03', '40P01', '40001'].includes(String(pgCode));
+        if (transient && attempt < 2) {
+          await delay(50 * (attempt + 1));
+          continue;
+        }
+        const message = error instanceof Error ? error.message : '';
+        const known =
+          /^(?:CHECKPOINT_(?:SCOPE_INVALID|OWNER_INVALID|CLOCK_INVALID|PAYLOAD_INVALID|INPUT_INVALID|SEQUENCE_INVALID|SEQUENCE_GAP|RESPONSE_INVALID|CONSUMPTION_INVALID|POLICY_INVALID|POLICY_CAPACITY_EXCEEDED|LEASE_EXPIRED|EXPIRED|BINDING_CHANGED|CAPACITY_EXCEEDED))$/;
+        throw new CheckpointError(
+          transient
+            ? `CHECKPOINT_DB_${pgCode}`
+            : known.test(message)
+              ? message
+              : 'CHECKPOINT_OPERATION_FAILED',
+        );
+      }
     }
   }
 

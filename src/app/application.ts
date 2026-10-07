@@ -246,6 +246,8 @@ export function createApplication(
           media,
           accountId: config.messageDatabase.accountId,
           usageMode: usagePolicy?.mode ?? 'off',
+          onProcessingError: (failure) =>
+            logger.warn({ failure }, 'Durable message processing failed'),
           reminderEmployee: resolveReminderEmployee,
           usageEmployee: usageIdentity
             ? async (key, signal) =>

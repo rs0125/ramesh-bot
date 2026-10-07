@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { proto } from '@whiskeysockets/baileys';
 import { config as dotenv } from 'dotenv';
-import { loadAssistantConfig } from '../src/config/assistant.js';
+import { assistantModels, loadAssistantConfig } from '../src/config/assistant.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
 import { AssistantService } from '../src/modules/assistant/assistant.service.js';
 import type { AgentTrace, TextModel } from '../src/modules/assistant/assistant.types.js';
@@ -223,7 +223,7 @@ export async function runSchedulingEvaluation() {
   const usageMeter = await createEvalUsageMeter(
     { ...values, campaignId: runId, directory },
     process.env,
-    [selectedModel],
+    assistantModels(loaded),
   );
   const config = { ...loaded, usageMeter };
   const native = new OpenAITextModel(config);

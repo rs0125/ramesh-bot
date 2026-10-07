@@ -143,6 +143,45 @@ test('explicit pins replace by key, persist across restart and forget cannot res
   assert.equal(f.requests.length, 0);
 });
 
+test('a voice brief remains in ordered follow-up history without entering durable memory', async () => {
+  const f = setup();
+  await f.create().prepare(...f.turn(1, 'Hello'));
+  const brief = 'Historical user voice request: Client Lab needs 5000–10000 sqft, shed or BTS.';
+  f.entries.push({
+    id: id(2),
+    at: Date.now(),
+    role: 'user',
+    content: '[Audio message]',
+    transientContent: { text: brief, expiresAt: Date.now() + 3600000 },
+  });
+  const next = await f.create().prepare(...f.turn(3, '1359 is RCC. I want either bts or shed'));
+  assert.equal(next!.history.at(-1)!.content, brief);
+  assert.ok(!JSON.stringify(await f.store.load(scope)).includes('Client Lab'));
+  f.entries[0]!.transientContent!.expiresAt = 1;
+  const expired = await f.create().prepare(...f.turn(4, 'Retry'));
+  assert.equal(expired!.history.at(-1)!.content, '[Audio message]');
+});
+
+test('voice transcripts are excluded from summary requests when old turns are compacted', async () => {
+  const f = setup();
+  await f.create().prepare(...f.turn(1, 'Hello'));
+  for (let i = 2; i <= 46; i++)
+    f.entries.push({
+      id: id(i),
+      at: Date.now(),
+      role: 'user',
+      content: '[Audio message]',
+      transientContent: {
+        text: `Ephemeral secret transcript ${i}`,
+        expiresAt: Date.now() + 3600000,
+      },
+    });
+  await f.create().prepare(...f.turn(47, 'Continue'));
+  assert.ok(f.requests.length > 0);
+  assert.ok(f.requests.every((request) => !JSON.stringify(request).includes('Ephemeral secret')));
+  assert.ok(!JSON.stringify(await f.store.load(scope)).includes('Ephemeral secret'));
+});
+
 test('compaction validates provenance and atomically advances a cursor while retaining recent messages', async () => {
   const f = setup();
   await f.create().prepare(...f.turn(1, '/pin format: short bullets'));
