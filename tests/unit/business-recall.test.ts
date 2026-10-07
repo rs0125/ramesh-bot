@@ -718,9 +718,10 @@ test('native dates use IST, missing dates stay missing and deal UUIDs fail prese
   (original.evidence[0]!.result.data.items as any[])[0].last_polled_at = new Date().toISOString();
   assert.equal(dealDisplayFacts(original.evidence)[0]?.created, 'Not recorded');
   assert.ok(dealDisplayIssues(`ID: ${facts[0]!.internal_id}`, original.evidence).length);
-  assert.ok(dealDisplayIssues('Fixture Acme Storage', original.evidence).length);
-  assert.ok(
-    dealDisplayIssues('1. **Fixture Acme Storage**\nBengaluru warehouse', original.evidence).length,
+  assert.deepEqual(dealDisplayIssues('Fixture Acme Storage', original.evidence), []);
+  assert.deepEqual(
+    dealDisplayIssues('1. **Fixture Acme Storage**\nBengaluru warehouse', original.evidence),
+    [],
   );
   assert.deepEqual(
     dealDisplayIssues(

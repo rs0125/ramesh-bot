@@ -3,7 +3,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSalesFixture, FIXTURE_JID } from '../../scripts/lib/sales-fixture.js';
 import { ContextEngineError } from '../../src/modules/context-engine/context.types.js';
-import { dealDisplayIssues, withDealDates } from '../../src/modules/assistant/deal-display.js';
+import { dealDisplayIssues } from '../../src/modules/assistant/deal-display.js';
+import { renderAnswer } from '../../src/modules/assistant/answer-rendering.js';
+const renderText = (text: string, evidence: Parameters<typeof renderAnswer>[1]) =>
+  renderAnswer(text, evidence).text;
 import { chatLayoutIssues } from '../../src/modules/assistant/style.js';
 import { planningContext } from '../../src/modules/assistant/planning-context.js';
 const trusted = { key: { remoteJid: FIXTURE_JID }, runId: 'adversarial' };
@@ -164,61 +167,51 @@ async function dealEvidence() {
   return run.evidence;
 }
 
-test('inline CRM lists receive per-record native dates, without a shared date bypass', async () => {
+test('ordinary CRM prose is not mutated to add optional display dates', async () => {
   const evidence = await dealEvidence();
-  const text =
-    '- 3 Oct: Fixture Beacon Retail, RFQ received\n- 2 Oct: Fixture Acme Storage, RFQ received\nCreated: 1 Sep 2026\nLast updated: 29 Sep 2026';
-  assert.ok(dealDisplayIssues(text, evidence).some((s) => s.includes('Beacon')));
-  const enriched = withDealDates(text, evidence);
-  assert.equal((enriched.match(/Created:/g) ?? []).length, 2);
-  assert.match(enriched, /Created: 13 Sept 2026/);
-  assert.deepEqual(dealDisplayIssues(enriched, evidence), []);
-  assert.equal(withDealDates(enriched, evidence), enriched);
+  const text = '- Fixture Beacon Retail: RFQ received.\n- Fixture Acme Storage: RFQ received.';
+  assert.equal(renderText(text, evidence), text);
+  assert.deepEqual(dealDisplayIssues(text, evidence), []);
 });
 
 test('wrong displayed dates are rejected, not silently overwritten', async () => {
   const evidence = await dealEvidence();
   const text = '**Fixture Acme Storage**\nCreated: 1 Sept 2025\nLast updated: 29 Sept 2026';
-  assert.equal(withDealDates(text, evidence), text);
+  assert.equal(renderText(text, evidence), text);
   assert.ok(dealDisplayIssues(text, evidence).some((s) => s.includes('Created: 1 Sept 2026')));
   const valid = text.replace('1 Sept 2025', '2026-09-01');
   assert.deepEqual(dealDisplayIssues(valid, evidence), []);
 });
 
-test('quoted full RFQ names receive their own dates even when company labels overlap', async () => {
+test('explicit CRM cards bind dates by identity even when names and company labels overlap', async () => {
   const evidence = await dealEvidence();
   const rows = evidence[0]!.result.data.items as any[];
-  for (const row of rows) row.company_name = 'Fixture Shared Client';
-  rows[0].name = '20,000 sft requirement in Fixture North';
-  rows[1].name = '50k sqft requirement in Fixture South';
-  for (const [open, close] of [
-    ['“', '”'],
-    ['"', '"'],
-    ["'", "'"],
-  ]) {
-    const reply = `*${open}${rows[0].name}${close}*\nStage: RFQ received\n\n*${open}${rows[1].name}${close}*\nStage: RFQ received`;
-    const enriched = withDealDates(reply, evidence);
-    assert.equal((enriched.match(/Created:/g) ?? []).length, 2);
-    assert.deepEqual(dealDisplayIssues(enriched, evidence), []);
-    assert.equal(withDealDates(enriched, evidence), enriched);
-    const firstBlock = enriched.split(rows[1].name)[0]!;
-    assert.match(firstBlock, /Created: 13 Sept 2026/);
-    assert.doesNotMatch(firstBlock, /Created: 1 Sept 2026/);
-    assert.ok(dealDisplayIssues(enriched.replace('13 Sept 2026', '14 Sept 2026'), evidence).length);
-    const labelled = `*Deal: ${open}${rows[0].name}${close}*\nRecorded requirement\n\n*Deal: ${open}${rows[1].name}${close}*\nRecorded requirement`;
-    const labelledDates = withDealDates(labelled, evidence);
-    assert.equal((labelledDates.match(/Created:/g) ?? []).length, 2);
-    assert.deepEqual(dealDisplayIssues(labelledDates, evidence), []);
+  for (const row of rows) {
+    row.company_name = 'Fixture Shared Client';
+    row.name = 'Shared requirement';
   }
+  const rendered = renderAnswer(
+    {
+      answer_blocks: rows.map((row) => ({
+        kind: 'crm_record' as const,
+        record_id: row.id,
+        body: 'Stage: RFQ received',
+        include_time: false,
+      })),
+    },
+    evidence,
+  );
+  assert.deepEqual(rendered.issues, []);
+  assert.equal(rendered.records.length, 2);
+  assert.notEqual(rendered.records[0]!.created, rendered.records[1]!.created);
+  assert.equal((rendered.text.match(/Created:/g) ?? []).length, 2);
+  assert.equal(renderText(rendered.text, evidence), rendered.text);
   for (const text of [
     '*Fixture Shared Client*',
-    `Message draft:\n*“${rows[0].name}”*`,
-    `1. Call ${rows[0].name} about the requirement.`,
+    'Message draft:\nShared requirement',
+    '- Company: Fixture Shared Client',
   ])
-    assert.equal(withDealDates(text, evidence), text);
-  rows[1].name = rows[0].name;
-  const ambiguous = `*“${rows[0].name}”*`;
-  assert.equal(withDealDates(ambiguous, evidence), ambiguous);
+    assert.equal(renderText(text, evidence), text);
 });
 
 test('inline native dates accept common chat separators without dropping correctness checks', async () => {
@@ -226,7 +219,7 @@ test('inline native dates accept common chat separators without dropping correct
   for (const separator of [' • ', ' · ', ' | ', '; ', ', ']) {
     const valid = `1. **Fixture Beacon Retail**\nCreated: **13 Sept 2026**${separator}Last updated: **29 Sept 2026**\n2. **Fixture Acme Storage**\nCreated: **1 Sept 2026**${separator}Last updated: **29 Sept 2026**`;
     assert.deepEqual(dealDisplayIssues(valid, evidence), [], separator);
-    assert.equal(withDealDates(valid, evidence), valid);
+    assert.equal(renderText(valid, evidence), valid);
     assert.equal(
       dealDisplayIssues(valid.replace('13 Sept 2026', '14 Sept 2026'), evidence).length,
       1,
@@ -242,7 +235,7 @@ test('ordinary action lists and drafts do not become CRM inventory cards', async
     'Message draft:\n- Fixture Acme Storage needs a follow-up.',
     '> Fixture Acme Storage needs a follow-up.',
   ]) {
-    assert.equal(withDealDates(text, evidence), text);
+    assert.equal(renderText(text, evidence), text);
     assert.deepEqual(dealDisplayIssues(text, evidence), []);
   }
 });
@@ -251,11 +244,11 @@ test('a warehouse caveat mentioning the client does not acquire the CRM dates', 
   const evidence = await dealEvidence();
   const reply =
     '*Fixture Acme Storage*\nCreated: 1 Sep 2026\nLast updated: 29 Sep 2026\n\n*Separate warehouse*\n- ID 101\n- Recorded area: 51,000 sq ft.\n- The listing is not verified. Its area is unrelated to Fixture Acme Storage’s requirement.';
-  assert.equal(withDealDates(reply, evidence), reply);
+  assert.equal(renderText(reply, evidence), reply);
   assert.deepEqual(dealDisplayIssues(reply, evidence), []);
   for (const prefix of ['1. ', '- 3 Oct: ', '### 1. ', '- Company: ']) {
     const card = prefix + 'Fixture Acme Storage, Bengaluru';
-    assert.match(withDealDates(card, evidence), /Created: 1 Sept 2026/);
+    assert.equal(renderText(card, evidence), card);
   }
 });
 
@@ -264,7 +257,7 @@ test('CRM dates accept both bare and parenthesized IST without accepting a wrong
   for (const timezone of [' IST', ' (IST)']) {
     const reply = `1. **Fixture Acme Storage**\nCreated: 1 Sept 2026${timezone}\nLast updated: 29 Sept 2026${timezone}`;
     assert.deepEqual(dealDisplayIssues(reply, evidence), []);
-    assert.equal(withDealDates(reply, evidence), reply);
+    assert.equal(renderText(reply, evidence), reply);
     assert.ok(dealDisplayIssues(reply.replace('1 Sept 2026', '2 Sept 2026'), evidence).length);
   }
 });
@@ -281,7 +274,7 @@ test('captured lookup dates accept accurate native IST times without masking fal
       .replace('7:00 pm IST', '19:00:00 (IST)'),
   ]) {
     assert.deepEqual(dealDisplayIssues(valid, evidence), []);
-    assert.equal(withDealDates(valid, evidence), valid);
+    assert.equal(renderText(valid, evidence), valid);
   }
   for (const invalid of [
     reply.replace('2:00 pm', '2:00 am'),
@@ -319,7 +312,7 @@ test('duplicate company labels cannot receive dates from a guessed record', asyn
   const rows = evidence[0]!.result.data.items as any[];
   rows[0].name = rows[1].name;
   const text = '- Fixture Acme Storage, Bengaluru';
-  assert.equal(withDealDates(text, evidence), text);
+  assert.equal(renderText(text, evidence), text);
 });
 
 test('missing native dates remain absent despite fresh mirror polling', async () => {
@@ -327,7 +320,20 @@ test('missing native dates remain absent despite fresh mirror polling', async ()
   const row = (evidence[0]!.result.data.items as any[]).find((r) => r.name.includes('Acme'));
   row.source_created_at = null;
   row.last_polled_at = new Date().toISOString();
-  assert.match(withDealDates('Fixture Acme Storage', evidence), /Created: Not recorded/);
+  const rendered = renderAnswer(
+    {
+      answer_blocks: [
+        {
+          kind: 'crm_record',
+          record_id: row.id,
+          body: 'Requirement needs verification.',
+          include_time: false,
+        },
+      ],
+    },
+    evidence,
+  );
+  assert.match(rendered.text, /Created: Not recorded/);
 });
 
 test('runtime chat guard includes the same stock phrases used by paid evals', () => {
@@ -340,7 +346,7 @@ test('native date fields end at sentence boundaries without accepting incorrect 
   for (const month of ['Sept', 'Sept.']) {
     const reply = `### 1. Fixture Acme Storage\nCreated: 1 ${month} 2026. Last updated: 29 ${month} 2026. Dates in IST.`;
     assert.deepEqual(dealDisplayIssues(reply, evidence), []);
-    assert.equal(withDealDates(reply, evidence), reply);
+    assert.equal(renderText(reply, evidence), reply);
     assert.ok(
       dealDisplayIssues(reply.replace(`29 ${month} 2026`, `30 ${month} 2026`), evidence).length,
     );

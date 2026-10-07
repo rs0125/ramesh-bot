@@ -15,6 +15,7 @@ async function run(
     revisedDraft?: string;
     onRevise?: () => void;
     formatter?: (request: ModelRequest) => string;
+    evidenceRepair?: (request: ModelRequest) => string;
     researchDeadlineMs?: number;
   } = {},
 ) {
@@ -68,6 +69,8 @@ async function run(
       if (request.stage === 'verifier') return output(JSON.stringify(review(request, ++count)));
       if (request.stage === 'formatter' && options.formatter)
         return output(options.formatter(request));
+      if (request.stage === 'worker')
+        return output(options.evidenceRepair?.(request) ?? options.revisedDraft ?? draft);
       // A formatter rewrite would reproduce the original failure: reverse ranking/change units.
       throw new Error('A completed worker answer must not be freely rewritten');
     },
@@ -271,8 +274,10 @@ test('an unpatchable aggregate correction preserves the independently repaired w
   assert.equal(result.reply, revisedShortlist);
   assert.equal(result.unavailable, false);
   assert.equal(result.draftReady, false);
-  assert.equal(revisions.length, 1);
-  assert.match(revisions[0]!, /could not be bound/);
+  assert.equal(revisions.length, 0);
+  const repairs = requests.filter((r) => r.stage === 'worker');
+  assert.equal(repairs.length, 1);
+  assert.match(JSON.parse(repairs[0]!.messages[0]!.content).feedback, /could not be bound/);
   assert.equal(requests.filter((r) => r.stage === 'formatter').length, 0);
   assert.equal(requests.filter((r) => r.stage === 'verifier').length, 2);
 });
@@ -331,7 +336,10 @@ test('a research-limited revision synthesizes evidence without reviving the prev
   const { result, requests, revisions, workerCalls } = await run(
     shortlist,
     (request, pass) => {
-      if (pass === 1) return unpatchableAggregateReview(request);
+      if (pass === 1) {
+        now = deadline;
+        return unpatchableAggregateReview(request);
+      }
       const payload = JSON.parse(request.messages[0]!.content);
       assert.equal(payload.answer, revisedShortlist);
       assert.equal(payload.research_limited, true);
@@ -340,10 +348,7 @@ test('a research-limited revision synthesizes evidence without reviving the prev
     {
       search: true,
       researchDeadlineMs: deadline,
-      onRevise: () => {
-        now = deadline;
-      },
-      formatter: (request) => {
+      evidenceRepair: (request) => {
         assert.equal(JSON.parse(request.messages[0]!.content).research_limited, true);
         return revisedShortlist;
       },
@@ -352,8 +357,9 @@ test('a research-limited revision synthesizes evidence without reviving the prev
   assert.equal(result.reply, revisedShortlist);
   assert.equal(result.unavailable, false);
   assert.equal(result.draftReady, false);
-  assert.equal(revisions.length, 1);
+  assert.equal(revisions.length, 0);
   assert.equal(workerCalls, 2);
-  assert.equal(requests.filter((r) => r.stage === 'formatter').length, 1);
+  assert.equal(requests.filter((r) => r.stage === 'formatter').length, 0);
+  assert.equal(requests.filter((r) => r.stage === 'worker').length, 1);
   assert.equal(requests.filter((r) => r.stage === 'verifier').length, 2);
 });

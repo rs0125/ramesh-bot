@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { loadPrompt } from '../../src/modules/assistant/prompt-files.js';
 import {
   BUSINESS_FORMATTER_PROMPT,
+  EVIDENCE_REPAIR_PROMPT,
   PLANNER_PROMPT,
   ROUTER_PROMPT,
   SALES_MANAGER_PROMPT,
@@ -16,6 +17,7 @@ const roles = {
   worker: WORKER_PROMPT,
   manager: SALES_MANAGER_PROMPT,
   formatter: BUSINESS_FORMATTER_PROMPT,
+  evidenceRepair: EVIDENCE_REPAIR_PROMPT,
   verifier: SALES_VERIFIER_PROMPT,
   router: ROUTER_PROMPT,
 };

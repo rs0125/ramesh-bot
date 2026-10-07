@@ -4,7 +4,17 @@ Status: **Code source checks and independent model answer review implemented.**
 
 This release's follow-up revision: verdicts include a fixed diagnostic reason, and stage traces retain only approval, repair category, reason and presentation-issue count. Rejected prose and reviewer feedback remain excluded from logs. Current-task instructions distinguish contextual explanations from a preceding shortlist request and permit useful supported partial answers with specific limitations. The fallback no longer instructs users to narrow an otherwise valid question. See [follow-up recovery](../followup-recovery.md), including its limits and deterministic validation.
 
-**Implemented subset:** tool-evidence.ts validates source path/query, response/source clocks, explicit scope, page counts, totals and consistency metadata. sales.graph.ts reviews the formatted answer against current registered evidence in a fresh model context. One repair is allowed, routed directly to formatting for wording issues or back to the tool loop for missing evidence; a second failure returns a limitation. Model review cannot override code authorization and is probabilistic. See the [personal-assistant runbook](../sales-manager-agent.md) and [module 22](22-sales-manager-tool-loop.md) for the current contract. Production enablement remains separate. The richer role/task contracts below remain target design unless explicitly identified as implemented.
+**Implemented subset:** tool-evidence.ts validates source path/query, response/source clocks, explicit scope, page counts, totals and consistency metadata. sales.graph.ts reviews the formatted answer against current registered evidence in a fresh model context. The two-review allowance routes wording/layout repairs to the formatter, source-backed factual corrections to a tool-free evidence repair, and missing reads or corrected staged operations back to the tool loop while research remains available. A second failed review returns a limitation. Model review cannot override code authorization and is probabilistic. See the [personal-assistant runbook](../sales-manager-agent.md) and [module 22](22-sales-manager-tool-loop.md) for the current contract. Production enablement remains separate. The richer role/task contracts below remain target design unless explicitly identified as implemented.
+
+Current v44 review enforces material correctness without treating optional enrichment
+as a prerequisite. A normal CRM create uses the supplied facts and advertised required
+fields; absent optional budget/contact details, preferred wording or native dates for
+an uncreated record do not block it. Suggestion-only verdicts may approve a supported
+operation without editing its exact proposal. Incorrect targets/values, missing
+required input, authorization and unsupported success claims still block dispatch.
+Factual and presentation diagnostics are separate. One evidence repair and no-progress
+detection bound correction work under the original deadline; they do not raise the
+two-review limit or give the repair stage tool authority. See [the current implementation](55-latency-and-model-routing.md#answer-rendering-and-review-cleanup-v44).
 
 ## Responsibility
 

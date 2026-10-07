@@ -805,7 +805,7 @@ test('format-only review repairs bypass the conversational tool loop and retain 
       assert.match(payload.request_clock.local_time_24h, /^\d{2}:\d{2}$/);
       if (formatted > 0) assert.equal(payload.previous_reply, 'A concise draft.');
       formatted++;
-      return result('A concise draft.');
+      return result(formatted > 1 ? 'A brief draft.' : 'A concise draft.');
     },
   };
   const assistant = new AssistantService(

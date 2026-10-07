@@ -13,7 +13,7 @@ export const reviewFailure = z.enum([
 export type ReviewFailure = z.infer<typeof reviewFailure>;
 export interface ReviewMetric {
   approved: boolean;
-  repair: 'none' | 'format' | 'tools';
+  repair: 'none' | 'format' | 'evidence' | 'tools';
   reason: ReviewFailure;
   presentationIssueCount: number;
 }
@@ -39,7 +39,10 @@ export function reviewMetric(
   const parsedReason = reviewFailure.safeParse(review.reason);
   return {
     approved: false,
-    repair: review.repair === 'none' || review.repair === 'format' ? review.repair : 'tools',
+    repair:
+      review.repair === 'none' || review.repair === 'format' || review.repair === 'evidence'
+        ? review.repair
+        : 'tools',
     reason: parsedReason.success && parsedReason.data !== 'none' ? parsedReason.data : 'other',
     presentationIssueCount: count,
   };

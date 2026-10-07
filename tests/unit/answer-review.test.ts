@@ -122,13 +122,13 @@ test('area references need scalar leaves and cannot patch an unlabelled aggregat
     true,
   );
   assert.equal(aggregate.patchedAnswer, undefined);
-  assert.equal(aggregate.repair, 'tools');
+  assert.equal(aggregate.repair, 'evidence');
   const independent = review([{ ...correction, replacement: null }]);
-  independent.repair = 'tools';
+  independent.repair = 'evidence';
   const revision = resolveAnswerReview(independent, correction.quote, evidence, execution, true);
   assert.equal(revision.patchedAnswer, undefined);
   assert.equal(revision.supported, false);
-  assert.equal(revision.repair, 'tools');
+  assert.equal(revision.repair, 'evidence');
 });
 
 test('ambiguous, overlapping, missing and entity-free spans do not get patched', () => {
@@ -166,7 +166,7 @@ test('rejected factual presentation patches retain diagnostics without applying 
   value.feedback = 'Use the native dates already present in the evidence.';
   const resolved = resolveAnswerReview(value, 'Client A', evidence, execution, true);
   assert.equal(resolved.supported, false);
-  assert.equal(resolved.repair, 'tools');
+  assert.equal(resolved.repair, 'evidence');
   assert.equal(resolved.patchedAnswer, undefined);
   assert.ok(resolved.feedback.includes(diagnostic));
   assert.ok(resolved.feedback.includes(value.feedback));

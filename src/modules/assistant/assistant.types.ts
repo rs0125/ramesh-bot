@@ -100,6 +100,8 @@ export interface StageMetric {
   cachedInputTokens?: number;
   /** Allowlisted verdict metadata only; no reviewer feedback, answer text, or source values. */
   review?: ReviewMetric;
+  /** Fixed diagnostics only; never include candidate text, source values or feedback. */
+  answerRepair?: { kind: 'format' | 'evidence'; outcome: 'changed' | 'unchanged' | 'rejected' };
 }
 
 export interface AgentTrace {

@@ -246,7 +246,7 @@ test('successive targeted recalls retain both groups from the same historical tu
   );
 });
 
-test('review exhaustion reports sanitized reasons without sending rejected claims or blaming query scope', async () => {
+test('no-progress stopping reports sanitized reasons without sending rejected claims or blaming query scope', async () => {
   const fixture = createSalesFixture();
   const metrics: unknown[] = [];
   let step = 0;
@@ -295,14 +295,20 @@ test('review exhaustion reports sanitized reasons without sending rejected claim
   const reviews = (metrics as Array<{ review?: unknown }>).flatMap((m) =>
     m.review ? [m.review] : [],
   );
-  assert.deepEqual(
-    reviews,
-    [1, 2].map(() => ({
+  assert.deepEqual(reviews, [
+    {
       approved: false,
       repair: 'format',
       reason: 'unsupported_claim',
       presentationIssueCount: 0,
-    })),
+    },
+  ]);
+  assert.deepEqual(
+    reply.stages.flatMap((s) => (s.answerRepair ? [s.answerRepair] : [])),
+    [
+      { kind: 'format', outcome: 'unchanged' },
+      { kind: 'evidence', outcome: 'unchanged' },
+    ],
   );
   assert.doesNotMatch(JSON.stringify(metrics), /PRIVATE_REVIEW_DETAIL|UNSUPPORTED_DRAFT/);
 });

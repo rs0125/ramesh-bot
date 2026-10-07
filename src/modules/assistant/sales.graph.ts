@@ -1,6 +1,7 @@
 import { MEMORY_INSTRUCTIONS, historyForStage } from './chat-context.js';
 import { toolDiscovery, planningToolDefinitions } from '../context-engine/tool-discovery.js';
 /** Bounded native tool loop in LangGraph, with style formatting and fresh evidence review. */
+import { createHash } from 'node:crypto';
 import { END, START, StateGraph, StateSchema } from '@langchain/langgraph';
 import { z } from 'zod';
 import type {
@@ -16,6 +17,7 @@ import type { ToolDelivery } from './tool-evidence.js';
 import { indiaDate } from './followups.js';
 import {
   BUSINESS_FORMATTER_PROMPT,
+  EVIDENCE_REPAIR_PROMPT,
   ROUTER_PROMPT,
   PLANNER_PROMPT,
   WORKER_PROMPT,
@@ -23,7 +25,13 @@ import {
 } from './sales-prompts.js';
 import { finishReply, chatLayoutIssues } from './style.js';
 import { businessRecall, recallDefinition, RECALL_TOOL } from './business-recall.js';
-import { dealDisplayFacts, dealDisplayIssues, withDealDates } from './deal-display.js';
+import { dealDisplayFacts, dealDisplayIssues } from './deal-display.js';
+import {
+  answerContentSchema,
+  answerStyleText,
+  renderAnswer,
+  type RenderedCrmRecord,
+} from './answer-rendering.js';
 import { planningContext } from './planning-context.js';
 import { routeSchema, taskPlanSchema, validateTaskPlan, lookupPlan } from './task-plan.js';
 import { MAX_READ_BATCH } from './assistant.types.js';
@@ -48,7 +56,7 @@ import {
   type ExecutionReport,
 } from './answer-review.js';
 
-const supplementSchema = z.object({ additional_reply: z.string().max(4000) }).strict();
+const supplementSchema = z.object({ additional_reply: answerContentSchema }).strict();
 const state = new StateSchema({
   input: z.string(),
   history: z.array(z.custom<ChatMessage>()),
@@ -67,9 +75,13 @@ const state = new StateSchema({
   stages: z.array(z.custom<StageMetric>()).default([]),
   approved: z.boolean().default(false),
   feedback: z.string().default(''),
-  repairKind: z.enum(['none', 'format', 'tools']).default('none'),
+  repairKind: z.enum(['none', 'format', 'evidence', 'tools']).default('none'),
   reviewReason: reviewFailure.default('none'),
   reviewPatched: z.boolean().default(false),
+  renderIssues: z.array(z.string()).default([]),
+  renderedRecords: z.array(z.custom<RenderedCrmRecord>()).default([]),
+  repairStatus: z.enum(['none', 'changed', 'unchanged', 'rejected']).default('none'),
+  evidenceRepairs: z.number().default(0),
   repairs: z.number().default(0),
   blocked: z.boolean().default(false),
   unavailable: z.boolean().default(false),
@@ -259,6 +271,212 @@ export function buildSalesGraph(
       messages: [...modelHistory, { role: 'user', content: input }],
       tools: sessionTools,
     });
+  };
+  let lastReviewedArtifact: string | undefined;
+  const artifactKey = (reply: string, records: readonly RenderedCrmRecord[]) =>
+    createHash('sha256')
+      .update(
+        JSON.stringify([
+          reply,
+          records,
+          run?.evidence,
+          run?.failures,
+          utilities?.evidence,
+          personal?.evidence,
+          personal?.pendingOperations,
+          writes?.evidence,
+          writes?.preview(),
+        ]),
+      )
+      .digest('hex');
+  const composeReply = async (
+    value: typeof state.State,
+    signal: AbortSignal | undefined,
+    evidenceRepair: boolean,
+  ): Promise<typeof state.Update> => {
+    if (options.replyDeadlineMs !== undefined) {
+      const remaining = options.replyDeadlineMs - Date.now();
+      if (remaining <= 0) throw new DOMException('Reply deadline', 'TimeoutError');
+      const deadline = AbortSignal.timeout(Math.ceil(remaining));
+      signal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    }
+    const researchExhausted =
+      value.researchExhausted || Date.now() >= (options.researchDeadlineMs ?? Infinity);
+    const preview = personal?.preview();
+    const writePreview = writes?.preview();
+    if (!evidenceRepair && value.personalOnly && preview && !writePreview)
+      return { reply: preview, supplement: '', draftReady: false };
+    const started = Date.now();
+    const composed = !!preview || !!writePreview;
+    // Consume each completed worker answer once, including independent review repairs.
+    // Formatter-only retries must not reuse a draft already rejected by the verifier.
+    if (
+      !evidenceRepair &&
+      !composed &&
+      value.draftReady &&
+      (value.route === 'direct' || run?.evidence.length) &&
+      value.draft.length <= 12000
+    ) {
+      const rendered = renderAnswer(value.draft, run?.evidence ?? []);
+      const reply = finishReply(rendered.text);
+      const unchanged =
+        !!value.feedback && lastReviewedArtifact === artifactKey(reply, rendered.records);
+      return {
+        reply,
+        renderIssues: rendered.issues,
+        renderedRecords: rendered.records,
+        researchExhausted,
+        repairStatus: rendered.issues.length ? 'rejected' : unchanged ? 'unchanged' : 'none',
+        ...(rendered.issues.length ? { feedback: rendered.issues.join(' ') } : {}),
+        supplement: '',
+        draftReady: false,
+        stages: [
+          ...value.stages,
+          recordMetric({
+            stage: 'formatter',
+            durationMs: Date.now() - started,
+            inputTokens: 0,
+            outputTokens: 0,
+          }),
+        ],
+      };
+    }
+    const stage = evidenceRepair ? ('worker' as const) : ('formatter' as const);
+    const budget = await observedBudget(
+      `${evidenceRepair ? 'evidence-repair' : 'formatter'}-${toolSteps}-${value.repairs}`,
+    );
+    const result = await model.complete(
+      {
+        stage,
+        reasoningEffort:
+          run?.evidence.length || utilities?.evidence.length || value.feedback ? 'low' : 'none',
+        instructions: `${evidenceRepair ? EVIDENCE_REPAIR_PROMPT : BUSINESS_FORMATTER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies personal_result and business_write_result separately. It appends authoritative personal receipts/lists and the application-owned business write response. The internal write preview has not executed yet: after review, the runtime either executes direct_request and substitutes the saved outcome, or publishes a confirmation step. Do not repeat those receipts, independently claim success, invent confirmation codes, or ask for confirmation for direct_request. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Make only the smallest supported correction to previous_reply. Preserve all unaffected text, record order, units and recommendations. Never infer a failure cause or apply an unvalidated factual correction.' : ''}`,
+        messages: [
+          {
+            role: 'user',
+            content: JSON.stringify({
+              request: value.input,
+              task_plan: value.plan,
+              research_limited: researchExhausted,
+              execution_status: executionReport(researchExhausted),
+              tool_budget: budget,
+              history: historyForStage(modelHistory, stage),
+              request_clock: requestClock,
+              application_context: applicationContext(),
+              audience: value.audience,
+              access: accessStatus,
+              draft: value.draft,
+              response_character_budget: composed ? 4000 : 12000,
+              source_tool_definitions: tools
+                .filter((tool) => run?.evidence.some((entry) => entry.tool === tool.name))
+                .map(({ name, description }) => ({ name, description })),
+              recalled: currentRecalls(),
+              working_context: workingContext(
+                run?.evidence ?? [],
+                modelHistory,
+                value.input,
+                currentRecalls(),
+              ),
+              evidence: presentEvidence(run?.evidence ?? []),
+              utility_evidence: utilities?.evidence ?? [],
+              utility_failures: utilities?.failures ?? [],
+              personal_evidence: personal?.evidence ?? [],
+              personal_result: preview,
+              personal_failures: personal?.failures ?? [],
+              business_write_evidence: writes?.evidence ?? [],
+              business_write_result: writePreview,
+              business_write_execution_mode: writes?.pendingExecutionMode,
+              business_write_failures: writes?.failures ?? [],
+              business_write_tool_definitions: planningToolDefinitions(
+                writes?.tools ?? [],
+                model.toolLoadingMode,
+              ),
+              retired_evidence_ids: run?.retiredEvidenceIds ?? [],
+              pagination: run?.pagination ?? [],
+              failures: run?.failures ?? [],
+              deal_display: dealDisplayFacts(run?.evidence ?? []),
+              rendered_crm_records: value.renderedRecords,
+              render_issues: value.renderIssues,
+              repair_status: value.repairStatus,
+              ...(value.feedback ? { feedback: value.feedback, previous_reply: value.reply } : {}),
+            }),
+          },
+        ],
+        ...(composed
+          ? {
+              jsonSchema: {
+                name: writePreview ? 'ramesh_action_supplement' : 'ramesh_personal_supplement',
+                schema: z.toJSONSchema(supplementSchema),
+              },
+            }
+          : {}),
+      },
+      signal,
+    );
+    const additional = composed
+      ? supplementSchema.parse(JSON.parse(result.text)).additional_reply
+      : result.text;
+    const rendered = renderAnswer(additional, run?.evidence ?? []);
+    const candidate = finishReply(rendered.text);
+    const previous = composed ? value.supplement : value.reply;
+    const formattingRepair = !evidenceRepair && !!value.feedback && !!value.reply;
+    const rejected =
+      rendered.issues.length > 0 ||
+      (formattingRepair && !preservesAnswerFacts(previous, candidate));
+    const supplement = rejected ? previous : candidate;
+    const reply = composed
+      ? [supplement, preview, writePreview].filter(Boolean).join('\n\n')
+      : supplement;
+    if (
+      (!reply && !rejected) ||
+      reply.length > (composed ? 16000 : 12000) ||
+      (composed && supplement.length > 4000)
+    )
+      throw new Error('Invalid sales reply');
+    const repairStatus = rejected
+      ? ('rejected' as const)
+      : lastReviewedArtifact === artifactKey(reply, rendered.records)
+        ? ('unchanged' as const)
+        : ('changed' as const);
+    const diagnosis = rendered.issues.length
+      ? rendered.issues.join(' ')
+      : rejected
+        ? 'The formatting edit was rejected because it changed factual content. Correct the original answer from source evidence; the rejected edit is not evidence.'
+        : repairStatus === 'unchanged'
+          ? 'The repair left the reviewed answer and evidence unchanged. Reconsider the unresolved finding; do not repeat the same rejected answer.'
+          : '';
+    return {
+      reply,
+      supplement: composed ? supplement : '',
+      draftReady: false,
+      renderIssues: rendered.issues,
+      renderedRecords: rejected ? value.renderedRecords : rendered.records,
+      repairStatus: evidenceRepair || formattingRepair || rejected ? repairStatus : 'none',
+      evidenceRepairs: value.evidenceRepairs + (evidenceRepair ? 1 : 0),
+      researchExhausted,
+      ...(diagnosis ? { feedback: `${value.feedback} ${diagnosis}`.trim() } : {}),
+      stages: [
+        ...value.stages,
+        recordMetric({
+          stage,
+          ...(evidenceRepair || formattingRepair
+            ? {
+                answerRepair: {
+                  kind: evidenceRepair ? ('evidence' as const) : ('format' as const),
+                  outcome: repairStatus,
+                },
+              }
+            : {}),
+          durationMs: Date.now() - started,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          reasoningTokens: result.reasoningTokens ?? 0,
+          cachedInputTokens: result.cachedInputTokens ?? 0,
+          model: result.model,
+          responseCalls: result.responseCalls,
+        }),
+      ],
+    };
   };
   return new StateGraph(state)
     .addNode('context', async (value, config) => {
@@ -610,148 +828,19 @@ export function buildSalesGraph(
       }
       return { calls: [], stages };
     })
-    .addNode('formatter', async (value, config) => {
-      const preview = personal?.preview();
-      const writePreview = writes?.preview();
-      if (value.personalOnly && preview && !writePreview)
-        return { reply: preview, supplement: '', draftReady: false };
-      const started = Date.now();
-      const composed = !!preview || !!writePreview;
-      // Consume each completed worker answer once, including independent review repairs.
-      // Formatter-only retries must not reuse a draft already rejected by the verifier.
-      if (
-        !composed &&
-        value.draftReady &&
-        (value.route === 'direct' || run?.evidence.length) &&
-        value.draft.length <= 12000
-      ) {
-        const reply = withDealDates(finishReply(value.draft), run?.evidence ?? []);
-        return {
-          reply,
-          supplement: '',
-          draftReady: false,
-          stages: [
-            ...value.stages,
-            recordMetric({
-              stage: 'formatter',
-              durationMs: Date.now() - started,
-              inputTokens: 0,
-              outputTokens: 0,
-            }),
-          ],
-        };
-      }
-      const budget = await observedBudget(`formatter-${toolSteps}-${value.repairs}`);
-      const result = await model.complete(
-        {
-          stage: 'formatter',
-          reasoningEffort:
-            run?.evidence.length || utilities?.evidence.length || value.feedback ? 'low' : 'none',
-          instructions: `${BUSINESS_FORMATTER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${engineOrientation()}\n${composed ? 'Response composition: output JSON with additional_reply containing ONLY the other requested answer (business findings, advice, drafts, or clarification). The application supplies personal_result and business_write_result separately. It appends authoritative personal receipts/lists and the application-owned business write response. The internal write preview has not executed yet: after review, the runtime either executes direct_request and substitutes the saved outcome, or publishes a confirmation step. Do not repeat those receipts, independently claim success, invent confirmation codes, or ask for confirmation for direct_request. If there is no other requested answer, additional_reply is empty. Preserve all useful non-personal work.' : ''}\n${value.feedback ? 'A source reviewer found a problem. Make only the smallest supported correction to previous_reply. Preserve all unaffected text, record order, units and recommendations. Never infer a failure cause or apply an unvalidated factual correction.' : ''}`,
-          messages: [
-            {
-              role: 'user',
-              content: JSON.stringify({
-                request: value.input,
-                task_plan: value.plan,
-                research_limited: value.researchExhausted,
-                execution_status: executionReport(value.researchExhausted),
-                tool_budget: budget,
-                history: historyForStage(modelHistory, 'formatter'),
-                request_clock: requestClock,
-                application_context: applicationContext(),
-                audience: value.audience,
-                access: accessStatus,
-                draft: value.draft,
-                response_character_budget: composed ? 4000 : 12000,
-                source_tool_definitions: tools
-                  .filter((tool) => run?.evidence.some((entry) => entry.tool === tool.name))
-                  .map(({ name, description }) => ({ name, description })),
-                recalled: currentRecalls(),
-                working_context: workingContext(
-                  run?.evidence ?? [],
-                  modelHistory,
-                  value.input,
-                  currentRecalls(),
-                ),
-                evidence: presentEvidence(run?.evidence ?? []),
-                utility_evidence: utilities?.evidence ?? [],
-                utility_failures: utilities?.failures ?? [],
-                personal_evidence: personal?.evidence ?? [],
-                personal_result: preview,
-                personal_failures: personal?.failures ?? [],
-                business_write_evidence: writes?.evidence ?? [],
-                business_write_result: writePreview,
-                business_write_execution_mode: writes?.pendingExecutionMode,
-                business_write_failures: writes?.failures ?? [],
-                business_write_tool_definitions: planningToolDefinitions(
-                  writes?.tools ?? [],
-                  model.toolLoadingMode,
-                ),
-                retired_evidence_ids: run?.retiredEvidenceIds ?? [],
-                pagination: run?.pagination ?? [],
-                failures: run?.failures ?? [],
-                deal_display: dealDisplayFacts(run?.evidence ?? []),
-                ...(value.feedback
-                  ? { feedback: value.feedback, previous_reply: value.reply }
-                  : {}),
-              }),
-            },
-          ],
-          ...(composed
-            ? {
-                jsonSchema: {
-                  name: writePreview ? 'ramesh_action_supplement' : 'ramesh_personal_supplement',
-                  schema: z.toJSONSchema(supplementSchema),
-                },
-              }
-            : {}),
-        },
-        config.signal,
-      );
-      const additional = composed
-        ? supplementSchema.parse(JSON.parse(result.text)).additional_reply
-        : result.text;
-      const protectedAdditional =
-        !composed && value.feedback && value.reply && !preservesAnswerFacts(value.reply, additional)
-          ? value.reply
-          : additional;
-      const supplement = protectedAdditional.trim()
-        ? withDealDates(finishReply(protectedAdditional), run?.evidence ?? [])
-        : '';
-      const reply = composed
-        ? [supplement, preview, writePreview].filter(Boolean).join('\n\n')
-        : supplement;
-      if (!reply || reply.length > (composed ? 16000 : 12000))
-        throw new Error('Invalid sales reply');
-      return {
-        reply,
-        supplement: composed ? supplement : '',
-        draftReady: false,
-        stages: [
-          ...value.stages,
-          recordMetric({
-            stage: 'formatter' as const,
-            durationMs: Date.now() - started,
-            inputTokens: result.inputTokens,
-            outputTokens: result.outputTokens,
-            reasoningTokens: result.reasoningTokens ?? 0,
-            cachedInputTokens: result.cachedInputTokens ?? 0,
-            model: result.model,
-            responseCalls: result.responseCalls,
-          }),
-        ],
-      };
-    })
+    .addNode('formatter', (value, config) => composeReply(value, config.signal, false))
+    .addNode('evidence_repair', (value, config) => composeReply(value, config.signal, true))
     .addNode('verifier', async (value, config) => {
       const started = Date.now();
       // Exact user-authored personal records and application-owned write previews are
       // data, not generated prose. Review their semantics below without rewriting literals.
       const prose = personal?.preview() || writes?.preview() ? value.supplement : value.reply;
-      const issues = [
+      const factualIssues = [
+        ...value.renderIssues,
         ...dealDisplayIssues(prose, run?.evidence ?? [], run?.internalCrmIds),
-        ...chatLayoutIssues(prose),
       ];
+      const layoutIssues = chatLayoutIssues(answerStyleText(prose, value.renderedRecords));
+      const issues = [...factualIssues, ...layoutIssues];
       const budget = await observedBudget(`verifier-${toolSteps}-${value.repairs}`);
       const result = await model.complete(
         {
@@ -804,7 +893,9 @@ export function buildSalesGraph(
                 pagination: run?.pagination ?? [],
                 failures: run?.failures ?? [],
                 answer: value.reply,
-                presentation_issues: issues,
+                presentation_issues: layoutIssues,
+                factual_issues: factualIssues,
+                rendered_crm_records: value.renderedRecords,
                 review_pass: value.repairs + 1,
                 ...(value.feedback ? { previous_review_feedback: value.feedback } : {}),
               }),
@@ -814,6 +905,7 @@ export function buildSalesGraph(
         },
         config.signal,
       );
+      lastReviewedArtifact = artifactKey(value.reply, value.renderedRecords);
       const rawReview = answerReviewSchema.parse(JSON.parse(result.text));
       const review = resolveAnswerReview(
         rawReview,
@@ -826,10 +918,17 @@ export function buildSalesGraph(
           !writes?.usedPrivateData,
       );
       if (review.patchedAnswer) {
-        const patchedIssues = [
+        factualIssues.splice(
+          0,
+          factualIssues.length,
           ...dealDisplayIssues(review.patchedAnswer, run?.evidence ?? [], run?.internalCrmIds),
-          ...chatLayoutIssues(review.patchedAnswer),
-        ];
+        );
+        layoutIssues.splice(
+          0,
+          layoutIssues.length,
+          ...chatLayoutIssues(answerStyleText(review.patchedAnswer, value.renderedRecords)),
+        );
+        const patchedIssues = [...factualIssues, ...layoutIssues];
         // A patch is reviewed as a complete answer; old presentation issues may have been fixed.
         issues.splice(0, issues.length, ...patchedIssues);
       }
@@ -838,12 +937,25 @@ export function buildSalesGraph(
         review.supported = false;
         review.feedback = `${issues.join(' ')} ${review.feedback}`;
       }
-      const diagnostic = reviewMetric({ ...review, supported: modelApproved }, issues.length);
+      if (modelApproved && factualIssues.length) {
+        review.reason = 'unsupported_claim';
+        review.repair = 'evidence';
+      }
+      const diagnostic = reviewMetric(
+        { ...review, supported: modelApproved && !factualIssues.length },
+        layoutIssues.length,
+      );
       return {
         approved: review.supported,
         ...(review.patchedAnswer && !issues.length ? { reply: review.patchedAnswer } : {}),
         reviewPatched: !!review.patchedAnswer && !issues.length,
-        repairKind: issues.length && modelApproved ? ('format' as const) : review.repair,
+        repairKind: factualIssues.length
+          ? ('evidence' as const)
+          : layoutIssues.length && modelApproved
+            ? ('format' as const)
+            : review.repair,
+        repairStatus: 'none',
+        renderIssues: [],
         feedback: review.feedback,
         reviewReason: diagnostic.reason,
         repairs: value.repairs + (review.supported ? 0 : 1),
@@ -987,21 +1099,42 @@ export function buildSalesGraph(
           ? 'formatter'
           : 'worker',
     )
-    .addConditionalEdges('formatter', (value) => (value.casual ? 'finish' : 'verifier'))
+    .addConditionalEdges('formatter', (value) =>
+      value.repairStatus === 'rejected' || value.repairStatus === 'unchanged'
+        ? value.evidenceRepairs < 1 && value.repairs < 2
+          ? 'evidence_repair'
+          : 'finish'
+        : value.casual
+          ? 'finish'
+          : 'verifier',
+    )
+    .addConditionalEdges('evidence_repair', (value) =>
+      value.repairStatus === 'rejected' || value.repairStatus === 'unchanged'
+        ? 'finish'
+        : 'verifier',
+    )
     .addConditionalEdges('verifier', (value) =>
       value.approved || value.repairs >= 2
         ? 'finish'
         : value.reviewPatched
           ? 'verifier'
-          : !value.researchExhausted &&
-              Date.now() < (options.researchDeadlineMs ?? Infinity) &&
-              value.repairKind !== 'format' &&
-              remainingTools() > 0 &&
-              toolSteps < 28
-            ? session?.revise
-              ? 'revise'
-              : 'planner'
-            : 'formatter',
+          : value.repairKind === 'evidence'
+            ? value.evidenceRepairs < 1
+              ? 'evidence_repair'
+              : 'finish'
+            : !value.researchExhausted &&
+                Date.now() < (options.researchDeadlineMs ?? Infinity) &&
+                value.repairKind !== 'format' &&
+                remainingTools() > 0 &&
+                toolSteps < 28
+              ? session?.revise
+                ? 'revise'
+                : 'planner'
+              : value.repairKind === 'format'
+                ? 'formatter'
+                : value.evidenceRepairs < 1
+                  ? 'evidence_repair'
+                  : 'finish',
     )
     .addEdge('revise', 'worker')
     .addEdge('finish', END)

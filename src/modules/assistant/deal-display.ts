@@ -20,8 +20,8 @@ export function dealDisplayFacts(evidence: readonly ToolEvidence[]) {
     last_updated: date(row.source_updated_at),
   }));
 }
-/** Recognize unambiguous record entries, including compact due-date/name bullets.
- * Never infer identity from a shortened/duplicate name or turn a task/draft into a card. */
+/** Best-effort validation of dates claimed in legacy prose. Never insert facts or
+ * require missing display metadata here. Structured cards render by record ID. */
 function recordBlocks(reply: string, evidence: readonly ToolEvidence[]) {
   const facts = dealDisplayFacts(evidence);
   const records = new Map(nativeCrmRecords(evidence).map((row) => [row.id, row]));
@@ -134,11 +134,12 @@ function sameDate(value: string, expected: string, nativeInstant?: unknown): boo
   if (expected === 'Not recorded') return value.toLowerCase() === 'not recorded';
   // A correct native time is useful detail, not a date-format violation. Validate
   // the supplied IST time against this record's timestamp, at its shown precision.
-  const timed = /^(.*?)[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?\s*(?:IST|\(IST\))$/i.exec(
-    value,
-  );
+  const timed =
+    /^(.*?)[,\s]+(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?\s*(am|pm)?\s*(?:IST|\(IST\))$/i.exec(
+      value,
+    );
   if (timed) {
-    const [, day, hour, minute, second, period] = timed;
+    const [, day, hour, minute, second, fraction, period] = timed;
     let hours = Number(hour);
     if (
       !sameDate(day!, expected) ||
@@ -150,9 +151,11 @@ function sameDate(value: string, expected: string, nativeInstant?: unknown): boo
     )
       return false;
     if (period) hours = (hours % 12) + (period.toLowerCase() === 'pm' ? 12 : 0);
-    const actual = Date.parse(`${day} ${hours}:${minute}:${second ?? '00'} +05:30`);
+    const actual = Date.parse(
+      `${day} ${hours}:${minute}:${second ?? '00'}${fraction ? `.${fraction}` : ''} +05:30`,
+    );
     const recorded = Date.parse(nativeInstant);
-    const precision = second === undefined ? 60000 : 1000;
+    const precision = fraction ? 10 ** (3 - fraction.length) : second === undefined ? 60000 : 1000;
     return (
       Number.isFinite(actual) &&
       Number.isFinite(recorded) &&
@@ -163,18 +166,6 @@ function sameDate(value: string, expected: string, nativeInstant?: unknown): boo
   // while human labels otherwise inherit the host timezone.
   const actual = Date.parse(`${value.replace(/\s*(?:\(IST\)|IST)$/i, '')} UTC`);
   return Number.isFinite(actual) && actual === Date.parse(`${expected} UTC`);
-}
-/** Add only missing metadata from validated native fields; never manufacture or overwrite a fact. */
-export function withDealDates(reply: string, evidence: readonly ToolEvidence[]) {
-  const { lines, entries } = recordBlocks(reply, evidence);
-  for (const { index, row, body } of entries.reverse()) {
-    const missing = [
-      ...(!displayedDate(body, 'Created') ? [`Created: ${row.created}`] : []),
-      ...(!displayedDate(body, 'Last updated') ? [`Last updated: ${row.last_updated}`] : []),
-    ];
-    if (missing.length) lines.splice(index + 1, 0, missing.join(' · '));
-  }
-  return lines.join('\n');
 }
 export function dealDisplayIssues(
   reply: string,
@@ -196,7 +187,7 @@ export function dealDisplayIssues(
       ['Last updated', row.last_updated, 'source_updated_at'],
     ]) {
       const shown = displayedDate(body, field!);
-      if (!shown || !sameDate(shown, expected!, native?.[nativeField!]))
+      if (shown && !sameDate(shown, expected!, native?.[nativeField!]))
         issues.push(`For ${row.label}, use ${field}: ${expected} from native CRM dates.`);
     }
   }

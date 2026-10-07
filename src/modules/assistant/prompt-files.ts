@@ -7,6 +7,7 @@ export const PROMPT_NAMES = [
   'formatter',
   'chief-of-staff',
   'business-formatter',
+  'evidence-repair',
   'verifier',
   'legacy-read-converser',
   'evidence-policy',

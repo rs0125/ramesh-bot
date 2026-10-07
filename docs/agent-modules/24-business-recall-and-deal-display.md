@@ -39,14 +39,22 @@ For references to an earlier list, recall it before searching new records or ask
 
 Deal cards contain a human-readable heading, requirement/location, useful stage/next follow-up, and `Created` / `Last updated` dates. Dates use `source_created_at` and `source_updated_at`, rendered in Asia/Kolkata; never substitute mirror polling or meaningful-activity clocks. A missing date is `Not recorded`. Last updated can include automation changes. Preserve uncertainty without repeating a long generic disclaimer for every field.
 
-Date insertion recognizes an exact unique company label or full requirement name,
-including quoted headings. Shared company names cannot bind dates to an arbitrary
-RFQ. Existing incorrect dates still fail validation; drafts and action lists do not
-become CRM cards. Reviewer additions of dates are factual changes, never pure
-presentation patches. If a patch cannot be safely bound, its diagnostic survives for
-independent revision from existing evidence; the unvalidated replacement is not applied.
+Current v44 CRM cards use the internal `answer_blocks` envelope. Each `crm_record`
+block supplies an explicit current source `record_id`; the renderer resolves its
+exact name and native dates from accepted evidence. Text blocks cover warehouses,
+comparisons and caveats. There is no automatic date insertion by matching company
+names in prose. Missing/retired IDs and model-supplied native date fields inside a
+card body require repair. `include_time` renders native IST timestamps to milliseconds
+when requested; missing native dates remain `Not recorded`.
 
-Formatter receives current evidence on its first pass. Prompts and verifier disallow raw deal UUIDs/API paths, require date labels when listing individual deals, and preserve warehouse IDs for actionable shortlists. A deterministic UUID guard triggers the bounded repair path, even if the model reviewer approves. Unknown deal names get a grounded requirement/location label, not their UUID.
+Ordinary prose remains valid. Missing unrequested date labels are optional display
+detail and cannot veto a supported answer. Wrong dates, explicitly requested dates
+and internal-ID leaks remain material. A best-effort legacy prose validator checks
+claimed dates; it never inserts facts. Both formatting and evidence-only repairs
+receive current evidence. A rejected/no-op formatting edit is diagnosed explicitly
+and may receive one independent factual repair without tools under the original
+reply deadline. Corrected answers still require source review. See the
+[v44 ownership and repair contract](55-latency-and-model-routing.md#answer-rendering-and-review-cleanup-v44).
 
 The reported live regression also requires a tool-capable correction pass: a reviewer detecting missing searches cannot fix that by asking the formatter to rewrite. On the first rejection, continue the same private tool session with the reviewed answer and feedback, within the existing read/step/deadline budgets. Then format and review the revised result. No fresh budget or authority is granted. One rejected correction still fails honestly. Older non-tool mock adapters may use the formatting-only fallback. Keep shared caveats once per shortlist and specific pros/cons per property; avoid repetitive multi-line disclaimers.
 

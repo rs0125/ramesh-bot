@@ -430,7 +430,10 @@ export class AssistantService {
         if (error instanceof CheckpointError) throw error;
         signal?.throwIfAborted();
         trace.outcome = 'unavailable';
-        trace.failureCode = deadline.signal.aborted ? 'DEADLINE_EXCEEDED' : 'RUN_FAILED';
+        trace.failureCode =
+          deadline.signal.aborted || Date.now() >= deadlineAtMs
+            ? 'DEADLINE_EXCEEDED'
+            : 'RUN_FAILED';
         const business = contextRun?.historyDelivery();
         const personalDelivery =
           personal?.usedPrivateData && !personal.blocked ? personal.deliveryReference : undefined;

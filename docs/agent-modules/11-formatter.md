@@ -2,7 +2,17 @@
 
 Status: **Model formatting followed by independent evidence review implemented.**
 
-**Implemented subset:** The personal-assistant formatter uses human-readable deal names, native Created/Last updated dates, and warehouse IDs, with page coverage, uncertainty and capability boundaries. Deal UUIDs are hidden. The first formatting pass receives source evidence; a deterministic UUID/date-label guard complements semantic review. finishReply applies style guards, then the verifier reviews the resulting text. The historical daily preset retains its deterministic renderer. Generic multi-worker AnswerBundle contracts below remain proposed. See the [personal-assistant runbook](../sales-manager-agent.md) and [module 22](22-sales-manager-tool-loop.md) for the current contract. Production enablement remains separate. The richer role/task contracts below remain target design unless explicitly identified as implemented.
+**Implemented subset:** The personal-assistant formatter uses human-readable deal names, native Created/Last updated dates, and warehouse IDs, with page coverage, uncertainty and capability boundaries. Deal UUIDs are hidden. The first formatting pass receives source evidence; explicit record bindings render native dates and a deterministic UUID/date-value guard complements semantic review. finishReply applies style guards, then the verifier reviews the resulting text. The historical daily preset retains its deterministic renderer. Generic multi-worker AnswerBundle contracts below remain proposed. See the [personal-assistant runbook](../sales-manager-agent.md) and [module 22](22-sales-manager-tool-loop.md) for the current contract. Production enablement remains separate. The richer role/task contracts below remain target design unless explicitly identified as implemented.
+
+Current v44 separates presentation edits from factual correction. Current CRM cards
+may use `answer_blocks` with explicit source IDs; the renderer owns names and native
+dates, and leaves ordinary prose untouched. Missing unrequested dates do not block
+an answer. Formatting-only edits cannot introduce new numbers/units; rejected or
+unchanged edits are recorded rather than silently restoring a draft and reviewing
+it again. One evidence-only worker repair can correct facts without new reads,
+including after research ends, within the original reply deadline. The revised
+answer still needs independent review. Application-owned action previews and
+receipts remain outside generated prose. See [the current implementation](55-latency-and-model-routing.md#answer-rendering-and-review-cleanup-v44).
 
 ## Responsibility
 

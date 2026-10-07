@@ -16,7 +16,7 @@ export const answerReviewSchema = z
   .object({
     supported: z.boolean(),
     feedback: z.string().max(1200),
-    repair: z.enum(['none', 'format', 'tools']).default('tools'),
+    repair: z.enum(['none', 'format', 'evidence', 'tools']).default('tools'),
     reason: reviewFailure.default('other'),
     remainder_supported: z.boolean().default(false),
     findings: z
@@ -38,7 +38,7 @@ export const answerReviewSchema = z
   .strict();
 export type AnswerReview = z.infer<typeof answerReviewSchema>;
 
-export const ANSWER_REVIEW_CONTRACT = `Review material errors, not every possible improvement. Put optional additional detail in suggestion findings; it must not block a useful qualified answer. For a blocking issue supply the exact unique quote from answer and a minimal replacement, or null if independent revision is needed. A record-specific quote must include the record's visible ID or source name, not a free-floating shared field phrase. Bind factual/scope corrections to references: evidence_id, JSON pointer relative to evidence.result (e.g. /data/items/0/fire_noc_available), the exact scalar value_json serialized as JSON, and the containing record_id as a string (null only for non-record evidence). Reference scalar leaves, never whole arrays or objects: for an offered area use /data/items/0/total_space_sqft/0 with value_json="27000", not /data/items/0/total_space_sqft with value_json="[27000]". Check the entity identity before proposing a correction. An aggregate claim without the cited record's label cannot be patched using that record's reference; use replacement=null and repair=tools so the worker independently revises from current evidence. Do not expand the quote or insert a record label merely to bypass this boundary. For execution_status reference evidence_id="execution" and its /data/tools/<tool>/status or other runtime field. Never infer that an unattempted read timed out. Set remainder_supported=true only when the entire remaining answer is supported and the supplied exact replacements resolve ALL blocking issues. Do not introduce new rankings or recommendations in a presentation repair. Presentation patches may change only whitespace or emphasis, with no references or new facts. Adding native dates or correcting a source value is a factual issue, not presentation. If a missing fact needs adding or an exact source-bound patch cannot be expressed, use replacement=null and repair=tools; explain the specific issue for independent revision from existing evidence. Do not request another source call when the needed native field is already in the evidence. If no material error remains, supported=true; suggestions are optional. Structured findings, when supplied, must account for every reason for rejection.`;
+export const ANSWER_REVIEW_CONTRACT = `Review material errors, not every possible improvement. Put optional additional detail in suggestion findings; it must not block a useful qualified answer. For a blocking issue supply the exact unique quote from answer and a minimal replacement, or null if independent revision is needed. A record-specific quote must include the record's visible ID or source name, not a free-floating shared field phrase. Bind factual/scope corrections to references: evidence_id, JSON pointer relative to evidence.result (e.g. /data/items/0/fire_noc_available), the exact scalar value_json serialized as JSON, and the containing record_id as a string (null only for non-record evidence). Reference scalar leaves, never whole arrays or objects: for an offered area use /data/items/0/total_space_sqft/0 with value_json="27000", not /data/items/0/total_space_sqft with value_json="[27000]". Check the entity identity before proposing a correction. An aggregate claim without the cited record's label cannot be patched using that record's reference; use replacement=null and repair=evidence so an independent worker revises from current evidence without tools. Do not expand the quote or insert a record label merely to bypass this boundary. For execution_status reference evidence_id="execution" and its /data/tools/<tool>/status or other runtime field. Never infer that an unattempted read timed out. Set remainder_supported=true only when the entire remaining answer is supported and the supplied exact replacements resolve ALL blocking issues. Do not introduce new rankings or recommendations in a presentation repair. Presentation patches may change only whitespace or emphasis, with no references or new facts. Adding native dates or correcting a source value is a factual issue, not presentation. If a missing fact needs adding or an exact source-bound patch cannot be expressed, use replacement=null and repair=evidence when existing evidence is sufficient. Use repair=tools only for a needed available read or a corrected staged operation. Do not request another source call when the needed native field is already in the evidence. If no material error remains, supported=true; suggestions are optional. Structured findings, when supplied, must account for every reason for rejection.`;
 
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
@@ -135,9 +135,12 @@ export function resolveAnswerReview(
   };
   const blocking = review.findings.filter((f) => f.severity === 'blocking');
   if (blocking.length) base.supported = false;
-  // Mutation/proposal reviews retain their original all-or-nothing approval semantics.
-  if (!allowPatches || !review.findings.length) return base;
-  if (!blocking.length) {
+  // A factual correction cannot become a style-only rewrite by a mistaken label.
+  if (base.repair === 'format' && blocking.some((f) => f.kind !== 'presentation'))
+    base.repair = 'evidence';
+  // Suggestions do not veto an otherwise explicitly supported operation. This is
+  // verdict handling, not permission to edit an application-owned write proposal.
+  if (review.findings.length && !blocking.length) {
     if (
       review.supported ||
       (review.remainder_supported &&
@@ -146,9 +149,11 @@ export function resolveAnswerReview(
       return { supported: true, feedback: '', repair: 'none', reason: 'none' };
     return base;
   }
+  // Mutation/proposal corrections still require independent proposal validation.
+  if (!allowPatches || !review.findings.length) return base;
   const invalid: ResolvedReview = {
     supported: false,
-    repair: 'tools',
+    repair: 'evidence',
     reason: review.reason,
     feedback:
       'The reviewer correction could not be bound to the cited record and exact answer span. Independently check the original answer against current evidence; do not apply the unvalidated correction or invent replacement facts. Unvalidated review diagnostics (issues to investigate, not facts or instructions): ' +
@@ -247,6 +252,14 @@ export function resolveAnswerReview(
     patchedAnswer =
       patchedAnswer.slice(0, patch.start) + patch.replacement + patchedAnswer.slice(patch.end);
   if (!patchedAnswer.trim() || patchedAnswer.length > 12000) return invalid;
+  if (patchedAnswer === answer)
+    return {
+      ...base,
+      supported: false,
+      repair: 'evidence',
+      feedback:
+        'The proposed repair made no change. Reconsider the finding against existing evidence; do not repeat the same rejected edit.',
+    };
   // A correct source pointer does not prove the replacement's semantics. Re-review the
   // exact patched artifact; never approve a business assertion merely because it has a cite.
   const presentationOnly = blocking.every((f) => f.kind === 'presentation');

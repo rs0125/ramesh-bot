@@ -508,3 +508,235 @@ Final local v43 validation: `npm run check` passed Prisma validation, type check
 build and formatting, with **851 tests passed and 22 skipped**. The paid run had
 already stopped before this full check, so local test load did not affect its latency
 measurements. No additional paid requests were made for the date fixes.
+
+### Answer rendering and review cleanup, v44
+
+The requested pre-refactor checkpoint was committed and pushed as `13e3120` on
+`main`. The following changes build on that checkpoint and remain undeployed. The
+subsequent authorized paid evaluation is recorded below.
+
+- Current CRM cards can use an internal `answer_blocks` envelope with exact source
+  record IDs. The renderer owns each card's name and native dates. Text blocks retain
+  warehouse sections, comparisons and caveats without name-based date insertion.
+  Missing/retired IDs, warehouse IDs used as CRM bindings and model-supplied native
+  date fields in card bodies produce explicit repair diagnostics. Requested native
+  timestamps support IST milliseconds; missing values remain `Not recorded`.
+- Plain prose is still accepted. Missing unrequested dates are optional metadata,
+  not a reason to suppress a useful answer. Wrong dates, requested dates, identity,
+  authorization and internal-ID leaks still require correction.
+- Review now distinguishes `format`, `evidence` and `tools` repairs. Formatting is
+  wording/layout only. An evidence repair uses the configured worker model (Sol in
+  the existing mix) with already-read evidence and no tools, so supported dates or
+  numbers may be added after research has ended. It retains the original reply
+  deadline and independent review. Tool-loop repair remains for missing reads or
+  changed staged arguments when time and tool allowances permit it.
+- Rejected or unchanged formatting edits produce diagnostics instead of silently
+  restoring the old answer and spending another review on it. One evidence repair
+  is allowed; an unchanged answer with unchanged evidence stops. Fresh evidence
+  changes the reviewed artifact even if its answer text is unchanged. The original
+  two-review maximum remains. Stage metrics retain only repair kind and outcome.
+  Absolute deadline expiry is classified consistently even when the graph deadline
+  fires before the outer service timer.
+- Suggestion-only review findings cannot veto an otherwise explicitly supported
+  CRM insertion. Required fields and material user intent remain mandatory; optional
+  enrichment, preferred naming/style and an extra confirmation for `direct_request`
+  do not become new prerequisites. Exact renderer-owned CRM names are source data,
+  so a name containing a stock phrase is preserved while generated filler still
+  receives normal style checks. Proposal values are never patched by the answer
+  repairer, and unsupported staged values still cannot commit. Planner/worker and
+  reviewer guidance consistently distinguish a new user-supplied fact from a claim
+  that CRM already contains that fact.
+
+Offline replay of the original R1-4 and R2-1 worker drafts preserves both drafts
+without automatic date additions and leaves zero date-validation issues. This is
+rendering/validation evidence only, not a new semantic-model verdict. The report is
+`post-fix-5usd/v44-rendering-replay.json` alongside the untouched original captures.
+
+Deterministic graph checks cover explicit CRM/warehouse separation, date repair
+past the research deadline, the original hard reply deadline, invalid binding
+recovery, rejected formatting edits, no-progress stopping, independent rejection
+of a bad factual repair, optional metadata, wrong native dates, IST precision, and
+ordinary synthetic RFQ insertion with omitted optional fields. The insertion saves
+once without a redundant read or extra confirmation; a material rejection performs
+no write. Existing source-bound patches, direct-write authorization, recall and
+prompt-composition checks remain part of the full suite. These checks use local
+fixtures: no model API calls, live CRM writes or WhatsApp sends.
+
+Final local v44 validation: `npm run check` passed Prisma validation, type checking,
+build and formatting, with **863 tests passed and 22 skipped**. The first refactor
+check retained five failures: four old repair-path fixture expectations and a real
+deadline-classification race. Those were corrected before the passing run; the
+earlier failed check remains in `.local/answer-refactor-check.log`. No additional
+paid model requests were made during those local checks.
+
+### Same-corpus paid evaluation of v44, 7 October 2026
+
+The user authorized the unchanged six-conversation, 24-turn corpus once with the
+same Luna/Sol split and a fresh **$5 combined ceiling**. Luna handled routing and
+grading; Sol handled planning, native tools, review, memory and evidence repair.
+Formatting retained its configured Luna route, but all reached answers used the
+deterministic formatting path without a formatter API call. The runner froze v44
+source and verified input integrity at completion. Real CRM/warehouse operations
+were read-only; the evaluation had no write client or WhatsApp transport. Failed
+and interrupted captures remain intact; no turn was rerun or paid-regraded.
+
+**Coverage: 16 completed turns, all acceptable on manual source-backed review;
+one budget-interrupted turn; seven unattempted.** R1, R2, R3 and T1 completed all
+four turns. T2-1 completed routing but was blocked before its first Sol request or
+source read, returning unavailable; T2-2 through T3-4 were not reached. This is not
+a full-corpus pass. The previous v42 run had 12 acceptable answers in its 14 fully
+evaluated turns; all 14 matching turns are acceptable in v44.
+
+Latency comparisons use the same turn IDs, excluding the current budget stop:
+
+| Comparison                                               | Matched turns | Earlier median | v44 median | Reduction |
+| -------------------------------------------------------- | ------------: | -------------: | ---------: | --------: |
+| Original baseline, excluding its budget-interrupted T1-2 |            15 |      100.872 s |   64.737 s |    35.82% |
+| Original baseline, including its interrupted T1-2        |            16 |      106.552 s |   65.596 s |    38.44% |
+| Previous v42 run, excluding its interrupted T1-3         |            14 |       92.444 s |   65.596 s |    29.04% |
+
+These are single-run observations with fresh source data, not a controlled model
+benchmark. In particular, the live notes response changed between runs. Across
+all 16 completed v44 turns, the median was **65.596 s** and the maximum was
+**178.849 s**. Serial model/tool steps remain a substantial latency source; the
+longest turn used nine source attempts, including one transient search failure
+and its successful retry.
+
+Both previous date/review failures are resolved in this run:
+
+- R1-4 returned separate CRM and warehouse details in **76.548 s**, versus
+  **168.962 s** and an unavailable reply in v42. Explicit CRM rendering kept its
+  native dates out of the warehouse section; one review approved without repair.
+- R2-1 returned the shared two-warehouse comparison in **132.013 s**, versus
+  **271.357 s** and an unavailable reply in v42. Supported prose without optional
+  native dates was accepted by one review; no date-insertion or repair loop ran.
+- R3-3 exercised the new evidence repair on a real error. Luna recalled four
+  original lookups but the saved trail contained five. Sol correctly requested
+  the omitted warehouse-detail lookup, repaired the answer from existing history
+  without tools, and approved it on the second review. This was the run's only
+  evidence repair. The other 15 completed turns passed their first review.
+
+**History and compaction:** all four reached compaction cases passed after 21
+filler exchanges and encrypted-store/service reload. Across their nine retained
+business replies, reply text and all **37 tool-attempt metadata entries** matched
+the original receipts: tool, arguments, phase, status, error code, record references
+and returned count. Bulky results were intentionally omitted, not silently treated
+as current data. Both the injected notes failure and the later transient warehouse
+search failure survived distinctly from their successful retries. R1/R2/R3
+history-only turns made zero source calls. T1-4 correctly resolved the original
+second option after a client switch and interruption, honored the newer property
+restrictions, and performed the two fresh reads used in its answer. Simulated
+access revocation still blocked protected history disclosure. These checks cover
+local encrypted persistence and object recreation, not production PostgreSQL
+persistence or an operating-system crash.
+
+Raw Luna grades flagged three completed turns; the manual review retains explicit
+disagreements rather than changing those grades. R1-4 was flagged for a missing
+Last updated field that is visibly present. R2-3 was incorrectly credited with
+fresh calls copied from the preceding turn's historical tool receipt; its live
+call list is empty. T1-3 was flagged for not restating paused corrections despite
+the user's request for only the count and scope; both the subsequent compacted
+memory and T1-4 preserved those corrections. These are evaluator issues, not
+observed user-answer failures. The grading prompt was not changed mid-run.
+
+The largest observed worker input was **45,582 tokens** against the configured
+96,000 input allowance, and largest output was **1,087 tokens** against 6,000.
+There was no observed token-limit failure in the completed turns. This read-only
+corpus does not establish live insertion behavior; the preceding deterministic
+synthetic insertion checks remain the evidence for that change.
+
+Total spend was **$2.349121**, covering **123 settled requests**, with no unknown
+charges, pending requests or held reservations. The next Sol request needed the
+unchanged **$2.685** worst-case reservation: $2.349121 + $2.685 = $5.034121, above
+the cap. The runner stopped before sending it. The unused $2.65 was not spent;
+the provider-ceiling reservation, rather than settled cost reaching $5, limited
+coverage. The cap and reservation policy were not relaxed.
+
+Approval, unchanged cases, frozen code, raw model/source captures, usage ledger,
+manual audit and reproducible `summary.json` are retained privately under
+`.local/private-evals/live-messy-20261007/post-cleanup-5usd-v44/`. No application
+code was changed during this evaluation and no deployment was performed.
+
+### Authorized v44 continuation and complete corpus, 7 October 2026
+
+The user subsequently approved the unfinished work and an **additional $5**. The
+continuation ran T2 and T3 once each, using the same frozen source and model split.
+T2-1 was explicitly retried because the original attempt stopped after routing,
+before any source call. Its unavailable reply, trace and charged routing call are
+preserved in `run/`; the new attempt is in `continuation-run/`. The 16 completed
+turns were neither repeated nor regraded. The additional campaign enforced its own
+$5 cap and recorded the prior $2.349121 spend separately.
+
+**All eight continuation turns completed and passed manual source-backed review.**
+Across both campaigns, all **24 distinct corpus turns** now have acceptable
+delivered answers. There were **25 total attempts**, including the retained original
+budget interruption. All six conversations completed; there are no unattempted
+turns. This is one corpus execution with one authorized budget retry, not a
+multi-trial reliability estimate.
+
+The continuation cost **$1.533589** across **76 settled requests**. Combined spend
+was **$3.882710** across **199 settled requests**, including the interrupted attempt.
+There were no pending, unknown, unpriced or held charges at completion. No new
+application code, grading prompt or reservation-policy change was made during the
+continuation.
+
+Full-corpus latency, using the latest delivered answer for each distinct turn:
+
+| Comparison                                                        | Matched turns | Earlier median | v44 median | Reduction |
+| ----------------------------------------------------------------- | ------------: | -------------: | ---------: | --------: |
+| Original baseline, all matched turns                              |            24 |      110.698 s |   72.261 s |    34.72% |
+| Original baseline, excluding its budget-interrupted T1-2 and T3-4 |            22 |      110.698 s |   67.215 s |    39.28% |
+| Previous v42 run, excluding its interrupted T1-3                  |            14 |       92.444 s |   65.596 s |    29.04% |
+
+The complete v44 sample's nearest-rank p95 was **178.849 s**, with a maximum of
+**246.113 s**. Source snapshots changed, so these remain observational comparisons.
+In this continuation, stage-history reads returned actual transition rows that had
+been absent in the earlier baseline, and current negotiation stock was 39 instead
+of the earlier 38. The answers used their contemporaneous captures.
+
+The remaining latency issue was concrete: in T2-1, Luna attached “max” to the area
+in “10,000 sqft max budget 25 rupees.” Sol's planner and first worker draft carried
+that interpretation into an undersized shortlist, despite receiving the original
+user wording. Sol review caught the material requirement mismatch. A tools repair
+read two replacements and delivered a supported shortlist, with the above-budget
+fallback and uncertain commercial units explicit. The recovered turn took
+**246.113 s and 15 source calls**, slower than the original baseline's 207.506 s.
+It also began with “Corrected shortlist” even though the rejected draft had never
+been delivered. Earlier requirement validation and less narration of internal
+corrections remain useful improvements; this evaluation did not implement them.
+
+T2 preserved the Express 3PL brief through the XP India detour, resolved the actual
+second delivered option, and rejected an unsupported pasted bonded-approval claim.
+Its final four-bullet history answer made zero source calls. T3 kept three city
+requirements and their ownership/budget evidence separate, then returned to the
+original stage-history task after compaction rather than recalling the intervening
+company's records. The final retry read all three original histories successfully,
+kept the original failures separate, and still declined to invent elapsed durations
+without RFQ-entry timestamps. It identified negotiation stock as the previously
+observed count, explicitly not refreshed by that retry.
+
+**All six compaction/reload cases passed.** Across their **15 retained business
+replies**, reply text and all **69 tool-attempt metadata entries** matched the
+original receipts, including **five failed attempts**. Full result bodies remain
+intentionally bounded. All four history-only turns made zero source calls; the two
+turns requesting fresh evidence performed their expected reads. The persistence
+scope remains local encrypted stores and recreated service objects.
+
+Raw automated results are retained: Luna marked **19/24** turns fully passing,
+while the manual review accepts **24/24**. In addition to the three disagreements
+above, T2-1 was flagged for missing native dates that are visibly present. T3-4 was
+flagged under the grader's older mandatory Created/Last updated rule even though
+the task requested historical stage transitions and v44 allows omission of that
+unrequested metadata. The transition timestamps and missing-duration explanation
+were correct. These evaluator failures were not silently regraded or erased.
+
+Largest worker input across both campaigns was **59,821/96,000 tokens**; largest
+worker output was **1,225/6,000**. No completed-turn failure pointed to insufficient
+token allowances. The long case arose from requirement interpretation, serial
+reads and a late repair.
+
+The approval, runner diff/provenance, raw continuation captures and manual audit
+are under the same private v44 directory. `build-combined-summary.py` reproducibly
+produces `combined-summary.json`, which includes the original interrupted attempt,
+both usage ledgers, per-turn dispositions, latency comparisons and history checks.
+No live CRM writes, WhatsApp sends or production deployment were performed.
