@@ -81,8 +81,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const sendTimeoutMs = positiveInteger(env, 'SEND_TIMEOUT_MS', 15_000);
   if (sendTimeoutMs > 60_000) throw new Error('SEND_TIMEOUT_MS must be at most 60000');
   const replyDelay = {
-    minMs: nonNegativeInteger(env, 'REPLY_DELAY_MIN_MS', 1500),
-    maxMs: nonNegativeInteger(env, 'REPLY_DELAY_MAX_MS', 4000),
+    minMs: nonNegativeInteger(env, 'REPLY_DELAY_MIN_MS', 0),
+    maxMs: nonNegativeInteger(env, 'REPLY_DELAY_MAX_MS', 0),
   };
   if (replyDelay.minMs > replyDelay.maxMs || replyDelay.maxMs > 60_000)
     throw new Error(

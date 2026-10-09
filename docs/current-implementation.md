@@ -46,7 +46,7 @@ The implementation already includes:
 - A real Supabase/Context Engine capture GUI as a server-configured employee, plus optional synthetic SQLite chat and repeated model evaluations.
 - Employee-scoped MCP services, a bounded native tool loop across CRM/supply/knowledge/shortlists, deterministic source checks, independent answer review, private delivery rechecks and encrypted Supabase run/event storage, disabled until explicitly configured.
 - Trusted phone/LID resolution to an active employee and fresh signed Context Engine requests, with no per-employee OAuth enrollment.
-- A configurable random delay before each eligible reply.
+- Prepared replies send without an artificial delay by default; optional pacing is configurable.
 - Cancellation of pending timers, recovery of unsent jobs after reconnect, and conservative handling of uncertain sends.
 - A separate authenticated admin application for pairing, status, and session controls.
 - Local tests, independent CI/CD workflows, and EC2 provisioning, release, and backup assets.
@@ -137,7 +137,7 @@ The application follows a layered structure: domain behavior depends on small in
 | [`src/modules/greetings/greeting.service.ts`](../src/modules/greetings/greeting.service.ts)                   | Coordinates eligibility, durable claims, pacing, sending, and outcome persistence                        |
 | [`src/modules/greetings/greeting.types.ts`](../src/modules/greetings/greeting.types.ts)                       | Domain contracts for messages, repository operations, and reply callbacks                                |
 | [`src/lib/serial-queue.ts`](../src/lib/serial-queue.ts)                                                       | Bounded in-memory FIFO with synchronous admission and an awaitable drain                                 |
-| [`src/lib/reply-delay.ts`](../src/lib/reply-delay.ts)                                                         | Samples a fresh delay and waits using an abortable timer                                                 |
+| [`src/lib/reply-delay.ts`](../src/lib/reply-delay.ts)                                                         | Skips pacing at zero delay; explicit nonzero bounds use an abortable timer                               |
 | [`src/infrastructure/database/auth-store.ts`](../src/infrastructure/database/auth-store.ts)                   | Encrypts and persists Baileys credentials and Signal keys                                                |
 | [`src/infrastructure/database/greeting.repository.ts`](../src/infrastructure/database/greeting.repository.ts) | Implements atomic claims and greeting status updates through Prisma                                      |
 | [`src/infrastructure/database/admin-access.ts`](../src/infrastructure/database/admin-access.ts)               | Persists admin sessions, login limits, and retention cleanup                                             |
@@ -307,19 +307,19 @@ Results preserve source paths, request IDs, timestamps, cursors, coverage, acces
 
 ## Reply pacing and cancellation
 
-Each eligible claimed job samples a fresh delay with `Math.random()`:
+Prepared replies have no artificial delay by default: both reply-delay bounds are `0`, and the pacing hook returns without drawing jitter or creating a timer. Explicit nonzero bounds enable a fresh delay for each eligible claimed job:
 
 ```text
 delay = minMs + floor(random() × (maxMs - minMs + 1))
 ```
 
-The default inclusive range is 1,500–4,000 ms. This delays each reply; it does not combine messages into a debounce batch. Total latency also includes preceding queued work. The worker rechecks message age and fenced lease ownership before committing the `SENDING` marker and invoking Baileys.
+Optional pacing delays each reply; it does not combine messages into a debounce batch. Total latency still includes preceding queued work, generation, delivery authorization and sending. The worker rechecks message age and fenced lease ownership before committing the `SENDING` marker and invoking Baileys.
 
 Each WhatsApp session owns an `AbortController`. Stop, connection loss, and fatal auth-storage errors cancel its consumer/timers. In durable mode, already-admitted events finish their persistence step, and work known not to have been sent is released to `QUEUED` for inbound work or `READY_TO_SEND` for saved outbound replies. A new connection can resume it while it remains eligible. Already-started sends are awaited subject to send/process deadlines; interrupted sends become `UNCERTAIN` and are not retried.
 
 The lease window covers the larger of the generation and business-preflight deadlines, plus maximum reply delay, send timeout and 150 seconds of recovery margin. Inbound processing and outbound preflight own separate leases. A new UUID token fences each lease; expired pre-send work can be recovered, but an expired `SENDING` marker cannot be automatically replayed. The original SQLite-only development path retains cancelled `CLAIMED` rows instead of requeuing them.
 
-Pacing smooths traffic; it does not guarantee avoidance of platform restrictions. No fake typing, randomized SDK heartbeat, account rotation, or message-polling camouflage is implemented.
+Optional pacing does not guarantee avoidance of platform restrictions. No fake typing, randomized SDK heartbeat, account rotation, or message-polling camouflage is implemented.
 
 ## Persistence and delivery semantics
 
@@ -516,16 +516,16 @@ Source: [`src/config/env.ts`](../src/config/env.ts) and [`.env.example`](../.env
 | `MAX_PENDING_MESSAGES`    | `100`, positive integer, at most 1000                      | Total admitted message work, including the active item                                  |
 | `SEND_TIMEOUT_MS`         | `15000`, positive integer, at most 60000                   | Reply send deadline and SDK default query timeout                                       |
 | `SHUTDOWN_TIMEOUT_MS`     | `10000`, positive integer, at most 300000                  | Process-level shutdown deadline                                                         |
-| `REPLY_DELAY_MIN_MS`      | `1500`, nonnegative integer                                | Lower inclusive reply-delay bound                                                       |
-| `REPLY_DELAY_MAX_MS`      | `4000`, nonnegative integer, at most 60000                 | Upper inclusive reply-delay bound; must be at least the minimum                         |
+| `REPLY_DELAY_MIN_MS`      | `0`, nonnegative integer                                   | Lower inclusive reply-delay bound                                                       |
+| `REPLY_DELAY_MAX_MS`      | `0`, nonnegative integer, at most 60000                    | Upper inclusive reply-delay bound; must be at least the minimum                         |
 | `PRINT_QR`                | `false`; literal `true` or `false`                         | Optional terminal QR output for local pairing                                           |
 | `RELEASE_SHA`             | `development` or a 40-character lowercase hexadecimal SHA  | Release identity returned by readiness checks                                           |
 
-For example, these nonsecret settings select the current pacing behavior:
+For example, these nonsecret settings send prepared replies without artificial pacing:
 
 ```dotenv
-REPLY_DELAY_MIN_MS=1500
-REPLY_DELAY_MAX_MS=4000
+REPLY_DELAY_MIN_MS=0
+REPLY_DELAY_MAX_MS=0
 MAX_MESSAGE_AGE_SECONDS=300
 MAX_PENDING_MESSAGES=100
 ```

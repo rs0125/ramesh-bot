@@ -1,4 +1,4 @@
-/** Spaces replies with bounded jitter; cancellation never leaves a shutdown waiting on a timer. */
+/** Optional reply pacing; zero delay skips timers and cancellation stops pending waits. */
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { BeforeReply } from '../modules/greetings/greeting.types.js';
 
@@ -15,6 +15,7 @@ export function createReplyDelay(
 ): BeforeReply {
   return async (signal) => {
     if (signal?.aborted) return false;
+    if (options.minMs === 0 && options.maxMs === 0) return true;
     const delay = options.minMs + Math.floor(random() * (options.maxMs - options.minMs + 1));
     try {
       await wait(delay, signal);

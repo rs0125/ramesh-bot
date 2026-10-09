@@ -32,16 +32,17 @@ test('an abort cancels an active timer and already-aborted work never starts a t
   assert.equal(await neverWait(controller.signal), false);
 });
 
-test('configuration validates delay bounds and supports a zero-delay test override', () => {
+test('configuration defaults to zero delay and validates explicit pacing overrides', () => {
   const env = {
     DATABASE_URL: 'file:./unused-test.db',
     AUTH_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString('base64url'),
     WORKER_API_TOKEN: 'isolated-test-worker-token-not-a-secret',
   };
-  assert.deepEqual(loadConfig(env).whatsapp.replyDelay, { minMs: 1500, maxMs: 4000 });
+  assert.deepEqual(loadConfig(env).whatsapp.replyDelay, { minMs: 0, maxMs: 0 });
   assert.deepEqual(
-    loadConfig({ ...env, REPLY_DELAY_MIN_MS: '0', REPLY_DELAY_MAX_MS: '0' }).whatsapp.replyDelay,
-    { minMs: 0, maxMs: 0 },
+    loadConfig({ ...env, REPLY_DELAY_MIN_MS: '1500', REPLY_DELAY_MAX_MS: '4000' }).whatsapp
+      .replyDelay,
+    { minMs: 1500, maxMs: 4000 },
   );
   for (const [min, max] of [
     ['-1', '4000'],
