@@ -73,6 +73,7 @@ const state = new StateSchema({
   calls: z.array(z.custom<ModelToolCall>()).default([]),
   stages: z.array(z.custom<StageMetric>()).default([]),
   approved: z.boolean().default(false),
+  deterministicComplete: z.boolean().default(false),
   feedback: z.string().default(''),
   repairKind: z.enum(['none', 'format', 'evidence', 'tools']).default('none'),
   reviewReason: reviewFailure.default('none'),
@@ -846,6 +847,42 @@ export function buildSalesGraph(
         if (run?.blocked || personal?.blocked || writes?.blocked)
           return { calls: [], blocked: true, stages };
       }
+      // Renderability alone cannot skip review. Only a code-owned whole-request
+      // proof may finish, after the normal executor recorded the exact tool result.
+      // Requiring the first/only call also excludes mixed business work and retries.
+      const presentationStarted = Date.now();
+      const presentation =
+        options.optimizeLatency &&
+        value.personalOnly &&
+        !value.plan?.clarification &&
+        !value.repairs &&
+        !value.researchExhausted &&
+        toolSteps === 1 &&
+        value.calls.length === 1
+          ? personal?.completedListPresentation(value.input, value.calls[0]!)
+          : undefined;
+      if (presentation) {
+        stages.push(
+          recordMetric({
+            stage: 'formatter',
+            durationMs: Date.now() - presentationStarted,
+            inputTokens: 0,
+            outputTokens: 0,
+            presentation: {
+              adapter: presentation.adapter,
+              renderer: presentation.renderer,
+              completion: 'personal_default_list',
+            },
+          }),
+        );
+        return {
+          calls: [],
+          stages,
+          reply: presentation.text,
+          approved: true,
+          deterministicComplete: true,
+        };
+      }
       return { calls: [], stages };
     })
     .addNode('formatter', (value, config) => composeReply(value, config.signal, false))
@@ -1040,6 +1077,10 @@ export function buildSalesGraph(
       // Save only server-owned user provenance. It becomes recallable only once this reply is sent.
       await personal?.saveContext(signal);
       const personalResult = value.plan?.clarification ? undefined : await personal?.finish(signal);
+      // The completion proof covers exactly this deterministic text. Never let a
+      // later finalizer replace it with an unreviewed mutation receipt or other reply.
+      if (value.deterministicComplete && personalResult?.text !== value.reply)
+        throw new Error('PERSONAL_PRESENTATION_CHANGED');
       const personalReply =
         personalResult ??
         (personal?.usedPrivateData
@@ -1123,7 +1164,7 @@ export function buildSalesGraph(
     )
     .addConditionalEdges('worker', (value) => (value.calls.length ? 'executor' : 'formatter'))
     .addConditionalEdges('executor', (value) =>
-      value.blocked
+      value.blocked || value.deterministicComplete
         ? 'finish'
         : value.researchExhausted || remainingTools() <= 0
           ? 'formatter'

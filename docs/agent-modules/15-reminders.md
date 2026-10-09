@@ -35,9 +35,40 @@ Commit the normalized mutations and their result receipt atomically in `ramesh-a
 
 Success prose comes from the committed receipt, including exact saved time, affected count and send-boundary outcome. The verifier reviews a deterministic pending preview before application commit. It can revise the entire uncommitted proposal; only the final approved batch commits once. A storage error means no success acknowledgement. Queue handoff requires the exact stored command receipt if a mutation committed, so a late failure cannot become a generic retry invitation. Receipt and delivery reauthorization retries remain bounded.
 
-The implemented tools are `personal_list`, `personal_recall` and `personal_apply`; reminder mutations are operation kinds in the latter. The personal-only route skips planner/formatter inference when it has a deterministic personal result, retaining the router, tool worker and verifier. Mixed requests keep the general graph and preserve their additional answer alongside the receipt, with both personal and business authorization when required.
+The implemented tools are `personal_list`, `personal_recall` and `personal_apply`; reminder mutations are operation kinds in the latter. The personal-only route skips planner/formatter inference when it has a deterministic personal result. Plain default list requests in split-model mode can also skip the second worker response and model verifier under the application completion proof below. Other personal operations retain independent review. Mixed requests keep the general graph and preserve their additional answer alongside the receipt, with both personal and business authorization when required.
 
 `personal_recall` can resolve a delivered reminder occurrence for “snooze that”, even after its one-off schedule completed. It also exposes owner-authorized direct instructions from delivered own-chat turns for 24 hours to complete a clarification. Those instructions provide text provenance only; the current direct message still authorizes a change and supplies its time anchor. Forwarded text and retrieved business content do not acquire instruction authority through recall.
+
+### Extensible deterministic presentation
+
+`personal_list` advertises this application metadata alongside its existing input schema and read-only annotations:
+
+```json
+{
+  "_meta": {
+    "wareongo/presentation-v1": {
+      "adapter": "personal-list-v1",
+      "renderer": "list-v1"
+    }
+  }
+}
+```
+
+The [presentation registry](../../src/modules/presentation/tool-presentation.ts) binds each adapter to a runtime-owned tool family and tool name. Metadata selects only explicitly registered application code. It cannot supply templates, employee identity, authorization, a `skipReview` flag or a completion claim. Unknown metadata, mismatched registrations, invalid results and oversized presentations fall back to the existing graph.
+
+The [personal adapter](../../src/modules/scheduling/personal-list-presentation.ts) validates arguments, successful output, kinds/states, stable IDs/versions, dates, recurrence and pagination before normalizing the result into a list document. The shared renderer preserves order and numbering. The existing personal renderer and repository page sizing use this same layout, so the shortcut produces identical text and retains the “More entries are available” notice. IDs, versions, selection ID and cursor come from the read result; they are not invented by a formatter.
+
+Successful `personal_list` activity also stores `personalSelection`: kind, selection ID, cursor and up to 50 ordered ID/version pairs. This bounded metadata survives result-body compaction and authorized history projection, even when generic output limits omit the last rows or pagination fields. It identifies the earlier list for follow-ups; repository ownership, delivered-selection and current-version checks still apply. Normal history expiry and whole-entry eviction remain in force. Previously compacted history cannot recover references already omitted from that history.
+
+Renderability and request completion are separate contracts. `PersonalToolRun.completedListPresentation` accepts only a single direct, unquoted command such as “show my tasks” or “list my reminders”, with exactly one successful `personal_list` call. Arguments must match the requested kind and default state (`open` tasks / `scheduled` reminders), a first page and the default limit of ten. An empty successful page is valid. A failed read is not an empty page. Filters, “all”, “show more”, terse clarification answers such as “tasks”, multiple lists, extra clauses, attachments, forwarded messages, message bursts, earlier tool attempts and mutations retain the ordinary model workflow. Unrecognized phrasing is not rejected by this check. Older protected replies may remain in context; the proof uses only the fresh result, never historical facts.
+
+In split mode, the path is router → initial worker → normal authorized/journaled read → application completion proof → existing finalization. The proof replaces the second worker and verifier only for the supported list request; it never executes tools itself. Finalization still saves command provenance, persists selections under the inbound lease and rechecks ownership. The exact finalized text must match the validated presentation. Transport delivery authorization and delivered-only conversation history remain required. Single-model mode retains the earlier reviewed path. Traces mark the zero-token formatter stage with `presentation.adapter`, `presentation.renderer` and `presentation.completion = personal_default_list`; this is a completion check, not a model-review verdict.
+
+To extend this pattern, register a versioned adapter for the new tool's runtime owner/name and validate its result semantics. Reuse `list-v1` or add a typed document kind and registered renderer. Advertise the matching metadata on that tool. Separately implement and test a whole-request coverage rule before allowing any additional review shortcut. A renderable comparison, recommendation or write receipt does not by itself prove that the requested reasoning or mutation checks are complete. Currently only personal task/reminder default lists have such a completion rule.
+
+The completion proof and the mutation guard share the default-list wording classifier, including polite requests such as “Can you list my tasks?” A mistaken write proposal for those read-only requests is rejected even if the model reviewer approves it. Mixed requests such as “Add a task, then list my tasks” retain normal write review and execution.
+
+Offline tests: `tests/unit/tool-presentation.test.ts` covers the registry and schema boundary; `tests/unit/personal-list-shortcut.test.ts` covers graph completion, mistaken write proposals, ordinary insertion, failure/retry, owner revocation, finalization, paging and history after compaction/restart. `tests/unit/business-history.test.ts` checks ordered personal references under result-body pressure and rejects malformed reference metadata. These tests use synthetic model responses and storage, with no provider requests or WhatsApp sends.
 
 ## Time interpretation in IST
 

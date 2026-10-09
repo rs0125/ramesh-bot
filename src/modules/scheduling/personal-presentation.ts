@@ -1,5 +1,9 @@
 /** Pure deterministic personal record presentation, shared by storage page sizing and replies. */
 import { formatIst } from './schedule-time.js';
+import {
+  renderListPresentation,
+  type ListPresentation,
+} from '../presentation/tool-presentation.js';
 import type {
   PersonalRecord,
   PersonalCommandReceipt,
@@ -53,9 +57,25 @@ export function renderReceipt(receipt: PersonalCommandReceipt): string {
     .join('\n\n');
 }
 export function renderList(kind: 'task' | 'reminder', result: PersonalListResult): string {
-  if (!result.records.length)
-    return result.nextCursor
-      ? `No personal ${kind === 'task' ? 'tasks' : 'reminders'} match that filter on this page. More entries are available.`
-      : `No personal ${kind === 'task' ? 'tasks' : 'reminders'} match that filter.`;
-  return `Your ${kind === 'task' ? 'tasks' : 'reminders'} (this page):\n${result.records.map((record, index) => `${index + 1}. ${describe(record)} [${record.state}${record.occurrenceState ? `; ${['pending', 'preparing', 'waiting_source', 'queued'].includes(record.occurrenceState) ? 'notification' : 'last occurrence'} ${record.occurrenceState}${record.occurrenceAcknowledgedAt ? ', marked done' : ''}` : record.lastOutcome ? `; last delivery ${record.lastOutcome}` : ''}]`).join('\n')}${result.nextCursor ? '\nMore entries are available.' : ''}`;
+  return renderListPresentation(personalListDocument(kind, result));
+}
+
+/** Domain wording lives here; the shared renderer owns numbering/layout, never source semantics. */
+export function personalListDocument(
+  kind: 'task' | 'reminder',
+  result: PersonalListResult,
+): ListPresentation {
+  const label = kind === 'task' ? 'tasks' : 'reminders';
+  return {
+    kind: 'list',
+    heading: `Your ${label} (this page):`,
+    items: result.records.map((record) => ({
+      id: record.id,
+      version: record.version,
+      text: `${describe(record)} [${record.state}${record.occurrenceState ? `; ${['pending', 'preparing', 'waiting_source', 'queued'].includes(record.occurrenceState) ? 'notification' : 'last occurrence'} ${record.occurrenceState}${record.occurrenceAcknowledgedAt ? ', marked done' : ''}` : record.lastOutcome ? `; last delivery ${record.lastOutcome}` : ''}]`,
+    })),
+    emptyText: `No personal ${label} match that filter${result.nextCursor ? ' on this page' : ''}.`,
+    ...(result.nextCursor ? { footer: 'More entries are available.' } : {}),
+    page: { selectionId: result.selectionId, nextCursor: result.nextCursor },
+  };
 }

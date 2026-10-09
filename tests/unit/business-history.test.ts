@@ -9,6 +9,7 @@ import {
 import { businessRecall } from '../../src/modules/assistant/business-recall.js';
 import {
   BUSINESS_HISTORY_PREFIX,
+  compactToolActivity,
   ToolHistory,
 } from '../../src/modules/assistant/business-history.js';
 import { PRIVATE_HISTORY_REPLY } from '../../src/modules/assistant/conversation-memory.js';
@@ -123,6 +124,82 @@ test('result pressure compacts bodies before losing failed, uncertain or success
   );
   assert.ok(Buffer.byteLength(JSON.stringify(history.snapshot())) < 25000);
 });
+
+test('personal list history keeps complete ordered selectors when bodies are compacted', () => {
+  for (const count of [0, 10, 50]) {
+    const history = new ToolHistory(Date.now);
+    const records = Array.from({ length: count }, (_, index) => ({
+      kind: 'task',
+      id: `task-${index + 1}`,
+      version: index + 2,
+      text: 'Lengthy user-authored task text. '.repeat(60),
+      state: 'open',
+      authorization: 'PRIVATE_FIELD',
+    }));
+    history.record('personal_list', '{"kind":"task"}', {
+      ok: true,
+      kind: 'task',
+      records,
+      selectionId: 'earlier-selection',
+      nextCursor: count ? 'cursor-after-this-page' : null,
+    });
+    const expected = {
+      kind: 'task',
+      selectionId: 'earlier-selection',
+      nextCursor: count ? 'cursor-after-this-page' : null,
+      records: records.map(({ id, version }) => ({ id, version })),
+    };
+    assert.deepEqual(history.activity[0]!.personalSelection, expected);
+    assert.deepEqual(compactToolActivity(history.activity[0]!).personalSelection, expected);
+    for (let n = 0; n < 16; n++)
+      history.record('search_warehouses', JSON.stringify({ q: `Later ${n}` }), {
+        ok: true,
+        data: { fields: Array.from({ length: 5 }, () => 'source '.repeat(80)) },
+      });
+    assert.deepEqual(history.activity[0]!.personalSelection, expected);
+    assert.equal(history.activity[0]!.result, undefined);
+    assert.equal(history.activity[0]!.resultOmitted, true);
+    assert.equal(history.snapshot().omittedCount, undefined);
+    assert.ok(Buffer.byteLength(JSON.stringify(history.snapshot())) < 25000);
+    assert.doesNotMatch(JSON.stringify(history.snapshot()), /PRIVATE_FIELD/);
+  }
+});
+
+test('invalid personal result references never become history selectors or erase the call', () => {
+  const valid = {
+    ok: true,
+    kind: 'task',
+    records: [{ kind: 'task', id: 'task-1', version: 2 }],
+    selectionId: 'selection',
+    nextCursor: null,
+  };
+  for (const output of [
+    { ...valid, ok: false },
+    { ...valid, selectionId: undefined },
+    { ...valid, selectionId: 'x'.repeat(201) },
+    { ...valid, nextCursor: 'x'.repeat(301) },
+    { ...valid, records: [null] },
+    { ...valid, records: [{ ...valid.records[0], kind: 'reminder' }] },
+    { ...valid, records: [{ ...valid.records[0], version: 0 }] },
+    { ...valid, records: [valid.records[0], valid.records[0]] },
+    {
+      ...valid,
+      records: Array.from({ length: 51 }, (_, index) => ({
+        ...valid.records[0],
+        id: `task-${index}`,
+      })),
+    },
+  ]) {
+    const history = new ToolHistory(Date.now);
+    history.record('personal_list', '{"kind":"task"}', output);
+    assert.equal(history.activity.length, 1);
+    assert.equal(history.activity[0]!.personalSelection, undefined);
+  }
+  const history = new ToolHistory(Date.now);
+  history.record('future_tool', '{}', valid);
+  assert.equal(history.activity[0]!.personalSelection, undefined);
+});
+
 async function setup() {
   const fixture = createSalesFixture();
   const original = (await fixture.service.openTools(trusted, signal())).run!;

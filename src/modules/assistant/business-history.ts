@@ -14,6 +14,31 @@ export function historyRequest(text: string) {
     ? text
     : `${text.slice(0, 1200)}\n[... original request excerpt omitted ...]\n${text.slice(-700)}`;
 }
+// List bodies can exceed the generic node/byte limits before their last rows or
+// selection ID are visited. Keep the bounded, ordered references separately so
+// "the ninth item from the earlier list" still identifies the original selection.
+// These are historical selectors, never permission or a substitute for current
+// owner/version checks in the personal repository. Whole old entries can still
+// expire or be evicted by the normal history budget.
+const personalSelectionSchema = z
+  .object({
+    kind: z.enum(['task', 'reminder']),
+    selectionId: z.string().min(1).max(200),
+    nextCursor: z.string().min(1).max(300).nullable(),
+    records: z
+      .array(
+        z
+          .object({
+            id: z.string().min(1).max(200),
+            version: z.number().int().positive().safe(),
+          })
+          .strict(),
+      )
+      .max(50),
+  })
+  .strict()
+  .refine((value) => new Set(value.records.map((row) => row.id)).size === value.records.length);
+
 export const toolActivitySchema = z
   .object({
     tool: z.string().regex(TOOL_NAME),
@@ -53,6 +78,7 @@ export const toolActivitySchema = z
       .max(32)
       .optional(),
     returnedCount: z.number().int().nonnegative().optional(),
+    personalSelection: personalSelectionSchema.optional(),
     result: z.unknown().optional(),
     resultOmitted: z.literal(true).optional(),
   })
@@ -130,6 +156,30 @@ function historicalResult(value: unknown): Pick<ToolActivity, 'result' | 'result
   return { result, ...(omitted ? { resultOmitted: true } : {}) };
 }
 
+function historicalPersonalSelection(
+  tool: string,
+  value: Record<string, unknown> | undefined,
+): Pick<ToolActivity, 'personalSelection'> {
+  if (
+    tool !== 'personal_list' ||
+    value?.ok !== true ||
+    !Array.isArray(value.records) ||
+    value.records.length > 50 ||
+    !value.records.every(
+      (row) => row && typeof row === 'object' && !Array.isArray(row) && row.kind === value.kind,
+    )
+  )
+    return {};
+  const parsed = personalSelectionSchema.safeParse({
+    kind: value.kind,
+    selectionId: value.selectionId,
+    nextCursor: value.nextCursor,
+    // Copy only selector fields from the actual result, never arbitrary tool text.
+    records: value.records.map((row) => ({ id: row.id, version: row.version })),
+  });
+  return parsed.success ? { personalSelection: parsed.data } : {};
+}
+
 /** Shared by every tool family. Recording never authorizes, dispatches or retries a tool. */
 export class ToolHistory {
   private readonly entries: ToolActivity[] = [];
@@ -183,6 +233,7 @@ export class ToolHistory {
         ? { retryAfterSeconds: value.retry_after_seconds }
         : {}),
       ...(value && value.ok !== false ? historicalResult(value) : {}),
+      ...historicalPersonalSelection(tool, value),
       ...details,
     });
     if (!entry.success) return;

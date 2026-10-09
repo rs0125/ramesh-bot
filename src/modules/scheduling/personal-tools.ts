@@ -2,12 +2,23 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
-import type { ToolSessionRequest } from '../assistant/assistant.types.js';
+import type { ModelToolCall, ToolSessionRequest } from '../assistant/assistant.types.js';
 import { CheckpointError } from '../assistant/checkpoint.types.js';
 import { currentCheckpoint } from '../assistant/model-replay.js';
 import { ToolHistory, toolHistorySchema } from '../assistant/business-history.js';
 import { formatIst, resolveSchedule, validateTaskDeadline } from './schedule-time.js';
-import { renderList, renderReceipt } from './personal-presentation.js';
+import {
+  PERSONAL_LIST_MAX_CHARACTERS,
+  renderList,
+  renderReceipt,
+} from './personal-presentation.js';
+import {
+  defaultPersonalListKind,
+  personalListArgumentsSchema as listSchema,
+  personalPresentations,
+  simplePersonalListKind,
+} from './personal-list-presentation.js';
+import { PRESENTATION_META_KEY } from '../presentation/tool-presentation.js';
 export { renderList, renderReceipt } from './personal-presentation.js';
 import {
   SchedulingError,
@@ -188,19 +199,12 @@ const proposalSchema = z.discriminatedUnion('kind', [
     .strict(),
 ]);
 const applySchema = z.object({ operations: z.array(proposalSchema).min(1).max(8) }).strict();
-const listSchema = z
-  .object({
-    kind: z.enum(['task', 'reminder']),
-    state: z.enum(['open', 'done', 'cancelled', 'scheduled', 'completed', 'all']).optional(),
-    limit: z.number().int().min(1).max(10).optional(),
-    cursor: z.string().min(1).max(300).optional(),
-    continuation: z.literal('latest').optional(),
-  })
-  .strict()
-  .refine((value) => !(value.cursor && value.continuation), 'Use cursor or continuation, not both');
 const recallSchema = z.object({ kind: z.enum(['instructions', 'task', 'reminder']) }).strict();
 /** Narrow read commands cannot inherit mutation authority from an earlier turn. */
 function isListOnly(text: string): boolean {
+  // Share supported wording with deterministic completion, then retain the older
+  // broader read-only forms (such as "show all my tasks") that still need review.
+  if (defaultPersonalListKind(text)) return true;
   return /^(?:(?:please|then|after (?:this|that)|and then)[,\s]+)*(?:(?:show|list|display|view)(?: me)?(?: all)?(?: my| the)? (?:tasks?|reminders?)(?: list)?|(?:what are|what's|what is) my (?:tasks?|reminders?)(?: list)?)(?: please)?[.!?\s]*$/i.test(
     text.trim(),
   );
@@ -211,6 +215,9 @@ const definitions: ToolSessionRequest['tools'] = [
     description:
       'Read your own saved personal tasks or reminders, independently of CRM. Returns stable IDs/versions and selectionId. State open applies to tasks; scheduled applies to reminders. Within this turn use the returned cursor to append pages in order, up to 50 records. For a later "show more", use continuation="latest" to resume the last delivered page with its original filter; omit state and cursor. These are private records, not CRM tasks. The application renders the accumulated list in this exact order.',
     inputSchema: z.toJSONSchema(listSchema),
+    // Presentation is opt-in and versioned. This selects registered local code only;
+    // the runtime separately proves request coverage and reauthorizes before delivery.
+    _meta: { [PRESENTATION_META_KEY]: { adapter: 'personal-list-v1', renderer: 'list-v1' } },
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -382,6 +389,68 @@ export class PersonalToolRun {
   }
   rememberHistoricalReply() {
     this.usedHistoricalReply = true;
+  }
+  /**
+   * Called only after the ordinary executor has authorized and journaled a read.
+   * Exactly one successful default-page read must cover the entire current request.
+   * A failed/retried read, recall or staged write retains independent model review.
+   * The returned text is a preview: finish() still owns selection persistence and
+   * fresh owner checks, and the transport still checks canDeliver() before sending.
+   */
+  completedListPresentation(input: string, call: ModelToolCall) {
+    const kind = simplePersonalListKind(input, this.trusted);
+    if (
+      !kind ||
+      call.name !== 'personal_list' ||
+      this.calls !== 1 ||
+      this.blocked ||
+      this.failures.length ||
+      this.staged ||
+      this.stagingFailure ||
+      this.recalledRecords ||
+      this.recalledInstructions.length ||
+      this.lists.size !== 1
+    )
+      return undefined;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(call.arguments);
+    } catch {
+      return undefined;
+    }
+    const args = listSchema.safeParse(raw);
+    if (
+      !args.success ||
+      args.data.kind !== kind ||
+      args.data.cursor ||
+      args.data.continuation ||
+      (args.data.limit !== undefined && args.data.limit !== 10) ||
+      (args.data.state !== undefined &&
+        args.data.state !== (kind === 'task' ? 'open' : 'scheduled'))
+    )
+      return undefined;
+    const result = this.lists.get(kind);
+    const tool = this.tools.find((tool) => tool.name === call.name);
+    // Merely loading protected history is allowed: this proof uses only the fresh
+    // result below. Explicit recall calls still fail the one-call condition above.
+    // First-page reads return at most the default ten records. Pagination remains
+    // visible, and subsequent "show more" uses the normal cursor/selection workflow.
+    if (
+      !tool ||
+      tool.annotations?.readOnlyHint !== true ||
+      tool.annotations.destructiveHint !== false ||
+      !result ||
+      !Array.isArray(result.records) ||
+      result.records.length > 10
+    )
+      return undefined;
+    return personalPresentations.present({
+      owner: 'personal',
+      tool,
+      argumentsValue: raw,
+      result: { ok: true, kind, ...result },
+      maxCharacters: PERSONAL_LIST_MAX_CHARACTERS,
+    });
   }
   /** Deterministic material for review. Persistence is never claimed before finish commits. */
   preview(): string | undefined {

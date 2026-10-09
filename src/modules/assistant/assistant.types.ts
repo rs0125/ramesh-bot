@@ -57,6 +57,8 @@ export interface ToolSessionRequest {
     name: string;
     description?: string;
     inputSchema: Record<string, unknown>;
+    /** Namespaced application hints; never executable templates or authorization grants. */
+    _meta?: Record<string, unknown>;
     /** Presentation hint from the authenticated catalogue, never an authorization grant. */
     discovery?: {
       capability: string;
@@ -102,6 +104,8 @@ export interface StageMetric {
   review?: ReviewMetric;
   /** Fixed diagnostics only; never include candidate text, source values or feedback. */
   answerRepair?: { kind: 'format' | 'evidence'; outcome: 'changed' | 'unchanged' | 'rejected' };
+  /** Code-owned completion rule and registered IDs only; excludes source text and record IDs. */
+  presentation?: { adapter: string; renderer: string; completion: 'personal_default_list' };
 }
 
 export interface AgentTrace {
