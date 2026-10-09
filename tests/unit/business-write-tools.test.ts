@@ -222,6 +222,8 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
       const op = pending[0];
       return op?.payload.executionMode === 'direct_request' &&
         (!/\bdraft\b/i.test(text) || op.payload.sourceFamily === 'mail') &&
+        (!/\brfq\b/i.test(text) ||
+          (op.payload.sourceFamily === 'crm' && /_crm_rfq$/.test(op.payload.toolName))) &&
         op.approvalRunId
         ? structuredClone(op)
         : null;
@@ -388,6 +390,101 @@ const rfqCreate = tool(
   { raw_text: { type: 'string', minLength: 1, maxLength: 3000 } },
   { requiredScopes: ['crm.rfq:write'], sourceFamily: 'crm', sourceTextArgument: 'raw_text' },
 );
+test('a failure before RFQ review can truthfully say nothing was submitted without losing the brief', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const brief =
+    'Save this RFQ: 3,000-5,000sft in Devanahalli, office cum warehouse, parking for 2-3 trucks.';
+  const run = (await h.service.open(h.trusted(brief), signal()))!;
+  assert.equal(run.unsubmittedReply, undefined);
+  await run.execute(rfqCreate.name, '{}', signal());
+  assert.match(run.unsubmittedReply!, /requirement wasn’t submitted to CRM/);
+  assert.match(run.unsubmittedReply!, /don’t need to resend/);
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, brief);
+  assert.equal(h.calls.length, 0);
+  run.blocked = true;
+  assert.equal(run.unsubmittedReply, undefined);
+});
+
+test('an interrupted finalization never claims the requirement was not submitted', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(h.trusted('Save an RFQ for 5000 sqft in Hoskote'), signal()))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  h.repository.publish = async () => {
+    throw new Error('Synthetic lost commit response');
+  };
+  await assert.rejects(run.finalize(signal()), /lost commit response/);
+  assert.equal(run.unsubmittedReply, undefined);
+});
+
+test('a submitted or uncertain RFQ never gets the preparation-failure reply', async () => {
+  for (const uncertain of [false, true]) {
+    const h = harness();
+    h.changeDefinitions([
+      tool(
+        'create_crm_rfq',
+        'create',
+        { raw_text: { type: 'string', minLength: 1, maxLength: 3000 } },
+        {
+          requiredScopes: ['crm.rfq:write'],
+          sourceFamily: 'crm',
+          sourceTextArgument: 'raw_text',
+          executionMode: 'direct_request',
+        },
+      ),
+    ]);
+    h.useUnknown(uncertain);
+    const run = (await h.service.open(
+      h.trusted('Save an RFQ for 5000 sqft in Hoskote'),
+      signal(),
+    ))!;
+    await run.execute(rfqCreate.name, '{}', signal());
+    await run.finalize(signal());
+    assert.equal(h.calls.length, 1);
+    assert.equal([...h.operations.values()][0]!.state, uncertain ? 'UNKNOWN' : 'SUCCEEDED');
+    assert.equal(run.unsubmittedReply, undefined);
+  }
+});
+
+test('an invalid direct RFQ can be cancelled in ordinary language before a source-preserving correction', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const source = h.trusted(
+    'Save this RFQ: Fixture Logistics needs space in Hoskote, parking for two trucks.',
+  );
+  const run = (await h.service.open(source, signal()))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  h.useResult({
+    outcome: 'not_dispatched',
+    code: 'CRM_RFQ_INCOMPLETE',
+    message: 'Please supply or correct: requirement (positive quantity and explicit unit).',
+  });
+  const failed = (await run.finalize(signal()))!;
+  assert.match(failed.text, /space requirement needs checking/);
+  assert.doesNotMatch(failed.text, /CRM_RFQ|ABCDEF12/);
+  const cancelled = (await h.service.recover(h.trusted('cancel that RFQ attempt'), signal()))!;
+  assert.match(cancelled.text, /cancelled/i);
+  assert.equal([...h.operations.values()][0]!.state, 'CANCELLED');
+  assert.equal(h.calls.length, 1);
+  const correction = h.trusted('Use 5000 sqft.');
+  const corrected = (await h.service.open(correction, signal()))!;
+  await corrected.execute(
+    rfqCreate.name,
+    JSON.stringify({
+      _source_message_ids: [source.commandMessages![0]!.id, correction.commandMessages![0]!.id],
+    }),
+    signal(),
+  );
+  assert.equal(
+    h.proposals.at(-1)!.payload.arguments.raw_text,
+    source.commandMessages![0]!.text + '\n\n' + correction.commandMessages![0]!.text,
+  );
+  h.useResult({ outcome: 'created', code: 'OK', message: 'Created' });
+  await corrected.finalize(signal());
+  assert.equal(h.calls.length, 2);
+});
+
 test('an RFQ validation failure offers correction without redisclosing stored business details', async () => {
   const h = harness();
   h.changeDefinitions([rfqCreate]);
@@ -1604,6 +1701,26 @@ test('code-free draft recovery rejects ambiguity, altered batches, forwarded com
   const legacy = await h.service.recover(h.trusted('try that draft again'), signal());
   assert.match(legacy!.text, /no single unresolved direct action/);
   assert.equal(h.calls.length, 1);
+});
+
+test('an explicit RFQ or draft recovery command never acts on the other kind of pending action', async () => {
+  for (const pendingDraft of [true, false]) {
+    const h = harness();
+    const { run, operation } = await stageDirect(
+      h,
+      directTool(pendingDraft ? draft : rfqCreate),
+      pendingDraft ? draftArgs() : {},
+    );
+    h.useResult({ outcome: 'not_dispatched', code: 'TEMPORARY', message: 'Synthetic failure' });
+    await run.finalize(signal());
+    for (const action of ['cancel', 'retry']) {
+      const command = `${action} that ${pendingDraft ? 'RFQ' : 'draft'}${action === 'cancel' ? ' attempt' : ''}`;
+      const reply = await h.service.recover(h.trusted(command), signal());
+      assert.match(reply!.text, /no single unresolved direct action/i);
+      assert.equal(h.operations.get(operation.operationId)!.state, 'APPROVED');
+      assert.equal(h.calls.length, 1);
+    }
+  }
 });
 
 test('direct expired drafts return a definite no-dispatch response and uncertain expiry never retries', async () => {

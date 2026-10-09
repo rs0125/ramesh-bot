@@ -56,7 +56,13 @@ type Change = {
   before?: Note;
 };
 
-export function createTranscriptFixture(mode: 'rfq' | 'notes' | 'recall', now: () => number) {
+export function createTranscriptFixture(
+  mode: 'rfq' | 'notes' | 'recall',
+  now: () => number,
+  options: {
+    prepareRfq?: (args: Record<string, unknown>) => Record<string, unknown> | undefined;
+  } = {},
+) {
   const actor: WriteActor = {
     employeeId: FIXTURE_EMPLOYEE.employeeId,
     phoneE164: FIXTURE_EMPLOYEE.phoneE164,
@@ -505,17 +511,8 @@ export function createTranscriptFixture(mode: 'rfq' | 'notes' | 'recall', now: (
       let result: ContextWriteResult;
       if (name === 'create_crm_rfq') {
         const raw = String(args.raw_text);
-        const fields = [
-          'location',
-          'requirement',
-          'city',
-          'micro_market',
-          'company_name',
-          'poc_name',
-          'poc_phone',
-          'budget',
-        ];
-        if (fields.some((key) => args[key] !== undefined && !raw.includes(String(args[key]))))
+        const prepared = options.prepareRfq?.(args);
+        if (options.prepareRfq ? !prepared : !raw.trim())
           result = { ...base, outcome: 'not_dispatched', code: 'CRM_RFQ_INCOMPLETE' };
         else {
           const record = {
@@ -536,7 +533,17 @@ export function createTranscriptFixture(mode: 'rfq' | 'notes' | 'recall', now: (
               : {
                   data: {
                     id: record.id,
-                    name: String(args.company_name),
+                    name: String(
+                      prepared?.name ??
+                        ([
+                          args.company_name,
+                          args.requirement,
+                          args.location ?? args.city ?? args.micro_market,
+                        ]
+                          .filter((value) => typeof value === 'string' && value.trim())
+                          .join(' - ') ||
+                          'New RFQ'),
+                    ),
                     stage: 'RFQ_RECEIVED',
                     updated_at: record.updated_at,
                     undo_available: true,

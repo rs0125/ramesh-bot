@@ -14,6 +14,8 @@ export const taskPlanSchema = z
   .object({
     objective: z.string().min(1).max(2000),
     successCriteria: z.array(z.string().min(1).max(600)).min(1).max(8),
+    // Presentation hint only; review checks the full request and runtime owns authorization.
+    responseMode: z.enum(['answer', 'receipt_only']).default('answer'),
     clarification: z
       .object({
         question: z.string().trim().min(1).max(600),

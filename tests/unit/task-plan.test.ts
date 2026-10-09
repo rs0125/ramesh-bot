@@ -8,6 +8,7 @@ import type { TextModel, ModelRequest } from '../../src/modules/assistant/assist
 const plan = {
   objective: 'Prepare a follow-up brief',
   successCriteria: ['Identify priorities with supported next steps'],
+  responseMode: 'answer',
   clarification: null,
   steps: [
     { id: 'find', goal: 'Read assigned work', dependsOn: [], toolNames: ['search_crm_leads'] },
@@ -33,6 +34,10 @@ test('planner strict response schema requires its nullable clarification field',
   assert.deepEqual(new Set(schema.required), new Set(Object.keys(schema.properties!)));
   assert.deepEqual(
     validateTaskPlan({ ...plan, clarification: undefined }, [{ name: 'search_crm_leads' }]),
+    plan,
+  );
+  assert.deepEqual(
+    validateTaskPlan({ ...plan, responseMode: undefined }, [{ name: 'search_crm_leads' }]),
     plan,
   );
 });
@@ -111,6 +116,7 @@ test('plan validation accepts newly registered capabilities without CRM-specific
   const documentPlan = {
     objective: 'Compare the renewal clauses in the supplied documents',
     successCriteria: ['Cite conflicting clauses and identify unread sections'],
+    responseMode: 'answer',
     clarification: null,
     steps: [
       {

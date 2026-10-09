@@ -2,6 +2,7 @@ import { loadPrompt } from './prompt-files.js';
 /** First tool-enabled LangGraph route: natural intent, fixed scoped read, verified facts and deterministic formatting. */
 import { END, START, StateGraph, StateSchema } from '@langchain/langgraph';
 import { z } from 'zod';
+import { modelJsonSchema } from './model-schema.js';
 import type { TextModel, StageMetric } from './assistant.types.js';
 import type { BusinessReadResult } from './business-reads.js';
 import { FORMATTER_PROMPT } from './prompts.js';
@@ -44,7 +45,7 @@ export function buildBusinessGraph(
           stage: 'converser',
           instructions: `${READ_CONVERSER_PROMPT}\nAudience: ${value.audience}.`,
           messages: [...value.history, { role: 'user', content: value.input }],
-          jsonSchema: { name: 'ramesh_read_intent', schema: z.toJSONSchema(readIntentSchema) },
+          jsonSchema: modelJsonSchema('ramesh_read_intent', readIntentSchema),
         },
         config.signal,
       );

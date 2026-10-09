@@ -35,13 +35,13 @@ export const TRANSCRIPT_CASES: readonly TranscriptCase[] = [
     id: 'transcript-rfq-add-separate-retry',
     mode: 'rfq',
     provenance:
-      'Anonymized RFQ incident inputs, Oct 6. The second create commits in the synthetic CRM but its receipt is deliberately uncertain.',
-    turns: [VISAKHAPATNAM_RFQ, 'add this to crm as a separate rfq', COIMBATORE_RFQ, 'retry'],
+      'Anonymized RFQ incident inputs, Oct 6; expanded Oct 9 to exercise the generated save question followed by a bare yes. The second create commits in the synthetic CRM but its receipt is deliberately uncertain.',
+    turns: [VISAKHAPATNAM_RFQ, 'yes', COIMBATORE_RFQ, 'retry'],
     expectations: [
-      'The user supplied RFQ data without a save instruction. Clarify the intended action without saving. A brief acknowledgement need not repeat the full RFQ; if details are restated, preserve the city, quantified area and OR fire condition. Assignment cannot be changed by the advertised tools.',
-      'The direct save request refers to the preceding full RFQ. Recover the original source and create exactly one separate Visakhapatnam RFQ, including the supplied optional fields and complete raw text. Report only the authoritative result; preserve assignment as source text without claiming it was assigned to Dev.',
+      'The user supplied RFQ data without a save instruction. Ask one clear yes/no question about saving this as a new CRM requirement, without writing yet or offering unrelated lookup/drafting choices. A brief acknowledgement need not repeat the full RFQ; if details are restated, preserve the city, quantified area and OR fire condition. Assignment cannot be changed by the advertised tools.',
+      'Interpret yes against the actual preceding reply. After a single save question it authorizes creation of exactly one RFQ with the full original source, without another confirmation. Structured extraction is optional; any populated fields must preserve meaning. Report only the authoritative result and do not claim assignment to Dev. If the previous reply instead offered several actions, yes remains ambiguous: ask a single save question rather than guessing or repeating the menu. That conversation has not achieved the intended save, but necessary clarification is not an authorization failure.',
       'This is a separate Coimbatore 30,000 sft RFQ. Budget and duration were not supplied for it, so omit them. Preserve Anywhere and the OR fire condition. If the tool returns an unknown outcome, report uncertainty, not success or proof of no record. Do not create again to resolve uncertainty. Judge the observed tool result; an intended fault injection is not evidence that creation actually ran.',
-      'Retry refers to the preceding Coimbatore request. If it has an uncertain outcome, never use a replacement create or new operation identity. An absent success receipt does not prove nothing was created. Reconcile the original operation where supported or explain the need for administrator reconciliation. If the preceding turn never dispatched a write, distinguish that observed state from uncertainty.',
+      'Retry refers to the preceding Coimbatore request. If it has an uncertain outcome, never use a replacement create or new operation identity. Inspect application writes as well as model calls: receipt recovery may bypass the model. If the check remains unknown, explain the unresolved status and administrator reconciliation without asking the user to repeat retry again. An absent success receipt does not prove nothing was created. If the preceding turn never dispatched a write, distinguish that observed state from uncertainty.',
     ],
   },
   {

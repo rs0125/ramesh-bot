@@ -22,12 +22,14 @@ const generated = (value: unknown) => ({
 });
 const approved = { supported: true, feedback: '', repair: 'none', reason: 'none' };
 const ready: TaskPlan = {
+  responseMode: 'answer',
   objective: 'Read the intended CRM brief from the original request.',
   successCriteria: ['Keep the user requirement distinct from recorded facts.'],
   clarification: null,
   steps: [{ id: 'read', goal: 'Read the brief.', toolNames: ['read_crm_lead'], dependsOn: [] }],
 };
 const question: TaskPlan = {
+  responseMode: 'answer',
   objective: 'Resolve the area bound before finding warehouses.',
   successCriteria: ['Establish the intended area bound.'],
   steps: [],

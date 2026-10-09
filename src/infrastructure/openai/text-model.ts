@@ -1,6 +1,8 @@
 /** OpenAI Responses adapter: bounded tokens/retries, cancellation, and redacted errors. */
 import OpenAI from 'openai';
+import { ModelFailureError, type ModelFailure } from '../../modules/assistant/model-failure.js';
 import { OpenAIToolCatalog } from './tool-catalog.js';
+import { structuredResponseText } from './structured-response.js';
 import { replayModelResponse } from '../../modules/assistant/model-replay.js';
 import { CheckpointError } from '../../modules/assistant/checkpoint.types.js';
 import {
@@ -12,6 +14,7 @@ import { withUsageStage } from '../../modules/usage/usage-scope.js';
 import { MEMORY_INSTRUCTIONS } from '../../modules/assistant/chat-context.js';
 import { MAX_READ_BATCH } from '../../modules/assistant/assistant.types.js';
 import type {
+  AgentStage,
   ModelRequest,
   ModelResult,
   TextModel,
@@ -51,7 +54,7 @@ export class OpenAITextModel implements TextModel {
 
   private async checkInput(
     body: OpenAI.Responses.ResponseCreateParamsNonStreaming,
-    stage: string,
+    stage: AgentStage,
     signal?: AbortSignal,
   ) {
     if (!this.config.context) return;
@@ -82,7 +85,7 @@ export class OpenAITextModel implements TextModel {
       count.input_tokens < 0 ||
       count.input_tokens > limit
     )
-      throw new ContextBudgetError();
+      throw new ContextBudgetError(stage);
   }
 
   startToolSession(request: ToolSessionRequest): ToolModelSession {
@@ -186,6 +189,11 @@ export class OpenAITextModel implements TextModel {
             if (response.status !== 'completed') throw new Error('Incomplete model response');
             validateToolResponse(response, searchEnabled, parallelReads, batchLimit);
             const calls = response.output.filter((item) => item.type === 'function_call');
+            const decodedCalls = calls.map((call) => ({
+              id: call.call_id,
+              name: call.name,
+              arguments: catalog.arguments(call.name, call.namespace, allowedNames, call.arguments),
+            }));
             // Keep all continuation items, including encrypted reasoning, with store:false.
             // Durable replay encrypts these items; they are never logged or shared across runs.
             for (const item of response.output) {
@@ -219,11 +227,7 @@ export class OpenAITextModel implements TextModel {
             if (!calls.length && !response.output_text?.trim()) continue;
             return {
               text: response.output_text?.trim() ?? '',
-              calls: calls.map((call) => ({
-                id: call.call_id,
-                name: call.name,
-                arguments: call.arguments,
-              })),
+              calls: decodedCalls,
               ...totals,
               model: this.config.model,
               responseCalls,
@@ -234,10 +238,7 @@ export class OpenAITextModel implements TextModel {
         } catch (error) {
           if (error instanceof CheckpointError || error instanceof ContextBudgetError) throw error;
           signal.throwIfAborted();
-          const status = error instanceof OpenAI.APIError ? error.status : undefined;
-          throw new Error(
-            status ? `OpenAI request failed (HTTP ${status})` : 'OpenAI tool request failed',
-          );
+          throw modelFailure(error, 'worker', 'OpenAI tool request failed');
         }
       },
       accept(callId, output) {
@@ -299,15 +300,19 @@ export class OpenAITextModel implements TextModel {
           this.client.responses.create(body, { signal }),
         );
         signal?.throwIfAborted();
-        if (value.status !== 'completed' || !value.output_text?.trim())
+        if (request.jsonSchema) structuredResponseText(value, request);
+        else if (value.status !== 'completed' || !value.output_text?.trim())
           throw new Error('Incomplete model response');
         return value;
       });
       signal?.throwIfAborted();
-      if (response.status !== 'completed' || !response.output_text?.trim())
+      const text = request.jsonSchema
+        ? structuredResponseText(response, request)
+        : response.output_text?.trim();
+      if (response.status !== 'completed' || !text)
         throw new Error('OpenAI returned no complete text response');
       return {
-        text: response.output_text.trim(),
+        text,
         model: body.model,
         responseCalls: replayed ? 0 : 1,
         inputTokens: replayed ? 0 : (response.usage?.input_tokens ?? 0),
@@ -319,8 +324,7 @@ export class OpenAITextModel implements TextModel {
       if (error instanceof CheckpointError || error instanceof ContextBudgetError) throw error;
       signal?.throwIfAborted();
       // Never bubble provider bodies, request headers or user prompts into worker logs.
-      const status = error instanceof OpenAI.APIError ? error.status : undefined;
-      throw new Error(status ? `OpenAI request failed (HTTP ${status})` : 'OpenAI request failed');
+      throw modelFailure(error, request.stage, 'OpenAI request failed');
     }
   }
 }
@@ -361,10 +365,32 @@ function validateToolResponse(
     throw new Error('Invalid tool response');
 }
 
-export class ContextBudgetError extends Error {
-  constructor() {
-    super('OPENAI_CONTEXT_BUDGET_EXCEEDED');
+export class ContextBudgetError extends ModelFailureError {
+  constructor(stage: AgentStage = 'worker') {
+    super({ stage, code: 'CONTEXT_BUDGET' }, 'OPENAI_CONTEXT_BUDGET_EXCEEDED');
   }
+}
+
+function modelFailure(error: unknown, stage: AgentStage, fallback: string): ModelFailureError {
+  if (error instanceof ModelFailureError) return error;
+  const api = error instanceof OpenAI.APIError ? error : undefined;
+  const status = api?.status;
+  const code: ModelFailure['code'] =
+    api?.code === 'invalid_json_schema'
+      ? 'INVALID_SCHEMA'
+      : status === 401 || status === 403
+        ? 'ACCESS_DENIED'
+        : status === 429
+          ? 'RATE_LIMITED'
+          : api && (!status || status >= 500)
+            ? 'UNAVAILABLE'
+            : status
+              ? 'REQUEST_REJECTED'
+              : 'INVALID_RESPONSE';
+  return new ModelFailureError(
+    { stage, code, ...(status ? { httpStatus: status } : {}) },
+    status ? `OpenAI request failed (HTTP ${status})` : fallback,
+  );
 }
 
 /** Stateless automatic compaction: retain the encrypted item and a valid call/result tail. */

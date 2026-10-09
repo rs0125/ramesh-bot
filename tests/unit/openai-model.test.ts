@@ -3,6 +3,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenAITextModel } from '../../src/infrastructure/openai/text-model.js';
 import { loadAssistantConfig } from '../../src/config/assistant.js';
+import { AssistantService } from '../../src/modules/assistant/assistant.service.js';
+import { ModelFailureError } from '../../src/modules/assistant/model-failure.js';
+import { modelJsonSchema } from '../../src/modules/assistant/model-schema.js';
+import { supplementSchema } from '../../src/modules/assistant/sales.graph.js';
+import { assertStrictResponseSchema } from '../fixtures/strict-response-schema.js';
 const config = {
   apiKey: 'synthetic-secret',
   model: 'gpt-5.6-terra',
@@ -117,6 +122,255 @@ test('an already cancelled model request performs no fetch', async () => {
   await assert.rejects(model.complete(request, AbortSignal.abort()));
 });
 
+test('the actual SDK serializes a supported action schema without changing the validation policy', async () => {
+  const model = new OpenAITextModel(config, async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    assert.equal(body.text.format.strict, true);
+    assertStrictResponseSchema(body.text.format.schema);
+    return Response.json({
+      id: 'schema-test',
+      object: 'response',
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '{"additional_reply":""}' }],
+        },
+      ],
+    });
+  });
+  await model.complete({
+    ...request,
+    stage: 'formatter',
+    jsonSchema: modelJsonSchema('action', supplementSchema),
+  });
+});
+
+test('structured parsing selects a final message without concatenating commentary', async () => {
+  const model = new OpenAITextModel(config, async () =>
+    Response.json({
+      id: 'phased',
+      object: 'response',
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'PRIVATE commentary, not JSON.' }],
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          status: 'completed',
+          content: [{ type: 'output_text', text: '{"additional_reply":""}' }],
+        },
+      ],
+    }),
+  );
+  const result = await model.complete({
+    ...request,
+    stage: 'formatter',
+    jsonSchema: modelJsonSchema('action', supplementSchema),
+  });
+  assert.equal(result.text, '{"additional_reply":""}');
+});
+
+test('malformed, ambiguous, refused and incomplete structured answers fail once with safe diagnostics', async () => {
+  const message = (text: string) => ({
+    type: 'message',
+    role: 'assistant',
+    status: 'completed',
+    content: [{ type: 'output_text', text }],
+  });
+  const valid = '{"additional_reply":""}';
+  const cases = [
+    { output: [message(`${valid} PRIVATE extra text ${valid}`)], code: 'INVALID_JSON' },
+    { output: [message('{"additional_reply":123}')], code: 'SCHEMA_MISMATCH' },
+    { output: [message(valid), message(valid)], code: 'AMBIGUOUS_OUTPUT' },
+    { output: [{ ...message(valid), phase: 'commentary' }], code: 'AMBIGUOUS_OUTPUT' },
+    {
+      output: [{ ...message(valid), phase: 'final_answer' }, message(valid)],
+      code: 'AMBIGUOUS_OUTPUT',
+    },
+    {
+      output: [
+        {
+          ...message(valid),
+          content: [
+            { type: 'output_text', text: valid },
+            { type: 'output_text', text: valid },
+          ],
+        },
+      ],
+      code: 'AMBIGUOUS_OUTPUT',
+    },
+    {
+      output: [{ ...message(valid), content: [{ type: 'refusal', refusal: 'PRIVATE refusal' }] }],
+      code: 'REFUSAL',
+    },
+    { output: [message(valid)], status: 'incomplete', code: 'INCOMPLETE_RESPONSE' },
+    { output: [{ ...message(valid), status: 'incomplete' }], code: 'INCOMPLETE_RESPONSE' },
+    {
+      output: [
+        message(valid),
+        { type: 'function_call', call_id: 'unexpected', name: 'save', arguments: '{}' },
+      ],
+      code: 'INVALID_RESPONSE',
+    },
+  ];
+  for (const fixture of cases) {
+    let calls = 0;
+    const model = new OpenAITextModel(config, async () => {
+      calls++;
+      return Response.json({
+        id: 'private-response',
+        object: 'response',
+        status: fixture.status ?? 'completed',
+        output: fixture.output,
+      });
+    });
+    await assert.rejects(
+      model.complete({
+        ...request,
+        stage: 'formatter',
+        jsonSchema: modelJsonSchema('action', supplementSchema),
+      }),
+      (error) => {
+        assert.ok(error instanceof ModelFailureError);
+        assert.equal(error.details.stage, 'formatter');
+        assert.equal(error.details.code, fixture.code);
+        assert.equal(
+          error.details.outputShape?.messages,
+          fixture.output.filter((item) => item.type === 'message').length,
+        );
+        assert.doesNotMatch(JSON.stringify(error), /PRIVATE|private-response|additional_reply/);
+        return true;
+      },
+    );
+    assert.equal(calls, 1, 'a malformed response must not start an automatic formatter retry');
+  }
+});
+
+test('strict tool transport decodes omission and clears while preserving native continuation arguments', async () => {
+  const bodies: any[] = [];
+  const wire = { id: 'record', changes: { budget: { value: null }, location: null } };
+  const model = new OpenAITextModel(config, async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({
+      id: 'strict-edit',
+      object: 'response',
+      status: 'completed',
+      output:
+        bodies.length === 1
+          ? [
+              {
+                type: 'function_call',
+                call_id: 'edit',
+                name: 'update',
+                arguments: JSON.stringify(wire),
+              },
+            ]
+          : [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Prepared.' }],
+              },
+            ],
+    });
+  });
+  const session = model.startToolSession({
+    ...request,
+    tools: [
+      {
+        name: 'update',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            changes: {
+              type: 'object',
+              properties: {
+                budget: { type: ['string', 'null'] },
+                location: { type: ['string', 'null'] },
+              },
+              additionalProperties: false,
+            },
+          },
+          required: ['id', 'changes'],
+          additionalProperties: false,
+        },
+      },
+    ],
+  });
+  const result = await session.next(2, AbortSignal.timeout(1000));
+  assert.deepEqual(JSON.parse(result.calls[0]!.arguments), {
+    id: 'record',
+    changes: { budget: null },
+  });
+  assertStrictResponseSchema(bodies[0].tools[0].parameters);
+  assert.equal(bodies[0].tools[0].strict, true);
+  session.accept('edit', { status: 'draft_not_executed' });
+  await session.next(0, AbortSignal.timeout(1000));
+  assert.deepEqual(
+    JSON.parse(bodies[1].input.find((item: any) => item.type === 'function_call').arguments),
+    wire,
+  );
+});
+
+test('schema rejection retains a safe failing stage and HTTP category in the assistant trace', async () => {
+  const model = new OpenAITextModel(config, async () =>
+    Response.json(
+      {
+        error: {
+          code: 'invalid_json_schema',
+          message: 'PRIVATE_PROMPT synthetic-secret',
+          param: 'PRIVATE_FIELD',
+        },
+      },
+      { status: 400 },
+    ),
+  );
+  await assert.rejects(model.complete({ ...request, stage: 'formatter' }), (error) => {
+    assert.ok(error instanceof ModelFailureError);
+    assert.deepEqual(error.details, {
+      stage: 'formatter',
+      code: 'INVALID_SCHEMA',
+      httpStatus: 400,
+    });
+    assert.ok(!JSON.stringify(error).includes('PRIVATE'));
+    return true;
+  });
+  const assistant = new AssistantService(config, {
+    complete: async () => {
+      throw new ModelFailureError(
+        { stage: 'formatter', code: 'INVALID_SCHEMA', httpStatus: 400 },
+        'OpenAI request failed (HTTP 400)',
+      );
+    },
+  });
+  const result = await assistant.prepare({
+    chatId: 'synthetic@s.whatsapp.net',
+    text: 'hello',
+    isGroup: false,
+    fromMe: false,
+    sentAtMs: Date.now(),
+    mentionsBot: false,
+    messageId: 'synthetic-model-failure',
+  });
+  assert.equal(result.trace.failureCode, 'RUN_FAILED');
+  assert.deepEqual(result.trace.modelFailure, {
+    stage: 'formatter',
+    code: 'INVALID_SCHEMA',
+    httpStatus: 400,
+  });
+  assert.ok(!JSON.stringify(result).includes('PRIVATE'));
+});
+
 test('server-only private history cannot cross either OpenAI serialization boundary', async () => {
   let calls = 0;
   const model = new OpenAITextModel(config, async (_input, init) => {
@@ -164,7 +418,7 @@ test('native tool sessions preserve continuation, optional arguments and correla
     id: 'fc-1',
     call_id: 'call-1',
     name: 'crm_summary',
-    arguments: '{}',
+    arguments: '{"view":null}',
   };
   const model = new OpenAITextModel(config, async (_input, init) => {
     const body = JSON.parse(String(init?.body));
@@ -205,8 +459,8 @@ test('native tool sessions preserve continuation, optional arguments and correla
   for (const body of bodies) {
     assert.equal(body.store, false);
     assert.equal(body.parallel_tool_calls, false);
-    assert.equal(body.tools[0].strict, false);
-    assert.equal(body.tools[0].parameters.required, undefined);
+    assert.equal(body.tools[0].strict, true);
+    assert.deepEqual(body.tools[0].parameters.required, ['view']);
     assert.deepEqual(body.include, ['reasoning.encrypted_content']);
   }
   assert.equal(bodies[0].tool_choice, 'auto');
@@ -346,7 +600,13 @@ test('native tool sessions redact provider failures and reject parallel proposal
   );
   await assert.rejects(
     failed.startToolSession({ ...request, tools: [] }).next(8, AbortSignal.timeout(1000)),
-    /^Error: OpenAI request failed \(HTTP 403\)$/,
+    (error: unknown) => {
+      assert.ok(error instanceof ModelFailureError);
+      assert.equal(error.message, 'OpenAI request failed (HTTP 403)');
+      assert.deepEqual(error.details, { stage: 'worker', code: 'ACCESS_DENIED', httpStatus: 403 });
+      assert.ok(!JSON.stringify(error).includes('synthetic-secret'));
+      return true;
+    },
   );
   const parallel = new OpenAITextModel(config, async () =>
     Response.json({

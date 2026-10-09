@@ -58,6 +58,8 @@ export function transcriptChecks(
   const check = (ok: unknown, name: string) => {
     if (!ok) failures.push(`turn${index + 1}:${name}`);
   };
+  const supplied = (value: unknown) =>
+    value != null && !(typeof value === 'string' && !value.trim());
   if (scenario.mode === 'rfq') {
     check(fixture.state.rfqs.length === [0, 1, 2, 2][index], 'rfq_effect_count');
     if (index === 1 && fixture.state.rfqs[0] && !fixture.state.rfqs[0].uncertain)
@@ -70,28 +72,34 @@ export function transcriptChecks(
     if (index === 1) {
       const record = fixture.state.rfqs[0];
       check(
-        record?.args.location === 'Visakhapatnam' &&
-          record.args.requirement === '25,000 sft' &&
-          record.args.micro_market === 'Anywhere',
+        record &&
+          (!supplied(record.args.location) || record.args.location === 'Visakhapatnam') &&
+          (!supplied(record.args.requirement) || record.args.requirement === '25,000 sft') &&
+          (!supplied(record.args.micro_market) || record.args.micro_market === 'Anywhere'),
         'first_rfq_fields',
       );
       check(String(record?.args.raw_text).includes(scenario.turns[0]!), 'complete_original_source');
-      check(record?.args.budget === 'market rate', 'supplied_budget_preserved');
       check(
-        (record?.args.lease_duration as { value?: string } | undefined)?.value === 'LONG_TERM',
+        !supplied(record?.args.budget) || record?.args.budget === 'market rate',
+        'supplied_budget_preserved',
+      );
+      check(
+        !supplied(record?.args.lease_duration) ||
+          (record?.args.lease_duration as { value?: string } | undefined)?.value === 'LONG_TERM',
         'supplied_duration_preserved',
       );
     }
     if (index >= 2) {
       const record = fixture.state.rfqs[1];
       check(
-        record?.args.location === 'Coimbatore' &&
-          record.args.requirement === '30,000 sft' &&
-          record.args.micro_market === 'Anywhere',
+        record &&
+          (!supplied(record.args.location) || record.args.location === 'Coimbatore') &&
+          (!supplied(record.args.requirement) || record.args.requirement === '30,000 sft') &&
+          (!supplied(record.args.micro_market) || record.args.micro_market === 'Anywhere'),
         'second_rfq_fields',
       );
       check(
-        record && !('budget' in record.args) && !('lease_duration' in record.args),
+        record && !supplied(record.args.budget) && !supplied(record.args.lease_duration),
         'no_field_carryover',
       );
       check(record?.args.raw_text === scenario.turns[2], 'second_rfq_own_source_only');

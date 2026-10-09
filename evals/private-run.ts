@@ -12,6 +12,7 @@ import { loadLivePlaygroundConfig } from '../src/config/playground.js';
 import { messagePoolOptions } from '../src/infrastructure/database/message-pool.js';
 import { authCipher } from '../src/infrastructure/database/auth-store.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
+import { modelJsonSchema } from '../src/modules/assistant/model-schema.js';
 import { assertEvalRun, DEFAULT_EVAL_MODEL, evalPolicyOptions } from './lib/run-policy.js';
 const scenarioSchema = z
   .object({
@@ -166,7 +167,7 @@ async function main() {
                 }),
               },
             ],
-            jsonSchema: { name: 'private_outcome_review', schema: z.toJSONSchema(reviewSchema) },
+            jsonSchema: modelJsonSchema('private_outcome_review', reviewSchema),
           });
           record.review = reviewSchema.parse(JSON.parse(judgment.text));
           record.judgeUsage = {

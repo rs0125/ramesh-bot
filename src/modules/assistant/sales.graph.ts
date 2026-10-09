@@ -48,6 +48,7 @@ import { reviewFailure, reviewMetric, reviewFailureReply } from './review-diagno
 import type { BusinessWriteRun, BusinessWriteReply } from '../writes/write-tools.js';
 import { notifyToolActivity } from './tool-activity.js';
 import { workingContext } from './working-context.js';
+import { modelJsonSchema } from './model-schema.js';
 import {
   answerReviewSchema,
   ANSWER_REVIEW_CONTRACT,
@@ -56,7 +57,7 @@ import {
   type ExecutionReport,
 } from './answer-review.js';
 
-const supplementSchema = z.object({ additional_reply: answerContentSchema }).strict();
+export const supplementSchema = z.object({ additional_reply: answerContentSchema }).strict();
 const state = new StateSchema({
   input: z.string(),
   history: z.array(z.custom<ChatMessage>()),
@@ -322,6 +323,42 @@ export function buildSalesGraph(
       return { reply: preview, supplement: '', draftReady: false };
     const started = Date.now();
     const composed = !!preview || !!writePreview;
+    // A receipt-only plan can skip prose generation, never independent review.
+    // Mixed work, errors and reviewer-requested explanations keep normal composition.
+    if (
+      !evidenceRepair &&
+      !value.feedback &&
+      !value.repairs &&
+      value.plan?.responseMode === 'receipt_only' &&
+      writePreview &&
+      writes?.hasRfqCreationReceipt &&
+      !preview &&
+      !personal?.evidence.length &&
+      !personal?.failures.length &&
+      !run?.evidence.length &&
+      !run?.failures.length &&
+      !utilities?.evidence.length &&
+      !utilities?.failures.length &&
+      !writes.failures.length
+    ) {
+      return {
+        reply: writePreview,
+        supplement: '',
+        draftReady: false,
+        renderIssues: [],
+        renderedRecords: [],
+        researchExhausted,
+        stages: [
+          ...value.stages,
+          recordMetric({
+            stage: 'formatter',
+            durationMs: Date.now() - started,
+            inputTokens: 0,
+            outputTokens: 0,
+          }),
+        ],
+      };
+    }
     // Consume each completed worker answer once, including independent review repairs.
     // Formatter-only retries must not reuse a draft already rejected by the verifier.
     if (
@@ -418,10 +455,10 @@ export function buildSalesGraph(
         ],
         ...(composed
           ? {
-              jsonSchema: {
-                name: writePreview ? 'ramesh_action_supplement' : 'ramesh_personal_supplement',
-                schema: z.toJSONSchema(supplementSchema),
-              },
+              jsonSchema: modelJsonSchema(
+                writePreview ? 'ramesh_action_supplement' : 'ramesh_personal_supplement',
+                supplementSchema,
+              ),
             }
           : {}),
       },
@@ -606,7 +643,7 @@ export function buildSalesGraph(
           reasoningEffort: 'low',
           instructions: `${ROUTER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${engineOrientation()}`,
           messages: [...modelHistory, { role: 'user', content: value.input }],
-          jsonSchema: { name: 'ramesh_route', schema: z.toJSONSchema(routeSchema) },
+          jsonSchema: modelJsonSchema('ramesh_route', routeSchema),
         },
         config.signal,
       );
@@ -683,7 +720,7 @@ export function buildSalesGraph(
                 }),
               },
             ],
-            jsonSchema: { name: 'ramesh_task_plan', schema: z.toJSONSchema(taskPlanSchema) },
+            jsonSchema: modelJsonSchema('ramesh_task_plan', taskPlanSchema),
           },
           signal,
         );
@@ -966,7 +1003,7 @@ export function buildSalesGraph(
               }),
             },
           ],
-          jsonSchema: { name: 'ramesh_sales_review', schema: z.toJSONSchema(answerReviewSchema) },
+          jsonSchema: modelJsonSchema('ramesh_sales_review', answerReviewSchema),
         },
         config.signal,
       );

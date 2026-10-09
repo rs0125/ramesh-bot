@@ -18,8 +18,13 @@ The API request still carries definitions for hosted search; deferral concerns
 model context, not MCP network transfer. Review stages retain the definitions
 needed to assess actual evidence and write proposals.
 
-The adapter checks namespace/name bindings and returned search schemas against
-its original catalogue. Search cannot invent permissions, tools or schemas. It
+The adapter transforms admitted input schemas into strict provider schemas, then
+checks namespace/name bindings and returned search schemas against that exact
+provider catalogue. Search may omit the optional `strict` echo, but cannot return
+`strict: false` or change parameters; declarations always specify `strict: true`.
+Arguments decode back to the original contract before dispatch, preserving
+omission versus explicit null. Native continuation items retain the original
+provider arguments. Search cannot invent permissions, tools or schemas. It
 handles completed server search items, preserves them in continuation/replay,
 and aggregates usage across search-only responses. Client-executed search is not
 implemented and is rejected. Search is bounded to eight calls per tool session.

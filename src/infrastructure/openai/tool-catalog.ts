@@ -2,8 +2,14 @@
 import { isDeepStrictEqual } from 'node:util';
 import type OpenAI from 'openai';
 import type { ToolSessionRequest } from '../../modules/assistant/assistant.types.js';
+import { strictToolSchema } from './strict-tool-schema.js';
 
-type Binding = { name: string; namespace?: string; definition: OpenAI.Responses.FunctionTool };
+type Binding = {
+  name: string;
+  namespace?: string;
+  definition: OpenAI.Responses.FunctionTool;
+  decode(value: unknown): unknown;
+};
 export class OpenAIToolCatalog {
   readonly bindings: Binding[] = [];
   private readonly namespaces = new Map<string, string>();
@@ -29,15 +35,17 @@ export class OpenAIToolCatalog {
           throw new Error('AMBIGUOUS_TOOL_CAPABILITY');
         this.namespaces.set(namespace, description);
       }
+      const codec = strictToolSchema(tool.inputSchema);
       this.bindings.push({
         name: tool.name,
+        decode: codec.decode,
         ...(namespace ? { namespace } : {}),
         definition: {
           type: 'function',
           name: tool.name,
           description: tool.description,
-          parameters: structuredClone(tool.inputSchema),
-          strict: false,
+          parameters: codec.schema,
+          strict: true,
           ...(namespace ? { defer_loading: true } : {}),
         },
       });
@@ -72,6 +80,12 @@ export class OpenAIToolCatalog {
     return binding;
   }
 
+  arguments(name: string, namespace: string | undefined, allowed: readonly string[], raw: string) {
+    if (Buffer.byteLength(raw) > 100_000) throw new Error('INVALID_STRICT_TOOL_ARGUMENTS');
+    const binding = this.resolve(name, namespace, allowed);
+    return JSON.stringify(binding.decode(JSON.parse(raw)));
+  }
+
   validateSearchTools(tools: OpenAI.Responses.Tool[], allowed: readonly string[]) {
     const check = (
       tool: OpenAI.Responses.Tool | OpenAI.Responses.NamespaceTool.Function,
@@ -79,7 +93,12 @@ export class OpenAIToolCatalog {
     ) => {
       if (tool.type !== 'function') throw new Error('UNEXPECTED_SEARCH_TOOL');
       const binding = this.resolve(tool.name, namespace, allowed);
-      if (!isDeepStrictEqual(tool.parameters, binding.definition.parameters))
+      // Hosted search may omit this optional echo. The request declaration stays
+      // strict, and returned parameters must still match the exact strict schema.
+      if (
+        tool.strict === false ||
+        !isDeepStrictEqual(tool.parameters, binding.definition.parameters)
+      )
         throw new Error('CHANGED_SEARCH_SCHEMA');
     };
     for (const tool of tools) {

@@ -7,6 +7,7 @@ import type {
   TrustedReplyContext,
 } from '../greetings/greeting.types.js';
 import type { AgentTrace, ChatMessage, TextModel } from './assistant.types.js';
+import { ModelFailureError } from './model-failure.js';
 import { buildAssistantGraph } from './assistant.graph.js';
 import { ConversationMemory, PRIVATE_HISTORY_REPLY } from './conversation-memory.js';
 import { PROMPT_VERSION } from './prompts.js';
@@ -277,6 +278,7 @@ export class AssistantService {
         });
       trace.outcome = 'unavailable';
       trace.failureCode = 'RUN_FAILED';
+      if (error instanceof ModelFailureError) trace.modelFailure = error.details;
       return finish({
         text: UNAVAILABLE_REPLY,
         ...(personal?.usedPrivateData && !personal.blocked
@@ -434,6 +436,8 @@ export class AssistantService {
           deadline.signal.aborted || Date.now() >= deadlineAtMs
             ? 'DEADLINE_EXCEEDED'
             : 'RUN_FAILED';
+        if (error instanceof ModelFailureError) trace.modelFailure = error.details;
+        const failureReply = writes?.unsubmittedReply ?? UNAVAILABLE_REPLY;
         const business = contextRun?.historyDelivery();
         const personalDelivery =
           personal?.usedPrivateData && !personal.blocked ? personal.deliveryReference : undefined;
@@ -444,14 +448,14 @@ export class AssistantService {
                 version: 1,
                 personal: personalDelivery,
                 business,
-                businessText: UNAVAILABLE_REPLY,
+                businessText: failureReply,
                 businessRecallAllowed: false,
               })
             : (personalDelivery ?? business);
         const write = writes?.historyDelivery();
-        const evidence = write ? writeDeliveryBundle(write, other, UNAVAILABLE_REPLY) : other;
+        const evidence = write ? writeDeliveryBundle(write, other, failureReply) : other;
         return finish({
-          text: UNAVAILABLE_REPLY,
+          text: failureReply,
           ...(evidence
             ? {
                 businessEvidence: evidence,

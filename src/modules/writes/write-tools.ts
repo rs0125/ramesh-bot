@@ -16,7 +16,7 @@ import type {
 } from '../context-engine/context.types.js';
 import { argumentsSha256, canonicalJson, schemaAccepts } from '../context-engine/read-contract.js';
 import { contextWriteDescriptor, writeContract } from '../context-engine/write-contract.js';
-import { rfqWriteResultText } from './rfq-write-presentation.js';
+import { rfqWriteRecoveryText, rfqWriteResultText } from './rfq-write-presentation.js';
 import { crmNoteResultText } from './crm-note-presentation.js';
 import {
   mailDraftProposalText,
@@ -184,6 +184,8 @@ function resultText(
 ) {
   const recovery = mailDraftRecoveryText(operation, now);
   if (recovery) return recovery;
+  const rfqRecovery = rfqWriteRecoveryText(operation, now);
+  if (rfqRecovery) return rfqRecovery;
   const label = operation.payload.summary;
   switch (operation.state) {
     case 'DRAFT':
@@ -296,6 +298,8 @@ function recoverableText(
 ) {
   const mailRecovery = mailDraftRecoveryText(operation, now);
   if (mailRecovery) return mailRecovery;
+  const rfqRecovery = rfqWriteRecoveryText(operation, now);
+  if (rfqRecovery) return rfqRecovery;
   if (
     definitions.some(
       (t) =>
@@ -711,6 +715,7 @@ export class BusinessWriteRun {
   blocked = false;
   private calls = 0;
   private staged?: WriteOperation;
+  private finalizationStarted = false;
   private history: WriteOperation[] = [];
   private privateRead = false;
   constructor(
@@ -812,6 +817,37 @@ export class BusinessWriteRun {
   }
   get pendingExecutionMode() {
     return this.staged?.payload.executionMode ?? 'confirmation';
+  }
+  /** Only this known write has a complete code-owned creation receipt. Not approval. */
+  get hasRfqCreationReceipt() {
+    const operation = this.staged;
+    return (
+      !this.blocked &&
+      !this.finalizationStarted &&
+      !!operation &&
+      operation.state === 'DRAFT' &&
+      operation.dispatchAttempts === 0 &&
+      !operation.hasUncertainAttempt &&
+      operation.payload.sourceFamily === 'crm' &&
+      operation.payload.toolName === 'create_crm_rfq' &&
+      operation.payload.executionMode === 'direct_request'
+    );
+  }
+  /** Never infer non-submission from an interrupted or uncertain commit. */
+  get unsubmittedReply(): string | undefined {
+    const operation = this.staged;
+    if (
+      this.blocked ||
+      this.finalizationStarted ||
+      !operation ||
+      operation.payload.toolName !== 'create_crm_rfq' ||
+      operation.payload.sourceFamily !== 'crm' ||
+      operation.state !== 'DRAFT' ||
+      operation.dispatchAttempts !== 0 ||
+      operation.hasUncertainAttempt
+    )
+      return undefined;
+    return 'The requirement wasn’t submitted to CRM. I ran into a problem preparing it; you don’t need to resend the details.';
   }
   preview() {
     if (!this.staged) return undefined;
@@ -1047,6 +1083,7 @@ export class BusinessWriteRun {
     signal.throwIfAborted();
   }
   async finalize(signal: AbortSignal): Promise<BusinessWriteReply | undefined> {
+    this.finalizationStarted = true;
     try {
       const result = await this.finalizeWrite(signal);
       if (this.staged && result) rememberWrite(this.toolHistory, this.staged, 'commit');

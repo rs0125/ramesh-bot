@@ -397,6 +397,101 @@ test(
         },
       );
       await t.test(
+        'plain RFQ cancellation retires only a definite unsent attempt and cannot erase uncertainty',
+        async () => {
+          for (const outcome of ['not_dispatched', 'outcome_unknown'] as const) {
+            const f = fixture();
+            const c = await command(f, 'Create an RFQ for this requirement');
+            const op = await f.repo.propose(c.ctx, {
+              ...payload(),
+              toolName: 'create_crm_rfq',
+              executionMode: 'direct_request',
+              sourceFamily: 'crm',
+              toolMeta: {
+                'wareongo/context-write-v1': {
+                  requiredScopes: ['crm.rfq:write'],
+                  sourceFamily: 'crm',
+                  effect: 'create',
+                  idempotencyArgument: 'operation_id',
+                  executionMode: 'direct_request',
+                },
+              },
+            });
+            const approved = await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+            const claim = (await f.repo.claim(c.ctx, op.operationId, approved.version))!;
+            const finished = await f.repo.finish(c.ctx, op.operationId, claim.dispatchToken, {
+              operation_id: op.operationId,
+              outcome,
+              code: 'SYNTHETIC',
+              message: 'Synthetic status',
+            });
+            await deliver(f, c.job);
+            const cancel = await command(f, 'cancel that RFQ attempt');
+            assert.equal(
+              (await f.repo.findDirectRecovery(cancel.ctx))!.operationId,
+              op.operationId,
+            );
+            if (outcome === 'not_dispatched') {
+              assert.equal(
+                (await f.repo.cancel(cancel.ctx, op.operationId, finished.version)).state,
+                'CANCELLED',
+              );
+            } else {
+              await assert.rejects(
+                f.repo.cancel(cancel.ctx, op.operationId, finished.version),
+                hasCode('WRITE_CANNOT_CANCEL_DISPATCHED'),
+              );
+              assert.equal((await f.repo.receiptLookup(actor, op.operationId))!.state, 'UNKNOWN');
+            }
+          }
+        },
+      );
+      await t.test(
+        'RFQ and email draft recovery commands cannot select or cancel each other',
+        async () => {
+          for (const isRfq of [true, false]) {
+            const f = fixture();
+            const c = await command(f, isRfq ? 'Save this RFQ' : 'Save this email draft');
+            const sourceFamily = isRfq ? 'crm' : 'mail';
+            const op = await f.repo.propose(c.ctx, {
+              ...payload(),
+              toolName: isRfq ? 'create_crm_rfq' : 'create_email_draft',
+              executionMode: 'direct_request',
+              sourceFamily,
+              toolMeta: {
+                'wareongo/context-write-v1': {
+                  requiredScopes: [isRfq ? 'crm.rfq:write' : 'mail:drafts'],
+                  sourceFamily,
+                  effect: 'create',
+                  idempotencyArgument: 'operation_id',
+                  executionMode: 'direct_request',
+                },
+              },
+            });
+            const approved = await f.repo.approveDirect(c.ctx, op.operationId, op.version);
+            await deliver(f, c.job);
+            for (const action of ['cancel', 'retry']) {
+              const wrongKind = isRfq ? 'draft' : 'RFQ';
+              const request = await command(
+                f,
+                `${action} that ${wrongKind}${action === 'cancel' ? ' attempt' : ''}`,
+              );
+              assert.equal(await f.repo.findDirectRecovery(request.ctx), null);
+              if (action === 'cancel')
+                await assert.rejects(
+                  f.repo.cancel(request.ctx, op.operationId, approved.version),
+                  hasCode('WRITE_RECOVERY_AMBIGUOUS'),
+                );
+              const unchanged = (await f.repo.receiptLookup(actor, op.operationId))!;
+              assert.equal(unchanged.state, 'APPROVED');
+              assert.equal(unchanged.version, approved.version);
+              assert.equal(unchanged.dispatchAttempts, 0);
+              await deliver(f, request.job);
+            }
+          }
+        },
+      );
+      await t.test(
         'a retry after an unrelated request cannot resume an older approved write',
         async () => {
           const f = fixture();

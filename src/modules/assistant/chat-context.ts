@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { getEncoding } from 'js-tiktoken';
 import { z } from 'zod';
+import { modelJsonSchema } from './model-schema.js';
 import type { GreetingCandidate, TrustedReplyContext } from '../greetings/greeting.types.js';
 import type { AgentStage, ChatMessage, TextModel, StageMetric } from './assistant.types.js';
 import { toolDeliverySchema } from './tool-evidence.js';
@@ -454,7 +455,7 @@ export class ChatContext {
               }),
             },
           ],
-          jsonSchema: { name: 'conversation_summary', schema: z.toJSONSchema(summarySchema) },
+          jsonSchema: modelJsonSchema('conversation_summary', summarySchema),
         },
         signal,
       );

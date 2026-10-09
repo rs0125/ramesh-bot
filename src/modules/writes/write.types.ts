@@ -169,6 +169,6 @@ export function directRecoveryAction(text: string): 'retry' | 'cancel' | undefin
     /^(?:please )?(?:retry (?:that|the last) draft|try (?:that|the last) draft again)$/.test(value)
   )
     return 'retry';
-  if (/^(?:please )?cancel (?:that|the last) draft attempt$/.test(value)) return 'cancel';
+  if (/^(?:please )?cancel (?:that|the last) (?:draft|rfq) attempt$/.test(value)) return 'cancel';
   return undefined;
 }

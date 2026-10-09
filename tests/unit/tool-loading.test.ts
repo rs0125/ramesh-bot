@@ -236,6 +236,25 @@ test('search cannot introduce a tool, alter its schema or dispatch under another
   }
 });
 
+test('hosted search can omit optional strict metadata without weakening the supplied contract', () => {
+  const catalog = new OpenAIToolCatalog([tool], 'deferred');
+  const group = catalog.render().find((item) => item.type === 'namespace')!;
+  const definition = group.tools[0]!;
+  assert.ok(definition.type === 'function');
+  assert.equal(definition.strict, true);
+  const { strict: _, ...withoutEcho } = definition;
+  catalog.validateSearchTools([{ ...group, tools: [withoutEcho] }], [tool.name]);
+  assert.throws(
+    () =>
+      catalog.validateSearchTools(
+        [{ ...group, tools: [{ ...definition, strict: false }] }],
+        [tool.name],
+      ),
+    /CHANGED_SEARCH_SCHEMA/,
+  );
+  assert.ok(group.tools.every((item) => item.type === 'function' && item.strict === true));
+});
+
 test('withdrawn functions are removed from deferred search and rejected on dispatch', async () => {
   let body: any;
   const model = new OpenAITextModel(config, async (_url, init) => {

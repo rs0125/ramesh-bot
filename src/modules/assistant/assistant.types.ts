@@ -118,6 +118,8 @@ export interface AgentTrace {
   outcome: 'completed' | 'unavailable' | 'input_rejected';
   limitedBy?: 'research_deadline';
   failureCode?: 'DEADLINE_EXCEEDED' | 'RUN_FAILED';
+  /** Safe provider category and failing stage, without the original error body. */
+  modelFailure?: import('./model-failure.js').ModelFailure;
   usage?: import('../usage/usage.types.js').UsageSummary;
   usageUnavailable?: boolean;
   /** Completed native model responses reused without another provider call. */

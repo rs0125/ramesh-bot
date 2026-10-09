@@ -49,12 +49,60 @@ test('each transcript fixture admits its CRM search, detail and related-note res
   }
 });
 
-test('add this uses exact earlier source; a separate RFQ keeps its own absent fields and uncertain recovery never creates twice', async () => {
+test('a brief-only RFQ survives confirmation with exact stored source and no questionnaire fields', async () => {
+  const fixture = createTranscriptFixture('rfq', Date.now);
+  const brief =
+    '  Need office-cum-godown. Size/location later.\nParking for 2 trucks.\nSupply POC: Meera\n#twenty\n';
+  const source = fixture.trusted(brief);
+  const trusted = fixture.trusted('yes, save this requirement');
+  const run = (await fixture.writes.open(trusted, signal()))!;
+  const tool = run.tools.find((item) => item.name === 'create_crm_rfq')!;
+  assert.deepEqual(tool.inputSchema.required ?? [], []);
+  await run.execute(
+    'create_crm_rfq',
+    JSON.stringify({ _source_message_ids: [source.commandMessages![0]!.id] }),
+    signal(),
+  );
+  const receipt = await run.finalize(signal());
+  assert.equal(fixture.state.rfqs.length, 1);
+  assert.deepEqual(fixture.state.rfqs[0]!.args, {
+    raw_text: brief,
+    operation_id: fixture.state.rfqs[0]!.operation_id,
+  });
+  assert.match(receipt!.text, /^Saved RFQ: New RFQ/);
+  assert.match(receipt!.text, /Full brief saved in the description/);
+  assert.doesNotMatch(receipt!.text, /Location:|Requirement:|Phone:|confirm|cancel/i);
+});
+
+test('the RFQ review oracle accepts full-source capture with no structured extraction', () => {
+  const fixture = createTranscriptFixture('rfq', Date.now);
+  fixture.state.rfqs.push({
+    id: 'synthetic-first',
+    args: { raw_text: VISAKHAPATNAM_RFQ },
+    updated_at: new Date().toISOString(),
+    operation_id: 'first-operation',
+    uncertain: false,
+  });
+  const turn = {
+    reply: 'Saved RFQ. Full brief saved in the description.',
+    calls: [],
+    local_calls: [],
+    protected: false,
+    trace: { outcome: 'completed' },
+  };
+  assert.deepEqual(transcriptChecks(TRANSCRIPT_CASES[0]!, 1, fixture, turn), []);
+  fixture.state.rfqs[0]!.args.location = 'Unrelated city';
+  assert.ok(
+    transcriptChecks(TRANSCRIPT_CASES[0]!, 1, fixture, turn).includes('turn2:first_rfq_fields'),
+  );
+});
+
+test('yes uses exact earlier source; a separate RFQ keeps its own absent fields and uncertain recovery never creates twice', async () => {
   let now = Date.parse('2026-10-06T09:00:00Z');
   const fixture = createTranscriptFixture('rfq', () => now);
   const source = fixture.trusted(VISAKHAPATNAM_RFQ);
   now += 60000;
-  const trusted = fixture.trusted('add this to crm as a separate rfq');
+  const trusted = fixture.trusted(TRANSCRIPT_CASES[0]!.turns[1]!);
   const run = (await fixture.writes.open(trusted, signal()))!;
   assert.ok(run);
   const sources = await run.execute('write_sources', '{}', signal());
@@ -91,11 +139,14 @@ test('add this uses exact earlier source; a separate RFQ keeps its own absent fi
   assert.equal(saved.args.lease_duration, undefined);
   assert.ok(saved.uncertain);
   const attemptsBeforeRetry = fixture.state.writes.length;
-  await fixture.writes.recover(fixture.trusted('retry'), signal());
+  const recovery = await fixture.writes.recover(fixture.trusted('retry'), signal());
   assert.equal(fixture.state.rfqs.length, 2);
   assert.equal(fixture.state.writes.length, attemptsBeforeRetry + 1);
   assert.equal(fixture.state.writes.at(-1)!.result.operation_id, saved.operation_id);
   assert.equal(fixture.state.writes.at(-1)!.result.outcome, 'outcome_unknown');
+  assert.match(recovery!.text, /still can’t confirm/);
+  assert.match(recovery!.text, /administrator.*existing submission/);
+  assert.doesNotMatch(recovery!.text, /Say “retry”|Nothing was sent|Saved RFQ/);
   const calls = fixture.state.writes.length;
   fixture.trusted('An unrelated question');
   assert.equal(await fixture.writes.recover(fixture.trusted('retry'), signal()), undefined);

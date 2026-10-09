@@ -1,5 +1,5 @@
 /** Causal evaluation: a judge never sees user turns that had not happened yet. */
-import { z } from 'zod';
+import { modelJsonSchema } from '../../src/modules/assistant/model-schema.js';
 import type { TextModel, ModelResult } from '../../src/modules/assistant/assistant.types.js';
 import { evidenceClocks, parseVerdict, verdictSchema } from './judge.js';
 export interface JudgedTurn {
@@ -57,7 +57,7 @@ export async function judgeTurns(
             content: JSON.stringify(turnJudgeInput(expectation, turns, index, category)),
           },
         ],
-        jsonSchema: { name: 'causal_turn_verdict', schema: z.toJSONSchema(verdictSchema) },
+        jsonSchema: modelJsonSchema('causal_turn_verdict', verdictSchema),
       },
       AbortSignal.any([signal, AbortSignal.timeout(90000)]),
     );

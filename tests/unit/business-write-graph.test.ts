@@ -1,8 +1,13 @@
 /** Generic write orchestration: synthetic tools/models, no remote writes or paid calls. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { assertStrictResponseSchema } from '../fixtures/strict-response-schema.js';
 import { createHash } from 'node:crypto';
-import { AssistantService } from '../../src/modules/assistant/assistant.service.js';
+import {
+  AssistantService,
+  UNAVAILABLE_REPLY,
+} from '../../src/modules/assistant/assistant.service.js';
+import { ModelFailureError } from '../../src/modules/assistant/model-failure.js';
 import {
   ConversationMemory,
   PRIVATE_HISTORY_REPLY,
@@ -67,6 +72,7 @@ function writeRun(
     historyOnly?: boolean;
     failFinalize?: boolean;
     executionMode?: 'direct_request' | 'confirmation';
+    unsubmittedReply?: string;
   } = {},
 ) {
   let staged: Record<string, unknown> | undefined;
@@ -89,6 +95,9 @@ function writeRun(
     failures: [],
     get usedPrivateData() {
       return usedPrivateData;
+    },
+    get unsubmittedReply() {
+      return staged && !finalized ? options.unsubmittedReply : undefined;
     },
     deliveryReference: receipt,
     historyDelivery: () => undefined,
@@ -189,6 +198,7 @@ function model(
   let rejected = false;
   const fake: TextModel = {
     async complete(request) {
+      if (request.jsonSchema) assertStrictResponseSchema(request.jsonSchema.schema);
       requests.push(request);
       events.push(request.stage);
       if (request.stage === 'converser')
@@ -683,6 +693,58 @@ const trusted: TrustedReplyContext = {
     { id: message.messageId, text: message.text, receivedAtMs: now, forwarded: false },
   ],
 };
+
+test('formatter failures explain verified non-submission and retain safe diagnostic details', async () => {
+  for (const status of [
+    undefined,
+    'This attempt did not submit the requirement. Your details are still here.',
+  ]) {
+    const writes = writeRun({ unsubmittedReply: status });
+    const fake = model([{ name: writeDefinition.name, args: exact }]);
+    const complete = fake.fake.complete.bind(fake.fake);
+    fake.fake.complete = async (request, signal) => {
+      if (request.stage === 'formatter')
+        throw new ModelFailureError(
+          { stage: 'formatter', code: 'INVALID_SCHEMA', httpStatus: 400 },
+          'OpenAI request failed (HTTP 400)',
+        );
+      return complete(request, signal);
+    };
+    const service = {
+      async recover() {
+        return undefined;
+      },
+      async open() {
+        return writes.run;
+      },
+    } as unknown as BusinessWriteService;
+    const business = {
+      toolLoop: true,
+      async openTools() {
+        return { status: 'denied' };
+      },
+    } as unknown as BusinessReadService;
+    const assistant = new AssistantService(
+      { model: 'offline-write-fake', timeoutMs: 5000 },
+      fake.fake,
+      undefined,
+      undefined,
+      undefined,
+      business,
+      { now: () => now, businessWrites: service },
+    );
+    const reply = await assistant.prepare(message, undefined, trusted);
+    assert.equal(reply.text, status ?? UNAVAILABLE_REPLY);
+    assert.equal(writes.invocations.length, 1);
+    assert.equal(writes.finalized(), 0);
+    assert.deepEqual(reply.trace.modelFailure, {
+      stage: 'formatter',
+      code: 'INVALID_SCHEMA',
+      httpStatus: 400,
+    });
+    assert.doesNotMatch(reply.text, /HTTP|INVALID_SCHEMA|RUN_FAILED/);
+  }
+});
 
 test('direct confirmation recovery runs before checkpoint/model and never opens a second proposal session', async () => {
   let recovered = 0;
