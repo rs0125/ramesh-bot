@@ -14,20 +14,20 @@ const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 // Recorded 2026-10-10 at ramesh-chief-of-staff-v45 (after 3e22cbb); router lowered at v46;
 // all roles lowered when the shared evidence policy became core principles (v48).
 const COMPOSED: Record<string, number> = {
-  ROUTER_PROMPT: 2098,
-  PLANNER_PROMPT: 3457,
-  WORKER_PROMPT: 5694,
-  SALES_VERIFIER_PROMPT: 2843,
+  ROUTER_PROMPT: 2092,
+  PLANNER_PROMPT: 3451,
+  WORKER_PROMPT: 5688,
+  SALES_VERIFIER_PROMPT: 2836,
   // Core plus every domain section; the per-turn review loads a subset.
-  SALES_VERIFIER_FULL_PROMPT: 4813,
-  BUSINESS_FORMATTER_PROMPT: 2548,
-  EVIDENCE_REPAIR_PROMPT: 1505,
+  SALES_VERIFIER_FULL_PROMPT: 4806,
+  BUSINESS_FORMATTER_PROMPT: 2542,
+  EVIDENCE_REPAIR_PROMPT: 1499,
 };
 const FILES: Record<string, number> = {
   'business-formatter.md': 1719,
   'chief-of-staff.md': 1737,
   'converser.md': 452,
-  'evidence-policy.md': 652,
+  'evidence-policy.md': 646,
   'evidence-repair.md': 244,
   'formatter.md': 247,
   'legacy-read-converser.md': 247,
@@ -42,7 +42,7 @@ const FILES: Record<string, number> = {
   'verifier-recall.md': 238,
   'verifier-supply.md': 242,
   'verifier-writes.md': 886,
-  'verifier.md': 1759,
+  'verifier.md': 1758,
   'worker.md': 1472,
 };
 
