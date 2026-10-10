@@ -9,6 +9,9 @@ import {
   ROUTER_PROMPT,
   SALES_MANAGER_PROMPT,
   SALES_VERIFIER_PROMPT,
+  SALES_VERIFIER_FULL_PROMPT,
+  VERIFIER_SECTIONS,
+  verifierInstructions,
   WORKER_PROMPT,
 } from '../../src/modules/assistant/sales-prompts.js';
 
@@ -69,4 +72,19 @@ test('live-role composition and synthetic source guidance do not restore traced 
       );
     }
   }
+});
+
+test('verifier domain sections compose onto the core only when requested', () => {
+  const policy = loadPrompt('evidence-policy');
+  assert.equal(verifierInstructions(new Set()), SALES_VERIFIER_PROMPT);
+  for (const section of VERIFIER_SECTIONS) {
+    const text = loadPrompt(`verifier-${section}`);
+    const only = verifierInstructions(new Set([section]));
+    assert.ok(only.startsWith(SALES_VERIFIER_PROMPT) && only.includes(text), section);
+    for (const other of VERIFIER_SECTIONS.filter((name) => name !== section))
+      assert.ok(!only.includes(loadPrompt(`verifier-${other}`)), `${section} leaks ${other}`);
+  }
+  assert.equal(SALES_VERIFIER_FULL_PROMPT.split(policy).length - 1, 1);
+  for (const section of VERIFIER_SECTIONS)
+    assert.equal(SALES_VERIFIER_FULL_PROMPT.split(loadPrompt(`verifier-${section}`)).length - 1, 1);
 });

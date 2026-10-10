@@ -17,7 +17,9 @@ const COMPOSED: Record<string, number> = {
   ROUTER_PROMPT: 2098,
   PLANNER_PROMPT: 3457,
   WORKER_PROMPT: 5694,
-  SALES_VERIFIER_PROMPT: 4860,
+  SALES_VERIFIER_PROMPT: 2843,
+  // Core plus every domain section; the per-turn review loads a subset.
+  SALES_VERIFIER_FULL_PROMPT: 4813,
   BUSINESS_FORMATTER_PROMPT: 2548,
   EVIDENCE_REPAIR_PROMPT: 1505,
 };
@@ -34,7 +36,13 @@ const FILES: Record<string, number> = {
   'planning-reference.md': 1224,
   'requirement-interpretation.md': 432,
   'router.md': 1446,
-  'verifier.md': 3776,
+  'verifier-analytics.md': 83,
+  'verifier-crm.md': 353,
+  'verifier-personal.md': 168,
+  'verifier-recall.md': 238,
+  'verifier-supply.md': 242,
+  'verifier-writes.md': 886,
+  'verifier.md': 1759,
   'worker.md': 1472,
 };
 

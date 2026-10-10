@@ -21,7 +21,8 @@ import {
   ROUTER_PROMPT,
   PLANNER_PROMPT,
   WORKER_PROMPT,
-  SALES_VERIFIER_PROMPT,
+  verifierInstructions,
+  type VerifierSection,
 } from './sales-prompts.js';
 import { finishReply, chatLayoutIssues } from './style.js';
 import { businessRecall, recallDefinition, RECALL_TOOL } from './business-recall.js';
@@ -255,6 +256,39 @@ export function buildSalesGraph(
       const current = currentRecall(value, sources, run?.evidence ?? []);
       return current ? [current] : [];
     });
+  };
+  // Domain review rules follow what this turn actually touched, so a CRM lookup is not
+  // reviewed against Gmail, RFQ, personal-reminder and analytics rules.
+  const reviewSections = (value: {
+    plan?: { responseMode?: string } | null;
+    renderedRecords: unknown[];
+  }) => {
+    const used = new Set([
+      ...(run?.evidence ?? []).map((item) => item.tool),
+      ...(run?.failures ?? []).map((item) => item.tool),
+    ]);
+    const recalledHere = used.has(RECALL_TOOL) || currentRecalls().length > 0;
+    const any = (pattern: RegExp) => [...used].some((tool) => pattern.test(tool));
+    const sections = new Set<VerifierSection>();
+    if (
+      writes?.evidence.length ||
+      writes?.failures.length ||
+      writes?.preview() ||
+      value.plan?.responseMode === 'receipt_only'
+    )
+      sections.add('writes');
+    if (
+      personal?.evidence.length ||
+      personal?.failures.length ||
+      personal?.pendingOperations.length ||
+      personal?.preview()
+    )
+      sections.add('personal');
+    if (recalledHere) sections.add('recall');
+    if (recalledHere || value.renderedRecords.length || any(/crm/)) sections.add('crm');
+    if (recalledHere || any(/warehouse|shortlist|resolve_location/)) sections.add('supply');
+    if (any(/ga4|search_console|analytics/)) sections.add('analytics');
+    return sections;
   };
   const requestTime = (options.now ?? Date.now)();
   const recordMetric = (stage: StageMetric) => {
@@ -1174,7 +1208,7 @@ export function buildSalesGraph(
         {
           stage: 'verifier',
           reasoningEffort: 'medium',
-          instructions: `${SALES_VERIFIER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${engineOrientation()}\n${ANSWER_REVIEW_CONTRACT}`,
+          instructions: `${verifierInstructions(reviewSections(value))}\n${MEMORY_INSTRUCTIONS}\n${engineOrientation()}\n${ANSWER_REVIEW_CONTRACT}`,
           messages: [
             {
               role: 'user',

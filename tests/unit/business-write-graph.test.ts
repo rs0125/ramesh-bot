@@ -319,6 +319,11 @@ test('dynamic writes can follow reads but publish exact proposals only after ind
   assert.deepEqual(payload(fake.requests, 'verifier').business_write_evidence[0].arguments, exact);
   assert.equal(payload(fake.requests, 'verifier').evidence.length, 1);
   assert.equal(payload(fake.requests, 'verifier').business_write_execution_mode, 'confirmation');
+  // A staged write loads the write review rules; untouched domains stay out of the prompt.
+  const reviewInstructions = fake.requests.find((r) => r.stage === 'verifier')!.instructions;
+  assert.ok(reviewInstructions.includes('# Business write review'));
+  assert.ok(!reviewInstructions.includes('# Analytics answer review'));
+  assert.ok(!reviewInstructions.includes('# Personal task and reminder review'));
 });
 
 test('direct writes dispatch after independent review and replace the unexecuted preview with the authoritative result', async () => {
