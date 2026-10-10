@@ -55,8 +55,6 @@ const date = (value: unknown, includeTime: boolean) => {
         ? {
             hour: '2-digit',
             minute: '2-digit',
-            second: '2-digit',
-            fractionalSecondDigits: 3,
             hourCycle: 'h23' as const,
           }
         : {}),
@@ -117,6 +115,10 @@ export function renderAnswer(
       `*${record.label}*\nCreated: ${record.created} · Last updated: ${record.last_updated}\n${block.body}`.trim(),
     );
   }
+  // A closing heading with nothing under it (for example "CRM timestamps (IST):") adds nothing.
+  const last = parsed.data.answer_blocks.at(-1);
+  if (last?.kind === 'text' && /^[^\n]{1,80}:$/.test(last.text.replace(/[*_]/g, '').trim()))
+    blocks.pop();
   const text = blocks.filter(Boolean).join('\n\n');
   if (!text.trim() || text.length > 12000)
     return invalid('The rendered answer is empty or exceeds the reply limit.');

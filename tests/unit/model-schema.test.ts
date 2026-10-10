@@ -54,3 +54,10 @@ test('action composition accepts empty/text/card supplements and rejects malform
   // This incident would pass a generic JSON Schema validator but fail the API contract.
   assert.throws(() => assertStrictResponseSchema(z.toJSONSchema(supplementSchema)), /oneOf/);
 });
+
+test('the review schema defines each finding kind for the verifier', () => {
+  const schema = JSON.stringify(modelJsonSchema('ramesh_sales_review', answerReviewSchema));
+  // A missing step is scope; execution_status is reserved for claims that something happened.
+  assert.match(schema, /scope: part of the request is missing or was not attempted/);
+  assert.match(schema, /execution_status: the answer claims a tool ran/);
+});

@@ -84,5 +84,11 @@ export function chatLayoutIssues(text: string): string[] {
     ...(/```/.test(text)
       ? ['Remove code fences and present the answer as ordinary chat text.']
       : []),
+    // Internal API paths are system provenance, not links a person can open.
+    ...(/(?<![\w.:/-])\/api\/v\d+\//i.test(text)
+      ? [
+          'Remove the internal /api/... source path; cite the readable source title (and update date) instead.',
+        ]
+      : []),
   ];
 }

@@ -366,7 +366,7 @@ test('wrong dates still block even when the model reviewer mistakenly approves',
   assert.equal(observed.requests.filter((r) => r.stage === 'verifier').length, 2);
 });
 
-test('CRM renderer refuses absent identities and model-supplied dates, and preserves native IST precision', async () => {
+test('CRM renderer refuses absent identities and model-supplied dates, and shows native IST times to the minute', async () => {
   const observed = await run({ draft: 'Recorded requirement read.', review: () => approved });
   for (const block of [
     { ...card(), record_id: 'unavailable-record' },
@@ -383,14 +383,38 @@ test('CRM renderer refuses absent identities and model-supplied dates, and prese
     { answer_blocks: [{ ...card(), include_time: true }] },
     observed.evidence,
   );
-  assert.match(rendered.text, /2 Sept 2026, 00:00:42.123 IST/);
+  // Cards show minutes; seconds and milliseconds are noise in chat.
+  assert.match(rendered.text, /2 Sept 2026, 00:00 IST/);
+  assert.doesNotMatch(rendered.text, /00:00:42/);
   assert.deepEqual(dealDisplayIssues(rendered.text, observed.evidence), []);
-  assert.ok(dealDisplayIssues(rendered.text.replace('42.123', '42.124'), observed.evidence).length);
+  assert.ok(
+    dealDisplayIssues(rendered.text.replace('00:00 IST', '00:01 IST'), observed.evidence).length,
+  );
+  // A time written at finer precision is still checked at that precision.
+  const precise = (value: string) => rendered.text.replace('00:00 IST', value);
+  assert.deepEqual(dealDisplayIssues(precise('00:00:42.123 IST'), observed.evidence), []);
+  assert.ok(dealDisplayIssues(precise('00:00:42.124 IST'), observed.evidence).length);
   record.source_created_at = null;
   record.last_polled_at = new Date().toISOString();
   assert.match(
     renderAnswer({ answer_blocks: [card()] }, observed.evidence).text,
     /Created: Not recorded/,
+  );
+});
+
+test('a closing heading with nothing under it is dropped; other text blocks are kept', async () => {
+  const observed = await run({ draft: 'Recorded requirement read.', review: () => approved });
+  const heading = { kind: 'text' as const, text: '*CRM timestamps (IST):*' };
+  const closing = renderAnswer({ answer_blocks: [card(), heading] }, observed.evidence);
+  assert.deepEqual(closing.issues, []);
+  assert.doesNotMatch(closing.text, /CRM timestamps/);
+  // An introduction before a card, and a real closing sentence, stay.
+  const intro = renderAnswer({ answer_blocks: [heading, card()] }, observed.evidence);
+  assert.match(intro.text, /^\*CRM timestamps \(IST\):\*/);
+  const sentence = { kind: 'text' as const, text: 'Both need verification before the visit.' };
+  assert.match(
+    renderAnswer({ answer_blocks: [card(), sentence] }, observed.evidence).text,
+    /Both need verification before the visit\.$/,
   );
 });
 

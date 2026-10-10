@@ -59,6 +59,7 @@ import { modelJsonSchema } from './model-schema.js';
 import {
   answerReviewSchema,
   ANSWER_REVIEW_CONTRACT,
+  executionFailure,
   resolveAnswerReview,
   preservesAnswerFacts,
   type ExecutionReport,
@@ -1040,6 +1041,10 @@ export function buildSalesGraph(
           attemptStatus.status =
             output.ok === true ? 'completed' : output.code === 'TIMEOUT' ? 'timed_out' : 'failed';
           if (output.ok === true) attemptStatus.successes++;
+          // Review must not demand a retry that only someone outside the chat can unblock.
+          delete attemptStatus.last_code;
+          delete attemptStatus.outside_action_required;
+          Object.assign(attemptStatus, executionFailure(output));
         }
         if (call.name === RECALL_TOOL) {
           const selectors = output.ok === true ? JSON.parse(call.arguments) : {};

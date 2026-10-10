@@ -461,6 +461,31 @@ test('a narrowed route draft is never the partial answer for the widened turn', 
   assert.equal(result.trace.outcome, 'unavailable');
 });
 
+test('review sees the failure code, a fixable failure is not marked final, and success clears it', async () => {
+  const bad = { name: 'search_crm_leads', arguments: '{"query":"Acme"}' };
+  const good = { name: 'search_crm_leads', arguments: '{"view":"assigned"}' };
+  const route = { route: 'work', objective: 'Find leads.', reply: '', workflow: 'general' };
+  const reviewed = async (batches: Array<Array<typeof bad>>) => {
+    const f = fixtureAgent(route, batches, true, 'Fixture Acme Storage is assigned.');
+    await f.prepare('Find my Acme lead.');
+    const review = f.requests.find((r) => r.stage === 'verifier')!;
+    return JSON.parse(review.messages[0]!.content).execution_status.tools.search_crm_leads;
+  };
+  // Context Engine marks invalid arguments retryable=false ("do not repeat unchanged"), but a
+  // corrected call can succeed, so review must not treat this read as impossible.
+  assert.deepEqual(await reviewed([[bad]]), {
+    status: 'failed',
+    attempts: 1,
+    successes: 0,
+    last_code: 'INVALID_ARGUMENTS',
+  });
+  assert.deepEqual(await reviewed([[bad], [good]]), {
+    status: 'completed',
+    attempts: 2,
+    successes: 1,
+  });
+});
+
 test('a direct reply rejected only for layout is reformatted, not re-planned', async () => {
   const f = fixtureAgent(
     {

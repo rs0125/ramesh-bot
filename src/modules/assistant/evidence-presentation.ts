@@ -33,6 +33,14 @@ export function presentSource<T extends ContextEvidence>(value: T, tool: string)
   if (consistency) delete consistency.transaction_started_at;
   const clock = object(data.server_clock);
   if (clock) delete clock.as_of;
+  // A null cursor means every item this query matched is here. Say so, so a one-item list
+  // is not hedged as possibly partial. Never on an empty list: "complete, 0 items" would make
+  // a wrong filter (a locality searched as a city) look like a confirmed absence.
+  if (Array.isArray(data.items) && data.items.length > 0 && 'nextCursor' in data)
+    data.list_status = {
+      all_results_for_this_query: data.nextCursor === null,
+      item_count: data.items.length,
+    };
   return result;
 }
 

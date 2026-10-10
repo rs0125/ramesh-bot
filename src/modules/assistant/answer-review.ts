@@ -24,7 +24,11 @@ export const answerReviewSchema = z
         z
           .object({
             severity: z.enum(['blocking', 'suggestion']),
-            kind: z.enum(['factual', 'scope', 'execution_status', 'presentation']),
+            kind: z
+              .enum(['factual', 'scope', 'execution_status', 'presentation'])
+              .describe(
+                'factual: a stated fact is wrong or unsupported by evidence. scope: part of the request is missing or was not attempted. execution_status: the answer claims a tool ran, returned a result, or saved or sent something, when it did not. presentation: wording or layout only.',
+              ),
             message: z.string().min(1).max(800),
             quote: z.string().max(2400),
             replacement: z.string().max(4000).nullable(),
@@ -108,9 +112,55 @@ export interface ExecutionReport {
         | 'evidence_available';
       attempts: number;
       successes: number;
+      /** Latest failure code. */
+      last_code?: string;
+      /** Set only when no request from this chat can succeed until someone acts outside it. */
+      outside_action_required?: string;
     }
   >;
 }
+// Recovery actions that need a person outside the chat. correct_query, retry_later and
+// investigate_source_response stay fixable: a corrected or later request may succeed.
+const OUTSIDE_ACTIONS = new Set([
+  'check_source_configuration',
+  'check_google_access',
+  'check_capabilities',
+  'check_engine_access',
+  'connect_gmail',
+  'reconnect_gmail',
+  'finish_gmail_disconnect',
+  'check_gmail_connection',
+]);
+const OUTSIDE_CODES = new Set(['ACCESS_DENIED', 'AUTH_REQUIRED', 'NOT_CONFIGURED']);
+
+/**
+ * What review may know about a failed tool call. Context Engine marks most errors
+ * retryable=false, meaning only "do not repeat this exact request", so that flag is not
+ * used: a corrected request can still succeed after invalid arguments or a large response.
+ */
+export function executionFailure(output: Record<string, unknown>): {
+  last_code?: string;
+  outside_action_required?: string;
+} {
+  if (output.ok === true) return {};
+  const code = typeof output.code === 'string' ? output.code : undefined;
+  const recovery = output.recovery;
+  const action =
+    recovery && typeof recovery === 'object' && !Array.isArray(recovery)
+      ? (recovery as Record<string, unknown>).action
+      : undefined;
+  const outside =
+    typeof action === 'string' && OUTSIDE_ACTIONS.has(action)
+      ? action
+      : code && OUTSIDE_CODES.has(code)
+        ? code.toLowerCase()
+        : undefined;
+  return {
+    ...(code ? { last_code: code } : {}),
+    ...(outside ? { outside_action_required: outside } : {}),
+  };
+}
+
 export interface ResolvedReview {
   supported: boolean;
   feedback: string;

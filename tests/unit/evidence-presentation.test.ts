@@ -57,3 +57,25 @@ test('replay projection removes only named retrieval clocks, retaining business 
   assert.notEqual(runEvidenceId('job-one', 1), runEvidenceId('job-two', 1));
   assert.notEqual(runEvidenceId('job-one', 1), runEvidenceId('job-one', 2));
 });
+
+test('a returned list says whether it is complete, so a single item is not hedged as partial', () => {
+  const list = (nextCursor: string | null, items: unknown[]): ContextEvidence => ({
+    status: 200,
+    source_path: '/api/v1/crm/opportunities/fictional/context',
+    meta: { requestId: 'request', generatedAt: '2026-10-03T10:00:00Z' },
+    data: { section: 'notes', items, nextCursor },
+  });
+  const done = presentSource(list(null, [{ id: 'note-1' }]), 'read_crm_lead_context');
+  assert.deepEqual((done.data as Record<string, unknown>).list_status, {
+    all_results_for_this_query: true,
+    item_count: 1,
+  });
+  const more = presentSource(list('cursor-2', [{ id: 'a' }, { id: 'b' }]), 'search_crm_leads');
+  assert.deepEqual((more.data as Record<string, unknown>).list_status, {
+    all_results_for_this_query: false,
+    item_count: 2,
+  });
+  // An empty result is not labelled complete: it may come from a wrong filter.
+  const empty = presentSource(list(null, []), 'search_warehouses');
+  assert.equal((empty.data as Record<string, unknown>).list_status, undefined);
+});

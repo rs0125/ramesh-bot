@@ -1,7 +1,7 @@
 import { loadPrompt } from './prompt-files.js';
 import { ANSWER_RENDERING_CONTRACT } from './answer-rendering.js';
 /** Personal-assistant instructions; exported names retained for graph compatibility. */
-export const SALES_PROMPT_VERSION = 'ramesh-chief-of-staff-v46';
+export const SALES_PROMPT_VERSION = 'ramesh-chief-of-staff-v47';
 const evidencePolicy = loadPrompt('evidence-policy');
 const requirementInterpretation = loadPrompt('requirement-interpretation');
 export const SALES_MANAGER_PROMPT = `${loadPrompt('chief-of-staff')}\n\n${loadPrompt('planning-reference')}\n\n${requirementInterpretation}\n\n${evidencePolicy}`;
