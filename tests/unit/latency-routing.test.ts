@@ -219,7 +219,9 @@ test('terse real-chat commands and injected greetings never take the social shor
 });
 
 /** true/false approve or reject with a format repair; an object rejects with that repair. */
-type Verdict = boolean | { supported: false; repair: 'evidence' | 'tools' };
+type Verdict =
+  | boolean
+  | { supported: false; repair: 'evidence' | 'tools'; kind?: 'scope' | 'factual' };
 
 function fixtureAgent(
   route: Record<string, unknown>,
@@ -231,7 +233,7 @@ function fixtureAgent(
   const fixture = createSalesFixture();
   // A list gives one verdict per review pass; the last verdict repeats.
   let reviews = 0;
-  const verdict = (): { supported: boolean; repair: string } => {
+  const verdict = (): { supported: boolean; repair: string; kind?: string } => {
     const next = Array.isArray(approved)
       ? approved[Math.min(reviews++, approved.length - 1)]!
       : approved;
@@ -247,12 +249,27 @@ function fixtureAgent(
       const plan = planningResult(request);
       if (plan) return plan;
       if (request.stage === 'verifier') {
-        const { supported, repair } = verdict();
+        const { supported, repair, kind } = verdict();
         return generated(
           JSON.stringify({
             supported,
             feedback: supported ? '' : 'No authoritative write receipt. Do not claim a save.',
             repair,
+            ...(kind
+              ? {
+                  reason: kind === 'scope' ? 'incomplete_answer' : 'unsupported_claim',
+                  findings: [
+                    {
+                      severity: 'blocking',
+                      kind,
+                      message: `Synthetic ${kind} finding.`,
+                      quote: '',
+                      replacement: null,
+                      references: [],
+                    },
+                  ],
+                }
+              : {}),
           }),
         );
       }
@@ -417,6 +434,31 @@ test('a rejected direct reply re-plans with tools instead of only rewording', as
   const widened = result.trace.events?.find((e) => e.code === 'ROUTE_WIDENED');
   assert.deepEqual(widened?.detail?.from, 'direct');
   assert.ok(!result.trace.events?.some((e) => e.code === 'REVIEW_EXHAUSTED_FALLBACK'));
+});
+
+test('a narrowed route draft is never the partial answer for the widened turn', async () => {
+  // The router's wrong direct reply was only incomplete; the widened answer then fails a fact
+  // check. Sending the router's "can't access" reply as a partial answer would be wrong.
+  const f = fixtureAgent(
+    {
+      route: 'direct',
+      objective: 'Answer.',
+      reply: 'I can’t access your follow-ups in this chat.',
+      workflow: 'general',
+    },
+    [[{ name: 'search_crm_leads', arguments: '{"view":"assigned"}' }]],
+    [
+      { supported: false, repair: 'tools', kind: 'scope' },
+      { supported: false, repair: 'tools', kind: 'factual' },
+    ],
+    'Fixture Acme Storage has a follow-up today at 10:00.',
+  );
+  const result = await f.prepare('What are my follow-ups today?');
+  const codes = result.trace.events?.map((e) => e.code) ?? [];
+  assert.ok(codes.includes('ROUTE_WIDENED'));
+  assert.ok(!codes.includes('PARTIAL_DELIVERED'));
+  assert.doesNotMatch(result.text, /can’t access/);
+  assert.equal(result.trace.outcome, 'unavailable');
 });
 
 test('a direct reply rejected only for layout is reformatted, not re-planned', async () => {

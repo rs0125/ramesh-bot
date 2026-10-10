@@ -49,6 +49,10 @@ export function reviewMetric(
 }
 
 /** A failed review cannot turn its draft, feedback, or source values into a user-facing reply. */
+/** Appended when review ran out and only an incomplete, otherwise supported draft remains. */
+export const PARTIAL_ANSWER_NOTE =
+  '_This is a partial answer: I couldn’t get everything you asked for._';
+
 export function reviewFailureReply(input: {
   hasEvidence: boolean;
   reason: ReviewFailure;

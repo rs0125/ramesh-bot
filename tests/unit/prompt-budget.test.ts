@@ -11,9 +11,9 @@ import * as prompts from '../../src/modules/assistant/sales-prompts.js';
 
 const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 
-// Recorded 2026-10-10 at prompt version ramesh-chief-of-staff-v45 (after 3e22cbb).
+// Recorded 2026-10-10 at ramesh-chief-of-staff-v45 (after 3e22cbb); router lowered at v46.
 const COMPOSED: Record<string, number> = {
-  ROUTER_PROMPT: 3867,
+  ROUTER_PROMPT: 3866,
   PLANNER_PROMPT: 5642,
   WORKER_PROMPT: 8262,
   SALES_VERIFIER_PROMPT: 6838,
@@ -32,7 +32,7 @@ const FILES: Record<string, number> = {
   'planner.md': 1404,
   'planning-reference.md': 1423,
   'requirement-interpretation.md': 432,
-  'router.md': 1484,
+  'router.md': 1483,
   'verifier.md': 4023,
   'worker.md': 1893,
 };

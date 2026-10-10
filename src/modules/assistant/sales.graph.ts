@@ -44,7 +44,12 @@ import type { PersonalToolRun, PersonalReply } from '../scheduling/personal-tool
 import { compositeDeliverySchema } from '../messaging/delivery-evidence.js';
 import { displayedWarehouseRecords } from './displayed-records.js';
 import { currentRecall } from './recall-evidence.js';
-import { reviewFailure, reviewMetric, reviewFailureReply } from './review-diagnostics.js';
+import {
+  PARTIAL_ANSWER_NOTE,
+  reviewFailure,
+  reviewMetric,
+  reviewFailureReply,
+} from './review-diagnostics.js';
 import type { BusinessWriteRun, BusinessWriteReply } from '../writes/write-tools.js';
 import { notifyToolActivity } from './tool-activity.js';
 import { workingContext } from './working-context.js';
@@ -89,6 +94,10 @@ const state = new StateSchema({
   /** Layout-only findings get one formatting pass; afterwards an approved answer is delivered. */
   layoutRepairTried: z.boolean().default(false),
   approvedSnapshot: z
+    .custom<{ reply: string; supplement: string; renderedRecords: RenderedCrmRecord[] } | null>()
+    .default(null),
+  /** Latest reviewed draft whose only blocking finding was missing scope; a last resort. */
+  partialCandidate: z
     .custom<{ reply: string; supplement: string; renderedRecords: RenderedCrmRecord[] } | null>()
     .default(null),
   blocked: z.boolean().default(false),
@@ -863,8 +872,16 @@ export function buildSalesGraph(
         personalOnly: false,
         // The plan used the rejected reply and feedback. The widened attempt is a fresh answer,
         // not a repair that must preserve the rejected reply's facts.
+        // A draft from the narrowed route is not a safe partial answer for the widened one.
         ...(widened
-          ? { reply: '', supplement: '', renderedRecords: [], renderIssues: [], feedback: '' }
+          ? {
+              reply: '',
+              supplement: '',
+              renderedRecords: [],
+              renderIssues: [],
+              feedback: '',
+              partialCandidate: null,
+            }
           : {}),
         ...(plan.clarification ? { draft: plan.clarification.question, draftReady: true } : {}),
         stages: [...value.stages, recordMetric(metric('planner', started, result))],
@@ -1260,6 +1277,17 @@ export function buildSalesGraph(
             pass: value.repairs + 1,
           },
         });
+      // Incomplete but honest: every blocking finding is missing scope, with no factual or
+      // execution finding and no deterministic factual issue. Kept in case review runs out.
+      // Access problems are reported through the reason, not the finding kind, so require it.
+      const blockingFindings = rawReview.findings.filter((f) => f.severity === 'blocking');
+      const scopeOnly =
+        !review.supported &&
+        rawReview.reason === 'incomplete_answer' &&
+        !factualIssues.length &&
+        !review.patchedAnswer &&
+        blockingFindings.length > 0 &&
+        blockingFindings.every((f) => f.kind === 'scope');
       // The formatting pass for an approved answer was itself rejected: deliver the approved original.
       const revert = !review.supported && value.approvedSnapshot ? value.approvedSnapshot : null;
       if (revert) gate({ stage: 'verifier', code: 'FORMAT_REPAIR_REVERTED', blocking: false });
@@ -1274,6 +1302,13 @@ export function buildSalesGraph(
                 renderedRecords: value.renderedRecords,
               }
             : null,
+        partialCandidate: scopeOnly
+          ? {
+              reply: value.reply,
+              supplement: value.supplement,
+              renderedRecords: value.renderedRecords,
+            }
+          : value.partialCandidate,
         ...(review.patchedAnswer && !issues.length ? { reply: review.patchedAnswer } : {}),
         ...(revert ?? {}),
         reviewPatched: !!review.patchedAnswer && !issues.length,
@@ -1308,12 +1343,30 @@ export function buildSalesGraph(
       session!.revise!(JSON.stringify({ answer: value.reply, feedback: value.feedback }));
       return {};
     })
-    .addNode('finish', async (value, config) => {
+    .addNode('finish', async (input, config) => {
       activeStage = 'finish';
-      if (value.blocked) {
+      if (input.blocked) {
         gate({ stage: 'finish', code: 'ACCESS_BLOCKED', blocking: true });
         return { reply: deniedReply, unavailable: true };
       }
+      // Review ran out, but an earlier draft was only incomplete. Deliver it, marked partial,
+      // unless that would commit an unapproved personal change or business write.
+      const partial =
+        !input.approved &&
+        input.partialCandidate &&
+        !input.plan?.clarification &&
+        !personal?.pendingOperations.length &&
+        !writes?.preview()
+          ? input.partialCandidate
+          : null;
+      if (partial)
+        gate({
+          stage: 'finish',
+          code: 'PARTIAL_DELIVERED',
+          blocking: false,
+          detail: { reason: input.reviewReason },
+        });
+      const value = partial ? { ...input, ...partial, approved: true } : input;
       if (!value.approved) {
         gate({
           stage: 'finish',
@@ -1403,7 +1456,9 @@ export function buildSalesGraph(
           : writes?.historyDelivery()
             ? { text: '', delivery: writes.historyDelivery()! }
             : undefined);
-      const reply = [otherReply, writeReply?.text].filter(Boolean).join('\n\n');
+      const reply = [otherReply, writeReply?.text, partial ? PARTIAL_ANSWER_NOTE : undefined]
+        .filter(Boolean)
+        .join('\n\n');
       if (!reply || reply.length > 16000)
         throw new GateRejection('REPLY_LENGTH_INVALID', { length: reply.length, composed: true });
       return {
