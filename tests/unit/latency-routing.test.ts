@@ -393,6 +393,50 @@ test('a formatting pass the reviewer rejects falls back to the approved original
   assert.ok(!codes?.includes('REVIEW_EXHAUSTED_FALLBACK'));
 });
 
+test('a rejected direct reply re-plans with tools instead of only rewording', async () => {
+  // Smoke run 1, case 9: the router answered an actionable request directly with a wrong claim.
+  const f = fixtureAgent(
+    {
+      route: 'direct',
+      objective: 'Answer.',
+      reply: 'That time has already passed. Which day did you mean?',
+      workflow: 'general',
+    },
+    [[{ name: 'search_crm_leads', arguments: '{"view":"assigned"}' }]],
+    [{ supported: false, repair: 'evidence' }, true],
+    'Fixture Acme Storage has a follow-up today at 10:00.',
+    'Fixture Acme Storage has a follow-up today at 10:00.',
+  );
+  const result = await f.prepare('Check Acme and tell me when to follow up.');
+  assert.equal(result.trace.outcome, 'completed');
+  const stages = f.requests.map((x) => x.stage);
+  assert.deepEqual(stages.slice(0, 3), ['converser', 'verifier', 'planner']);
+  assert.ok(!result.trace.stages.some((s) => s.answerRepair?.kind === 'evidence'));
+  assert.equal(f.sessions.length, 1);
+  assert.ok(f.sessions[0]!.tools.some((t) => t.name === 'search_crm_leads'));
+  const widened = result.trace.events?.find((e) => e.code === 'ROUTE_WIDENED');
+  assert.deepEqual(widened?.detail?.from, 'direct');
+  assert.ok(!result.trace.events?.some((e) => e.code === 'REVIEW_EXHAUSTED_FALLBACK'));
+});
+
+test('a direct reply rejected only for layout is reformatted, not re-planned', async () => {
+  const f = fixtureAgent(
+    {
+      route: 'direct',
+      objective: 'Answer.',
+      reply: 'We can leverage the dock from 12 Oct.',
+      workflow: 'general',
+    },
+    [],
+    true,
+    undefined,
+    'We can use the dock from 12 Oct.',
+  );
+  const result = await f.prepare('When can we use the dock?');
+  assert.ok(!f.requests.some((x) => x.stage === 'planner'));
+  assert.ok(!result.trace.events?.some((e) => e.code === 'ROUTE_WIDENED'));
+});
+
 test('an invented save in a misrouted RFQ reply cannot bypass review', async () => {
   const f = fixtureAgent(
     {

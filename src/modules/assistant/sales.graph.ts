@@ -200,6 +200,25 @@ export function buildSalesGraph(
       ? sessionTools.filter(({ name }) => budgets[toolFamily(name)] > 0).map(({ name }) => name)
       : [];
   };
+  // The router's direct and personal-only routes are latency hints, not final decisions. When
+  // review rejects work done on a narrowed route for a substantive reason, re-plan once with
+  // every tool instead of spending the remaining review pass on rewording.
+  const narrowedRoute = (value: typeof state.State): 'direct' | 'personal' | undefined =>
+    value.repairKind === 'format' ||
+    value.researchExhausted ||
+    Date.now() >= (options.researchDeadlineMs ?? Infinity) ||
+    toolSteps >= 28
+      ? undefined
+      : value.route === 'direct'
+        ? !session && remainingTools() > 0
+          ? 'direct'
+          : undefined
+        : value.personalOnly &&
+            value.repairKind === 'tools' &&
+            !!run?.tools.length &&
+            familyBudgets().business > 0
+          ? 'personal'
+          : undefined;
   const toolBudget = () => ({
     remaining: remainingTools(),
     families: familyBudgets(),
@@ -825,8 +844,28 @@ export function buildSalesGraph(
       const result = attempt.result;
       const plan = validateTaskPlan(JSON.parse(result.text), tools);
       if (!plan.clarification) startSession(plan, value.input, false);
+      // Reached from a direct or personal-only route only after review asked for more work.
+      const widened = value.route === 'direct' || value.personalOnly;
+      if (widened)
+        gate({
+          stage: 'planner',
+          code: 'ROUTE_WIDENED',
+          blocking: false,
+          detail: {
+            from: value.personalOnly ? 'personal' : 'direct',
+            reason: value.reviewReason,
+            repair: value.repairKind,
+          },
+        });
       return {
         plan,
+        route: 'work' as const,
+        personalOnly: false,
+        // The plan used the rejected reply and feedback. The widened attempt is a fresh answer,
+        // not a repair that must preserve the rejected reply's facts.
+        ...(widened
+          ? { reply: '', supplement: '', renderedRecords: [], renderIssues: [], feedback: '' }
+          : {}),
         ...(plan.clarification ? { draft: plan.clarification.question, draftReady: true } : {}),
         stages: [...value.stages, recordMetric(metric('planner', started, result))],
       };
@@ -1429,23 +1468,25 @@ export function buildSalesGraph(
         ? 'finish'
         : value.reviewPatched
           ? 'verifier'
-          : value.repairKind === 'evidence'
-            ? value.evidenceRepairs < 1
-              ? 'evidence_repair'
-              : 'finish'
-            : !value.researchExhausted &&
-                Date.now() < (options.researchDeadlineMs ?? Infinity) &&
-                value.repairKind !== 'format' &&
-                remainingTools() > 0 &&
-                toolSteps < 28
-              ? !value.plan?.clarification && session?.revise
-                ? 'revise'
-                : 'planner'
-              : value.repairKind === 'format'
-                ? 'formatter'
-                : value.evidenceRepairs < 1
-                  ? 'evidence_repair'
-                  : 'finish',
+          : narrowedRoute(value)
+            ? 'planner'
+            : value.repairKind === 'evidence'
+              ? value.evidenceRepairs < 1
+                ? 'evidence_repair'
+                : 'finish'
+              : !value.researchExhausted &&
+                  Date.now() < (options.researchDeadlineMs ?? Infinity) &&
+                  value.repairKind !== 'format' &&
+                  remainingTools() > 0 &&
+                  toolSteps < 28
+                ? !value.plan?.clarification && session?.revise
+                  ? 'revise'
+                  : 'planner'
+                : value.repairKind === 'format'
+                  ? 'formatter'
+                  : value.evidenceRepairs < 1
+                    ? 'evidence_repair'
+                    : 'finish',
     )
     .addEdge('revise', 'worker')
     .addEdge('finish', END)
