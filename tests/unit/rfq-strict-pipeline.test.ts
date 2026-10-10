@@ -218,7 +218,7 @@ test('an uncertain receipt is checked with the same arguments and stops inviting
     'application recovery needs no formatting or tool inference',
   );
   assert.match(second.text, /still can’t confirm/);
-  assert.match(second.text, /administrator to check and resolve the existing submission/);
+  assert.match(second.text, /administrator to look for it in CRM first/);
   assert.doesNotMatch(
     second.text,
     /Say “retry”|Saved RFQ|submitting again|resubmit|new submission/,

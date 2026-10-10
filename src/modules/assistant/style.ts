@@ -55,10 +55,24 @@ export function styleViolations(text: string, maximumCharacters = 4000): string[
   ];
 }
 
+/**
+ * Quoted material is the user's or a source's wording, not generated phrasing: a CRM note
+ * that says "leverage" is data. Remove quotes, italic transcripts and quote blocks before
+ * the stock-phrase check. Layout checks still see the full text.
+ */
+export function withoutQuotedText(text: string): string {
+  return text
+    .replace(/^>.*$/gm, '')
+    .replace(/"[^"\n]{1,500}"/g, '""')
+    .replace(/“[^”\n]{1,500}”/g, '“”')
+    .replace(/(?<![\p{L}\p{N}_])_[^_\n]{1,500}_(?![\p{L}\p{N}_])/gu, '__');
+}
+
 /** Mechanical chat layout checks belong in code, independently of semantic model review. */
 export function chatLayoutIssues(text: string): string[] {
+  const generated = withoutQuotedText(text);
   return [
-    ...STOCK_PHRASES.filter((phrase) => phrase.test(text)).map(
+    ...STOCK_PHRASES.filter((phrase) => phrase.test(generated)).map(
       (phrase) =>
         `Rephrase the stock wording matching ${phrase.source} naturally while preserving its facts.`,
     ),

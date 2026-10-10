@@ -112,7 +112,7 @@ test('uncertainty takes priority over a later unsent result, while verified succ
     message: 'PRIVATE_BODY',
   };
   const text = rfqWriteRecoveryText(op, Date.parse(op.createdAt))!;
-  assert.match(text, /may already be there/);
+  assert.match(text, /may or may not be there/);
   assert.match(text, /Say “retry”/);
   assert.doesNotMatch(
     text,
@@ -121,7 +121,7 @@ test('uncertainty takes priority over a later unsent result, while verified succ
   op.dispatchAttempts = 2;
   const retried = rfqWriteRecoveryText(op, Date.parse(op.createdAt))!;
   assert.match(retried, /still can’t confirm/);
-  assert.match(retried, /administrator to check and resolve the existing submission/);
+  assert.match(retried, /administrator to look for it in CRM first/);
   assert.doesNotMatch(retried, /Say “retry”|Nothing was sent|cancel|PRIVATE_|Test Logistics/);
   assert.doesNotMatch(retried, /submitting again|resubmit|new submission/);
   op.dispatchAttempts = 1;

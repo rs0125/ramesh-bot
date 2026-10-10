@@ -16,14 +16,16 @@ export function rfqWriteRecoveryText(operation: WriteOperation, now: number): st
     operation.state === 'DISPATCHING' ||
     operation.result?.outcome === 'outcome_unknown'
   ) {
-    const reconcile = 'Ask an administrator to check and resolve the existing submission.';
+    // Unknown means it may or may not exist. Never imply a saved record, and steer away from a resend.
+    const reconcile =
+      'Please don’t send it again as a new RFQ: ask an administrator to look for it in CRM first, so it isn’t saved twice.';
     if (operation.dispatchAttempts > 1)
-      return `I still can’t confirm whether this requirement was saved in CRM. It may already be there. ${reconcile}`;
+      return `I still can’t confirm whether this requirement was saved in CRM. It may or may not be there. ${reconcile}`;
     const next =
       Date.parse(operation.expiresAt) > now
-        ? 'Say “retry” to check the existing submission.'
+        ? 'Say “retry” and I’ll check again. A retry reuses the same submission, so it won’t create a second RFQ.'
         : reconcile;
-    return `I can’t confirm whether this requirement was saved in CRM. It may already be there. ${next}`;
+    return `I can’t confirm whether this requirement was saved in CRM. It may or may not be there. ${next}`;
   }
   if (operation.state !== 'APPROVED' || operation.result?.outcome !== 'not_dispatched')
     return undefined;

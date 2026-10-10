@@ -19,6 +19,7 @@ import {
   simplePersonalListKind,
 } from './personal-list-presentation.js';
 import { PRESENTATION_META_KEY } from '../presentation/tool-presentation.js';
+import { containsUserText } from '../messaging/source-text.js';
 export { renderList, renderReceipt } from './personal-presentation.js';
 import {
   SchedulingError,
@@ -686,18 +687,19 @@ export class PersonalToolRun {
         const member = this.trusted.commandMessages!.find(
           (entry) => entry.id === proposal.source.messageId,
         );
-        if (!member || member.forwarded || !member.text.includes(proposal.source.quote))
+        // Case, layout and curly quotes may differ; words and numbers must match the user's text.
+        if (!member || member.forwarded || !containsUserText(member.text, proposal.source.quote))
           throw new SchedulingError('UNTRUSTED_COMMAND_SOURCE');
         const textMember =
           'text' in proposal && proposal.text !== undefined
             ? (this.trusted.commandMessages!.find(
-                (entry) => !entry.forwarded && entry.text.includes(proposal.text!),
+                (entry) => !entry.forwarded && containsUserText(entry.text, proposal.text!),
               ) ??
               this.recalledInstructions.find(
                 (entry) =>
                   this.now() - entry.receivedAtMs <= 86400000 &&
                   entry.receivedAtMs <= this.now() &&
-                  entry.text.includes(proposal.text!),
+                  containsUserText(entry.text, proposal.text!),
               ))
             : undefined;
         if ('text' in proposal && proposal.text !== undefined && !textMember)

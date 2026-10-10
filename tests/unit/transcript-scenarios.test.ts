@@ -145,7 +145,7 @@ test('yes uses exact earlier source; a separate RFQ keeps its own absent fields 
   assert.equal(fixture.state.writes.at(-1)!.result.operation_id, saved.operation_id);
   assert.equal(fixture.state.writes.at(-1)!.result.outcome, 'outcome_unknown');
   assert.match(recovery!.text, /still can’t confirm/);
-  assert.match(recovery!.text, /administrator.*existing submission/);
+  assert.match(recovery!.text, /administrator to look for it in CRM first/);
   assert.doesNotMatch(recovery!.text, /Say “retry”|Nothing was sent|Saved RFQ/);
   const calls = fixture.state.writes.length;
   fixture.trusted('An unrelated question');
