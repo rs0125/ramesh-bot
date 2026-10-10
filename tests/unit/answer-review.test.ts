@@ -62,6 +62,15 @@ test('source-bound repair changes only the reviewed span and preserves ranking a
   );
 });
 
+test('a reviewer replacement gets the same final normalisation as any reply', () => {
+  const dashed = { ...finding(), replacement: 'ID 101 \u2014 Fire NOC is recorded as available.' };
+  const result = resolveAnswerReview(review([dashed]), answer, evidence, execution, true);
+  assert.equal(
+    result.patchedAnswer,
+    'Start with ID 101.\nID 101, Fire NOC is recorded as available.\nConfirm the documents.',
+  );
+});
+
 test('review cannot transfer a field between records or use retired evidence', () => {
   const cases = [
     { pointer: '/data/items/1/fire_noc_available', value_json: 'false', record_id: '101' },

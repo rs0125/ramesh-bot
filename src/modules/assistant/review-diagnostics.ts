@@ -53,6 +53,39 @@ export function reviewMetric(
 export const PARTIAL_ANSWER_NOTE =
   '_This is a partial answer: I couldn’t get everything you asked for._';
 
+const ACRONYMS = new Set(['ga4', 'crm', 'rfq', 'kpi', 'url']);
+const toolLabel = (tool: string) =>
+  tool
+    .split('_')
+    .map((word, index) =>
+      ACRONYMS.has(word)
+        ? word.toUpperCase()
+        : index === 0
+          ? word.charAt(0).toUpperCase() + word.slice(1)
+          : word,
+    )
+    .join(' ');
+type ToolStatus = { status: string; last_code?: string; outside_action_required?: string };
+const failureReason = (failure: ToolStatus) =>
+  failure.outside_action_required
+    ? 'access or setup needs fixing outside this chat'
+    : failure.status === 'timed_out' || failure.last_code === 'TIMEOUT'
+      ? 'timed out'
+      : failure.last_code === 'RATE_LIMITED'
+        ? 'rate limited, try later'
+        : 'unavailable';
+
+/** Partial-answer note. Failed sources come from the execution report, never model wording. */
+export function partialAnswerNote(tools: Record<string, ToolStatus>): string {
+  const failed = Object.entries(tools)
+    .filter(([, tool]) => tool.status === 'failed' || tool.status === 'timed_out')
+    .slice(0, 4)
+    .map(([name, tool]) => `${toolLabel(name)} (${failureReason(tool)})`);
+  return failed.length
+    ? `_This is a partial answer. Couldn’t get: ${failed.join('; ')}._`
+    : PARTIAL_ANSWER_NOTE;
+}
+
 export function reviewFailureReply(input: {
   hasEvidence: boolean;
   reason: ReviewFailure;

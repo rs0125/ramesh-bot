@@ -45,7 +45,7 @@ import { compositeDeliverySchema } from '../messaging/delivery-evidence.js';
 import { displayedWarehouseRecords } from './displayed-records.js';
 import { currentRecall } from './recall-evidence.js';
 import {
-  PARTIAL_ANSWER_NOTE,
+  partialAnswerNote,
   reviewFailure,
   reviewMetric,
   reviewFailureReply,
@@ -316,6 +316,7 @@ export function buildSalesGraph(
     plan: z.infer<typeof taskPlanSchema>,
     input: string,
     personalOnly: boolean,
+    previousAttempt?: { answer: string; feedback: string },
   ) => {
     sessionTools = personalOnly ? [...(personal?.tools ?? [])] : tools;
     // Only authenticated Context Engine reads may share a response.
@@ -330,7 +331,19 @@ export function buildSalesGraph(
       instructions: `${WORKER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}`,
       messages: [
         ...modelHistory,
-        { role: 'assistant', content: JSON.stringify({ provisional_task_plan: plan }) },
+        {
+          role: 'assistant',
+          content: JSON.stringify({
+            provisional_task_plan: plan,
+            // Keep what the review did not criticise; fix only what it raised.
+            ...(previousAttempt
+              ? {
+                  rejected_previous_answer: previousAttempt.answer.slice(0, 4000),
+                  review_feedback: previousAttempt.feedback,
+                }
+              : {}),
+          }),
+        },
         { role: 'user', content: input },
       ],
       tools: sessionTools,
@@ -853,9 +866,17 @@ export function buildSalesGraph(
       if (attempt.limited) return { researchExhausted: true };
       const result = attempt.result;
       const plan = validateTaskPlan(JSON.parse(result.text), tools);
-      if (!plan.clarification) startSession(plan, value.input, false);
       // Reached from a direct or personal-only route only after review asked for more work.
       const widened = value.route === 'direct' || value.personalOnly;
+      if (!plan.clarification)
+        startSession(
+          plan,
+          value.input,
+          false,
+          widened && value.reply && value.feedback
+            ? { answer: value.reply, feedback: value.feedback }
+            : undefined,
+        );
       if (widened)
         gate({
           stage: 'planner',
@@ -1461,7 +1482,11 @@ export function buildSalesGraph(
           : writes?.historyDelivery()
             ? { text: '', delivery: writes.historyDelivery()! }
             : undefined);
-      const reply = [otherReply, writeReply?.text, partial ? PARTIAL_ANSWER_NOTE : undefined]
+      const reply = [
+        otherReply,
+        writeReply?.text,
+        partial ? partialAnswerNote(executionReport(value.researchExhausted).tools) : undefined,
+      ]
         .filter(Boolean)
         .join('\n\n');
       if (!reply || reply.length > 16000)

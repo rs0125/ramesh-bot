@@ -433,6 +433,15 @@ test('a rejected direct reply re-plans with tools instead of only rewording', as
   assert.ok(f.sessions[0]!.tools.some((t) => t.name === 'search_crm_leads'));
   const widened = result.trace.events?.find((e) => e.code === 'ROUTE_WIDENED');
   assert.deepEqual(widened?.detail?.from, 'direct');
+  // The re-planned worker sees what was rejected and why, so it can keep what was right.
+  const plan = JSON.parse(
+    f.sessions[0]!.messages.find((m) => m.role === 'assistant')!.content as string,
+  );
+  assert.equal(
+    plan.rejected_previous_answer,
+    'That time has already passed. Which day did you mean?',
+  );
+  assert.match(plan.review_feedback, /No authoritative write receipt/);
   assert.ok(!result.trace.events?.some((e) => e.code === 'REVIEW_EXHAUSTED_FALLBACK'));
 });
 
@@ -479,6 +488,12 @@ test('review sees the failure code, a fixable failure is not marked final, and s
     successes: 0,
     last_code: 'INVALID_ARGUMENTS',
   });
+  const plain = fixtureAgent(route, [[good]], true, 'Fixture Acme Storage is assigned.');
+  await plain.prepare('Find my Acme lead.');
+  assert.doesNotMatch(
+    plain.sessions[0]!.messages.find((m) => m.role === 'assistant')!.content as string,
+    /rejected_previous_answer/,
+  );
   assert.deepEqual(await reviewed([[bad], [good]]), {
     status: 'completed',
     attempts: 2,

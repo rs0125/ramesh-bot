@@ -1,4 +1,5 @@
 /** Source-bound, exact-span review repairs. Reviewer prose never becomes source evidence. */
+import { finishReply } from './style.js';
 import { z } from 'zod';
 import { reviewFailure } from './review-diagnostics.js';
 import type { ToolEvidence } from './tool-evidence.js';
@@ -301,6 +302,8 @@ export function resolveAnswerReview(
   for (const patch of patches.sort((a, b) => b.start - a.start))
     patchedAnswer =
       patchedAnswer.slice(0, patch.start) + patch.replacement + patchedAnswer.slice(patch.end);
+  // A reviewer replacement is new text: give it the same final normalisation as any reply.
+  patchedAnswer = finishReply(patchedAnswer);
   if (!patchedAnswer.trim() || patchedAnswer.length > 12000) return invalid;
   if (patchedAnswer === answer)
     return {

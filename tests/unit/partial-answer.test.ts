@@ -17,6 +17,7 @@ import {
 } from '../../src/modules/scheduling/personal-tools.js';
 import type { PersonalOperation } from '../../src/modules/scheduling/scheduling.types.js';
 import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.types.js';
+import { ContextEngineError } from '../../src/modules/context-engine/context.types.js';
 
 const now = Date.parse('2026-10-03T04:00:00Z');
 const actor = { employeeId: 7, phoneE164: '+919000000007', chatId: '919000000007@s.whatsapp.net' };
@@ -28,6 +29,8 @@ async function turn(options: {
   drafts: string[];
   reminder?: boolean;
   reason?: string;
+  /** The business read fails with a source that needs fixing outside the chat. */
+  sourceDenied?: boolean;
 }) {
   const requestText = options.reminder
     ? 'Remind me in 20 minutes to review the synthetic proposal. Also tell me the office opening time.'
@@ -73,6 +76,11 @@ async function turn(options: {
       ];
     },
     async call() {
+      if (options.sourceDenied)
+        throw new ContextEngineError('UNAVAILABLE', false, undefined, {
+          sourceCode: 'SYNTHETIC_SOURCE_DENIED',
+          action: 'check_source_configuration',
+        });
       return {
         source_path: '/api/v1/context',
         status: 200,
@@ -263,4 +271,18 @@ test('an access problem labelled as missing scope is never delivered as partial'
   assert.equal(reply.trace.outcome, 'unavailable');
   assert.ok(!reply.text.includes(PARTIAL_ANSWER_NOTE));
   assert.ok(!codes.includes('PARTIAL_DELIVERED'));
+});
+
+test('a partial answer names a failed source from execution facts, not model wording', async () => {
+  const { reply, codes } = await turn({
+    verdicts: ['scope', 'scope'],
+    drafts: [first, second],
+    sourceDenied: true,
+  });
+  assert.ok(codes.includes('PARTIAL_DELIVERED'));
+  assert.ok(reply.text.startsWith(second));
+  assert.match(
+    reply.text,
+    /_This is a partial answer\. Couldn’t get: Get context \(access or setup needs fixing outside this chat\)\._$/,
+  );
 });
