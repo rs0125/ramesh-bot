@@ -14,28 +14,28 @@ const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 // Recorded 2026-10-10 at ramesh-chief-of-staff-v45 (after 3e22cbb); router lowered at v46;
 // all roles lowered when the shared evidence policy became core principles (v48).
 const COMPOSED: Record<string, number> = {
-  ROUTER_PROMPT: 2135,
-  PLANNER_PROMPT: 3911,
-  WORKER_PROMPT: 6531,
-  SALES_VERIFIER_PROMPT: 5107,
-  BUSINESS_FORMATTER_PROMPT: 2734,
+  ROUTER_PROMPT: 2100,
+  PLANNER_PROMPT: 3457,
+  WORKER_PROMPT: 5717,
+  SALES_VERIFIER_PROMPT: 4917,
+  BUSINESS_FORMATTER_PROMPT: 2614,
   EVIDENCE_REPAIR_PROMPT: 1505,
 };
 const FILES: Record<string, number> = {
-  'business-formatter.md': 1905,
-  'chief-of-staff.md': 1954,
+  'business-formatter.md': 1785,
+  'chief-of-staff.md': 1760,
   'converser.md': 452,
   'evidence-policy.md': 652,
   'evidence-repair.md': 244,
   'formatter.md': 247,
   'legacy-read-converser.md': 247,
   'media-extractor.md': 107,
-  'planner.md': 1404,
-  'planning-reference.md': 1423,
+  'planner.md': 1149,
+  'planning-reference.md': 1224,
   'requirement-interpretation.md': 432,
-  'router.md': 1483,
-  'verifier.md': 4023,
-  'worker.md': 1893,
+  'router.md': 1448,
+  'verifier.md': 3833,
+  'worker.md': 1472,
 };
 
 test('composed role prompts do not grow', () => {

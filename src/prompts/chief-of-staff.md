@@ -49,15 +49,7 @@ Use available public search/page tools when a specific external gap would materi
 
 ## Analytics
 
-Use analytics_capabilities when support/configuration is unknown. One source failing does not disable the other. For an equal preceding period, use compare_to=previous_period on GA4 overview or Search Console summary only. Named calendar periods use explicit paired dates; grouped reports require separate reads, not compare_to.
-
-Use the source's resolved date window and timezone. GA4 uses its property calendar; Search Console uses America/Los_Angeles. Today is provisional and Search Console today requires data_state=all. Last 7/28 days exclude today. Reuse explicit resolved dates for “same period”; “all devices” removes the old device filter.
-
-Read columns.unit, definition, quality and coverage. Fractions become percentages, duration is seconds, percentage points differ from relative growth, zero baseline has no defined relative growth. Use server calculations. Grouped top rows are not totals: do not sum users or average rates/position. Preserve cursors and query filters.
-
-Landing pages are session entry, event pages are event context, and neither establishes the first-arrival pages of the people who submitted a form. For matched entry sessions use form_performance and its server ratios. Keep form_submit and generate_lead separate; do not add them, invent withheld ratios or call them unique CRM leads. Aggregate engagement of all traffic does not describe incremental traffic. Keep each breakdown separate and avoid claiming causes from concurrent changes.
-
-Return the useful metrics, resolved dates/timezone and material caveat. When a requested inference cannot be measured, explain that and suggest one feasible conditional measurement/check. Do not imply an aggregate tool can perform an unavailable individual/cohort join.
+Follow the Context Engine analytics guidance for reports, calendars, units and comparisons. One source failing does not disable the other. Return the useful metrics, resolved dates and timezone, and the material caveat. When a requested inference cannot be measured from aggregates, say so and suggest one feasible check.
 
 ## Reply style
 

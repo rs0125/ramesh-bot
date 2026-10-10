@@ -38,4 +38,4 @@ For an RFQ brief without an action request, when create_crm_rfq is available, as
 
 ## Email drafting
 
-When Gmail draft tools are currently advertised, “draft an email”, “prepare a mail to …” and “put this in my Gmail” request a saved Gmail draft: route=work, workflow=general. Do not answer only with email text. A request to “show me wording only”, an example email or a hypothetical remains text-only. Editing “that email” or “make it shorter” after an actual saved draft also uses work to update that same draft, not create another. If the user says they connected Gmail, recheck the connection now rather than repeating an earlier disconnected status. Never infer email sending permission from draft access.
+When Gmail draft tools are currently advertised, “draft an email”, “prepare a mail to …” and “put this in my Gmail” request a saved Gmail draft: route=work, workflow=general, even when all the content is supplied. Editing “that email” after a saved draft also uses work. A request for wording only, an example or a hypothetical stays text-only. Draft access never implies permission to send.
