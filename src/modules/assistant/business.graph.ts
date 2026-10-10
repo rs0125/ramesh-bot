@@ -9,6 +9,7 @@ import { FORMATTER_PROMPT } from './prompts.js';
 import { finishReply } from './style.js';
 import { renderFollowups } from './followups.js';
 import { notifyToolActivity } from './tool-activity.js';
+import { GateRejection } from './failure.js';
 
 export const READ_PROMPT_VERSION = 'ramesh-assigned-followups-v1';
 export const readIntentSchema = z
@@ -108,7 +109,7 @@ export function buildBusinessGraph(
                 : language === 'hi_latn'
                   ? 'Abhi aapke follow-ups check nahi ho paaye. Thodi der mein phir try karein.'
                   : 'अभी आपके फ़ॉलो-अप नहीं देख पाया। थोड़ी देर में फिर कोशिश करें।';
-        if (!reply || reply.length > 4000) throw new Error('Invalid business reply');
+        if (!reply || reply.length > 4000) throw new GateRejection('REPLY_LENGTH_INVALID');
         return {
           reply,
           stages: [
@@ -133,7 +134,7 @@ export function buildBusinessGraph(
         config.signal,
       );
       const reply = finishReply(generated.text);
-      if (!reply || reply.length > 4000) throw new Error('Invalid formatted reply');
+      if (!reply || reply.length > 4000) throw new GateRejection('REPLY_LENGTH_INVALID');
       return {
         reply,
         stages: [

@@ -1,4 +1,7 @@
-/** Runs the graph within a deadline; keeps conversation context out of transport and prompts out of logs. */
+/**
+ * Runs the graph within a deadline; keeps conversation context out of transport and prompts out of
+ * pino logs. Opt-in LangSmith tracing records full content by decision (see AGENTS.md).
+ */
 import { createHash, randomUUID } from 'node:crypto';
 import type { AssistantConfig } from '../../config/assistant.js';
 import type {
@@ -8,6 +11,8 @@ import type {
 } from '../greetings/greeting.types.js';
 import type { AgentTrace, ChatMessage, TextModel } from './assistant.types.js';
 import { ModelFailureError } from './model-failure.js';
+import { classifyFailure, type GateEvent } from './failure.js';
+import { traceTurn, tracedModel } from '../../infrastructure/observability/tracing.js';
 import { buildAssistantGraph } from './assistant.graph.js';
 import { ConversationMemory, PRIVATE_HISTORY_REPLY } from './conversation-memory.js';
 import { PROMPT_VERSION } from './prompts.js';
@@ -43,6 +48,8 @@ export const UNAVAILABLE_REPLY = "I'm having trouble replying right now. Try aga
 
 export class AssistantService {
   private readonly graph;
+  /** The same model, with LangSmith spans when LANGSMITH_TRACING=true. */
+  private readonly tracedModel: TextModel;
   constructor(
     private readonly modelConfig: Pick<
       AssistantConfig,
@@ -64,7 +71,8 @@ export class AssistantService {
       conversationContext?: ChatContext;
     } = {},
   ) {
-    this.graph = buildAssistantGraph(model);
+    this.tracedModel = tracedModel(model);
+    this.graph = buildAssistantGraph(this.tracedModel);
   }
 
   private key(message: GreetingCandidate): string | undefined {
@@ -111,7 +119,43 @@ export class AssistantService {
             .update(message.senderId ?? message.chatId)
             .digest('hex')}`,
       },
-      () => this.prepareScoped(message, signal, trusted, runId),
+      () =>
+        traceTurn(
+          {
+            input: this.input(message),
+            audience: message.isGroup ? 'group' : 'dm',
+            ...(trusted?.mediaContext ? { media: trusted.mediaContext } : {}),
+          },
+          {
+            metadata: {
+              runId,
+              chat: this.key(message),
+              model: this.modelConfig.model,
+              modelRouting: this.modelConfig.modelRouting ?? 'single',
+              promptVersion: this.promptVersion(),
+            },
+            tags: [this.promptVersion(), this.modelConfig.model],
+          },
+          () => this.prepareScoped(message, signal, trusted, runId),
+          (reply) => ({
+            text: reply.text,
+            outcome: reply.trace.outcome,
+            ...(reply.trace.failureCode ? { failure_code: reply.trace.failureCode } : {}),
+            ...(reply.trace.failure ? { failure: reply.trace.failure } : {}),
+            ...(reply.trace.events?.length ? { events: reply.trace.events } : {}),
+            stages: reply.trace.stages.map((stage) => stage.stage),
+          }),
+        ),
+    );
+  }
+
+  private promptVersion() {
+    return (
+      (this.businessReads?.toolLoop || this.runtime.personalTools || this.runtime.businessWrites
+        ? SALES_PROMPT_VERSION
+        : this.businessReads
+          ? READ_PROMPT_VERSION
+          : PROMPT_VERSION) + (this.runtime.conversationContext ? '+memory-v2' : '')
     );
   }
 
@@ -133,17 +177,12 @@ export class AssistantService {
       runId,
       model: this.modelConfig.model,
       modelRouting: this.modelConfig.modelRouting ?? 'single',
-      promptVersion:
-        this.businessReads?.toolLoop || this.runtime.personalTools || this.runtime.businessWrites
-          ? SALES_PROMPT_VERSION
-          : this.businessReads
-            ? READ_PROMPT_VERSION
-            : PROMPT_VERSION,
+      promptVersion: this.promptVersion(),
       durationMs: 0,
       stages: [],
       outcome: 'completed',
     };
-    if (this.runtime.conversationContext) trace.promptVersion += '+memory-v2';
+    const events: GateEvent[] = [];
     let contextDelivery: ContextDelivery | undefined;
     const protect = (evidence?: unknown) =>
       contextDelivery ? contextDeliveryBundle(contextDelivery, evidence) : evidence;
@@ -152,6 +191,7 @@ export class AssistantService {
       let remembered = false;
       const key = this.key(message);
       trace.durationMs = Date.now() - started;
+      if (events.length) trace.events = events;
       const reused = replayedModelSteps();
       if (reused) trace.replayedSteps = reused;
       const meter = this.runtime.usageMeter ?? this.modelConfig.usageMeter;
@@ -278,6 +318,7 @@ export class AssistantService {
         });
       trace.outcome = 'unavailable';
       trace.failureCode = 'RUN_FAILED';
+      trace.failure = classifyFailure(error, 'prepare');
       if (error instanceof ModelFailureError) trace.modelFailure = error.details;
       return finish({
         text: UNAVAILABLE_REPLY,
@@ -341,7 +382,7 @@ export class AssistantService {
         const result =
           this.businessReads?.toolLoop || personal || writes
             ? await buildSalesGraph(
-                this.model,
+                this.tracedModel,
                 async (readSignal) => {
                   const tools = this.businessReads?.toolLoop
                     ? await this.businessReads.openTools(
@@ -365,6 +406,7 @@ export class AssistantService {
                   replyDeadlineMs: deadlineAtMs,
                   durableContextEnabled,
                   onStage: (stage) => trace.stages.push(stage),
+                  onGate: (event) => events.push(event),
                   onContext: this.runtime.observeContext,
                   onToolActivity,
                   utilities: new UtilityToolRun(
@@ -378,7 +420,7 @@ export class AssistantService {
               ).invoke(inputState, { signal: combined, recursionLimit: 76 })
             : this.businessReads
               ? await buildBusinessGraph(
-                  this.model,
+                  this.tracedModel,
                   (readSignal) =>
                     this.businessReads!.read(
                       trusted?.key.remoteJid === message.chatId ? trusted : undefined,
@@ -436,6 +478,7 @@ export class AssistantService {
           deadline.signal.aborted || Date.now() >= deadlineAtMs
             ? 'DEADLINE_EXCEEDED'
             : 'RUN_FAILED';
+        trace.failure = classifyFailure(error, 'graph');
         if (error instanceof ModelFailureError) trace.modelFailure = error.details;
         const failureReply = writes?.unsubmittedReply ?? UNAVAILABLE_REPLY;
         const business = contextRun?.historyDelivery();

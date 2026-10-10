@@ -8,6 +8,7 @@ import {
   type MediaProcessor,
   type MediaUpload,
 } from '../../modules/media/media.types.js';
+import { GateRejection } from '../../modules/assistant/failure.js';
 const AUDIO_EXTENSIONS: Record<string, string> = {
   'audio/ogg': 'ogg',
   'audio/wav': 'wav',
@@ -24,7 +25,7 @@ export class OpenAIMediaProcessor implements MediaProcessor {
     fetchImpl: typeof fetch = fetch,
   ) {
     if (config.usagePolicy && config.usagePolicy.mode !== 'off' && !config.usageMeter)
-      throw new Error('USAGE_METER_REQUIRED');
+      throw new GateRejection('USAGE_METER_REQUIRED');
     this.client = new OpenAI({
       apiKey: config.apiKey,
       maxRetries: 1,
@@ -42,9 +43,9 @@ export class OpenAIMediaProcessor implements MediaProcessor {
     signal.throwIfAborted();
     if (upload.mime.startsWith('audio/')) {
       const extension = AUDIO_EXTENSIONS[upload.mime];
-      if (!extension) throw new Error('UNSUPPORTED_AUDIO');
+      if (!extension) throw new GateRejection('UNSUPPORTED_AUDIO');
       if (!upload.bytes.length || upload.bytes.length > MAX_MEDIA_BYTES)
-        throw new Error('INVALID_AUDIO_SIZE');
+        throw new GateRejection('INVALID_AUDIO_SIZE');
       const result = await withUsageStage('transcription', async () =>
         this.transcriptionClient.audio.transcriptions.create(
           {
@@ -87,7 +88,7 @@ export class OpenAIMediaProcessor implements MediaProcessor {
         { signal },
       ),
     );
-    if (result.status !== 'completed') throw new Error('MEDIA_EXTRACTION_INCOMPLETE');
+    if (result.status !== 'completed') throw new GateRejection('MEDIA_EXTRACTION_INCOMPLETE');
     return result.output_text;
   }
 }

@@ -21,6 +21,7 @@ import {
   verifyToolEvidence,
   toolEvidenceFingerprint,
 } from './tool-evidence.js';
+import { GateRejection } from './failure.js';
 
 export interface BoundCrmReader {
   employeeId: number;
@@ -60,7 +61,7 @@ export class BusinessReadService {
       employeeIds !== 'all' &&
       (!employeeIds.length || employeeIds.some((id) => !Number.isSafeInteger(id) || id < 1))
     )
-      throw new Error('A business-read pilot employee list is required');
+      throw new GateRejection('BUSINESS_READ_PILOT_LIST_REQUIRED');
     this.employees = employeeIds === 'all' ? null : new Set(employeeIds);
   }
 

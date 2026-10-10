@@ -231,7 +231,7 @@ test('search cannot introduce a tool, alter its schema or dispatch under another
     const model = new OpenAITextModel(config, async () => response(output));
     await assert.rejects(
       model.startToolSession(request).next(4, AbortSignal.timeout(5000)),
-      /OpenAI tool request failed/,
+      /UNAVAILABLE_MODEL_TOOL|CHANGED_SEARCH_SCHEMA|UNEXPECTED_SEARCH_TOOL|TOOL_SEARCH_BUDGET_EXHAUSTED|INVALID_TOOL_RESPONSE/,
     );
   }
 });
@@ -267,7 +267,7 @@ test('withdrawn functions are removed from deferred search and rejected on dispa
   });
   await assert.rejects(
     session.next(4, AbortSignal.timeout(5000), ['local_calculate', 'invented']),
-    /OpenAI tool request failed/,
+    /UNAVAILABLE_MODEL_TOOL|CHANGED_SEARCH_SCHEMA|UNEXPECTED_SEARCH_TOOL|TOOL_SEARCH_BUDGET_EXHAUSTED|INVALID_TOOL_RESPONSE/,
   );
   assert.deepEqual(
     body.tools.map((t: any) => t.name),
@@ -283,7 +283,7 @@ test('repeated search is bounded without running a business tool', async () => {
   });
   await assert.rejects(
     model.startToolSession(request).next(4, AbortSignal.timeout(5000)),
-    /OpenAI tool request failed/,
+    /UNAVAILABLE_MODEL_TOOL|CHANGED_SEARCH_SCHEMA|UNEXPECTED_SEARCH_TOOL|TOOL_SEARCH_BUDGET_EXHAUSTED|INVALID_TOOL_RESPONSE/,
   );
   assert.equal(calls, 8);
 });

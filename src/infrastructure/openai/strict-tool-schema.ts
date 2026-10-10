@@ -1,9 +1,10 @@
 /** A provider-only encoding. Business schemas, arguments and receipt hashes stay unchanged. */
 import { isDeepStrictEqual } from 'node:util';
-import { schemaAccepts } from '../../modules/context-engine/read-contract.js';
+import { schemaAccepts, schemaErrors } from '../../modules/context-engine/read-contract.js';
 
 type Schema = Record<string, unknown>;
 type Codec = { schema: Schema; decode(value: unknown): unknown };
+type FieldError = { path: string; rule: string };
 const invalid = () => new Error('INVALID_STRICT_TOOL_ARGUMENTS');
 const unsupported = () => new Error('UNSUPPORTED_STRICT_TOOL_SCHEMA');
 const object = (value: unknown): value is Schema =>
@@ -45,7 +46,9 @@ const keywords = new Set([
   'maxProperties',
 ]);
 
-export function strictToolSchema(source: Schema): Codec {
+export function strictToolSchema(source: Schema): Codec & {
+  errors(value: unknown): FieldError[];
+} {
   const compile = (node: Schema, depth: number): Codec => {
     if (depth > 40 || Object.keys(node).some((key) => !keywords.has(key))) throw unsupported();
     if (node.allOf !== undefined) {
@@ -214,6 +217,19 @@ export function strictToolSchema(source: Schema): Codec {
       // Includes original oneOf exclusivity and every business-side constraint.
       if (!schemaAccepts(source, decoded)) throw invalid();
       return decoded;
+    },
+    /**
+     * Why decode rejected a value. Paths follow what the model sent (the provider schema);
+     * only constraints the provider schema omits are reported against the decoded business value.
+     */
+    errors(value) {
+      const encoded = schemaErrors(codec.schema, value);
+      if (encoded.length) return encoded;
+      try {
+        return schemaErrors(source, codec.decode(value));
+      } catch {
+        return [];
+      }
     },
   };
 }

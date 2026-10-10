@@ -1,5 +1,6 @@
 /** Bounded decimal arithmetic. No eval, JavaScript functions, variables or network access. */
 import { z } from 'zod';
+import { GateRejection } from './failure.js';
 
 const unit = z.enum(['sqft', 'sqm', 'acre', 'hectare', 'ft', 'm']);
 export const calculateInput = z
@@ -12,13 +13,13 @@ export const calculateInput = z
 
 type Fraction = { n: bigint; d: bigint };
 function fraction(n: bigint, d = 1n): Fraction {
-  if (d === 0n) throw new Error('DIVISION_BY_ZERO');
+  if (d === 0n) throw new GateRejection('DIVISION_BY_ZERO');
   if (d < 0n) {
     n = -n;
     d = -d;
   }
   if (n.toString().length > 2000 || d.toString().length > 2000)
-    throw new Error('CALCULATION_LIMIT');
+    throw new GateRejection('CALCULATION_LIMIT');
   let a = n < 0n ? -n : n,
     b = d;
   while (b) [a, b] = [b, a % b];
@@ -27,7 +28,8 @@ function fraction(n: bigint, d = 1n): Fraction {
 function decimal(text: string): Fraction {
   const [base = '', exponent = '0'] = text.toLowerCase().split('e');
   const power = Number(exponent);
-  if (!Number.isSafeInteger(power) || Math.abs(power) > 100) throw new Error('CALCULATION_LIMIT');
+  if (!Number.isSafeInteger(power) || Math.abs(power) > 100)
+    throw new GateRejection('CALCULATION_LIMIT');
   const [whole = '', part = ''] = base.split('.');
   const scale = part.length - power;
   const n = BigInt(whole + part);
@@ -47,7 +49,7 @@ function evaluate(expression: string): Fraction {
   while (offset < expression.length) {
     pattern.lastIndex = offset;
     const match = pattern.exec(expression);
-    if (!match || tokens.length >= 128) throw new Error('INVALID_EXPRESSION');
+    if (!match || tokens.length >= 128) throw new GateRejection('INVALID_EXPRESSION');
     tokens.push(match[1]!);
     offset = pattern.lastIndex;
   }
@@ -57,10 +59,10 @@ function evaluate(expression: string): Fraction {
     const token = tokens[cursor++];
     if (token === '(') {
       const value = sum();
-      if (tokens[cursor++] !== ')') throw new Error('INVALID_EXPRESSION');
+      if (tokens[cursor++] !== ')') throw new GateRejection('INVALID_EXPRESSION');
       return value;
     }
-    if (!token || !/^[\d.]/.test(token)) throw new Error('INVALID_EXPRESSION');
+    if (!token || !/^[\d.]/.test(token)) throw new GateRejection('INVALID_EXPRESSION');
     return decimal(token);
   };
   const power = (): Fraction => {
@@ -69,12 +71,12 @@ function evaluate(expression: string): Fraction {
     cursor++;
     const exponent = unary();
     if (exponent.d !== 1n || exponent.n < -100n || exponent.n > 100n)
-      throw new Error('INVALID_EXPONENT');
-    if (value.n === 0n && exponent.n === 0n) throw new Error('INVALID_EXPONENT');
+      throw new GateRejection('INVALID_EXPONENT');
+    if (value.n === 0n && exponent.n === 0n) throw new GateRejection('INVALID_EXPONENT');
     const e = exponent.n < 0n ? -exponent.n : exponent.n;
     // Bound intermediate exponentiation before allocating a large bigint.
     if (Math.max(value.n.toString().length, value.d.toString().length) * Number(e) > 2000)
-      throw new Error('CALCULATION_LIMIT');
+      throw new GateRejection('CALCULATION_LIMIT');
     return exponent.n < 0n
       ? fraction(value.d ** e, value.n ** e)
       : fraction(value.n ** e, value.d ** e);
@@ -109,7 +111,7 @@ function evaluate(expression: string): Fraction {
     return value;
   };
   const value = sum();
-  if (cursor !== tokens.length) throw new Error('INVALID_EXPRESSION');
+  if (cursor !== tokens.length) throw new GateRejection('INVALID_EXPRESSION');
   return value;
 }
 
@@ -127,7 +129,7 @@ export function calculate(args: z.infer<typeof calculateInput>) {
   if (args.conversion) {
     const from = units[args.conversion.from],
       to = units[args.conversion.to];
-    if (from[0] !== to[0]) throw new Error('INCOMPATIBLE_UNITS');
+    if (from[0] !== to[0]) throw new GateRejection('INCOMPATIBLE_UNITS');
     value = divide(multiply(value, decimal(from[1])), decimal(to[1]));
   }
   const places = args.decimal_places ?? 6;
@@ -136,7 +138,7 @@ export function calculate(args: z.infer<typeof calculateInput>) {
   const remainder = scaled % value.d;
   const rounded = scaled / value.d + (remainder * 2n >= value.d ? 1n : 0n);
   const digits = rounded.toString().padStart(places + 1, '0');
-  if (digits.length > 120) throw new Error('CALCULATION_LIMIT');
+  if (digits.length > 120) throw new GateRejection('CALCULATION_LIMIT');
   const text = places
     ? `${digits.slice(0, -places)}.${digits.slice(-places)}`.replace(/\.?0+$/, '')
     : digits;

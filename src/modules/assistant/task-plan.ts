@@ -1,5 +1,6 @@
 /** Typed outcome contract shared by planner, worker and verifier. Never an authorization grant. */
 import { z } from 'zod';
+import { GateRejection } from './failure.js';
 export const routeSchema = z
   .object({
     route: z.enum(['direct', 'work']),
@@ -67,7 +68,7 @@ export function validateTaskPlan(value: unknown, tools: readonly { name: string 
   const plan = taskPlanSchema.parse(value);
   // A question is a complete planning outcome, never permission to execute a guess.
   if (plan.clarification ? plan.steps.length !== 0 : plan.steps.length === 0)
-    throw new Error('INVALID_TASK_PLAN');
+    throw new GateRejection('INVALID_TASK_PLAN');
   const allowed = new Set(tools.map((t) => t.name));
   const prior = new Set<string>();
   for (const step of plan.steps) {
@@ -76,7 +77,7 @@ export function validateTaskPlan(value: unknown, tools: readonly { name: string 
       step.dependsOn.some((id) => !prior.has(id)) ||
       step.toolNames.some((name) => !allowed.has(name))
     )
-      throw new Error('INVALID_TASK_PLAN');
+      throw new GateRejection('INVALID_TASK_PLAN');
     prior.add(step.id);
   }
   return plan;

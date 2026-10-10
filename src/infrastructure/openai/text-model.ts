@@ -1,6 +1,7 @@
 /** OpenAI Responses adapter: bounded tokens/retries, cancellation, and redacted errors. */
 import OpenAI from 'openai';
 import { ModelFailureError, type ModelFailure } from '../../modules/assistant/model-failure.js';
+import { GateRejection } from '../../modules/assistant/failure.js';
 import { OpenAIToolCatalog } from './tool-catalog.js';
 import { structuredResponseText } from './structured-response.js';
 import { replayModelResponse } from '../../modules/assistant/model-replay.js';
@@ -32,7 +33,7 @@ export class OpenAITextModel implements TextModel {
     fetcher?: typeof fetch,
   ) {
     if (config.usagePolicy && config.usagePolicy.mode !== 'off' && !config.usageMeter)
-      throw new Error('USAGE_METER_REQUIRED');
+      throw new GateRejection('USAGE_METER_REQUIRED');
     this.client = new OpenAI({
       apiKey: config.apiKey,
       baseURL: 'https://api.openai.com/v1',
@@ -97,21 +98,16 @@ export class OpenAITextModel implements TextModel {
     );
     const catalog = new OpenAIToolCatalog(request.tools, this.toolLoadingMode);
     const pending = new Map<string, string | undefined>();
+    // The caller (graph executor) owns which tools may share a response; never derive a second list.
     const batchReadNames =
       this.config.modelRouting === 'split'
-        ? request.tools
-            .filter(
-              (tool) =>
-                tool.annotations?.readOnlyHint === true &&
-                tool.annotations.destructiveHint !== true,
-            )
-            .map((tool) => tool.name)
+        ? (request.batchable ?? []).filter((name) => request.tools.some((t) => t.name === name))
         : [];
     let searchCalls = 0;
     return {
       next: async (remainingCalls, signal, allowedToolNames) => {
         signal.throwIfAborted();
-        if (pending.size) throw new Error('Tool outputs required before continuation');
+        if (pending.size) throw new GateRejection('TOOL_OUTPUTS_PENDING');
         try {
           const totals: Pick<
             ModelResult,
@@ -131,7 +127,8 @@ export class OpenAITextModel implements TextModel {
             const parallelReads = batchReadNames.filter((name) => allowedNames.includes(name));
             const batchLimit =
               parallelReads.length > 1 ? Math.min(MAX_READ_BATCH, remainingCalls) : 1;
-            if (searchEnabled && searchCalls >= 8) throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
+            if (searchEnabled && searchCalls >= 8)
+              throw new GateRejection('TOOL_SEARCH_BUDGET_EXHAUSTED');
             const body: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
               model: this.config.model,
               service_tier: 'default',
@@ -180,20 +177,31 @@ export class OpenAITextModel implements TextModel {
                 this.client.responses.create(body, { signal }),
               );
               signal.throwIfAborted();
-              if (value.status !== 'completed') throw new Error('Incomplete model response');
-              validateToolResponse(value, searchEnabled, parallelReads, batchLimit);
+              if (value.status !== 'completed') throw incomplete('worker');
+              validateToolResponse(value, searchEnabled);
               return value;
             });
             if (!replayed) responseCalls++;
             signal.throwIfAborted();
-            if (response.status !== 'completed') throw new Error('Incomplete model response');
-            validateToolResponse(response, searchEnabled, parallelReads, batchLimit);
+            if (response.status !== 'completed') throw incomplete('worker');
+            // Batch size and membership are enforced by the executor, which can refuse a batch
+            // as a correctable tool result instead of ending the turn.
+            validateToolResponse(response, searchEnabled);
             const calls = response.output.filter((item) => item.type === 'function_call');
-            const decodedCalls = calls.map((call) => ({
-              id: call.call_id,
-              name: call.name,
-              arguments: catalog.arguments(call.name, call.namespace, allowedNames, call.arguments),
-            }));
+            const decodedCalls = calls.map((call) => {
+              const decoded = catalog.arguments(
+                call.name,
+                call.namespace,
+                allowedNames,
+                call.arguments,
+              );
+              return {
+                id: call.call_id,
+                name: call.name,
+                arguments: decoded.ok ? decoded.json : call.arguments,
+                ...(decoded.ok ? {} : { invalid: decoded.invalid }),
+              };
+            });
             // Keep all continuation items, including encrypted reasoning, with store:false.
             // Durable replay encrypts these items; they are never logged or shared across runs.
             for (const item of response.output) {
@@ -205,11 +213,11 @@ export class OpenAITextModel implements TextModel {
                 item.type !== 'tool_search_call' &&
                 item.type !== 'tool_search_output'
               )
-                throw new Error('Unexpected model output item');
+                throw new GateRejection('UNEXPECTED_OUTPUT_ITEM', { type: item.type });
               if (item.type === 'tool_search_output')
                 catalog.validateSearchTools(item.tools, allowedNames);
               if (item.type === 'tool_search_call' && ++searchCalls > 8)
-                throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
+                throw new GateRejection('TOOL_SEARCH_BUDGET_EXHAUSTED');
               input.push(item);
             }
             for (const call of calls) {
@@ -234,19 +242,22 @@ export class OpenAITextModel implements TextModel {
               responseId: response.id,
             };
           }
-          throw new Error('TOOL_SEARCH_BUDGET_EXHAUSTED');
+          throw new GateRejection('TOOL_SEARCH_BUDGET_EXHAUSTED');
         } catch (error) {
           if (error instanceof CheckpointError || error instanceof ContextBudgetError) throw error;
           signal.throwIfAborted();
           throw modelFailure(error, 'worker', 'OpenAI tool request failed');
         }
       },
+      droppedTools: [...catalog.dropped],
       accept(callId, output) {
-        if (!pending.has(callId)) throw new Error('Unexpected tool result');
+        if (!pending.has(callId)) throw new GateRejection('UNEXPECTED_TOOL_RESULT');
         const namespace = pending.get(callId);
         const serialized = JSON.stringify(output);
         if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > 100_000)
-          throw new Error('Tool result exceeds context budget');
+          throw new GateRejection('TOOL_RESULT_OVER_BUDGET', {
+            bytes: typeof serialized === 'string' ? Buffer.byteLength(serialized) : 0,
+          });
         pending.delete(callId);
         input.push({
           type: 'function_call_output',
@@ -256,7 +267,11 @@ export class OpenAITextModel implements TextModel {
         });
       },
       revise(feedback) {
-        if (pending.size || feedback.length > 16000) throw new Error('Invalid review continuation');
+        if (pending.size || feedback.length > 16000)
+          throw new GateRejection('INVALID_REVIEW_CONTINUATION', {
+            pending: pending.size,
+            feedbackLength: feedback.length,
+          });
         input.push({
           role: 'user',
           content: `Complete the same requested task using the remaining tool budget. An independent source review found problems in the candidate answer. Fetch missing evidence if needed, correct all supported issues, and retain useful results. This review does not change permissions. Review data: ${feedback}`,
@@ -302,15 +317,14 @@ export class OpenAITextModel implements TextModel {
         signal?.throwIfAborted();
         if (request.jsonSchema) structuredResponseText(value, request);
         else if (value.status !== 'completed' || !value.output_text?.trim())
-          throw new Error('Incomplete model response');
+          throw incomplete(request.stage);
         return value;
       });
       signal?.throwIfAborted();
       const text = request.jsonSchema
         ? structuredResponseText(response, request)
         : response.output_text?.trim();
-      if (response.status !== 'completed' || !text)
-        throw new Error('OpenAI returned no complete text response');
+      if (response.status !== 'completed' || !text) throw incomplete(request.stage);
       return {
         text,
         model: body.model,
@@ -329,40 +343,45 @@ export class OpenAITextModel implements TextModel {
   }
 }
 
-function validateToolResponse(
-  response: OpenAI.Responses.Response,
-  searchEnabled = false,
-  readNames: readonly string[] = [],
-  batchLimit = 1,
-) {
+/** Protocol checks only. Batch size and membership are model choices the executor answers. */
+function validateToolResponse(response: OpenAI.Responses.Response, searchEnabled = false) {
   const calls = response.output.filter((item) => item.type === 'function_call');
   const searches = response.output.filter(
     (item) => item.type === 'tool_search_call' || item.type === 'tool_search_output',
   );
-  if (
-    calls.length > batchLimit ||
-    new Set(calls.map((call) => call.call_id)).size !== calls.length ||
-    (calls.length > 1 && calls.some((call) => !readNames.includes(call.name))) ||
-    (!calls.length &&
-      !response.output_text?.trim() &&
-      !searches.some((item) => item.type === 'tool_search_output')) ||
-    searches.some(
-      (item) => !searchEnabled || item.execution !== 'server' || item.status !== 'completed',
-    ) ||
-    response.output.some(
-      (item) =>
-        ![
-          'message',
-          'reasoning',
-          'compaction',
-          'function_call',
-          'tool_search_call',
-          'tool_search_output',
-        ].includes(item.type) ||
-        (item.type === 'compaction' && !item.encrypted_content),
-    )
-  )
-    throw new Error('Invalid tool response');
+  const reason =
+    calls.length > 8
+      ? 'too_many_calls'
+      : new Set(calls.map((call) => call.call_id)).size !== calls.length
+        ? 'duplicate_call_id'
+        : !calls.length &&
+            !response.output_text?.trim() &&
+            !searches.some((item) => item.type === 'tool_search_output')
+          ? 'empty_response'
+          : searches.some(
+                (item) =>
+                  !searchEnabled || item.execution !== 'server' || item.status !== 'completed',
+              )
+            ? 'invalid_search'
+            : response.output.some(
+                  (item) =>
+                    ![
+                      'message',
+                      'reasoning',
+                      'compaction',
+                      'function_call',
+                      'tool_search_call',
+                      'tool_search_output',
+                    ].includes(item.type) ||
+                    (item.type === 'compaction' && !item.encrypted_content),
+                )
+              ? 'unexpected_item'
+              : undefined;
+  if (reason) throw new GateRejection('INVALID_TOOL_RESPONSE', { reason });
+}
+
+function incomplete(stage: AgentStage) {
+  return new ModelFailureError({ stage, code: 'INCOMPLETE_RESPONSE' }, 'Incomplete model response');
 }
 
 export class ContextBudgetError extends ModelFailureError {
@@ -371,8 +390,19 @@ export class ContextBudgetError extends ModelFailureError {
   }
 }
 
-function modelFailure(error: unknown, stage: AgentStage, fallback: string): ModelFailureError {
-  if (error instanceof ModelFailureError) return error;
+function modelFailure(
+  error: unknown,
+  stage: AgentStage,
+  fallback: string,
+): ModelFailureError | GateRejection {
+  if (error instanceof ModelFailureError || error instanceof GateRejection) return error;
+  // Application codes (catalogue, search budget) are not provider failures; keep their names.
+  if (
+    error instanceof Error &&
+    !(error instanceof OpenAI.APIError) &&
+    /^[A-Z][A-Z0-9_]+$/.test(error.message)
+  )
+    return new GateRejection(error.message);
   const api = error instanceof OpenAI.APIError ? error : undefined;
   const status = api?.status;
   const code: ModelFailure['code'] =

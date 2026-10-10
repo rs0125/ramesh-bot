@@ -15,6 +15,7 @@ import { currentCheckpoint } from './model-replay.js';
 import { CheckpointError } from './checkpoint.types.js';
 import { currentUsageScope } from '../usage/usage-scope.js';
 import { runEvidenceId } from './evidence-presentation.js';
+import { GateRejection } from './failure.js';
 
 const schemas = {
   calculate: calculateInput,
@@ -105,7 +106,7 @@ export class UtilityToolRun {
         throw new WebToolError('TOOL_UNAVAILABLE');
       let parsed: unknown;
       try {
-        if (Buffer.byteLength(argumentsJson) > 4096) throw new Error();
+        if (Buffer.byteLength(argumentsJson) > 4096) throw new GateRejection('ARGUMENTS_TOO_LARGE');
         parsed = JSON.parse(argumentsJson);
       } catch {
         throw new WebToolError('INVALID_ARGUMENTS');

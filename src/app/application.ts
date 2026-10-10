@@ -19,6 +19,7 @@ import { AgentCheckpointRepository } from '../infrastructure/database/agent-chec
 import { DurableMessages } from '../infrastructure/whatsapp/durable-messages.js';
 import { AssistantService } from '../modules/assistant/assistant.service.js';
 import { OpenAITextModel } from '../infrastructure/openai/text-model.js';
+import { flushTracing, tracedModel } from '../infrastructure/observability/tracing.js';
 import type { TextModel } from '../modules/assistant/assistant.types.js';
 import { InboxRepository } from '../infrastructure/database/inbox.repository.js';
 import { MediaRepository } from '../infrastructure/database/media.repository.js';
@@ -185,7 +186,7 @@ export function createApplication(
         )
       : undefined;
   const assistantModel = assistantConfig
-    ? (overrides.model ?? new OpenAITextModel(assistantConfig))
+    ? tracedModel(overrides.model ?? new OpenAITextModel(assistantConfig))
     : undefined;
   const contextRepository =
     assistantConfig?.context && messagePool && config.messageDatabase
@@ -463,6 +464,7 @@ export function createApplication(
             await durableMessages?.drainMediaIngress();
             await db.$disconnect();
             await messagePool?.end();
+            await flushTracing();
           }
         }
       })());

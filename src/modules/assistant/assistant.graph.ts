@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { TextModel, StageMetric } from './assistant.types.js';
 import { CONVERSER_PROMPT, FORMATTER_PROMPT } from './prompts.js';
 import { finishReply } from './style.js';
+import { GateRejection } from './failure.js';
 
 export const AssistantState = new StateSchema({
   input: z.string().min(1).max(40000),
@@ -63,7 +64,7 @@ export function buildAssistantGraph(model: TextModel) {
       config.signal,
     );
     const reply = finishReply(result.text);
-    if (!reply || reply.length > 4000) throw new Error('Invalid formatted reply');
+    if (!reply || reply.length > 4000) throw new GateRejection('REPLY_LENGTH_INVALID');
     return {
       reply,
       stages: [

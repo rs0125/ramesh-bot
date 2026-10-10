@@ -53,6 +53,8 @@ export interface TextModel {
 export interface ToolSessionRequest {
   instructions: string;
   messages: ChatMessage[];
+  /** Tools that may share one response. The executor enforces the same list; omitted means none. */
+  batchable?: readonly string[];
   tools: Array<{
     name: string;
     description?: string;
@@ -77,6 +79,8 @@ export interface ModelToolCall {
   id: string;
   name: string;
   arguments: string;
+  /** Arguments failed the original schema after strict decoding; returned to the model, never dispatched. */
+  invalid?: { code: 'INVALID_ARGUMENTS'; errors: Array<{ path: string; rule: string }> };
 }
 /** Provider continuation state is private to one run, never shared between employees. */
 export interface ToolModelSession {
@@ -89,6 +93,8 @@ export interface ToolModelSession {
   accept(callId: string, output: unknown): void;
   /** Continue the current task after a failed independent review; never resets tool budgets. */
   revise?(feedback: string): void;
+  /** Tools whose schemas the provider's strict mode cannot express; excluded from this session. */
+  readonly droppedTools?: readonly string[];
 }
 
 export interface StageMetric {
@@ -118,6 +124,10 @@ export interface AgentTrace {
   outcome: 'completed' | 'unavailable' | 'input_rejected';
   limitedBy?: 'research_deadline';
   failureCode?: 'DEADLINE_EXCEEDED' | 'RUN_FAILED';
+  /** Which check ended the turn, and in which stage. */
+  failure?: import('./failure.js').TurnFailure;
+  /** Checks that fired during the turn, including non-blocking degradations. */
+  events?: import('./failure.js').GateEvent[];
   /** Safe provider category and failing stage, without the original error body. */
   modelFailure?: import('./model-failure.js').ModelFailure;
   usage?: import('../usage/usage.types.js').UsageSummary;

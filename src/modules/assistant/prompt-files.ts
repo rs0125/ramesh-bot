@@ -1,6 +1,7 @@
 /** Immutable per-process prompts. No caller-supplied paths or runtime overrides. */
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { GateRejection } from './failure.js';
 
 export const PROMPT_NAMES = [
   'converser',
@@ -22,12 +23,13 @@ export type PromptName = (typeof PROMPT_NAMES)[number];
 const prompts = new Map<PromptName, string>();
 for (const name of PROMPT_NAMES) {
   const text = readFileSync(new URL(`../../prompts/${name}.md`, import.meta.url), 'utf8').trim();
-  if (!text || Buffer.byteLength(text) > 32_000) throw new Error(`Invalid prompt: ${name}`);
+  if (!text || Buffer.byteLength(text) > 32_000)
+    throw new GateRejection('INVALID_PROMPT', { name });
   prompts.set(name, text);
 }
 export function loadPrompt(name: PromptName): string {
   const text = prompts.get(name);
-  if (!text) throw new Error('Unknown prompt');
+  if (!text) throw new GateRejection('UNKNOWN_PROMPT');
   return text;
 }
 export function promptManifest() {

@@ -85,6 +85,28 @@ export const sameToolContract = (left: ContextToolDefinition, right: ContextTool
 
 /** Validation is synchronous and isolated: schema $id values cannot poison another tool's validator. */
 export function schemaAccepts(schema: Record<string, unknown>, value: unknown): boolean {
+  return validateAgainst(schema, value).valid;
+}
+
+/** Field paths and rule names only, never values, so the model can correct its own arguments. */
+export function schemaErrors(
+  schema: Record<string, unknown>,
+  value: unknown,
+  limit = 5,
+): Array<{ path: string; rule: string }> {
+  const result = validateAgainst(schema, value);
+  if (result.valid) return [];
+  return (result.errorMessage ?? '')
+    .split(/, (?=data\b)/)
+    .filter(Boolean)
+    .slice(0, limit)
+    .map((entry) => {
+      const match = /^data(\S*)\s+([\s\S]*)$/.exec(entry);
+      return { path: match?.[1] || '/', rule: (match?.[2] ?? entry).slice(0, 160) };
+    });
+}
+
+function validateAgainst(schema: Record<string, unknown>, value: unknown) {
   const check = (item: unknown, depth: number): void => {
     if (depth > 40) throw new ContextEngineError('INVALID_RESPONSE');
     if (!item || typeof item !== 'object') return;
@@ -93,7 +115,7 @@ export function schemaAccepts(schema: Record<string, unknown>, value: unknown): 
   };
   check(schema, 0);
   try {
-    return new AjvJsonSchemaValidator().getValidator(schema)(value).valid;
+    return new AjvJsonSchemaValidator().getValidator(schema)(value);
   } catch {
     throw new ContextEngineError('INVALID_RESPONSE');
   }

@@ -48,6 +48,8 @@ import { reviewFailure, reviewMetric, reviewFailureReply } from './review-diagno
 import type { BusinessWriteRun, BusinessWriteReply } from '../writes/write-tools.js';
 import { notifyToolActivity } from './tool-activity.js';
 import { workingContext } from './working-context.js';
+import { GateRejection, annotateStage, type GateEvent } from './failure.js';
+import { traceGate, traceTool } from '../../infrastructure/observability/tracing.js';
 import { modelJsonSchema } from './model-schema.js';
 import {
   answerReviewSchema,
@@ -84,6 +86,11 @@ const state = new StateSchema({
   repairStatus: z.enum(['none', 'changed', 'unchanged', 'rejected']).default('none'),
   evidenceRepairs: z.number().default(0),
   repairs: z.number().default(0),
+  /** Layout-only findings get one formatting pass; afterwards an approved answer is delivered. */
+  layoutRepairTried: z.boolean().default(false),
+  approvedSnapshot: z
+    .custom<{ reply: string; supplement: string; renderedRecords: RenderedCrmRecord[] } | null>()
+    .default(null),
   blocked: z.boolean().default(false),
   unavailable: z.boolean().default(false),
   researchExhausted: z.boolean().default(false),
@@ -105,6 +112,8 @@ export interface SalesGraphOptions {
   researchDeadlineMs?: number;
   replyDeadlineMs?: number;
   onStage?: (stage: StageMetric) => void;
+  /** Every check that fired, including degradations that do not end the turn. */
+  onGate?: (event: GateEvent) => void;
   onContext?: (context: GraphContextObservation) => void;
   /** Best-effort progress when substantial planning or tool execution starts. */
   onToolActivity?: () => void;
@@ -129,6 +138,13 @@ export function buildSalesGraph(
   let modelHistory: ChatMessage[] = [];
   let toolSteps = 0;
   let sessionTools: typeof tools = [];
+  // The same list goes to the model session and the executor, so they cannot disagree.
+  let sessionBatchable = new Set<string>();
+  let activeStage = 'context';
+  const gate = (event: GateEvent) => {
+    options.onGate?.(event);
+    traceGate(event);
+  };
   const execution: ExecutionReport['tools'] = {};
   const executionReport = (limited: boolean): ExecutionReport => ({
     research_limited: limited,
@@ -219,7 +235,10 @@ export function buildSalesGraph(
   const research = async <T>(call: (signal: AbortSignal) => Promise<T>, parent?: AbortSignal) => {
     parent?.throwIfAborted();
     const remaining = (options.researchDeadlineMs ?? Infinity) - Date.now();
-    if (remaining <= 0) return { limited: true } as const;
+    if (remaining <= 0) {
+      gate({ stage: 'research', code: 'RESEARCH_DEADLINE', blocking: false });
+      return { limited: true } as const;
+    }
     const deadline = new AbortController();
     const timer = Number.isFinite(remaining)
       ? setTimeout(
@@ -235,7 +254,10 @@ export function buildSalesGraph(
     } catch (error) {
       if (error instanceof CheckpointError) throw error;
       parent?.throwIfAborted();
-      if (deadline.signal.aborted) return { limited: true } as const;
+      if (deadline.signal.aborted) {
+        gate({ stage: 'research', code: 'RESEARCH_DEADLINE', blocking: false });
+        return { limited: true } as const;
+      }
       throw error;
     } finally {
       clearTimeout(timer);
@@ -267,6 +289,14 @@ export function buildSalesGraph(
     personalOnly: boolean,
   ) => {
     sessionTools = personalOnly ? [...(personal?.tools ?? [])] : tools;
+    // Only authenticated Context Engine reads may share a response.
+    sessionBatchable = new Set(
+      personalOnly
+        ? []
+        : (run?.tools ?? [])
+            .map((tool) => tool.name)
+            .filter((name) => sessionTools.some((tool) => tool.name === name)),
+    );
     session = model.startToolSession!({
       instructions: `${WORKER_PROMPT}\n${MEMORY_INSTRUCTIONS}\n${runtime}\n${personalOnly ? 'This request only concerns personal tasks/reminders. Use one complete proposal for requested changes. No business research is needed.' : engineOrientation()}`,
       messages: [
@@ -275,7 +305,22 @@ export function buildSalesGraph(
         { role: 'user', content: input },
       ],
       tools: sessionTools,
+      batchable: [...sessionBatchable],
     });
+    // A tool the provider's strict subset cannot express is dropped, not fatal for the turn.
+    const dropped = session.droppedTools ?? [];
+    if (dropped.length) {
+      sessionTools = sessionTools.filter((tool) => !dropped.includes(tool.name));
+      for (const tool of dropped) {
+        sessionBatchable.delete(tool);
+        gate({
+          stage: 'worker',
+          code: 'STRICT_SCHEMA_UNSUPPORTED',
+          blocking: false,
+          detail: { tool },
+        });
+      }
+    }
   };
   let lastReviewedArtifact: string | undefined;
   const artifactKey = (reply: string, records: readonly RenderedCrmRecord[]) =>
@@ -299,6 +344,7 @@ export function buildSalesGraph(
     signal: AbortSignal | undefined,
     evidenceRepair: boolean,
   ): Promise<typeof state.Update> => {
+    activeStage = evidenceRepair ? 'evidence_repair' : 'formatter';
     if (options.replyDeadlineMs !== undefined) {
       const remaining = options.replyDeadlineMs - Date.now();
       if (remaining <= 0) throw new DOMException('Reply deadline', 'TimeoutError');
@@ -483,12 +529,57 @@ export function buildSalesGraph(
       reply.length > (composed ? 16000 : 12000) ||
       (composed && supplement.length > 4000)
     )
-      throw new Error('Invalid sales reply');
+      throw new GateRejection('REPLY_LENGTH_INVALID', {
+        length: reply.length,
+        supplementLength: supplement.length,
+        composed,
+      });
     const repairStatus = rejected
       ? ('rejected' as const)
       : lastReviewedArtifact === artifactKey(reply, rendered.records)
         ? ('unchanged' as const)
         : ('changed' as const);
+    if (rendered.issues.length)
+      gate({
+        stage,
+        code: 'RENDER_ISSUES',
+        blocking: false,
+        detail: { count: rendered.issues.length },
+      });
+    if ((formattingRepair || evidenceRepair) && repairStatus !== 'changed')
+      gate({
+        stage,
+        code: rejected ? 'REPAIR_REJECTED' : 'REPAIR_UNCHANGED',
+        blocking: false,
+        detail: { kind: evidenceRepair ? 'evidence' : 'format' },
+      });
+    // A formatting pass for layout-only findings may not cost the user an approved answer.
+    if (formattingRepair && value.approvedSnapshot && repairStatus !== 'changed') {
+      gate({ stage, code: 'LAYOUT_ACCEPTED_AS_IS', blocking: false });
+      return {
+        ...value.approvedSnapshot,
+        approved: true,
+        approvedSnapshot: null,
+        draftReady: false,
+        renderIssues: [],
+        repairStatus: 'none',
+        researchExhausted,
+        stages: [
+          ...value.stages,
+          recordMetric({
+            stage,
+            answerRepair: { kind: 'format', outcome: repairStatus },
+            durationMs: Date.now() - started,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            reasoningTokens: result.reasoningTokens ?? 0,
+            cachedInputTokens: result.cachedInputTokens ?? 0,
+            model: result.model,
+            responseCalls: result.responseCalls,
+          }),
+        ],
+      };
+    }
     const diagnosis = rendered.issues.length
       ? rendered.issues.join(' ')
       : rejected
@@ -529,21 +620,22 @@ export function buildSalesGraph(
       ],
     };
   };
-  return new StateGraph(state)
+  const graph = new StateGraph(state)
     .addNode('context', async (value, config) => {
-      if (!model.startToolSession) throw new Error('A tool-capable model is required');
-      if (writes && value.audience !== 'dm') throw new Error('WRITE_AUDIENCE_NOT_ALLOWED');
+      activeStage = 'context';
+      if (!model.startToolSession) throw new GateRejection('TOOL_MODEL_REQUIRED');
+      if (writes && value.audience !== 'dm') throw new GateRejection('WRITE_AUDIENCE_NOT_ALLOWED');
       const access = await open(config.signal ?? new AbortController().signal);
       run = access.run;
       accessStatus = access.status;
       if (personal && run && personal.employeeId !== run.employeeId)
-        throw new Error('PERSONAL_IDENTITY_CHANGED');
+        throw new GateRejection('PERSONAL_IDENTITY_CHANGED');
       if (
         writes &&
         ((run && writes.employeeId !== run.employeeId) ||
           (personal && writes.employeeId !== personal.employeeId))
       )
-        throw new Error('WRITE_IDENTITY_CHANGED');
+        throw new GateRejection('WRITE_IDENTITY_CHANGED');
       bindReplayAuthority({
         employeeId: run?.employeeId ?? null,
         personalEmployeeId: personal?.employeeId ?? null,
@@ -576,7 +668,7 @@ export function buildSalesGraph(
         ...(writes?.tools ?? []),
       ];
       if (new Set(tools.map((tool) => tool.name)).size !== tools.length)
-        throw new Error('AMBIGUOUS_TOOL_CATALOGUE');
+        throw new GateRejection('AMBIGUOUS_TOOL_CATALOGUE');
       options.onContext?.({ access: accessStatus, tools: structuredClone(tools) });
       const checkpoint = currentCheckpoint();
       const recoveryThresholdMs =
@@ -627,6 +719,7 @@ export function buildSalesGraph(
       return {};
     })
     .addNode('converser', async (value, config) => {
+      activeStage = 'converser';
       const casual = options.optimizeLatency ? quickChatReply(value.input) : undefined;
       if (casual)
         return {
@@ -669,6 +762,7 @@ export function buildSalesGraph(
       };
     })
     .addNode('lookup_plan', async (value, config) => {
+      activeStage = 'lookup_plan';
       config.signal?.throwIfAborted();
       notifyToolActivity(options.onToolActivity);
       const plan = value.lookup!;
@@ -676,6 +770,7 @@ export function buildSalesGraph(
       return { plan };
     })
     .addNode('personal_plan', async (value, config) => {
+      activeStage = 'personal_plan';
       config.signal?.throwIfAborted();
       notifyToolActivity(options.onToolActivity);
       const plan = validateTaskPlan(
@@ -699,6 +794,7 @@ export function buildSalesGraph(
       return { plan };
     })
     .addNode('planner', async (value, config) => {
+      activeStage = 'planner';
       const started = Date.now();
       const attempt = await research((signal) => {
         notifyToolActivity(options.onToolActivity);
@@ -736,6 +832,7 @@ export function buildSalesGraph(
       };
     })
     .addNode('worker', async (value, config) => {
+      activeStage = 'worker';
       const started = Date.now();
       const attempt = await research(
         (signal) => session!.next(remainingTools(), signal, callableTools()),
@@ -763,23 +860,71 @@ export function buildSalesGraph(
       };
     })
     .addNode('executor', async (value, config) => {
-      // Validate the entire batch before any dispatch. Models cannot batch writes or recall.
-      if (
-        !value.calls.length ||
-        value.calls.length > MAX_READ_BATCH ||
-        new Set(value.calls.map((call) => call.id)).size !== value.calls.length ||
-        value.calls.some((call) => !sessionTools.some((tool) => tool.name === call.name)) ||
-        (value.calls.length > 1 &&
-          value.calls.some((call) => !run?.tools.some((tool) => tool.name === call.name)))
-      )
-        throw new Error('Invalid model tool proposal');
+      activeStage = 'executor';
+      // Validate the entire batch before any dispatch. Protocol violations end the turn.
+      if (!value.calls.length) throw new GateRejection('EXECUTOR_EMPTY_PROPOSAL');
+      if (new Set(value.calls.map((call) => call.id)).size !== value.calls.length)
+        throw new GateRejection('EXECUTOR_DUPLICATE_CALL_ID');
+      const unknown = value.calls.filter(
+        (call) => !sessionTools.some((tool) => tool.name === call.name),
+      );
+      if (unknown.length)
+        throw new GateRejection('EXECUTOR_UNKNOWN_TOOL', { names: unknown.map((c) => c.name) });
       const stages = [...value.stages];
+      // Models cannot batch writes, recall, personal or utility tools. An invalid batch is
+      // refused as a whole, before any dispatch, and the model is told to call them singly.
+      if (
+        value.calls.length > MAX_READ_BATCH ||
+        (value.calls.length > 1 && value.calls.some((call) => !sessionBatchable.has(call.name)))
+      ) {
+        toolSteps++;
+        gate({
+          stage: 'executor',
+          code: 'BATCH_NOT_ALLOWED',
+          blocking: false,
+          detail: { names: value.calls.map((call) => call.name) },
+        });
+        for (const call of value.calls)
+          session!.accept(call.id, {
+            ok: false,
+            code: 'BATCH_NOT_ALLOWED',
+            message: `Nothing in this response was executed. Up to ${MAX_READ_BATCH} business read calls may share a response; every other tool must be the only call in its response.`,
+            batchable_tools: [...sessionBatchable],
+            guidance:
+              'Propose these calls again: batch only the listed business reads, and send any other tool call on its own.',
+          });
+        return { calls: [], stages };
+      }
       // Reads share a model turn but dispatch in order, retaining lease, budget and journal fences.
       for (const call of value.calls) {
         const started = Date.now();
         toolSteps++;
+        if (call.invalid) {
+          // Strict decoding found a constraint the provider did not enforce. Let the model fix it.
+          gate({
+            stage: 'executor',
+            code: 'INVALID_ARGUMENTS',
+            blocking: false,
+            detail: { tool: call.name, errors: call.invalid.errors },
+          });
+          session!.accept(call.id, {
+            ok: false,
+            code: 'INVALID_ARGUMENTS',
+            errors: call.invalid.errors,
+            guidance:
+              'Nothing was executed. Correct only the listed fields and call again. Omit optional fields you are unsure about.',
+            runtime_budget: await observedBudget(`tool-${toolSteps}`),
+          });
+          continue;
+        }
         const attempt = await research((signal) => {
           if (toolSteps > 28 || familyBudgets()[toolFamily(call.name)] <= 0) {
+            gate({
+              stage: 'executor',
+              code: 'TOOL_BUDGET_EXHAUSTED',
+              blocking: false,
+              detail: { tool: call.name, family: toolFamily(call.name) },
+            });
             const output = {
               ok: false,
               code: 'TOOL_BUDGET_EXHAUSTED',
@@ -804,33 +949,35 @@ export function buildSalesGraph(
             attempts: (prior?.attempts ?? 0) + 1,
             successes: prior?.successes ?? 0,
           };
-          return personal?.hasTool(call.name)
-            ? personal.execute(call.name, call.arguments, signal)
-            : writes?.hasTool(call.name)
-              ? writes.execute(call.name, call.arguments, signal)
-              : call.name === RECALL_TOOL && run
-                ? run.toolHistory.track(call.name, call.arguments, () =>
-                    recall.execute(call.arguments, signal),
-                  )
-                : isUtilityTool(call.name) && utilities && run
-                  ? run!.executeUtility(
-                      (authorizeResult) =>
-                        utilities!.execute(
-                          call.name as UtilityToolName,
-                          call.arguments,
-                          signal,
-                          authorizeResult,
-                        ),
-                      signal,
-                      call,
+          return traceTool(call.name, call.arguments, () =>
+            personal?.hasTool(call.name)
+              ? personal.execute(call.name, call.arguments, signal)
+              : writes?.hasTool(call.name)
+                ? writes.execute(call.name, call.arguments, signal)
+                : call.name === RECALL_TOOL && run
+                  ? run.toolHistory.track(call.name, call.arguments, () =>
+                      recall.execute(call.arguments, signal),
                     )
-                  : run
-                    ? run.execute(call.name, call.arguments, signal)
-                    : Promise.reject(new Error('UNAVAILABLE_TOOL'));
+                  : isUtilityTool(call.name) && utilities && run
+                    ? run!.executeUtility(
+                        (authorizeResult) =>
+                          utilities!.execute(
+                            call.name as UtilityToolName,
+                            call.arguments,
+                            signal,
+                            authorizeResult,
+                          ),
+                        signal,
+                        call,
+                      )
+                    : run
+                      ? run.execute(call.name, call.arguments, signal)
+                      : Promise.reject(new GateRejection('UNAVAILABLE_TOOL', { tool: call.name })),
+          );
         }, config.signal);
         if (attempt.limited) return { calls: [], researchExhausted: true, stages };
         if (!attempt.result || typeof attempt.result !== 'object' || Array.isArray(attempt.result))
-          throw new Error('INVALID_TOOL_OUTPUT');
+          throw new GateRejection('INVALID_TOOL_OUTPUT', { tool: call.name });
         const output = attempt.result as Record<string, unknown>;
         const attemptStatus = execution[call.name];
         if (attemptStatus) {
@@ -895,7 +1042,8 @@ export function buildSalesGraph(
         !value.repairs &&
         !value.researchExhausted &&
         toolSteps === 1 &&
-        value.calls.length === 1
+        value.calls.length === 1 &&
+        !value.calls[0]!.invalid
           ? personal?.completedListPresentation(value.input, value.calls[0]!)
           : undefined;
       if (presentation) {
@@ -925,6 +1073,7 @@ export function buildSalesGraph(
     .addNode('formatter', (value, config) => composeReply(value, config.signal, false))
     .addNode('evidence_repair', (value, config) => composeReply(value, config.signal, true))
     .addNode('verifier', async (value, config) => {
+      activeStage = 'verifier';
       const started = Date.now();
       // Exact user-authored personal records and application-owned write previews are
       // data, not generated prose. Review their semantics below without rewriting literals.
@@ -1035,7 +1184,19 @@ export function buildSalesGraph(
         issues.splice(0, issues.length, ...patchedIssues);
       }
       const modelApproved = review.supported;
-      if (issues.length) {
+      // Layout findings alone never cost the user an approved answer: one formatting pass at
+      // most, and never the pass that would exhaust the repair allowance.
+      const layoutOnly =
+        modelApproved && !factualIssues.length && layoutIssues.length > 0 && !review.patchedAnswer;
+      const acceptLayout = layoutOnly && (value.layoutRepairTried || value.repairs + 1 >= 2);
+      if (acceptLayout)
+        gate({
+          stage: 'verifier',
+          code: 'LAYOUT_ACCEPTED_AS_IS',
+          blocking: false,
+          detail: { issues: layoutIssues.length },
+        });
+      if (issues.length && !acceptLayout) {
         review.supported = false;
         review.feedback = `${issues.join(' ')} ${review.feedback}`;
       }
@@ -1045,11 +1206,37 @@ export function buildSalesGraph(
       }
       const diagnostic = reviewMetric(
         { ...review, supported: modelApproved && !factualIssues.length },
-        layoutIssues.length,
+        acceptLayout ? 0 : layoutIssues.length,
       );
+      if (!review.supported)
+        gate({
+          stage: 'verifier',
+          code: 'REVIEW_REJECTED',
+          blocking: false,
+          detail: {
+            reason: diagnostic.reason,
+            repair: diagnostic.repair,
+            factualIssues: factualIssues.length,
+            layoutIssues: layoutIssues.length,
+            pass: value.repairs + 1,
+          },
+        });
+      // The formatting pass for an approved answer was itself rejected: deliver the approved original.
+      const revert = !review.supported && value.approvedSnapshot ? value.approvedSnapshot : null;
+      if (revert) gate({ stage: 'verifier', code: 'FORMAT_REPAIR_REVERTED', blocking: false });
       return {
-        approved: review.supported,
+        approved: review.supported || !!revert,
+        layoutRepairTried: value.layoutRepairTried || (layoutOnly && !acceptLayout),
+        approvedSnapshot:
+          layoutOnly && !acceptLayout
+            ? {
+                reply: value.reply,
+                supplement: value.supplement,
+                renderedRecords: value.renderedRecords,
+              }
+            : null,
         ...(review.patchedAnswer && !issues.length ? { reply: review.patchedAnswer } : {}),
+        ...(revert ?? {}),
         reviewPatched: !!review.patchedAnswer && !issues.length,
         repairKind: factualIssues.length
           ? ('evidence' as const)
@@ -1078,12 +1265,23 @@ export function buildSalesGraph(
       };
     })
     .addNode('revise', async (value) => {
+      activeStage = 'revise';
       session!.revise!(JSON.stringify({ answer: value.reply, feedback: value.feedback }));
       return {};
     })
     .addNode('finish', async (value, config) => {
-      if (value.blocked) return { reply: deniedReply, unavailable: true };
-      if (!value.approved)
+      activeStage = 'finish';
+      if (value.blocked) {
+        gate({ stage: 'finish', code: 'ACCESS_BLOCKED', blocking: true });
+        return { reply: deniedReply, unavailable: true };
+      }
+      if (!value.approved) {
+        gate({
+          stage: 'finish',
+          code: 'REVIEW_EXHAUSTED_FALLBACK',
+          blocking: true,
+          detail: { reason: value.reviewReason, researchExhausted: value.researchExhausted },
+        });
         return {
           ...(run?.historyDelivery()
             ? { business: { outcome: 'verified' as const, delivery: run.historyDelivery()! } }
@@ -1106,6 +1304,7 @@ export function buildSalesGraph(
           }),
           unavailable: true,
         };
+      }
       const signal = config.signal ?? new AbortController().signal;
       const writePreview = value.plan?.clarification ? undefined : writes?.preview();
       const otherDraft = writePreview
@@ -1117,7 +1316,7 @@ export function buildSalesGraph(
       // The completion proof covers exactly this deterministic text. Never let a
       // later finalizer replace it with an unreviewed mutation receipt or other reply.
       if (value.deterministicComplete && personalResult?.text !== value.reply)
-        throw new Error('PERSONAL_PRESENTATION_CHANGED');
+        throw new GateRejection('PERSONAL_PRESENTATION_CHANGED');
       const personalReply =
         personalResult ??
         (personal?.usedPrivateData
@@ -1157,7 +1356,7 @@ export function buildSalesGraph(
       // follows the persisted tool policy: dispatch direct writes or publish confirmation.
       // Model prose, evidence replay and delivery checks cannot dispatch a mutation.
       const publishedWrite = value.plan?.clarification ? undefined : await writes?.finalize(signal);
-      if (writePreview && !publishedWrite) throw new Error('WRITE_PROPOSAL_UNAVAILABLE');
+      if (writePreview && !publishedWrite) throw new GateRejection('WRITE_PROPOSAL_UNAVAILABLE');
       const writeReply =
         publishedWrite ??
         (writes?.usedPrivateData
@@ -1166,7 +1365,8 @@ export function buildSalesGraph(
             ? { text: '', delivery: writes.historyDelivery()! }
             : undefined);
       const reply = [otherReply, writeReply?.text].filter(Boolean).join('\n\n');
-      if (!reply || reply.length > 16000) throw new Error('Invalid composed reply');
+      if (!reply || reply.length > 16000)
+        throw new GateRejection('REPLY_LENGTH_INVALID', { length: reply.length, composed: true });
       return {
         reply,
         ...(personalReply ? { personal: personalReply } : {}),
@@ -1208,13 +1408,16 @@ export function buildSalesGraph(
           : 'worker',
     )
     .addConditionalEdges('formatter', (value) =>
-      value.repairStatus === 'rejected' || value.repairStatus === 'unchanged'
-        ? value.evidenceRepairs < 1 && value.repairs < 2
-          ? 'evidence_repair'
-          : 'finish'
-        : value.casual
-          ? 'finish'
-          : 'verifier',
+      // Approved here means an approved answer was restored after a formatting pass.
+      value.approved && !value.casual
+        ? 'finish'
+        : value.repairStatus === 'rejected' || value.repairStatus === 'unchanged'
+          ? value.evidenceRepairs < 1 && value.repairs < 2
+            ? 'evidence_repair'
+            : 'finish'
+          : value.casual
+            ? 'finish'
+            : 'verifier',
     )
     .addConditionalEdges('evidence_repair', (value) =>
       value.repairStatus === 'rejected' || value.repairStatus === 'unchanged'
@@ -1247,6 +1450,17 @@ export function buildSalesGraph(
     .addEdge('revise', 'worker')
     .addEdge('finish', END)
     .compile();
+  // Tag failures with the node that raised them, without wrapping (callers use instanceof).
+  const invoke = graph.invoke.bind(graph);
+  graph.invoke = (async (...args: Parameters<typeof invoke>) => {
+    try {
+      return await invoke(...args);
+    } catch (error) {
+      annotateStage(error, activeStage);
+      throw error;
+    }
+  }) as typeof graph.invoke;
+  return graph;
 }
 
 function metric(

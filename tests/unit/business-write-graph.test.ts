@@ -671,7 +671,7 @@ test('an oversize exact proposal is rejected before publication instead of trunc
     buildSalesGraph(fake.fake, async () => ({ status: 'denied' }), { writes: writes.run }).invoke(
       input,
     ),
-    /Invalid sales reply/,
+    /REPLY_LENGTH_INVALID/,
   );
   assert.equal(writes.finalized(), 0);
 });

@@ -361,7 +361,7 @@ test('incomplete text consumes reported usage even though the adapter rejects th
   );
   await assert.rejects(
     meter.run(scope, () => model.complete(request)),
-    /OpenAI request failed/,
+    /Incomplete model response/,
   );
   assert.equal((await meter.summarize(scope.runId)).knownActualMicros, 18);
 });

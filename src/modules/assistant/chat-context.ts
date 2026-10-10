@@ -29,6 +29,7 @@ import {
   HISTORY_TURN_ID,
   historyRequest,
 } from './business-history.js';
+import { GateRejection } from './failure.js';
 
 const DAY = 86400000;
 let encoding: ReturnType<typeof getEncoding> | undefined;
@@ -311,10 +312,10 @@ export class ChatContext {
       signal.throwIfAborted();
       const current = await this.options.resolve(trusted.key, signal);
       if (!current || current.key !== scope.key || current.owner !== scope.owner)
-        throw new Error('CONTEXT_OWNER_CHANGED');
+        throw new GateRejection('CONTEXT_OWNER_CHANGED');
       state = contextStateSchema.parse(state);
       if (!(await this.options.store.save(scope, revision, state, lease)))
-        throw new Error('CONTEXT_CONCURRENT_UPDATE');
+        throw new GateRejection('CONTEXT_CONCURRENT_UPDATE');
       revision++;
       signal.throwIfAborted();
     };
@@ -368,7 +369,7 @@ export class ChatContext {
             (index > 0 && entry.id <= entries[index - 1]!.id),
         )
       )
-        throw new Error('CONTEXT_SOURCE_ORDER_INVALID');
+        throw new GateRejection('CONTEXT_SOURCE_ORDER_INVALID');
       entries = entries.map((entry) => {
         const receipt = contextDeliveryBundleSchema.safeParse(entry.protectedReply?.receipt);
         if (receipt.success) {
@@ -430,7 +431,7 @@ export class ChatContext {
         if (size([...old, entry]) > 14000) break;
         old.push(entry);
       }
-      if (!old.length) throw new Error('CONTEXT_RECENT_INPUT_TOO_LARGE');
+      if (!old.length) throw new GateRejection('CONTEXT_RECENT_INPUT_TOO_LARGE');
       const sourceExpiry = new Map<string, number>();
       for (const item of state.summary.notes)
         for (const id of item.sources)
@@ -474,7 +475,7 @@ export class ChatContext {
         contextTokens(summary) > 3000 ||
         summary.notes.some((item) => item.sources.some((id) => !sourceExpiry.has(id)))
       )
-        throw new Error('CONTEXT_SUMMARY_INVALID');
+        throw new GateRejection('CONTEXT_SUMMARY_INVALID');
       state.summary = {
         notes: summary.notes
           .map((item) => ({
@@ -488,7 +489,7 @@ export class ChatContext {
       await save();
       entries = entries.slice(old.length);
       if (!batch.more && entries.length <= 32 && size(entries) <= 10000) break;
-      if (page === 7) throw new Error('CONTEXT_BACKLOG_TOO_LARGE');
+      if (page === 7) throw new GateRejection('CONTEXT_BACKLOG_TOO_LARGE');
     }
     // Includes expiry pruning and references from the uncompressed tail.
     await save();

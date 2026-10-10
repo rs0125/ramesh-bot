@@ -359,20 +359,21 @@ test('mixed advice survives composition alongside the exact committed personal r
   assert.equal(getPersonalDelivery(h.reply.businessEvidence)?.kind, 'personal');
 });
 
-test('generated stock phrasing still requires repair alongside an application-owned personal result', async () => {
+test('generated stock phrasing gets one formatting pass but never blocks an approved personal result', async () => {
   const h = await scenario({
     workflow: 'general',
     supplement: 'Certainly, I would leverage the available options.',
   });
-  assert.equal(h.reply.trace.outcome, 'unavailable');
-  assert.equal(h.applied.length, 0);
+  // Layout findings are not a reason to drop a reviewed, approved reminder.
+  assert.equal(h.reply.trace.outcome, 'completed');
+  assert.equal(h.applied.length, 1);
   const reviews = h.requests.filter((request) => request.stage === 'verifier');
   assert.ok(reviews.length > 0);
-  for (const review of reviews) {
-    const input = JSON.parse(review.messages[0]!.content);
-    assert.match(input.presentation_issues.join(' '), /stock wording/);
-    assert.match(input.answer, /Pending personal changes/);
-  }
+  const first = JSON.parse(reviews[0]!.messages[0]!.content);
+  assert.match(first.presentation_issues.join(' '), /stock wording/);
+  assert.match(first.answer, /Pending personal changes/);
+  assert.ok(h.reply.trace.events?.some((e) => e.code === 'LAYOUT_ACCEPTED_AS_IS'));
+  assert.ok(!h.reply.trace.events?.some((e) => e.code === 'REVIEW_EXHAUSTED_FALLBACK'));
 });
 
 test('mixed business answer has both authorities and business recall reveals only its business segment', async () => {

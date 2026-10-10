@@ -114,7 +114,11 @@ test('provider error bodies are redacted and incomplete answers are rejected', a
   const incomplete = new OpenAITextModel(config, async () =>
     Response.json({ id: 'r', status: 'incomplete', output: [] }),
   );
-  await assert.rejects(incomplete.complete(request), /OpenAI request failed/);
+  await assert.rejects(
+    incomplete.complete(request),
+    (error: unknown) =>
+      error instanceof ModelFailureError && error.details.code === 'INCOMPLETE_RESPONSE',
+  );
 });
 
 test('an already cancelled model request performs no fetch', async () => {
@@ -450,10 +454,10 @@ test('native tool sessions preserve continuation, optional arguments and correla
   });
   const first = await session.next(8, AbortSignal.timeout(1000));
   assert.deepEqual(first.calls, [{ id: 'call-1', name: 'crm_summary', arguments: '{}' }]);
-  await assert.rejects(session.next(7, AbortSignal.timeout(1000)), /outputs required/);
-  assert.throws(() => session.accept('forged-call', {}), /Unexpected tool result/);
+  await assert.rejects(session.next(7, AbortSignal.timeout(1000)), /TOOL_OUTPUTS_PENDING/);
+  assert.throws(() => session.accept('forged-call', {}), /UNEXPECTED_TOOL_RESULT/);
   session.accept('call-1', { total: 17 });
-  assert.throws(() => session.accept('call-1', {}), /Unexpected tool result/);
+  assert.throws(() => session.accept('call-1', {}), /UNEXPECTED_TOOL_RESULT/);
   assert.equal((await session.next(0, AbortSignal.timeout(1000))).text, '17 leads.');
   assert.equal(calls, 2);
   for (const body of bodies) {
@@ -622,7 +626,7 @@ test('native tool sessions redact provider failures and reject parallel proposal
   );
   await assert.rejects(
     parallel.startToolSession({ ...request, tools: [] }).next(8, AbortSignal.timeout(1000)),
-    /OpenAI tool request failed/,
+    /UNAVAILABLE_MODEL_TOOL/,
   );
 });
 

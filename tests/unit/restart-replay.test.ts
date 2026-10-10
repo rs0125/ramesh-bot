@@ -188,8 +188,8 @@ test('restart restores native reasoning and function calls before continuing the
       const session = model.startToolSession(toolRequest);
       const restored = await session.next(8, AbortSignal.timeout(2000));
       assert.deepEqual(restored.calls, first.calls);
-      await assert.rejects(session.next(7, AbortSignal.timeout(2000)), /outputs required/);
-      assert.throws(() => session.accept('wrong_call', {}), /Unexpected tool result/);
+      await assert.rejects(session.next(7, AbortSignal.timeout(2000)), /TOOL_OUTPUTS_PENDING/);
+      assert.throws(() => session.accept('wrong_call', {}), /UNEXPECTED_TOOL_RESULT/);
       session.accept(restored.calls[0]!.id, { total: 17 });
       return session.next(7, AbortSignal.timeout(2000));
     });

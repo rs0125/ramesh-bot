@@ -1,6 +1,7 @@
 /** Request-local durable replay; completed responses bypass the provider and usage meter. */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AgentCheckpointSession } from './checkpoint.types.js';
+import { GateRejection } from './failure.js';
 
 const replay = new AsyncLocalStorage<{
   session: AgentCheckpointSession;
@@ -36,7 +37,7 @@ export async function replayModelResponse<T>(
 ): Promise<{ response: T; replayed: boolean }> {
   const state = replay.getStore();
   if (!state) return { response: await generate(), replayed: false };
-  if (state.busy) throw new Error('CONCURRENT_MODEL_STEP');
+  if (state.busy) throw new GateRejection('CONCURRENT_MODEL_STEP');
   state.busy = true;
   try {
     const sequence = state.sequence;

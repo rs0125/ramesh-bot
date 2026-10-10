@@ -106,17 +106,34 @@ test('attachment extraction uses Luna while single-model rollback retains the co
   }
 });
 
-test('read batches preserve every call/output binding; mixed writes, unknown tools and duplicate IDs are rejected', async () => {
+test('read batches preserve every call/output binding; protocol violations are rejected and batch policy is left to the executor', async () => {
   const tools = [tool('read_a'), tool('read_b'), tool('create_rfq', false)];
+  const batchable = ['read_a', 'read_b'];
+  // Unknown tools and duplicate call IDs break the provider protocol and end the step.
   for (const proposals of [
-    [call('read_a'), call('create_rfq')],
     [call('read_a'), call('injected_tool')],
     [call('read_a', 'same'), call('read_b', 'same')],
-    [call('read_a', '1'), call('read_b', '2'), call('read_a', '3'), call('read_b', '4')],
   ]) {
     const model = new OpenAITextModel(config, async () => response(proposals));
     await assert.rejects(
-      model.startToolSession({ instructions: 'Read', messages: [], tools }).next(10, signal()),
+      model
+        .startToolSession({ instructions: 'Read', messages: [], tools, batchable })
+        .next(10, signal()),
+    );
+  }
+  // A mixed or oversized batch is a model choice: it is returned intact so the executor can
+  // refuse it as a correctable tool result instead of ending the turn.
+  for (const proposals of [
+    [call('read_a'), call('create_rfq')],
+    [call('read_a', '1'), call('read_b', '2'), call('read_a', '3'), call('read_b', '4')],
+  ]) {
+    const model = new OpenAITextModel(config, async () => response(proposals));
+    const result = await model
+      .startToolSession({ instructions: 'Read', messages: [], tools, batchable })
+      .next(10, signal());
+    assert.deepEqual(
+      result.calls.map((c) => c.name),
+      proposals.map((p) => p.name),
     );
   }
   const bodies: any[] = [];
@@ -124,11 +141,11 @@ test('read batches preserve every call/output binding; mixed writes, unknown too
     bodies.push(JSON.parse(String(init?.body)));
     return response(bodies.length === 1 ? [call('read_a'), call('read_b')] : textOutput);
   });
-  const session = model.startToolSession({ instructions: 'Read', messages: [], tools });
+  const session = model.startToolSession({ instructions: 'Read', messages: [], tools, batchable });
   assert.equal((await session.next(10, signal())).calls.length, 2);
   assert.equal(bodies[0].parallel_tool_calls, true);
   session.accept('read_a', { ok: true });
-  await assert.rejects(session.next(8, signal()), /outputs required/);
+  await assert.rejects(session.next(8, signal()), /TOOL_OUTPUTS_PENDING/);
   session.accept('read_b', { ok: true });
   await session.next(0, signal());
   assert.deepEqual(
@@ -139,20 +156,46 @@ test('read batches preserve every call/output binding; mixed writes, unknown too
   );
 });
 
-test('a single remaining read cannot be overspent by a batch', async () => {
+test('only the batchable list supplied by the caller enables parallel calls', async () => {
+  const bodies: any[] = [];
+  const model = new OpenAITextModel(config, async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return response(textOutput);
+  });
+  const tools = [tool('read_a'), tool('personal_list'), tool('write_history')];
+  // Read-only annotations alone no longer make a tool batchable.
+  await model.startToolSession({ instructions: 'Read', messages: [], tools }).next(5, signal());
+  await model
+    .startToolSession({ instructions: 'Read', messages: [], tools, batchable: ['read_a'] })
+    .next(5, signal());
+  await model
+    .startToolSession({
+      instructions: 'Read',
+      messages: [],
+      tools: [...tools, tool('read_b')],
+      batchable: ['read_a', 'read_b'],
+    })
+    .next(5, signal());
+  assert.deepEqual(
+    bodies.map((b) => b.parallel_tool_calls),
+    [false, false, true],
+  );
+});
+
+test('a single remaining read leaves batching off; the executor enforces the budget', async () => {
   const model = new OpenAITextModel(config, async (_url, init) => {
     assert.equal(JSON.parse(String(init?.body)).parallel_tool_calls, false);
     return response([call('read_a'), call('read_b')]);
   });
-  await assert.rejects(
-    model
-      .startToolSession({
-        instructions: 'Read',
-        messages: [],
-        tools: [tool('read_a'), tool('read_b')],
-      })
-      .next(1, signal()),
-  );
+  const result = await model
+    .startToolSession({
+      instructions: 'Read',
+      messages: [],
+      tools: [tool('read_a'), tool('read_b')],
+      batchable: ['read_a', 'read_b'],
+    })
+    .next(1, signal());
+  assert.equal(result.calls.length, 2);
 });
 
 test('terse real-chat commands and injected greetings never take the social shortcut', () => {
@@ -175,13 +218,25 @@ test('terse real-chat commands and injected greetings never take the social shor
   assert.equal(quickChatReply('hi ramesh'), 'Hi! How can I help?');
 });
 
+/** true/false approve or reject with a format repair; an object rejects with that repair. */
+type Verdict = boolean | { supported: false; repair: 'evidence' | 'tools' };
+
 function fixtureAgent(
   route: Record<string, unknown>,
   batches: Array<Array<{ name: string; arguments: string }>> = [],
-  approved = true,
+  approved: Verdict | Verdict[] = true,
   draft = 'The requested records were checked.',
+  formatterText = 'I cannot confirm that change was saved.',
 ) {
   const fixture = createSalesFixture();
+  // A list gives one verdict per review pass; the last verdict repeats.
+  let reviews = 0;
+  const verdict = (): { supported: boolean; repair: string } => {
+    const next = Array.isArray(approved)
+      ? approved[Math.min(reviews++, approved.length - 1)]!
+      : approved;
+    return typeof next === 'boolean' ? { supported: next, repair: 'format' } : next;
+  };
   const requests: ModelRequest[] = [],
     sessions: ToolSessionRequest[] = [],
     accepted: unknown[] = [];
@@ -191,15 +246,17 @@ function fixtureAgent(
       if (request.stage === 'converser') return generated(JSON.stringify(route));
       const plan = planningResult(request);
       if (plan) return plan;
-      if (request.stage === 'verifier')
+      if (request.stage === 'verifier') {
+        const { supported, repair } = verdict();
         return generated(
           JSON.stringify({
-            supported: approved,
-            feedback: approved ? '' : 'No authoritative write receipt. Do not claim a save.',
-            repair: 'format',
+            supported,
+            feedback: supported ? '' : 'No authoritative write receipt. Do not claim a save.',
+            repair,
           }),
         );
-      return generated('I cannot confirm that change was saved.');
+      }
+      return generated(formatterText);
     },
     startToolSession(request) {
       sessions.push(request);
@@ -259,6 +316,81 @@ test('ordinary drafts avoid a second generation but still receive independent re
   );
   assert.equal(result.trace.stages.find((s) => s.stage === 'formatter')!.inputTokens, 0);
   assert.equal(result.trace.modelRouting, 'split');
+});
+
+test('a layout-only finding on an approved answer never costs the user that answer', async () => {
+  // The formatting pass introduces new numbers, so it is rejected; the approved text is delivered.
+  const f = fixtureAgent(
+    {
+      route: 'direct',
+      objective: 'Answer.',
+      reply: 'We can leverage the dock from 12 Oct.',
+      workflow: 'general',
+    },
+    [],
+    true,
+    undefined,
+    'The dock is available from 2026-10-12.',
+  );
+  const result = await f.prepare('When can we use the dock?');
+  assert.equal(result.text, 'We can leverage the dock from 12 Oct.');
+  assert.equal(result.trace.outcome, 'completed');
+  assert.deepEqual(
+    f.requests.map((x) => x.stage),
+    ['converser', 'verifier', 'formatter'],
+  );
+  const codes = result.trace.events?.map((e) => e.code);
+  assert.ok(codes?.includes('REPAIR_REJECTED'));
+  assert.ok(codes?.includes('LAYOUT_ACCEPTED_AS_IS'));
+  assert.ok(!codes?.includes('REVIEW_EXHAUSTED_FALLBACK'));
+});
+
+test('after one formatting pass, remaining layout findings are accepted rather than retried', async () => {
+  const f = fixtureAgent(
+    {
+      route: 'direct',
+      objective: 'Answer.',
+      reply: 'We can leverage the dock from 12 Oct.',
+      workflow: 'general',
+    },
+    [],
+    true,
+    undefined,
+    'We can certainly use the dock from 12 Oct.',
+  );
+  const result = await f.prepare('When can we use the dock?');
+  assert.equal(result.text, 'We can certainly use the dock from 12 Oct.');
+  assert.equal(result.trace.outcome, 'completed');
+  assert.deepEqual(
+    f.requests.map((x) => x.stage),
+    ['converser', 'verifier', 'formatter', 'verifier'],
+  );
+  assert.ok(result.trace.events?.some((e) => e.code === 'LAYOUT_ACCEPTED_AS_IS'));
+});
+
+test('a formatting pass the reviewer rejects falls back to the approved original', async () => {
+  const f = fixtureAgent(
+    {
+      route: 'direct',
+      objective: 'Answer.',
+      reply: 'We can leverage the dock from 12 Oct.',
+      workflow: 'general',
+    },
+    [],
+    [true, false],
+    undefined,
+    'We can use the dock from 12 Oct.',
+  );
+  const result = await f.prepare('When can we use the dock?');
+  assert.equal(result.text, 'We can leverage the dock from 12 Oct.');
+  assert.equal(result.trace.outcome, 'completed');
+  assert.deepEqual(
+    f.requests.map((x) => x.stage),
+    ['converser', 'verifier', 'formatter', 'verifier'],
+  );
+  const codes = result.trace.events?.map((e) => e.code);
+  assert.ok(codes?.includes('FORMAT_REPAIR_REVERTED'));
+  assert.ok(!codes?.includes('REVIEW_EXHAUSTED_FALLBACK'));
 });
 
 test('an invented save in a misrouted RFQ reply cannot bypass review', async () => {
@@ -329,7 +461,7 @@ test('unadvertised and write names cannot qualify a request for the lookup plan'
   assert.equal(f.requests.filter((x) => x.stage === 'planner').length, 1);
 });
 
-test('the graph rejects a mixed read/write batch before executing its first read', async () => {
+test('the graph refuses a batch naming a tool outside the session before executing any read', async () => {
   const f = fixtureAgent(
     { route: 'work', objective: 'Read and change.', reply: '', workflow: 'general' },
     [
@@ -341,7 +473,59 @@ test('the graph rejects a mixed read/write batch before executing its first read
   );
   const result = await f.prepare('Read Fixture Acme and create a separate RFQ.');
   assert.equal(result.trace.outcome, 'unavailable');
+  assert.equal(result.trace.failure?.code, 'EXECUTOR_UNKNOWN_TOOL');
+  assert.equal(result.trace.failure?.stage, 'executor');
   assert.equal(f.fixture.state.calls.length, 0);
+});
+
+test('a batch mixing a business read with a non-batchable tool is refused as a tool result, and the turn continues', async () => {
+  const f = fixtureAgent(
+    { route: 'work', objective: 'Read and calculate.', reply: '', workflow: 'general' },
+    [
+      [
+        { name: 'search_crm_leads', arguments: '{}' },
+        { name: 'calculate', arguments: '{"expression":"2+2"}' },
+      ],
+    ],
+  );
+  const result = await f.prepare('Find Fixture Acme and work out 2+2.');
+  const session = f.sessions[0]!;
+  assert.ok(session.tools.some((t) => t.name === 'calculate'));
+  // The executor and the model session use the same batchable list: business reads only.
+  assert.ok(session.batchable!.includes('search_crm_leads'));
+  assert.ok(!session.batchable!.includes('calculate'));
+  assert.equal(f.fixture.state.calls.length, 0);
+  assert.deepEqual(
+    (f.accepted as Array<{ output: { code: string } }>).map((a) => a.output.code),
+    ['BATCH_NOT_ALLOWED', 'BATCH_NOT_ALLOWED'],
+  );
+  assert.equal(result.trace.outcome, 'completed');
+  assert.ok(result.trace.events?.some((e) => e.code === 'BATCH_NOT_ALLOWED' && !e.blocking));
+});
+
+test('arguments that fail the original schema go back to the model instead of ending the turn', async () => {
+  const f = fixtureAgent(
+    { route: 'work', objective: 'Search leads.', reply: '', workflow: 'general' },
+    [
+      [
+        {
+          name: 'search_crm_leads',
+          arguments: '{"limit":5000}',
+          invalid: {
+            code: 'INVALID_ARGUMENTS',
+            errors: [{ path: '/limit', rule: 'must be <= 50' }],
+          },
+        } as { name: string; arguments: string },
+      ],
+    ],
+  );
+  const result = await f.prepare('Find Fixture Acme.');
+  assert.equal(f.fixture.state.calls.length, 0);
+  const output = (f.accepted as Array<{ output: Record<string, unknown> }>)[0]!.output;
+  assert.equal(output.code, 'INVALID_ARGUMENTS');
+  assert.deepEqual(output.errors, [{ path: '/limit', rule: 'must be <= 50' }]);
+  assert.equal(result.trace.outcome, 'completed');
+  assert.ok(result.trace.events?.some((e) => e.code === 'INVALID_ARGUMENTS'));
 });
 
 test('a read batch stops when authorization is revoked after its first source call', async () => {
