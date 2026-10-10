@@ -11,20 +11,21 @@ import * as prompts from '../../src/modules/assistant/sales-prompts.js';
 
 const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 
-// Recorded 2026-10-10 at ramesh-chief-of-staff-v45 (after 3e22cbb); router lowered at v46.
+// Recorded 2026-10-10 at ramesh-chief-of-staff-v45 (after 3e22cbb); router lowered at v46;
+// all roles lowered when the shared evidence policy became core principles (v48).
 const COMPOSED: Record<string, number> = {
-  ROUTER_PROMPT: 3866,
-  PLANNER_PROMPT: 5642,
-  WORKER_PROMPT: 8262,
-  SALES_VERIFIER_PROMPT: 6838,
-  BUSINESS_FORMATTER_PROMPT: 4465,
-  EVIDENCE_REPAIR_PROMPT: 3236,
+  ROUTER_PROMPT: 2135,
+  PLANNER_PROMPT: 3911,
+  WORKER_PROMPT: 6531,
+  SALES_VERIFIER_PROMPT: 5107,
+  BUSINESS_FORMATTER_PROMPT: 2734,
+  EVIDENCE_REPAIR_PROMPT: 1505,
 };
 const FILES: Record<string, number> = {
   'business-formatter.md': 1905,
   'chief-of-staff.md': 1954,
   'converser.md': 452,
-  'evidence-policy.md': 2383,
+  'evidence-policy.md': 652,
   'evidence-repair.md': 244,
   'formatter.md': 247,
   'legacy-read-converser.md': 247,
