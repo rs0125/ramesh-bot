@@ -25,6 +25,7 @@ import {
   type VerifierSection,
 } from './sales-prompts.js';
 import { finishReply, chatLayoutIssues } from './style.js';
+import { afterReview } from './review-routing.js';
 import { businessRecall, recallDefinition, RECALL_TOOL } from './business-recall.js';
 import { dealDisplayFacts, dealDisplayIssues } from './deal-display.js';
 import {
@@ -1594,30 +1595,23 @@ export function buildSalesGraph(
         ? 'finish'
         : 'verifier',
     )
-    .addConditionalEdges('verifier', (value) =>
-      value.approved || value.repairs >= 2
-        ? 'finish'
-        : value.reviewPatched
-          ? 'verifier'
-          : narrowedRoute(value)
-            ? 'planner'
-            : value.repairKind === 'evidence'
-              ? value.evidenceRepairs < 1
-                ? 'evidence_repair'
-                : 'finish'
-              : !value.researchExhausted &&
-                  Date.now() < (options.researchDeadlineMs ?? Infinity) &&
-                  value.repairKind !== 'format' &&
-                  remainingTools() > 0 &&
-                  toolSteps < 28
-                ? !value.plan?.clarification && session?.revise
-                  ? 'revise'
-                  : 'planner'
-                : value.repairKind === 'format'
-                  ? 'formatter'
-                  : value.evidenceRepairs < 1
-                    ? 'evidence_repair'
-                    : 'finish',
+    .addConditionalEdges(
+      'verifier',
+      (value) =>
+        afterReview({
+          approved: value.approved,
+          repairs: value.repairs,
+          reviewPatched: !!value.reviewPatched,
+          narrowed: !!narrowedRoute(value),
+          repairKind: value.repairKind,
+          evidenceRepairs: value.evidenceRepairs,
+          canResearch:
+            !value.researchExhausted &&
+            Date.now() < (options.researchDeadlineMs ?? Infinity) &&
+            remainingTools() > 0 &&
+            toolSteps < 28,
+          canRevise: !value.plan?.clarification && !!session?.revise,
+        }).next,
     )
     .addEdge('revise', 'worker')
     .addEdge('finish', END)
