@@ -410,6 +410,19 @@ test('mixed business answer has both authorities and business recall reveals onl
   assert.doesNotMatch(JSON.stringify(recalled), /review the synthetic proposal|Saved reminder/);
 });
 
+test('a personal receipt with business context needs no fabricated business explanation', async () => {
+  const h = await scenario({ workflow: 'general', business: true, supplement: '' });
+  assert.equal(h.reply.trace.outcome, 'completed');
+  assert.equal(h.applied.length, 1);
+  assert.match(h.reply.text, /^Saved reminder:/);
+  const receipt = compositeDeliverySchema.parse(h.reply.businessEvidence);
+  assert.equal(receipt.businessText, '');
+  assert.equal(receipt.businessRecallAllowed, false);
+  assert.equal(getBusinessReply({ text: h.reply.text, receipt }), undefined);
+  assert.equal(await h.personalTools.canDeliver(h.trusted.key, receipt.personal, signal()), true);
+  assert.equal(await h.business.canDeliver(h.trusted.key, receipt.business, signal()), true);
+});
+
 test('composite delivery rejects mixed owners and malformed nested authority instead of treating either as valid', async () => {
   const h = await scenario({ workflow: 'general', business: true, supplement: businessText });
   const valid = compositeDeliverySchema.parse(h.reply.businessEvidence);

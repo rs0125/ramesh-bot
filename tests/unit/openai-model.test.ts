@@ -456,6 +456,10 @@ test('native tool sessions preserve continuation, optional arguments and correla
   assert.deepEqual(first.calls, [{ id: 'call-1', name: 'crm_summary', arguments: '{}' }]);
   await assert.rejects(session.next(7, AbortSignal.timeout(1000)), /TOOL_OUTPUTS_PENDING/);
   assert.throws(() => session.accept('forged-call', {}), /UNEXPECTED_TOOL_RESULT/);
+  assert.throws(
+    () => session.accept('call-1', { data: 'x'.repeat(1024 * 1024) }),
+    /TOOL_RESULT_OVER_BUDGET/,
+  );
   session.accept('call-1', { total: 17 });
   assert.throws(() => session.accept('call-1', {}), /UNEXPECTED_TOOL_RESULT/);
   assert.equal((await session.next(0, AbortSignal.timeout(1000))).text, '17 leads.');

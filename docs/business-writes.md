@@ -77,7 +77,7 @@ Backend business state and Ramesh's journal cannot share one SQL transaction acr
 
 Migration `202610040001_write_delivery_lookup.sql` adds a run-scoped audit-event
 index for receipt checks. It changes no write permissions or table columns and
-is an additive performance migration; runtime readiness still accepts `009`.
+is an additive performance migration. For expanded source capacity, apply `202610110001_write_source_capacity.sql` before deploying the updated bot and Context Engine catalogue. It widens only encrypted payload checks (2 MiB proposals, 5 MiB audit events); existing rows, ownership and append-only audit permissions are preserved. Application JSON limits remain 1 MiB per proposal and 3 MiB per before/after event.
 
 ## Recovery and undo
 
@@ -114,7 +114,7 @@ Examples include adding a CRM note, assigning a lead or changing a follow-up dat
 
 ## Locations and provenance
 
-`write_sources` can retrieve at most 32 original messages / 32 KB from the same account and private conversation from the last 7 days, at or before the current request. When the current request is a WhatsApp reply, the replied-to message is also returned, flagged `quoted`, for as long as the inbox retains it (30 days), under the same chat, origin and sender checks. Structured native pins survive raw-protocol cleanup. Historical messages have unknown forwarding status and cannot authorize a new action. A selected source ID is stored alongside the exact proposal. For tools declaring `coordinateArguments`, selected native coordinates must match the proposed coordinates exactly.
+`write_sources` can retrieve at most 32 original messages / 256 KiB from the same account and private conversation from the last 7 days, at or before the current request. When the current request is a WhatsApp reply, the replied-to message is also returned, flagged `quoted`, for as long as the inbox retains it (30 days), under the same chat, origin and sender checks. Structured native pins survive raw-protocol cleanup. Historical messages have unknown forwarding status and cannot authorize a new action. A selected source ID is stored alongside the exact proposal. For tools declaring `coordinateArguments`, selected native coordinates must match the proposed coordinates exactly.
 
 Google Maps links and raw coordinates are resolved through Context Engine's read-only `resolve_location`. It preserves ambiguity and provenance. It does not silently choose a viewport, geocode an unsupported address or treat a user-supplied URL as a trusted WhatsApp pin. The confirmation preview displays the final coordinates regardless of origin.
 

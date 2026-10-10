@@ -67,7 +67,8 @@ export async function appendWriteAudit(
   },
 ): Promise<void> {
   const id = randomUUID();
-  const payload = jsonCopy({ before: event.before, after: event.after }, 900000);
+  // Two complete proposal images plus bounded results and operation metadata.
+  const payload = jsonCopy({ before: event.before, after: event.after }, 3 * 1024 * 1024);
   await db.query(
     `INSERT INTO public."ramesh-write-events"(id,account_id,owner_employee_id,phone_e164,chat_id,operation_id,personal_command_id,source_family,kind,actor_type,run_id,source_message_id,operation_version,payload_encrypted)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
@@ -235,7 +236,7 @@ export class WriteRepository implements WriteRepositoryPort {
             )
           ).rows
         : [];
-      // Browsing earlier messages: up to 32 recent messages / 32 KB from the last 7 days.
+      // Up to 32 recent messages / 256 KiB, including JSON-escaped 32K briefs.
       const rows = (
         await db.query(
           `SELECT m.*, (m.id=$4 OR q.batch_parent=$4) AS current_turn FROM public."ramesh-messages" m
@@ -258,7 +259,7 @@ export class WriteRepository implements WriteRepositoryPort {
         if (!decoded) continue;
         const source: WriteSourceMessage = quoted ? { ...decoded, quoted: true } : decoded;
         const size = Buffer.byteLength(JSON.stringify(source));
-        if (bytes + size > 32000) continue;
+        if (bytes + size > 256 * 1024) continue;
         bytes += size;
         sources.push(source);
       }
@@ -407,7 +408,9 @@ export class WriteRepository implements WriteRepositoryPort {
     return this.event(db, ctx, updated, before, kind);
   }
   async propose(ctx: WriteCommandContext, payload: WriteProposalPayload): Promise<WriteOperation> {
-    const input = jsonCopy(payload, 180000);
+    // Raw source occurs in arguments and trusted provenance; allow four copies
+    // of a 32K source even at six JSON bytes per character, plus bounded metadata.
+    const input = jsonCopy(payload, 1024 * 1024);
     if (
       !input ||
       typeof input.toolName !== 'string' ||

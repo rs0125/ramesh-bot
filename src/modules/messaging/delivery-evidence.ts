@@ -12,14 +12,18 @@ export const compositeDeliverySchema = z
     version: z.literal(1),
     personal: personalDeliverySchema,
     business: toolDeliverySchema,
-    // Recall only this business segment under business receipts. Personal text has its own recall.
-    businessText: z.string().trim().min(1).max(12000),
+    // A receipt-only reply still carries both authorities even when there is no extra prose.
+    businessText: z.string().trim().max(12000),
     // Unsegmented prose informed by both personal recall and business reads cannot be
     // recalled using business permission alone. Retrieve each source again instead.
     businessRecallAllowed: z.literal(false).optional(),
   })
   .strict()
-  .refine((value) => value.personal.employeeId === value.business.employeeId);
+  .refine((value) => value.personal.employeeId === value.business.employeeId)
+  .refine((value) => value.businessText.length > 0 || value.businessRecallAllowed === false, {
+    path: ['businessText'],
+    message: 'An empty business segment cannot be recalled independently.',
+  });
 
 export const writeDeliveryBundleSchema = z
   .object({

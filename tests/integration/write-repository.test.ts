@@ -27,6 +27,7 @@ import type {
   WriteState,
 } from '../../src/modules/writes/write.types.js';
 import { temporaryMessageDatabase, postgresTestsEnabled } from '../fixtures/message-database.js';
+import { applyMessageSchema } from '../../scripts/message-schema.js';
 
 const actor: WriteActor = {
   employeeId: 23,
@@ -182,6 +183,77 @@ test(
       expiresAt: new Date(Date.now() + 300000).toISOString(),
     });
     try {
+      await t.test(
+        'source-capacity migration preserves existing intent and remains repeatable',
+        async () => {
+          const f = fixture();
+          const c = await command(f, 'Save this existing intent');
+          const draft = await f.repo.propose(c.ctx, payload());
+          const client = await db.admin.connect();
+          try {
+            await client.query('BEGIN');
+            // Restore the preceding release limits while retaining a real encrypted intent.
+            await client.query(`ALTER TABLE public."ramesh-write-operations"
+            DROP CONSTRAINT "ramesh-write-operations_payload_encrypted_check",
+            ADD CONSTRAINT "ramesh-write-operations_payload_encrypted_check" CHECK(octet_length(payload_encrypted)<=524288);
+            ALTER TABLE public."ramesh-write-events"
+            DROP CONSTRAINT "ramesh-write-events_payload_encrypted_check",
+            ADD CONSTRAINT "ramesh-write-events_payload_encrypted_check" CHECK(octet_length(payload_encrypted)<=1240000);
+            DELETE FROM public."ramesh-schema-migrations" WHERE version='202610110001'`);
+            await applyMessageSchema(client, 'ramesh_queue_tests_password_1234567890');
+            await applyMessageSchema(client, 'ramesh_queue_tests_password_1234567890');
+            await client.query('COMMIT');
+          } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+          } finally {
+            client.release();
+          }
+          assert.deepEqual(await f.repo.receiptLookup(actor, draft.operationId), draft);
+          assert.equal((await f.repo.auditRecent(actor)).length, 1);
+        },
+      );
+      await t.test(
+        'long escaped sources survive encrypted proposals, revisions and audit images',
+        async () => {
+          const f = fixture();
+          const rawText = 'Save this CRM brief.\n'.padEnd(32_000, '\u0001');
+          const c = await command(f, rawText);
+          const source = await f.repo.authorizeSource(c.ctx);
+          assert.equal(source.text, rawText);
+          assert.equal(
+            (await f.repo.readSources(c.ctx)).find((s) => s.id === source.id)?.text,
+            rawText,
+          );
+          const input = payload();
+          input.arguments.raw_text = rawText;
+          input.source = { instruction: source, trusted_request: source, evidence: [source] };
+          const first = await f.repo.propose(c.ctx, input);
+          assert.equal(first.payload.arguments.raw_text, rawText);
+          const revised = await f.repo.propose(c.ctx, {
+            ...input,
+            summary: 'Save the complete revised brief',
+          });
+          assert.equal(revised.operationId, first.operationId);
+          assert.equal(revised.version, first.version + 1);
+          assert.equal(
+            (await f.repo.receiptLookup(actor, first.operationId))!.payload.arguments.raw_text,
+            rawText,
+          );
+          const events = await f.repo.auditRecent(actor);
+          assert.equal(events.length, 2);
+          const revision = events.find((event) => event.before && event.after)!;
+          assert.equal((revision.before as WriteOperation).payload.arguments.raw_text, rawText);
+          assert.equal((revision.after as WriteOperation).payload.arguments.raw_text, rawText);
+          await assert.rejects(
+            f.repo.propose(c.ctx, { ...input, source: { oversized: 'x'.repeat(1024 * 1024) } }),
+            hasCode('WRITE_PAYLOAD_LIMIT'),
+          );
+          await deliver(f, c.job);
+          const followup = await command(f, 'yes');
+          assert.equal((await f.repo.readSources(followup.ctx, [source.id]))[0]!.text, rawText);
+        },
+      );
       await t.test(
         'direct approval is mode-bound, source-fenced and cannot upgrade persisted confirmation',
         async () => {

@@ -1558,6 +1558,28 @@ async function stageDirect(
   return { request, run, operation: [...h.operations.values()].at(-1)! };
 }
 
+test('direct email drafts retain the full schema-valid body and use a concise receipt', async () => {
+  const h = harness({
+    draft_ref: randomUUID(),
+    mailbox: 'employee@example.com',
+    subject: 'Synthetic update',
+    status: 'draft',
+    provider: 'gmail',
+  });
+  const args = { ...draftArgs(), body: 'Please review the fixture details. '.repeat(300) };
+  const { run, request } = await stageDirect(h, directTool(draft), args);
+  assert.doesNotMatch(run.tools[0]!.description!, /4,800-character/);
+  assert.ok(run.preview()!.includes(args.body), 'independent review sees the complete body');
+  assert.equal(h.calls.length, 0);
+  const reply = (await run.finalize(signal()))!;
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.body, args.body);
+  assert.match(reply.text, /Draft saved in employee@example.com/);
+  assert.match(reply.text, /The full draft is in Gmail/);
+  assert.ok(reply.text.length <= 4800);
+  assert.equal(await h.service.canDeliver(request.key, reply.delivery, signal()), true);
+});
+
 test('business history distinguishes staging, confirmation, commit, uncertainty and a safe retry', async () => {
   const h = harness();
   const { run, operation } = await stageDirect(h);

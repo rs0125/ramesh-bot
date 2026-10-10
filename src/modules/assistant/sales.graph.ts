@@ -1463,7 +1463,10 @@ export function buildSalesGraph(
       // mutation may invalidate their versions (for example editing that draft).
       // A receipt-only reply is authorized by its write receipt, not stale input
       // evidence. Any separately rendered answer retains every read check.
-      if (writePreview && !otherReply && !personalReply) delivery = run?.historyDelivery();
+      // Personal history/receipts are separately authorized; their presence does not
+      // turn a write-only response into a separately displayed business answer.
+      if (writePreview && !value.supplement) delivery = run?.historyDelivery();
+      const businessText = personalResult ? value.supplement : otherDraft;
       const composite =
         personalReply && delivery
           ? compositeDeliverySchema.parse({
@@ -1471,8 +1474,10 @@ export function buildSalesGraph(
               version: 1,
               personal: personalReply.delivery,
               business: delivery,
-              businessText: (personalResult ? value.supplement : otherDraft) || otherReply,
-              ...(personal?.usedPrivateReads || (personalResult && !value.supplement)
+              businessText,
+              ...(!businessText.trim() ||
+              personal?.usedPrivateReads ||
+              (personalResult && !value.supplement)
                 ? { businessRecallAllowed: false }
                 : {}),
             })

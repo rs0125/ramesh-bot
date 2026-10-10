@@ -254,7 +254,9 @@ export class OpenAITextModel implements TextModel {
         if (!pending.has(callId)) throw new GateRejection('UNEXPECTED_TOOL_RESULT');
         const namespace = pending.get(callId);
         const serialized = JSON.stringify(output);
-        if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > 100_000)
+        // Write evidence includes exact arguments, source messages and direct
+        // authorization. A 32K brief can occupy several escaped JSON copies.
+        if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > 1024 * 1024)
           throw new GateRejection('TOOL_RESULT_OVER_BUDGET', {
             bytes: typeof serialized === 'string' ? Buffer.byteLength(serialized) : 0,
           });
