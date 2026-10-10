@@ -10,6 +10,8 @@ export interface ConversationCase {
   id: string;
   turns: string[];
   expectation: string;
+  /** Optional verdict-free per-turn rubric shown to the judge; `expectation` text is withheld. */
+  expectations?: readonly string[];
   supply?: boolean;
   ownerQuestions?: boolean;
   ordinal?: boolean;

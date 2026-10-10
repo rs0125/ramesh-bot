@@ -41,18 +41,27 @@ export async function validateTranscriptCatalogue(
   return new OpenAIToolCatalog(tools, loading).render();
 }
 
-type Fixture = ReturnType<typeof createTranscriptFixture>;
+export type TranscriptFixture = ReturnType<typeof createTranscriptFixture>;
+type Fixture = TranscriptFixture;
+export interface TranscriptTurnView {
+  reply: string;
+  calls: unknown[];
+  local_calls: Array<{ name: string }>;
+  protected: boolean;
+  trace: { outcome: string };
+}
+/** Optional per-suite overrides; omitted hooks keep the incident transcript behaviour. */
+export interface TranscriptTrialHooks {
+  /** Replaces the default fault injection/revocation before each turn. */
+  beforeTurn?: (index: number, fixture: Fixture) => void;
+  /** Replaces transcriptChecks for each completed turn. */
+  checks?: (index: number, fixture: Fixture, turn: TranscriptTurnView) => string[];
+}
 export function transcriptChecks(
   scenario: TranscriptCase,
   index: number,
   fixture: Fixture,
-  turn: {
-    reply: string;
-    calls: unknown[];
-    local_calls: Array<{ name: string }>;
-    protected: boolean;
-    trace: { outcome: string };
-  },
+  turn: TranscriptTurnView,
 ) {
   const failures: string[] = [];
   const check = (ok: unknown, name: string) => {
@@ -161,6 +170,7 @@ export async function runTranscriptTrial(
   scenario: TranscriptCase,
   provider: TextModel,
   config: AssistantConfig,
+  hooks: TranscriptTrialHooks = {},
 ) {
   let now = Date.parse('2026-10-06T09:00:00Z');
   const fixture = createTranscriptFixture(scenario.mode, () => now);
@@ -228,8 +238,11 @@ export async function runTranscriptTrial(
   try {
     for (let index = 0; index < scenario.turns.length; index++) {
       now += 60000;
-      if (scenario.mode === 'rfq' && index === 2) fixture.state.uncertainNextCreate = true;
-      if (scenario.mode === 'recall' && index === 2) fixture.state.active = false;
+      if (hooks.beforeTurn) hooks.beforeTurn(index, fixture);
+      else {
+        if (scenario.mode === 'rfq' && index === 2) fixture.state.uncertainNextCreate = true;
+        if (scenario.mode === 'recall' && index === 2) fixture.state.active = false;
+      }
       const before = fixture.state.reads.length,
         writesBefore = fixture.state.writes.length,
         outputsBefore = record.toolResults.length,
@@ -267,7 +280,11 @@ export async function runTranscriptTrial(
         state: fixture.snapshot(),
       };
       record.turns.push(turn);
-      record.checks.push(...transcriptChecks(scenario, index, fixture, turn));
+      record.checks.push(
+        ...(hooks.checks
+          ? hooks.checks(index, fixture, turn)
+          : transcriptChecks(scenario, index, fixture, turn)),
+      );
       history.push(
         { role: 'user', content: text },
         {

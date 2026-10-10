@@ -245,3 +245,40 @@ The dollar value must be approved for the specific run. The source files are rea
 Context state is encrypted locally with a per-run key. Transcripts, source evidence and accounting are saved under the ignored `.local` directory, with private directory/file modes. Nothing is uploaded or saved into the remote playground conversation tables. Failed preflights and scenario executions are preserved; the runner does not retry scenarios. CI invocation is refused. Do not publish these private artifacts or copy their content into shared fixtures.
 
 Price profiles use the existing `usagePricesSchema`. Review current provider prices and ceilings before running; this harness caps exact rendered input at 96k, below Luna's long-context pricing threshold. A short live scenario tests app-owned summary/pins/recall, not the 64k native worker compaction threshold.
+
+## Smoke suite
+
+A fixed 12-case screen of live behaviour, run with a Luna agent and Luna grader, one trial per case, after every `SALES_PROMPT_VERSION` bump (`src/modules/assistant/sales-prompts.ts`). The cases live in [`smoke-cases.ts`](smoke-cases.ts), with IDs `smoke-01-greeting` to `smoke-12-conditional-reminder`. One `conversation-run` campaign uses three existing execution paths:
+
+- **5 read-only cases** use the in-memory sales fixture: greeting, today's follow-ups, a Chakan locality search, a comparison with no stated preference and an ISO date shown in IST. The fixture has no Bhiwandi listings, so the locality case uses Chakan.
+- **4 RFQ cases** use `runTranscriptTrial` against the synthetic CRM write fixture: an explicit full brief, an incomplete Hinglish brief, a save offer answered with "yes" (this case depends on open owner decision D2), and a bounded area with a placeholder foreign phone, an uncertain create and a retry.
+- **3 personal cases** use the scheduling trial shared with `scheduling-run.ts`: a reminder whose text differs only in letter case, a request that mixes the task list with CRM follow-ups, and a conditional reminder. Personal writes need a leased inbound row, so these cases need a disposable local PostgreSQL database.
+
+Hard checks work at the outcome level:
+
+- committed RFQ and reminder counts, with no duplicate on retry;
+- the saved record keeps the full brief, the bound on the area and the foreign phone;
+- no false success claim and no generic fallback or unavailable reply;
+- conditional reminders are reported as unsupported.
+
+The grader sees a verdict-free rubric for each turn. It cannot override a failed hard check.
+
+```sh
+# Free: prints the 12 IDs. Needs no key, model client, usage meter or database.
+npx tsx evals/conversation-run.ts --suite smoke --list
+
+# Paid. Start the Podman test database from ../docs/supabase-message-queue.md#verification first.
+TEST_MESSAGE_DATABASE_URL=postgresql://postgres:ramesh-test-only@127.0.0.1:55438/ramesh_queue_test \
+  npx tsx evals/conversation-run.ts --suite smoke --max-trials 12 --max-usd 2
+```
+
+You also need `OPENAI_API_KEY` in the ignored `.env` and a reviewed `EVAL_USAGE_PRICES_JSON` profile. The runner refuses to start, before it loads a key, in two cases:
+
+- without `--max-trials 12`: the default allowance is three, so the run fails with `EVAL_TRIAL_ALLOWANCE_EXCEEDED`;
+- without the database URL: the run fails with `SMOKE_LOCAL_DATABASE_REQUIRED`.
+
+Reports go to `.local/conversation-evals/<run-id>/`.
+
+**Cost.** The run has 12 cases and 14 user turns, because two RFQ cases have two turns. Each turn gets one grader call. The 5 October Luna screen (`results/2026-10-05-review-fixes-luna.md`) recorded $0.528 of conservatively accounted usage for 6 heavy workflow turns and 80 requests. That is about $0.09 per turn at long-context upper-bound rates. The 3 October scheduling probes cost $0.014 for 22 requests, without a grader. Smoke turns are lighter than those workflows, so expect at most about $1.25 of accounted usage. The approved ceiling is `--max-usd 2`, and the meter stops the campaign rather than exceed it. Expect roughly 15–25 minutes at concurrency 1.
+
+**Rules.** Run the suite on every `SALES_PROMPT_VERSION` bump, using the command above unchanged. Record the run ID and the pass count against the prompt version. **Never rerun failures to get green.** A failed or interrupted trial is evidence: preserve it, fix the cause and wait for the next version bump or a separately approved run. Running a subset with `--case` is for diagnosis only and is not a smoke result. A Luna pass screens behaviour; it does not prove Sol behaviour. Sol still needs explicit approval.

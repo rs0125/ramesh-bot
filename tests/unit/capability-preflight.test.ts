@@ -133,7 +133,16 @@ function fixture() {
         return state.toolNames.map(
           (name): ContextToolDefinition => ({
             name,
-            inputSchema: { type: 'object', additionalProperties: true },
+            // Closed schemas: an open object cannot be expressed in strict mode and is flagged.
+            inputSchema: {
+              type: 'object',
+              properties: Object.fromEntries(
+                ['view', 'limit', 'report', 'period', 'group', 'cursor', 'query', 'id'].map(
+                  (key) => [key, key === 'limit' ? { type: 'integer' } : { type: 'string' }],
+                ),
+              ),
+              additionalProperties: false,
+            },
           }),
         );
       },
@@ -371,7 +380,9 @@ test('CLI dependency closure contains no model adapters, application startup, qu
     seen.add(file);
     assert.doesNotMatch(
       file,
-      /infrastructure\/openai|app\/application|whatsapp\/(baileys-client|durable-messages)|message-queue\.repository/,
+      // strict-tool-schema is a pure JSON Schema codec with no SDK import; preflight uses it to
+      // flag tools the provider's strict mode cannot express.
+      /infrastructure\/openai\/(?!strict-tool-schema\.ts$)|app\/application|whatsapp\/(baileys-client|durable-messages)|message-queue\.repository/,
     );
     const source = await readFile(file, 'utf8');
     for (const match of source.matchAll(/(?:from\s+|import\s*)['"]([^'"]+)['"]/g)) {

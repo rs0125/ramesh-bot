@@ -29,6 +29,8 @@
     "db:identity": "tsx scripts/setup-identity-roster.ts",
     "context:auth": "tsx scripts/context-auth.ts",
     "capability:preflight": "tsx scripts/capability-preflight.ts",
+    "catalogue:drift": "tsx scripts/catalogue-drift.ts",
+    "probe:strict-catalogue": "tsx scripts/strict-catalogue-probe.ts",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "db:migrate": "prisma migrate deploy",

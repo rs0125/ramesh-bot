@@ -1,5 +1,5 @@
 /** Operator-only source readiness. No model, application startup, queue writer or WhatsApp sender. */
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -20,10 +20,17 @@ import {
   runCapabilityPreflight,
   type CapabilityReport,
 } from '../src/modules/operations/capability-preflight.js';
+import type { CatalogueTool } from '../src/modules/operations/catalogue-drift.js';
+
+const preflightOptions = {
+  'env-file': { type: 'string' },
+  // Writes the live read catalogue (tool definitions only) for `npm run catalogue:drift`.
+  'catalogue-out': { type: 'string' },
+} as const;
 
 /** An explicit file replaces ambient config, so a developer's credentials cannot mask a worker error. */
 export async function capabilityEnvironment(argv: string[], inherited: NodeJS.ProcessEnv) {
-  const { values } = parseArgs({ args: argv, options: { 'env-file': { type: 'string' } } });
+  const { values } = parseArgs({ args: argv, options: preflightOptions });
   if (!values['env-file']) return { ...inherited };
   const path = resolve(values['env-file']);
   const info = await stat(path);
@@ -33,7 +40,10 @@ export async function capabilityEnvironment(argv: string[], inherited: NodeJS.Pr
 }
 
 /** Split for offline import checks and fixture tests; calling this explicitly can read real sources. */
-export async function capabilityPreflight(env: NodeJS.ProcessEnv): Promise<CapabilityReport> {
+export async function capabilityPreflight(
+  env: NodeJS.ProcessEnv,
+  onCatalogue?: (tools: readonly CatalogueTool[]) => void,
+): Promise<CapabilityReport> {
   const started = performance.now();
   let config: ReturnType<typeof loadConfig>;
   let probe: ReturnType<typeof loadCapabilityProbeConfig>;
@@ -82,6 +92,7 @@ export async function capabilityPreflight(env: NodeJS.ProcessEnv): Promise<Capab
         }
       },
       resolve: createBusinessAccessResolver(config.businessReads, db, pool, config.encryptionKey),
+      ...(onCatalogue ? { onCatalogue } : {}),
     });
   } finally {
     await Promise.allSettled([db.$disconnect(), pool.end()]);
@@ -90,15 +101,22 @@ export async function capabilityPreflight(env: NodeJS.ProcessEnv): Promise<Capab
 
 async function main() {
   let report: CapabilityReport;
+  const { values } = parseArgs({ args: process.argv.slice(2), options: preflightOptions });
+  let catalogue: readonly CatalogueTool[] | undefined;
   try {
     report = await capabilityPreflight(
       await capabilityEnvironment(process.argv.slice(2), process.env),
+      (tools) => {
+        catalogue = tools;
+      },
     );
   } catch (error) {
     report = capabilityFailureReport(
       error instanceof CapabilityProbeError ? capabilityErrorCode(error) : 'CONFIG_INVALID',
     );
   }
+  if (values['catalogue-out'] && catalogue)
+    await writeFile(resolve(values['catalogue-out']), JSON.stringify(catalogue, null, 2) + '\n');
   console.log(JSON.stringify(report));
   process.exitCode = capabilityExitCode(report);
 }

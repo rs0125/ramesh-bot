@@ -1,5 +1,6 @@
 /** Model-free, read-only readiness. Reports never contain identity, source rows or credentials. */
 import { cancellable } from '../../lib/cancellable.js';
+import { strictUnsupportedTools, type CatalogueTool } from './catalogue-drift.js';
 import { BusinessReadService, type BusinessAccessResolver } from '../assistant/business-reads.js';
 import { ContextToolRun } from '../assistant/tool-executor.js';
 import { toolDelivery } from '../assistant/tool-evidence.js';
@@ -52,6 +53,7 @@ const errors = [
   'UNAVAILABLE',
   'TIMEOUT',
   'CANCELLED',
+  'STRICT_SCHEMA_UNSUPPORTED',
 ] as const;
 export type CapabilityErrorCode = (typeof errors)[number];
 export class CapabilityProbeError extends Error {
@@ -170,6 +172,8 @@ export async function runCapabilityPreflight(
     resolveEmployee(id: number, signal: AbortSignal): Promise<EmployeeIdentity | null>;
     resolve: BusinessAccessResolver;
     now?: () => number;
+    /** Receives the live read catalogue (definitions only), e.g. to compare with test fixtures. */
+    onCatalogue?: (tools: readonly CatalogueTool[]) => void;
   },
   caller?: AbortSignal,
 ): Promise<CapabilityReport> {
@@ -252,6 +256,25 @@ export async function runCapabilityPreflight(
       stage,
       latencyMs: elapsed(stageStarted),
     });
+    // A tool the provider's strict subset cannot express is dropped from every model session.
+    const unsupported = strictUnsupportedTools(run.tools);
+    checks.push({
+      capability: 'catalogue',
+      required: false,
+      status: unsupported.length ? 'failed' : 'ready',
+      stage,
+      latencyMs: 0,
+      ...(unsupported.length ? { error: 'STRICT_SCHEMA_UNSUPPORTED' as const } : {}),
+    });
+    runtime.onCatalogue?.(
+      run.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        ...(tool._meta ? { _meta: tool._meta } : {}),
+        ...(tool.annotations ? { annotations: tool.annotations as Record<string, unknown> } : {}),
+      })),
+    );
     for (const capability of [...config.required, ...config.optional]) {
       const capStarted = performance.now();
       const required = config.required.includes(capability);

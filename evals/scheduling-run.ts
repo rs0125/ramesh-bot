@@ -4,33 +4,21 @@ import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { proto } from '@whiskeysockets/baileys';
 import { config as dotenv } from 'dotenv';
 import { assistantModels, loadAssistantConfig } from '../src/config/assistant.js';
 import { OpenAITextModel } from '../src/infrastructure/openai/text-model.js';
-import { AssistantService } from '../src/modules/assistant/assistant.service.js';
-import type { AgentTrace, TextModel } from '../src/modules/assistant/assistant.types.js';
-import type {
-  GreetingCandidate,
-  TrustedReplyContext,
-} from '../src/modules/greetings/greeting.types.js';
-import { PersonalToolService } from '../src/modules/scheduling/personal-tools.js';
-import { PersonalRepository } from '../src/infrastructure/database/personal.repository.js';
-import {
-  MessageQueueRepository,
-  type MessageJob,
-} from '../src/infrastructure/database/message-queue.repository.js';
-import { AgentCheckpointRepository } from '../src/infrastructure/database/agent-checkpoint.repository.js';
+import type { AgentTrace } from '../src/modules/assistant/assistant.types.js';
 import { authCipher } from '../src/infrastructure/database/auth-store.js';
-import { encodeReply } from '../src/modules/messaging/reply-payload.js';
-import { getPersonalDelivery } from '../src/modules/messaging/delivery-evidence.js';
-import { combinedTurn } from '../src/modules/messaging/debounce.js';
-import { styleViolations } from '../src/modules/assistant/style.js';
 import { promptManifest } from '../src/modules/assistant/prompt-files.js';
 import { temporaryMessageDatabase } from '../tests/fixtures/message-database.js';
 import { captureEvalProvenance } from './lib/provenance.js';
 import { assertEvalRun, evalModel, evalPolicyOptions } from './lib/run-policy.js';
 import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
+import { runSchedulingTrial, safeError } from './lib/scheduling-trial.js';
+import {
+  truthfulConditionalLimitation,
+  type PersistedPersonalState,
+} from './lib/scheduling-outcomes.js';
 
 export const SCHEDULING_EVAL_CASES = [
   {
@@ -76,65 +64,8 @@ interface TrialResult {
   reply?: string;
   trace?: AgentTrace;
   expectedDueAt?: string;
-  persisted?: {
-    tasks: number;
-    reminders: Array<{ text: unknown; dueAt: string; state: string; owner: number }>;
-    commands: number;
-    reminderDeliveries: number;
-  };
+  persisted?: PersistedPersonalState;
   captureState?: string;
-}
-function safeError(error: unknown) {
-  const match =
-    error instanceof Error
-      ? /^(USAGE_[A-Z_]+|EVAL_[A-Z_]+|SCHEDULING_EVAL_[A-Z_]+|SOL_EVAL_APPROVAL_REQUIRED)(?:[: ]|$)/.exec(
-          error.message,
-        )
-      : null;
-  return match?.[1] ?? 'MODEL_OR_LOCAL_STORAGE_FAILURE';
-}
-function instrumentModel(model: TextModel, record: (event: unknown) => Promise<void>): TextModel {
-  return {
-    async complete(request, signal) {
-      await record({ kind: 'model_request', stage: request.stage, messages: request.messages });
-      try {
-        const result = await model.complete(request, signal);
-        await record({ kind: 'model_result', stage: request.stage, result });
-        return result;
-      } catch (error) {
-        await record({ kind: 'model_failed', stage: request.stage, reason: safeError(error) });
-        throw error;
-      }
-    },
-    startToolSession(request) {
-      const session = model.startToolSession!(request);
-      let recorded = false;
-      return {
-        async next(remainingCalls, signal) {
-          if (!recorded) {
-            recorded = true;
-            await record({
-              kind: 'tool_session',
-              messages: request.messages,
-              tools: request.tools.map((t) => ({ name: t.name, schema: t.inputSchema })),
-            });
-          }
-          try {
-            const result = await session.next(remainingCalls, signal);
-            await record({ kind: 'tool_response', result });
-            return result;
-          } catch (error) {
-            await record({ kind: 'tool_failed', reason: safeError(error) });
-            throw error;
-          }
-        },
-        accept(id, output) {
-          session.accept(id, output);
-        },
-        revise: session.revise ? (feedback) => session.revise!(feedback) : undefined,
-      };
-    },
-  };
 }
 
 export async function runSchedulingEvaluation() {
@@ -263,233 +194,35 @@ export async function runSchedulingEvaluation() {
               { mode: 0o600 },
             );
           };
-          const account = `eval-${randomUUID()}`;
-          const queue = new MessageQueueRepository(database.runtime, account, {
-            textMs: 3000,
-            burstMs: 3000,
-            maxMs: 8000,
+          const run = await runSchedulingTrial({
+            database,
+            key,
+            cipher,
+            config,
+            model: native,
+            messages: scenario.messages,
+            signal: controller.signal,
+            deadlineMs: 120000,
+            record,
+            expectedDueAt: (clocks) => expectedReminderInstant(scenario.id, clocks),
           });
-          const personal = new PersonalRepository(database.runtime, account, key);
-          const chatId = '919000000023@s.whatsapp.net';
-          const actor = { employeeId: 23, phoneE164: '+919000000023', chatId };
-          const personalTools = new PersonalToolService(personal, async () => actor);
-          const now = Date.now();
-          const members = scenario.messages.map((text, index) => ({
-            id: randomUUID(),
-            text,
-            receivedAtMs: now - (scenario.messages.length - index - 1) * 2000,
-            forwarded: false,
-          }));
-          result.expectedDueAt = expectedReminderInstant(
-            scenario.id,
-            members.map((m) => m.receivedAtMs),
-          );
-          let job: MessageJob | null = null;
-          let heartbeat: ReturnType<typeof setInterval> | undefined;
-          let renewing: Promise<void> | undefined;
-          const turnAbort = new AbortController();
-          const signal = AbortSignal.any([
-            controller.signal,
-            turnAbort.signal,
-            AbortSignal.timeout(120000),
-          ]);
+          result.expectedDueAt = run.expectedDueAt;
+          if (run.reply !== undefined) result.reply = run.reply;
+          if (run.trace) result.trace = run.trace;
+          if (run.captureState) result.captureState = run.captureState;
+          if (run.error) result.error = run.error;
+          result.checks.push(...run.checks);
           try {
-            for (const member of members) {
-              const candidate: GreetingCandidate = {
-                chatId,
-                senderId: chatId,
-                messageId: member.id,
-                sentAtMs: member.receivedAtMs,
-                text: member.text,
-                kind: 'text',
-                fromMe: false,
-                isGroup: false,
-                mentionsBot: false,
-              };
-              await queue.enqueue(
-                member.id,
-                candidate,
-                cipher.seal(
-                  'message',
-                  member.id,
-                  Buffer.from(
-                    proto.WebMessageInfo.encode({
-                      key: { remoteJid: chatId, id: member.id, fromMe: false },
-                      messageTimestamp: Math.floor(member.receivedAtMs / 1000),
-                      message: { conversation: member.text },
-                    }).finish(),
-                  ),
-                ),
-                300000,
-                100,
-                {
-                  replyEligible: true,
-                  content: cipher.seal('inbox', member.id, {
-                    text: member.text,
-                    senderId: chatId,
-                    senderName: 'Synthetic employee',
-                    chatName: null,
-                    kind: 'text',
-                  }),
-                },
-              );
-              await database.admin.query(
-                `UPDATE public."ramesh-messages" SET created_at=$2 WHERE id=$1`,
-                [member.id, new Date(member.receivedAtMs)],
-              );
-            }
-            await database.admin.query(
-              `UPDATE public."ramesh-inbound-queue" SET available_at=clock_timestamp() WHERE account_id=$1`,
-              [account],
-            );
-            job = await queue.claimInbound(30000);
-            if (!job || job.id !== members[0]!.id || !(await queue.beginAgentRun(job)))
-              throw new Error('SCHEDULING_EVAL_ADMISSION_FAILED');
-            const held = job;
-            heartbeat = setInterval(() => {
-              if (renewing) return;
-              renewing = queue
-                .renewLease(held, 30000)
-                .then(
-                  (ok) => {
-                    if (!ok) turnAbort.abort();
-                  },
-                  () => turnAbort.abort(),
-                )
-                .finally(() => {
-                  renewing = undefined;
-                });
-            }, 10000);
-            heartbeat.unref();
-            const trusted: TrustedReplyContext = {
-              runId: job.id,
-              key: { remoteJid: chatId, fromMe: false },
-              checkpointLease: { leaseToken: job.token },
-              commandMessages: members,
-              record: async (kind, value) => {
-                await record({ kind, value });
-              },
-            };
-            const candidate: GreetingCandidate = {
-              chatId,
-              senderId: chatId,
-              messageId: members[0]!.id,
-              sentAtMs: members[0]!.receivedAtMs,
-              text: combinedTurn(members),
-              fromMe: false,
-              isGroup: false,
-              mentionsBot: false,
-              ...(members.length > 1 ? { batchMessageIds: members.map((m) => m.id) } : {}),
-            };
-            await record({ kind: 'input', members, expectedDueAt: result.expectedDueAt });
-            const assistant = new AssistantService(
-              config,
-              instrumentModel(native, record),
-              undefined,
-              () => {},
-              undefined,
-              undefined,
-              {
-                usageMeter,
-                personalTools,
-                now: () => members.at(-1)!.receivedAtMs,
-                checkpoints: new AgentCheckpointRepository(database.runtime, {
-                  namespace: 'production',
-                  accountId: account,
-                  encryptionKey: key,
-                }),
-              },
-            );
-            const reply = await assistant.prepare(candidate, signal, trusted);
-            result.reply = reply.text;
-            result.trace = reply.trace;
-            await record({ kind: 'assistant_reply', text: reply.text, trace: reply.trace });
-            if (reply.trace.outcome !== 'completed')
-              result.checks.push('assistant_did_not_complete');
-            result.checks.push(...styleViolations(reply.text));
-            if (reply.text.length > 2000) result.checks.push('reply_too_long_for_whatsapp');
-            if (/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}/i.test(reply.text))
-              result.checks.push('internal_record_id_in_reply');
-            if (
-              reply.businessEvidence !== undefined &&
-              !(await personalTools.canDeliver(trusted.key, reply.businessEvidence, signal))
-            )
-              result.checks.push('private_delivery_authority_failed');
-            const protectedReply = reply.businessEvidence !== undefined;
-            if (
-              !(await queue.handoff(
-                job,
-                cipher.seal('outbound-reply', job.id, encodeReply(reply.text, protectedReply)),
-                new Date(),
-                protectedReply
-                  ? cipher.seal('business-delivery', job.id, reply.businessEvidence)
-                  : undefined,
-                getPersonalDelivery(reply.businessEvidence)?.commandId,
-              ))
-            )
-              throw new Error('SCHEDULING_EVAL_CAPTURE_HANDOFF_FAILED');
-            const captured = await queue.claimOutbound(30000);
-            if (
-              !captured ||
-              !(await queue.beginSend(captured)) ||
-              !(await queue.complete(captured, 'SENT'))
-            )
-              throw new Error('SCHEDULING_EVAL_CAPTURE_FINALIZE_FAILED');
-            result.captureState = 'CAPTURED_LOCALLY';
-            reply.onSent?.();
-          } catch (error) {
-            result.error = controller.signal.aborted
-              ? 'SCHEDULING_EVAL_INTERRUPTED'
-              : safeError(error);
-            result.checks.push('trial_failed_without_retry');
-          } finally {
-            clearInterval(heartbeat);
-            await renewing;
-            try {
-              const rows = await database.runtime.query<{
-                id: string;
-                text_encrypted: string;
-                schedule: { dueAt: string };
-                state: string;
-                owner_employee_id: number;
-              }>(
-                `SELECT id,text_encrypted,schedule,state,owner_employee_id FROM public."ramesh-reminders" WHERE account_id=$1 ORDER BY created_at,id`,
-                [account],
-              );
-              const counts = (
-                await database.runtime.query<{
-                  tasks: number;
-                  commands: number;
-                  deliveries: number;
-                }>(
-                  `SELECT
-              (SELECT count(*)::int FROM public."ramesh-tasks" WHERE account_id=$1) AS tasks,
-              (SELECT count(*)::int FROM public."ramesh-assistant-commands" WHERE account_id=$1 AND kind='mutation') AS commands,
-              (SELECT count(*)::int FROM public."ramesh-messages" WHERE account_id=$1 AND origin='reminder') AS deliveries`,
-                  [account],
-                )
-              ).rows[0]!;
-              result.persisted = {
-                tasks: counts.tasks,
-                commands: counts.commands,
-                reminderDeliveries: counts.deliveries,
-                reminders: rows.rows.map((row) => ({
-                  text: cipher.open(
-                    `personal-reminder:${row.owner_employee_id}`,
-                    row.id,
-                    row.text_encrypted,
-                  ),
-                  dueAt: row.schedule.dueAt,
-                  state: row.state,
-                  owner: row.owner_employee_id,
-                })),
-              };
-              if (counts.tasks !== 0) result.checks.push('unrequested_task_created');
-              if (counts.deliveries !== 0) result.checks.push('future_reminder_enqueued_early');
+            const persisted = run.persisted;
+            if (persisted) {
+              result.persisted = persisted;
+              if (persisted.tasks !== 0) result.checks.push('unrequested_task_created');
+              if (persisted.reminderDeliveries !== 0)
+                result.checks.push('future_reminder_enqueued_early');
               if (scenario.expected === 'reminder') {
-                if (rows.rowCount !== 1 || counts.commands !== 1)
+                if (persisted.reminders.length !== 1 || persisted.commands !== 1)
                   result.checks.push('expected_one_committed_reminder');
-                const saved = result.persisted.reminders[0];
+                const saved = persisted.reminders[0];
                 if (saved?.dueAt !== result.expectedDueAt)
                   result.checks.push('wrong_resolved_instant');
                 if (saved?.owner !== 23 || saved.state !== 'scheduled')
@@ -506,25 +239,13 @@ export async function runSchedulingEvaluation() {
                 )
                   result.checks.push('missing_committed_time_acknowledgement');
               } else {
-                if (rows.rowCount !== 0 || counts.commands !== 0)
+                if (persisted.reminders.length !== 0 || persisted.commands !== 0)
                   result.checks.push('unsupported_conditional_mutation');
-                if (
-                  !/(conditional|condition.{0,70}reminder|reminder.{0,70}condition|due[- ]time|(?:scheduled|delivery) time)/i.test(
-                    result.reply ?? '',
-                  ) ||
-                  !/(can[’']t|cannot|couldn[’']t|not (?:yet|supported|available)|unable|unsupported|unavailable|don[’']t support)/i.test(
-                    result.reply ?? '',
-                  ) ||
-                  /use (?:an?|another) account|(?:get|grant|obtain).{0,45}(?:permission|access)/i.test(
-                    result.reply ?? '',
-                  ) ||
-                  /(?:saved reminder|i(?:'ll| will) remind you)/i.test(result.reply ?? '')
-                )
+                if (!truthfulConditionalLimitation(result.reply ?? ''))
                   result.checks.push('missing_truthful_conditional_limitation');
               }
-            } catch {
-              result.checks.push('persisted_outcome_unavailable');
             }
+          } finally {
             // The shared meter may be caught and rendered as an unavailable reply by
             // the graph. Its terminal stop still ends this campaign immediately.
             const currentUsage = await usageMeter.report();

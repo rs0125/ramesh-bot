@@ -1,6 +1,6 @@
 /** Paid real-model conversational evals. Synthetic CRM/supply, no transport, retained failed trials. */
 import { createEvalUsageMeter, evalBudgetOptions, settleEvalWorkers } from './lib/usage-budget.js';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { mkdir, appendFile, writeFile, readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { resolve, join } from 'node:path';
@@ -37,7 +37,16 @@ import { createSalesFixture, FIXTURE_JID } from '../scripts/lib/sales-fixture.js
 import { SALES_PROMPT_VERSION } from '../src/modules/assistant/sales-prompts.js';
 import { styleViolations } from '../src/modules/assistant/style.js';
 import { indiaDate } from '../src/modules/assistant/followups.js';
-import { CONVERSATION_CASES } from './conversation-cases.js';
+import { CONVERSATION_CASES, type ConversationCase } from './conversation-cases.js';
+import {
+  SMOKE_CASES,
+  isDelegatedSmokeCase,
+  type SmokeCase,
+  type SmokePersonalCase,
+  type SmokeRfqCase,
+} from './smoke-cases.js';
+import { runTranscriptTrial, validateTranscriptCatalogue } from './lib/transcript-trial.js';
+import { FALLBACK_REPLY, personalSmokeChecks, rfqSmokeChecks } from './lib/smoke-checks.js';
 import {
   assertEvalRun,
   evalModel,
@@ -67,32 +76,42 @@ const concurrency = Number(values.concurrency);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
   throw new Error('Use concurrency 1–4');
 if (
-  !['all', 'conversation', 'journeys', 'adversarial', 'pagination', 'recovery', 'latency'].includes(
-    values.suite!,
-  )
+  ![
+    'all',
+    'conversation',
+    'journeys',
+    'adversarial',
+    'pagination',
+    'recovery',
+    'latency',
+    'smoke',
+  ].includes(values.suite!)
 )
   throw new Error('Unknown suite');
-const poolCases =
-  values.suite === 'latency'
-    ? LATENCY_CASES
-    : values.suite === 'conversation'
-      ? CONVERSATION_CASES
-      : values.suite === 'journeys'
-        ? JOURNEY_CASES
-        : values.suite === 'adversarial'
-          ? ADVERSARIAL_CASES
-          : values.suite === 'pagination'
-            ? PAGINATION_CASES
-            : values.suite === 'recovery'
-              ? RECOVERY_CASES
-              : [
-                  ...CONVERSATION_CASES,
-                  ...JOURNEY_CASES,
-                  ...ADVERSARIAL_CASES,
-                  ...PAGINATION_CASES,
-                  ...RECOVERY_CASES,
-                  ...LATENCY_CASES,
-                ];
+// `all` stays the CI pool; the smoke suite is a separate fixed screen (see evals/smoke-cases.ts).
+const poolCases: readonly (ConversationCase | SmokeCase)[] =
+  values.suite === 'smoke'
+    ? SMOKE_CASES
+    : values.suite === 'latency'
+      ? LATENCY_CASES
+      : values.suite === 'conversation'
+        ? CONVERSATION_CASES
+        : values.suite === 'journeys'
+          ? JOURNEY_CASES
+          : values.suite === 'adversarial'
+            ? ADVERSARIAL_CASES
+            : values.suite === 'pagination'
+              ? PAGINATION_CASES
+              : values.suite === 'recovery'
+                ? RECOVERY_CASES
+                : [
+                    ...CONVERSATION_CASES,
+                    ...JOURNEY_CASES,
+                    ...ADVERSARIAL_CASES,
+                    ...PAGINATION_CASES,
+                    ...RECOVERY_CASES,
+                    ...LATENCY_CASES,
+                  ];
 const filters = values.case?.split(',').map((value) => value.trim());
 const cases = poolCases.filter(
   (c) => !filters || filters.includes(c.id) || filters.includes(c.category ?? ''),
@@ -108,12 +127,25 @@ const spendingPolicy = assertEvalRun(
   cases.length * trials,
   values,
 );
+const smokeRfqCases = cases.filter(
+  (c): c is SmokeRfqCase => isDelegatedSmokeCase(c) && c.runner === 'transcript',
+);
+const smokePersonalCases = cases.filter(
+  (c): c is SmokePersonalCase => isDelegatedSmokeCase(c) && c.runner === 'scheduling',
+);
+if (smokePersonalCases.length && !process.env.TEST_MESSAGE_DATABASE_URL)
+  throw new Error(
+    'SMOKE_LOCAL_DATABASE_REQUIRED: personal reminder/task cases need TEST_MESSAGE_DATABASE_URL for a disposable local ramesh_queue_test database. No model request was sent.',
+  );
 const loaded = loadAssistantConfig({
   ...process.env,
   OPENAI_MODEL: selectedModel,
   ...(values['tool-effort'] ? { AGENT_TOOL_REASONING_EFFORT: values['tool-effort'] } : {}),
 });
 if (!loaded) throw new Error('OPENAI_API_KEY is required; do not pass it as a command argument');
+// Construct the RFQ write catalogue for the provider before any paid request.
+if (smokeRfqCases.length)
+  await validateTranscriptCatalogue('rfq', loaded.toolLoadingMode ?? 'eager');
 const runId = `${new Date().toISOString().replaceAll(':', '-')}-${randomUUID().slice(0, 8)}`;
 const directory = values.output
   ? pathToFileURL(join(resolve(values.output), runId) + '/')
@@ -143,6 +175,15 @@ const metadata = {
   runId,
   startedAt: new Date(startedAt).toISOString(),
   syntheticClock: '2026-10-02T09:00:00Z; +1 minute per user turn',
+  ...(smokeRfqCases.length || smokePersonalCases.length
+    ? {
+        delegatedClocks: {
+          transcript: '2026-10-06T09:00:00Z; +1 minute per user turn (synthetic CRM writes)',
+          scheduling:
+            'actual admission time; disposable local PostgreSQL queue lease and personal rows',
+        },
+      }
+    : {}),
   model: config.model,
   modelRouting: config.modelRouting,
   models: assistantModels(config),
@@ -168,6 +209,198 @@ const metadata = {
 await writeFile(new URL('run-metadata.json', directory), JSON.stringify(metadata, null, 2), {
   mode: 0o600,
 });
+/** Records agent usage, proposals and accepted tool outputs for one trial. */
+function recordingModel(record: any): TextModel {
+  return {
+    toolLoadingMode: provider.toolLoadingMode,
+    startToolSession(request) {
+      const session = provider.startToolSession(request);
+      return {
+        async next(remaining, signal, allowedTools) {
+          const next = await session.next(remaining, signal, allowedTools);
+          addUsage(record.usage, next);
+          addUsage(record.agentUsage, next);
+          record.proposedTools.push(
+            ...next.calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments })),
+          );
+          if (next.text) record.modelOutputs.push({ stage: 'worker', text: next.text });
+          return next;
+        },
+        accept(id, output) {
+          const proposal = record.proposedTools.filter((c: any) => c.id === id).at(-1);
+          record.toolResults.push({ ...proposal, output: structuredClone(output) });
+          if (proposal?.name === 'recall_business_context')
+            record.localTools.push({ ...proposal, output: structuredClone(output) });
+          session.accept(id, output);
+        },
+        revise: (feedback) => session.revise!(feedback),
+      };
+    },
+    async complete(request, signal) {
+      const response = await provider.complete(request, signal);
+      addUsage(record.usage, response);
+      addUsage(record.agentUsage, response);
+      if (request.stage === 'verifier') record.modelReviews.push(response.text);
+      record.modelOutputs.push({ stage: request.stage, text: response.text });
+      return response;
+    },
+  };
+}
+
+async function judgeDelegated(
+  record: any,
+  expectations: readonly string[],
+  category: string,
+): Promise<void> {
+  try {
+    record.judge = await judgeTurns(
+      judgeProvider,
+      judgePrompt,
+      expectations,
+      record.turns,
+      AbortSignal.timeout(90000 * Math.max(1, record.turns.length)),
+      (result) => {
+        addUsage(record.usage, result);
+        addUsage(record.judgeUsage, result);
+      },
+      category,
+    );
+    for (const turn of record.judge.turns)
+      for (const key of CRITERIA)
+        if (!turn[key]) record.checks.push(`turn${turn.turn}:judge:${key}`);
+  } catch (error) {
+    record.checks.push('judge_error');
+    record.judgeError =
+      error instanceof Error && /^INVALID_JUDGE_[A-Z_]+$/.test(error.message)
+        ? error.message
+        : 'JUDGE_FAILED';
+  }
+}
+
+/** Smoke RFQ case: production graph and write service over the synthetic transcript CRM. */
+async function smokeRfqTrial(scenario: SmokeRfqCase, trial: number) {
+  const started = Date.now();
+  const record = await runTranscriptTrial(scenario, provider, config, {
+    beforeTurn: (index, fixture) => {
+      if (index === scenario.effects.uncertainCreateTurn) fixture.state.uncertainNextCreate = true;
+    },
+    checks: (index, fixture, turn) => rfqSmokeChecks(scenario.effects, index, fixture, turn),
+  });
+  record.trial = trial;
+  record.category = scenario.category;
+  if (record.turns.length === scenario.turns.length)
+    await judgeDelegated(record, scenario.expectations, scenario.category);
+  record.durationMs = Date.now() - started;
+  record.passed = record.checks.length === 0 && record.turns.length === scenario.turns.length;
+  return record;
+}
+
+/** Personal tools commit only under a leased inbound row: one disposable local database per run. */
+let smokeDatabase:
+  | Promise<{
+      database: import('./lib/scheduling-trial.js').SchedulingDatabase;
+      key: string;
+      cipher: ReturnType<typeof import('../src/infrastructure/database/auth-store.js').authCipher>;
+    }>
+  | undefined;
+async function openSmokeDatabase() {
+  const [{ temporaryMessageDatabase }, { authCipher }] = await Promise.all([
+    import('../tests/fixtures/message-database.js'),
+    import('../src/infrastructure/database/auth-store.js'),
+  ]);
+  const database = await temporaryMessageDatabase();
+  const key = randomBytes(32).toString('base64url');
+  return { database, key, cipher: authCipher(key) };
+}
+
+/** Open pools keep the process alive, so the disposable database is always dropped. */
+async function closeSmokeDatabase() {
+  const opened = await smokeDatabase?.catch(() => undefined);
+  if (opened)
+    await opened.database
+      .close()
+      .catch(() =>
+        console.error('Smoke database cleanup failed; drop leftover ramesh_test_* databases.'),
+      );
+}
+
+/** Smoke personal case: the scheduling trial, optionally with synthetic CRM reads. */
+async function smokePersonalTrial(scenario: SmokePersonalCase, trial: number) {
+  const started = Date.now();
+  const record: any = {
+    case: scenario.id,
+    trial,
+    passed: false,
+    checks: [],
+    turns: [],
+    modelReviews: [],
+    modelOutputs: [],
+    proposedTools: [],
+    localTools: [],
+    toolResults: [],
+    category: scenario.category,
+    usage: emptyUsage(),
+    agentUsage: emptyUsage(),
+    judgeUsage: emptyUsage(),
+  };
+  try {
+    const { runSchedulingTrial } = await import('./lib/scheduling-trial.js');
+    const db = await (smokeDatabase ??= openSmokeDatabase()).catch(() => {
+      throw new Error('SMOKE_LOCAL_DATABASE_UNAVAILABLE');
+    });
+    const run = await runSchedulingTrial({
+      ...db,
+      config,
+      model: recordingModel(record),
+      messages: scenario.turns,
+      signal: new AbortController().signal,
+      deadlineMs: config.timeoutMs,
+      record: (event) =>
+        appendFile(
+          new URL(`${scenario.id}-${trial}.trace.ndjson`, directory),
+          `${JSON.stringify(event)}\n`,
+          { mode: 0o600 },
+        ),
+      expectedDueAt: scenario.personal.dueAt,
+      businessReads: scenario.businessReads ? (now) => createSalesFixture(now).service : undefined,
+    });
+    const admitted = run.members.at(-1)?.receivedAtMs ?? Date.now();
+    record.turns.push({
+      text: scenario.turns[0],
+      clock: {
+        instant: new Date(admitted).toISOString(),
+        timezone: 'Asia/Kolkata',
+        local_date: indiaDate(admitted),
+      },
+      authorization: { active_employee: true, audience: 'dm' },
+      reply: run.reply ?? '',
+      trace: run.trace,
+      proposed_tools: structuredClone(record.proposedTools),
+      tool_results: structuredClone(record.toolResults),
+      evidence: record.toolResults.map((r: any) => r.output),
+      persisted: run.persisted,
+      expected_due_at: run.expectedDueAt,
+      capture_state: run.captureState,
+    });
+    if (run.error) record.error = { name: 'SchedulingTrialError', code: run.error };
+    record.checks.push(...run.checks, ...personalSmokeChecks(scenario, run));
+    if (run.reply !== undefined)
+      await judgeDelegated(record, scenario.expectations, scenario.category);
+  } catch (error) {
+    record.error = {
+      name: error instanceof Error ? error.name : 'UnknownError',
+      code:
+        error instanceof Error && error.message === 'SMOKE_LOCAL_DATABASE_UNAVAILABLE'
+          ? error.message
+          : 'TRIAL_ERROR',
+    };
+    record.checks.push('trial_error');
+  }
+  record.durationMs = Date.now() - started;
+  record.passed = record.checks.length === 0;
+  return record;
+}
+
 const syntheticInstant = Date.parse('2026-10-02T09:00:00Z');
 const results: any[] = [];
 const jobs = cases.flatMap((scenario) =>
@@ -183,6 +416,20 @@ const usageBudget = await settleEvalWorkers(
       const item = jobs.shift();
       if (!item) return;
       const { scenario, trial } = item;
+      if (isDelegatedSmokeCase(scenario)) {
+        const record =
+          scenario.runner === 'transcript'
+            ? await smokeRfqTrial(scenario, trial)
+            : await smokePersonalTrial(scenario, trial);
+        results.push(record);
+        await appendFile(new URL('trials.ndjson', directory), `${JSON.stringify(record)}\n`, {
+          mode: 0o600,
+        });
+        console.log(
+          `${record.passed ? 'PASS' : 'FAIL'} ${scenario.id} ${trial}${record.checks.length ? ` (${record.checks.join(', ')})` : ''}`,
+        );
+        continue;
+      }
       let turnTime = syntheticInstant;
       const fixture = createSalesFixture(() => turnTime);
       scenario.setup?.(fixture.state);
@@ -205,40 +452,7 @@ const usageBudget = await settleEvalWorkers(
         agentUsage: emptyUsage(),
         judgeUsage: emptyUsage(),
       };
-      const model: TextModel = {
-        toolLoadingMode: provider.toolLoadingMode,
-        startToolSession(request) {
-          const session = provider.startToolSession(request);
-          return {
-            async next(remaining, signal, allowedTools) {
-              const next = await session.next(remaining, signal, allowedTools);
-              addUsage(record.usage, next);
-              addUsage(record.agentUsage, next);
-              record.proposedTools.push(
-                ...next.calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments })),
-              );
-              if (next.text) record.modelOutputs.push({ stage: 'worker', text: next.text });
-              return next;
-            },
-            accept(id, output) {
-              const proposal = record.proposedTools.filter((c: any) => c.id === id).at(-1);
-              record.toolResults.push({ ...proposal, output: structuredClone(output) });
-              if (proposal?.name === 'recall_business_context')
-                record.localTools.push({ ...proposal, output: structuredClone(output) });
-              session.accept(id, output);
-            },
-            revise: (feedback) => session.revise!(feedback),
-          };
-        },
-        async complete(request, signal) {
-          const response = await provider.complete(request, signal);
-          addUsage(record.usage, response);
-          addUsage(record.agentUsage, response);
-          if (request.stage === 'verifier') record.modelReviews.push(response.text);
-          record.modelOutputs.push({ stage: request.stage, text: response.text });
-          return response;
-        },
-      };
+      const model = recordingModel(record);
       const assistant = new AssistantService(
         config,
         model,
@@ -331,6 +545,8 @@ const usageBudget = await settleEvalWorkers(
             record.checks.push(`turn${index + 1}:incomplete`);
           if (/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/i.test(reply.text))
             record.checks.push(`turn${index + 1}:deal_uuid`);
+          if ('runner' in scenario && FALLBACK_REPLY.test(reply.text))
+            record.checks.push(`turn${index + 1}:fallback_reply`);
           if (/^\s*\|.*\|\s*$/m.test(reply.text) || /```/.test(reply.text))
             record.checks.push(`turn${index + 1}:desktop_or_code_format`);
           if (index === 0 && !scenario.generic) {
@@ -389,7 +605,7 @@ const usageBudget = await settleEvalWorkers(
         record.judge = await judgeTurns(
           judgeProvider,
           judgePrompt,
-          scenario.expectation,
+          scenario.expectations ?? scenario.expectation,
           record.turns,
           AbortSignal.timeout(90000 * Math.max(1, record.turns.length)),
           (result) => {
@@ -422,7 +638,7 @@ const usageBudget = await settleEvalWorkers(
       );
     }
   }),
-);
+).finally(closeSmokeDatabase);
 const sumUsage = (field: string) =>
   results.reduce((total, row) => {
     for (const key of Object.keys(total) as Array<keyof typeof total>)
