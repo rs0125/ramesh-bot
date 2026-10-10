@@ -54,28 +54,66 @@ export function classifyFailure(error: unknown, fallbackStage = 'unknown'): Turn
     code?: unknown;
     message?: unknown;
     detail?: unknown;
+    issues?: unknown;
+    stack?: unknown;
   };
   const message = typeof value.message === 'string' ? value.message : '';
+  const issues = schemaIssues(value.issues);
   const code =
     typeof value.code === 'string' && value.code
       ? value.code
       : /^[A-Z][A-Z0-9_]+$/.test(message)
         ? message
-        : // Deadlines and cancellation arrive as DOMExceptions with prose messages.
-          value.name === 'TimeoutError'
-          ? 'TIMEOUT'
-          : value.name === 'AbortError'
-            ? 'ABORTED'
-            : 'UNCLASSIFIED';
+        : issues
+          ? 'SCHEMA_INVALID'
+          : // Deadlines and cancellation arrive as DOMExceptions with prose messages.
+            value.name === 'TimeoutError'
+            ? 'TIMEOUT'
+            : value.name === 'AbortError'
+              ? 'ABORTED'
+              : 'UNCLASSIFIED';
   // Free-text messages are never kept: they can carry provider bodies or user content.
-  const detail =
-    value.detail && typeof value.detail === 'object' && !Array.isArray(value.detail)
+  // Schema issue paths/rules and code locations name what broke, never the data involved.
+  const at = code === 'UNCLASSIFIED' || issues ? codeLocations(value.stack) : undefined;
+  const detail = {
+    ...(value.detail && typeof value.detail === 'object' && !Array.isArray(value.detail)
       ? (value.detail as Record<string, unknown>)
-      : undefined;
+      : {}),
+    ...(issues ? { issues } : {}),
+    ...(at?.length ? { at } : {}),
+  };
   return {
     stage: failureStage(error) ?? fallbackStage,
     family: typeof value.name === 'string' && value.name ? value.name : 'Error',
     code,
-    ...(detail && Object.keys(detail).length ? { detail } : {}),
+    ...(Object.keys(detail).length ? { detail } : {}),
   };
+}
+
+/** Zod-style issues as path and rule only: never the received value or the message text. */
+function schemaIssues(raw: unknown) {
+  if (!Array.isArray(raw) || !raw.length) return undefined;
+  return raw.slice(0, 5).map((issue: { path?: unknown; code?: unknown }) => ({
+    path: Array.isArray(issue?.path)
+      ? issue.path.map((part) => (typeof part === 'number' ? part : String(part))).join('.')
+      : '',
+    code: typeof issue?.code === 'string' ? issue.code : 'unknown',
+  }));
+}
+
+/** Function names and file:line from a stack, skipping the message line and node internals. */
+function codeLocations(stack: unknown): string[] | undefined {
+  if (typeof stack !== 'string') return undefined;
+  return stack
+    .split('\n')
+    .filter(
+      (line) => /^\s+at /.test(line) && !line.includes('node:') && !line.includes('node_modules'),
+    )
+    .slice(0, 4)
+    .map((line) =>
+      line
+        .trim()
+        .replace(/^at /, '')
+        .replace(/(?:file:\/\/)?\/[^\s()]*\/(?=(?:dist|src)\/)/g, ''),
+    );
 }

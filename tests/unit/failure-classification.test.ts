@@ -51,6 +51,26 @@ test('every error family maps to a stable code and stage', () => {
   assert.equal(classifyFailure(AbortSignal.abort().reason).code, 'ABORTED');
 });
 
+test('a schema failure keeps its field path, rule and code location, never the value', async () => {
+  const { z } = await import('zod');
+  const schema = z.object({
+    history: z.object({ activity: z.array(z.object({ code: z.string().regex(/^[A-Z_]+$/) })) }),
+  });
+  let failure: ReturnType<typeof classifyFailure> | undefined;
+  try {
+    schema.parse({ history: { activity: [{ code: 'synthetic-secret value' }] } });
+  } catch (error) {
+    failure = classifyFailure(error, 'finish');
+  }
+  assert.equal(failure?.code, 'SCHEMA_INVALID');
+  assert.equal(failure?.stage, 'finish');
+  const detail = failure?.detail as { issues: Array<{ path: string; code: string }>; at: string[] };
+  assert.deepEqual(detail.issues, [{ path: 'history.activity.0.code', code: 'invalid_format' }]);
+  assert.ok(detail.at.length > 0);
+  assert.ok(detail.at.every((frame) => !frame.startsWith('/')));
+  assert.doesNotMatch(JSON.stringify(failure), /synthetic-secret|Invalid string|regex/i);
+});
+
 test('free-text messages are never kept, because they can carry provider bodies', () => {
   const failure = classifyFailure(new Error('provider said: synthetic-secret body'), 'graph');
   assert.equal(failure.code, 'UNCLASSIFIED');
