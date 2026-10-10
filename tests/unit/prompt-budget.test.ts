@@ -14,16 +14,16 @@ const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 // Recorded 2026-10-10 at ramesh-chief-of-staff-v45 (after 3e22cbb); router lowered at v46;
 // all roles lowered when the shared evidence policy became core principles (v48).
 const COMPOSED: Record<string, number> = {
-  ROUTER_PROMPT: 2100,
+  ROUTER_PROMPT: 2098,
   PLANNER_PROMPT: 3457,
-  WORKER_PROMPT: 5717,
-  SALES_VERIFIER_PROMPT: 4917,
-  BUSINESS_FORMATTER_PROMPT: 2614,
+  WORKER_PROMPT: 5694,
+  SALES_VERIFIER_PROMPT: 4860,
+  BUSINESS_FORMATTER_PROMPT: 2548,
   EVIDENCE_REPAIR_PROMPT: 1505,
 };
 const FILES: Record<string, number> = {
-  'business-formatter.md': 1785,
-  'chief-of-staff.md': 1760,
+  'business-formatter.md': 1719,
+  'chief-of-staff.md': 1737,
   'converser.md': 452,
   'evidence-policy.md': 652,
   'evidence-repair.md': 244,
@@ -33,8 +33,8 @@ const FILES: Record<string, number> = {
   'planner.md': 1149,
   'planning-reference.md': 1224,
   'requirement-interpretation.md': 432,
-  'router.md': 1448,
-  'verifier.md': 3833,
+  'router.md': 1446,
+  'verifier.md': 3776,
   'worker.md': 1472,
 };
 

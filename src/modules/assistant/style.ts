@@ -29,9 +29,24 @@ export function whatsappBold(text: string): string {
     .join('');
 }
 
+/** WhatsApp has no headings: a Markdown "## Title" line becomes a bold label. Code is left alone. */
+export function whatsappHeadings(text: string): string {
+  return text
+    .split(/(```[\s\S]*?(?:```|$))/g)
+    .map((part, index) =>
+      index % 2
+        ? part
+        : part.replace(
+            /^[ \t]*#{1,6}[ \t]+([^\n]*?[^\s#*][^\n]*?)[ \t#]*$/gm,
+            (_, title: string) => (/^\*.*\*$/.test(title) ? title : `*${title}*`),
+          ),
+    )
+    .join('');
+}
+
 export function finishReply(text: string): string {
   return (
-    whatsappBold(text)
+    whatsappBold(whatsappHeadings(text))
       // En/figure dashes normally denote ranges, including 25 Sep–1 Oct and 9 am–5 pm.
       .replace(/[\u2012\u2013]/g, '-')
       .replace(/(?<=\d)\s*[\u2014\u2015]\s*(?=\d)/g, '-')

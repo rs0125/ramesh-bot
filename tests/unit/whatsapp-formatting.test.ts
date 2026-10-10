@@ -18,6 +18,15 @@ test('converts Markdown bold in a fictional business reply to WhatsApp bold', ()
   );
 });
 
+test('Markdown headings become WhatsApp bold labels; tags, code and inline hashes are kept', () => {
+  assert.equal(
+    finishReply('## Shortlist\n- ID 101\n### **Owner checks** ##\n#twenty tag stays\nRoom # 4'),
+    '*Shortlist*\n- ID 101\n*Owner checks*\n#twenty tag stays\nRoom # 4',
+  );
+  assert.equal(finishReply('```\n# literal\n```'), '```\n# literal\n```');
+  assert.equal(finishReply(finishReply('# Title')), '*Title*');
+});
+
 test('native formatting and repeated cleanup preserve content', () => {
   const text = '*Brief*\n- _Tentative_ visit at 10 am\n1. ~Old date~\n> Quoted line';
   assert.equal(whatsappBold(text), text);
