@@ -385,7 +385,9 @@ test('review can recover a mistaken direct route and sees the actual protected-r
         )
       : complete(request, abort);
   const assistant = new AssistantService(
-    { model: 'fixture', timeoutMs: 5000 },
+    // Research gets half the budget. This path makes several model and recall steps, and
+    // 2.5s of research was not enough when the full suite saturated the CPU.
+    { model: 'fixture', timeoutMs: 20000 },
     fake.model,
     undefined,
     undefined,
