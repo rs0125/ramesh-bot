@@ -29,10 +29,11 @@ import type {
 } from '../../src/modules/assistant/assistant.types.js';
 import type { ContextToolRun } from '../../src/modules/assistant/tool-executor.js';
 import type { ToolDelivery, ToolEvidence } from '../../src/modules/assistant/tool-evidence.js';
-import type {
-  BusinessWriteReply,
-  BusinessWriteRun,
-  BusinessWriteService,
+import {
+  SOURCE_NEEDED_REPLY,
+  type BusinessWriteReply,
+  type BusinessWriteRun,
+  type BusinessWriteService,
 } from '../../src/modules/writes/write-tools.js';
 import type {
   PersonalToolRun,
@@ -73,6 +74,7 @@ function writeRun(
     failFinalize?: boolean;
     executionMode?: 'direct_request' | 'confirmation';
     unsubmittedReply?: string;
+    sourceNeededReply?: string;
   } = {},
 ) {
   let staged: Record<string, unknown> | undefined;
@@ -98,6 +100,9 @@ function writeRun(
     },
     get unsubmittedReply() {
       return staged && !finalized ? options.unsubmittedReply : undefined;
+    },
+    get sourceNeededReply() {
+      return options.sourceNeededReply;
     },
     deliveryReference: receipt,
     historyDelivery: () => undefined,
@@ -693,6 +698,39 @@ const trusted: TrustedReplyContext = {
     { id: message.messageId, text: message.text, receivedAtMs: now, forwarded: false },
   ],
 };
+
+test('a write that could not read its source asks for the brief when review gives up', async () => {
+  const writes = writeRun({ sourceNeededReply: SOURCE_NEEDED_REPLY });
+  const fake = model([{ name: writeDefinition.name, args: exact }], { approved: false });
+  const service = {
+    async recover() {
+      return undefined;
+    },
+    async open() {
+      return writes.run;
+    },
+  } as unknown as BusinessWriteService;
+  const business = {
+    toolLoop: true,
+    async openTools() {
+      return { status: 'denied' };
+    },
+  } as unknown as BusinessReadService;
+  const assistant = new AssistantService(
+    { model: 'offline-write-fake', timeoutMs: 5000 },
+    fake.fake,
+    undefined,
+    undefined,
+    undefined,
+    business,
+    { now: () => now, businessWrites: service },
+  );
+  const reply = await assistant.prepare(message, undefined, trusted);
+  assert.equal(reply.text, SOURCE_NEEDED_REPLY);
+  assert.equal(writes.finalized(), 0);
+  const fallback = reply.trace.events?.find((e) => e.code === 'REVIEW_EXHAUSTED_FALLBACK');
+  assert.equal(fallback?.detail?.sourceNeeded, true);
+});
 
 test('formatter failures explain verified non-submission and retain safe diagnostic details', async () => {
   for (const status of [

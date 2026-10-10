@@ -61,7 +61,7 @@ Separate dynamically discovered write contracts from reads and reserved local ut
 
 Write activation requires `BUSINESS_WRITES_ENABLED=true`, the journal migration and matching explicit `gis:write` grants in both worker signing configuration and Context Engine. The signing schema accepts read/write scopes; employee permissions still narrow the live tool list.
 
-`write_sources` retrieves structured location sources from the encrypted inbox in the same private conversation, bounded to 24 hours and 32 messages. Forwarded and historical data cannot authorize execution. The current direct instruction stages a proposal; independent review precedes execution according to the authenticated tool's `executionMode`. GIS tools declare `direct_request`, so an explicit request can complete in one turn. Tools declaring `confirmation`, or omitting a policy, require a delivered preview and later typed confirmation. Multiple candidate pins must be clarified or explicitly selected. The graph delegates mutation dispatch to the shared audited writer.
+`write_sources` retrieves structured location sources from the encrypted inbox in the same private conversation, bounded to 7 days and 32 messages. Forwarded and historical data cannot authorize execution. The current direct instruction stages a proposal; independent review precedes execution according to the authenticated tool's `executionMode`. GIS tools declare `direct_request`, so an explicit request can complete in one turn. Tools declaring `confirmation`, or omitting a policy, require a delivered preview and later typed confirmation. Multiple candidate pins must be clarified or explicitly selected. The graph delegates mutation dispatch to the shared audited writer.
 
 ## Focused acceptance checks
 

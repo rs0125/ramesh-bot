@@ -20,6 +20,8 @@ export interface WriteCommandContext extends WriteActor {
   leaseToken: string;
   sourceMessageId: string;
   requestTimeMs: number;
+  /** WhatsApp ID of the message the direct request replies to, if any. Source data only. */
+  quotedWhatsappId?: string;
 }
 export interface WriteProposalPayload {
   toolName: string;
@@ -135,6 +137,8 @@ export interface WriteSourceMessage {
   /** Historical inbox rows did not retain forwarding metadata. Unknown must never mean direct. */
   forwarded: boolean | null;
   location?: import('../messaging/native-location.js').NativeLocation;
+  /** The message the current request replies to; available beyond the usual 24-hour window. */
+  quoted?: true;
 }
 export interface WriteAuditRecord {
   eventId: string;

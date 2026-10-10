@@ -82,17 +82,22 @@ function mapMessage(
   const forwarded = context?.isForwarded === true || (context?.forwardingScore ?? 0) > 0;
   const mentions = context?.mentionedJid ?? [];
   const identities = new Set(botJids.filter(Boolean).map(jidNormalizedUser));
-  const quotedMessageId =
+  const quoteKey =
     !forwarded &&
     typeof context?.stanzaId === 'string' &&
     context.stanzaId.length > 0 &&
     context.stanzaId.length <= 256 &&
     !/[\x00-\x1f\x7f]/.test(context.stanzaId) &&
-    typeof context.participant === 'string' &&
-    identities.has(jidNormalizedUser(context.participant)) &&
     (!context.remoteJid || jidNormalizedUser(context.remoteJid) === jidNormalizedUser(chatId))
       ? context.stanzaId
       : undefined;
+  const quotesBot =
+    typeof context?.participant === 'string' &&
+    identities.has(jidNormalizedUser(context.participant));
+  const quotedMessageId = quoteKey && quotesBot ? quoteKey : undefined;
+  // In a one-to-one chat a reply to a message that is not the bot's quotes the user's own
+  // earlier message (for example an RFQ brief). Its key lets a write read that message as data.
+  const quotedUserMessageId = quoteKey && !isGroup && !quotesBot ? quoteKey : undefined;
   return {
     chatId,
     messageId,
@@ -106,6 +111,7 @@ function mapMessage(
     kind,
     forwarded,
     ...(quotedMessageId ? { quotedMessageId } : {}),
+    ...(quotedUserMessageId ? { quotedUserMessageId } : {}),
     ...(context?.stanzaId ? { hasQuotedMessage: true } : {}),
     ...(location ? { location } : {}),
     senderName: message.pushName?.slice(0, 256) || undefined,

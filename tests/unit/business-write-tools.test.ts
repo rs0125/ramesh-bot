@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { BusinessWriteService } from '../../src/modules/writes/write-tools.js';
+import { BusinessWriteService, SOURCE_NEEDED_REPLY } from '../../src/modules/writes/write-tools.js';
 import {
   writeContract,
   contextWriteDescriptor,
@@ -118,6 +118,8 @@ const signal = () => AbortSignal.timeout(5000);
 function harness(resultData?: Record<string, unknown>, onToolActivity?: () => void) {
   const operations = new Map<string, WriteOperation>();
   const sources = new Map<string, WriteSourceMessage>();
+  // WhatsApp ID of a stored message -> its queue ID, for replies that quote it.
+  const quotes = new Map<string, string>();
   const calls: Array<{ tool: string; args: Record<string, unknown>; operationId: string }> = [];
   const proposals: WriteOperation[] = [];
   const recoveryRuns = new Map<string, string>();
@@ -154,10 +156,15 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
         throw new WriteStorageError('WRITE_DIRECT_SOURCE_REQUIRED');
       return structuredClone(source);
     },
-    async readSources(_ctx, ids) {
+    async readSources(ctx, ids) {
       return [...sources.values()]
         .filter((s) => !ids || ids.includes(s.id))
-        .map((s) => structuredClone(s));
+        .map((s) => ({
+          ...structuredClone(s),
+          ...(ctx.quotedWhatsappId && quotes.get(ctx.quotedWhatsappId) === s.id
+            ? { quoted: true as const }
+            : {}),
+        }));
     },
     async propose(ctx, payload) {
       const previous = [...operations.values()].find((op) => op.proposalRunId === ctx.runId);
@@ -324,10 +331,21 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
   );
   function trusted(
     text: string,
-    options: { forwarded?: boolean; kind?: string; extra?: string } = {},
+    options: {
+      forwarded?: boolean;
+      kind?: string;
+      extra?: string;
+      quotedUserMessageId?: string;
+    } = {},
   ): TrustedReplyContext {
     const id = randomUUID();
-    const member = { id, text, receivedAtMs: now, forwarded: options.forwarded ?? false };
+    const member = {
+      id,
+      text,
+      receivedAtMs: now,
+      forwarded: options.forwarded ?? false,
+      ...(options.quotedUserMessageId ? { quotedUserMessageId: options.quotedUserMessageId } : {}),
+    };
     sources.set(id, { ...member, kind: options.kind ?? 'text', currentTurn: true });
     return {
       runId: randomUUID(),
@@ -342,6 +360,20 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
       ],
     };
   }
+  /** An earlier stored message (30 hours old) that a later reply can quote by WhatsApp ID. */
+  function stored(text: string, whatsappId: string) {
+    const id = randomUUID();
+    sources.set(id, {
+      id,
+      text,
+      kind: 'text',
+      receivedAtMs: now - 30 * 3_600_000,
+      currentTurn: false,
+      forwarded: null,
+    });
+    quotes.set(whatsappId, id);
+    return id;
+  }
   async function proposed() {
     const request = trusted('Save a point called Example.');
     const run = (await service.open(request, signal()))!;
@@ -353,6 +385,7 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
   return {
     service,
     trusted,
+    stored,
     proposed,
     operations,
     calls,
@@ -404,6 +437,50 @@ test('a failure before RFQ review can truthfully say nothing was submitted witho
   assert.equal(h.calls.length, 0);
   run.blocked = true;
   assert.equal(run.unsubmittedReply, undefined);
+});
+
+test('a reply to an older brief saves that brief with the request, not the request alone', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const brief =
+    'Requirement for CG Logistics\nRepeat client\n3,000-5,000sft in Devanahalli, parking for 2-3 trucks';
+  h.stored(brief, 'WA-BRIEF');
+  const run = (await h.service.open(
+    h.trusted('Add to crm', { quotedUserMessageId: 'WA-BRIEF' }),
+    signal(),
+  ))!;
+  const result = await run.execute(rfqCreate.name, '{}', signal());
+  assert.equal((result as { ok: boolean }).ok, true);
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, `${brief}\n\nAdd to crm`);
+  assert.equal(run.sourceNeededReply, undefined);
+});
+
+test('a reply to a message that cannot be read asks for the brief instead of saving the request', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  const run = (await h.service.open(
+    h.trusted('Add to crm', { quotedUserMessageId: 'WA-NOT-STORED' }),
+    signal(),
+  ))!;
+  const result = (await run.execute(rfqCreate.name, '{}', signal())) as Record<string, unknown>;
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'WRITE_QUOTED_SOURCE_UNAVAILABLE');
+  assert.match(String(result.guidance), /forward that message or paste the brief/);
+  assert.equal(h.proposals.length, 0);
+  assert.equal(run.sourceNeededReply, SOURCE_NEEDED_REPLY);
+});
+
+test('explicitly selected sources still win over the replied-to message', async () => {
+  const h = harness();
+  h.changeDefinitions([rfqCreate]);
+  h.stored('An older brief the user replied to', 'WA-BRIEF');
+  const chosen = h.stored('The brief the model selected', 'WA-OTHER');
+  const run = (await h.service.open(
+    h.trusted('Add to crm', { quotedUserMessageId: 'WA-BRIEF' }),
+    signal(),
+  ))!;
+  await run.execute(rfqCreate.name, JSON.stringify({ _source_message_ids: [chosen] }), signal());
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, 'The brief the model selected');
 });
 
 test('an interrupted finalization never claims the requirement was not submitted', async () => {

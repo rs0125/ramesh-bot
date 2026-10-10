@@ -69,6 +69,47 @@ test('native quote references only accept the bot participant in the same chat a
   }
 });
 
+test('a DM reply quoting the user’s own message keeps its key for writes, separately from bot quotes', () => {
+  const user = '910000000002@s.whatsapp.net';
+  const reply = (contextInfo: Record<string, unknown>, chat = user) =>
+    toInboxCandidate(
+      dm({
+        key: { id: 'reply-1', remoteJid: chat, fromMe: false },
+        message: { extendedTextMessage: { text: 'Add to crm', contextInfo } },
+      }),
+      botJids,
+    )!;
+  // "Add to crm" replying to the user's own earlier brief.
+  const own = reply({ stanzaId: 'BRIEF-1', participant: user });
+  assert.equal(own.quotedUserMessageId, 'BRIEF-1');
+  assert.equal(own.quotedMessageId, undefined);
+  assert.equal(reply({ stanzaId: 'BRIEF-1' }).quotedUserMessageId, 'BRIEF-1');
+  // Replying to the bot keeps the reminder-quote key only.
+  const bot = reply({ stanzaId: 'BOT-1', participant: phoneJid });
+  assert.equal(bot.quotedMessageId, 'BOT-1');
+  assert.equal(bot.quotedUserMessageId, undefined);
+  // Forwarded quotes, quotes from another chat and group replies never qualify.
+  for (const [contextInfo, chat] of [
+    [{ stanzaId: 'BRIEF-1', participant: user, isForwarded: true }, user],
+    [{ stanzaId: 'BRIEF-1', participant: user, remoteJid: '919000000099@s.whatsapp.net' }, user],
+    [{ stanzaId: 'BRIEF-1', participant: user }, '120363000000000001@g.us'],
+  ] as const) {
+    const candidate = toInboxCandidate(
+      dm({
+        key: {
+          id: 'reply-2',
+          remoteJid: chat,
+          fromMe: false,
+          ...(chat.endsWith('@g.us') ? { participant: user } : {}),
+        },
+        message: { extendedTextMessage: { text: 'Add to crm', contextInfo } },
+      }),
+      botJids,
+    );
+    assert.equal(candidate?.quotedUserMessageId, undefined, JSON.stringify(contextInfo));
+  }
+});
+
 test('replies to text DMs using phone and LID addressing', () => {
   for (const remoteJid of ['910000000002@s.whatsapp.net', '987654321@lid']) {
     assert.deepEqual(greetingTarget(dm({ key: { id: 'm', remoteJid } }), botJids, now), {

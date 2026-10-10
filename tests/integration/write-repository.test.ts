@@ -1041,6 +1041,59 @@ test(
         },
       );
       await t.test(
+        'sources browse 7 days; the replied-to message is available beyond that and flagged',
+        async () => {
+          const f = fixture();
+          const age = async (id: string, interval: string) =>
+            db.admin.query(
+              `UPDATE public."ramesh-messages" SET created_at=clock_timestamp()-$2::interval WHERE id=$1`,
+              [id, interval],
+            );
+          const old = await command(f, 'Eight-day-old brief');
+          await deliver(f, old.job);
+          await age(old.ctx.runId, '8 days');
+          const recent = await command(f, 'Thirty-hour-old brief');
+          await deliver(f, recent.job);
+          await age(recent.ctx.runId, '30 hours');
+          const current = await command(f, 'Add to crm');
+          const browsed = await f.repo.readSources(current.ctx);
+          assert.deepEqual(
+            browsed.map((s) => s.text),
+            ['Thirty-hour-old brief', 'Add to crm'],
+          );
+          assert.ok(browsed.every((s) => !s.quoted));
+          // The message ID doubles as the WhatsApp ID in this fixture.
+          const replying = { ...current.ctx, quotedWhatsappId: old.ctx.runId };
+          const withQuote = await f.repo.readSources(replying);
+          assert.deepEqual(
+            withQuote.map((s) => [s.text, s.quoted ?? false]),
+            [
+              ['Eight-day-old brief', true],
+              ['Thirty-hour-old brief', false],
+              ['Add to crm', false],
+            ],
+          );
+          assert.deepEqual(
+            (await f.repo.readSources(replying, [old.ctx.runId])).map((s) => s.text),
+            ['Eight-day-old brief'],
+          );
+          // Another employee's chat cannot reach it by quoting the same ID.
+          const foreign = await command(f, 'Other employee', {
+            actor: {
+              employeeId: 24,
+              phoneE164: '+919000000024',
+              chatId: '919000000024@s.whatsapp.net',
+            },
+          });
+          assert.deepEqual(
+            (await f.repo.readSources({ ...foreign.ctx, quotedWhatsappId: old.ctx.runId })).filter(
+              (s) => s.quoted,
+            ),
+            [],
+          );
+        },
+      );
+      await t.test(
         'only a later direct exact code after SENT can approve; another owner cannot find it',
         async () => {
           const f = fixture(),

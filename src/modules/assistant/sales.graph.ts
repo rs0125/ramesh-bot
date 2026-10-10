@@ -1398,7 +1398,11 @@ export function buildSalesGraph(
           stage: 'finish',
           code: 'REVIEW_EXHAUSTED_FALLBACK',
           blocking: true,
-          detail: { reason: value.reviewReason, researchExhausted: value.researchExhausted },
+          detail: {
+            reason: value.reviewReason,
+            researchExhausted: value.researchExhausted,
+            sourceNeeded: !!writes?.sourceNeededReply,
+          },
         });
         return {
           ...(run?.historyDelivery()
@@ -1410,16 +1414,19 @@ export function buildSalesGraph(
           ...(writes?.historyDelivery()
             ? { write: { text: '', delivery: writes.historyDelivery()! } }
             : {}),
-          reply: reviewFailureReply({
-            hasEvidence: !!(
-              run?.evidence.length ||
-              utilities?.evidence.length ||
-              personal?.evidence.length ||
-              writes?.evidence.length
-            ),
-            reason: value.reviewReason,
-            researchExhausted: value.researchExhausted,
-          }),
+          // A write that could not read its source asks for it instead of a generic failure.
+          reply:
+            writes?.sourceNeededReply ??
+            reviewFailureReply({
+              hasEvidence: !!(
+                run?.evidence.length ||
+                utilities?.evidence.length ||
+                personal?.evidence.length ||
+                writes?.evidence.length
+              ),
+              reason: value.reviewReason,
+              researchExhausted: value.researchExhausted,
+            }),
           unavailable: true,
         };
       }

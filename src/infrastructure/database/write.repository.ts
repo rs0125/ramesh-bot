@@ -223,28 +223,47 @@ export class WriteRepository implements WriteRepositoryPort {
     if (ids && (ids.length > 32 || ids.some((id) => !uuid(id))))
       throw new WriteStorageError('WRITE_SOURCE_LIMIT');
     return this.tx(ctx, async (db) => {
+      // The message the request replies to is named explicitly, so it stays available for the
+      // whole 30-day message retention. Same chat, WhatsApp origin and owner checks apply.
+      const quotedRows = ctx.quotedWhatsappId
+        ? (
+            await db.query(
+              `SELECT m.*, false AS current_turn FROM public."ramesh-messages" m
+        WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp' AND m.whatsapp_message_id=$3
+        AND ($4::uuid[] IS NULL OR m.id=ANY($4::uuid[]))`,
+              [this.accountId, ctx.chatId, ctx.quotedWhatsappId, ids ? [...ids] : null],
+            )
+          ).rows
+        : [];
+      // Browsing earlier messages: up to 32 recent messages / 32 KB from the last 7 days.
       const rows = (
         await db.query(
           `SELECT m.*, (m.id=$4 OR q.batch_parent=$4) AS current_turn FROM public."ramesh-messages" m
         LEFT JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
-        WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp' AND m.created_at>clock_timestamp()-interval '24 hours'
+        WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp' AND m.created_at>clock_timestamp()-interval '7 days'
         AND ($3::uuid[] IS NULL OR m.id=ANY($3::uuid[]))
         AND (m.queue_order <= (SELECT max(mm.queue_order) FROM public."ramesh-messages" mm JOIN public."ramesh-inbound-queue" qq ON qq.message_id=mm.id WHERE mm.account_id=$1 AND (mm.id=$4 OR qq.batch_parent=$4)))
         ORDER BY m.queue_order DESC LIMIT 32`,
           [this.accountId, ctx.chatId, ids ? [...ids] : null, ctx.runId],
         )
-      ).rows;
+      ).rows.filter((row) => !quotedRows.some((quoted) => quoted.id === row.id));
       const sources: WriteSourceMessage[] = [];
       let bytes = 0;
-      for (const row of rows) {
-        const source = this.decodeSource(row, row.current_turn === true);
-        if (!source) continue;
+      // The replied-to message is decoded first so it always fits the byte budget.
+      for (const [row, quoted] of [
+        ...quotedRows.map((row) => [row, true] as const),
+        ...rows.map((row) => [row, false] as const),
+      ]) {
+        const decoded = this.decodeSource(row, row.current_turn === true);
+        if (!decoded) continue;
+        const source: WriteSourceMessage = quoted ? { ...decoded, quoted: true } : decoded;
         const size = Buffer.byteLength(JSON.stringify(source));
         if (bytes + size > 32000) continue;
         bytes += size;
         sources.push(source);
       }
-      return sources.reverse();
+      // Source order, oldest first.
+      return sources.sort((a, b) => a.receivedAtMs - b.receivedAtMs);
     });
   }
   private codeHash(actor: WriteActor, code: string): string {

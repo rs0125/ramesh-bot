@@ -20,6 +20,8 @@ export interface GreetingCandidate extends GreetingKey {
   readonly forwarded?: boolean;
   /** Native quote key only; quoted text is never trusted as instructions or record identity. */
   readonly quotedMessageId?: string;
+  /** One-to-one chats: key of the user's own message this reply quotes. Source data only. */
+  readonly quotedUserMessageId?: string;
   readonly hasQuotedMessage?: boolean;
   readonly location?: NativeLocation;
   readonly batchMessageIds?: readonly string[];
@@ -50,6 +52,7 @@ export interface TrustedReplyContext {
     readonly receivedAtMs: number;
     readonly forwarded: boolean;
     readonly quotedMessageId?: string;
+    readonly quotedUserMessageId?: string;
     readonly hasQuotedMessage?: boolean;
   }[];
   /** Decoded native pins, bound to original transport members; labels never grant write intent. */

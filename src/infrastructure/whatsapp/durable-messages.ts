@@ -648,6 +648,9 @@ export class DurableMessages {
               ...(item.candidate.quotedMessageId
                 ? { quotedMessageId: item.candidate.quotedMessageId }
                 : {}),
+              ...(item.candidate.quotedUserMessageId
+                ? { quotedUserMessageId: item.candidate.quotedUserMessageId }
+                : {}),
               ...(item.candidate.hasQuotedMessage ? { hasQuotedMessage: true } : {}),
             },
           ];
