@@ -86,7 +86,18 @@ export function partialAnswerNote(tools: Record<string, ToolStatus>): string {
     : PARTIAL_ANSWER_NOTE;
 }
 
+/** A failed review is not a dead end: "retry" re-runs the same request in a fresh turn. */
+const RETRY_STEP = "Reply *retry* and I'll run it again.";
+
 export function reviewFailureReply(input: {
+  hasEvidence: boolean;
+  reason: ReviewFailure;
+  researchExhausted: boolean;
+}): string {
+  return `${reviewFailureReason(input)} ${RETRY_STEP}`;
+}
+
+function reviewFailureReason(input: {
   hasEvidence: boolean;
   reason: ReviewFailure;
   researchExhausted: boolean;

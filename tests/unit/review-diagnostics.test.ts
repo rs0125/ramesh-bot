@@ -79,6 +79,7 @@ test('rejection replies acknowledge retrieved evidence without blaming the user 
         const reply = reviewFailureReply(input);
         assert.doesNotMatch(reply, /private|rejected warehouse|narrow|please try|\u2014/i);
         assert.ok(reply.length < 180);
+        assert.match(reply, /Reply \*retry\* and I'll run it again\.$/);
         if (hasEvidence) {
           assert.match(reply, /I retrieved/);
           assert.match(reply, /couldn't|don't have enough/);
