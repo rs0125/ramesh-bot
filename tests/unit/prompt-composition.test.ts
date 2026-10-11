@@ -80,7 +80,9 @@ test('verifier domain sections compose onto the core only when requested', () =>
   for (const section of VERIFIER_SECTIONS) {
     const text = loadPrompt(`verifier-${section}`);
     const only = verifierInstructions(new Set([section]));
-    assert.ok(only.startsWith(SALES_VERIFIER_PROMPT) && only.includes(text), section);
+    // A section sits after the opening, ahead of the general rules and the shared policy.
+    assert.equal(only.replace(`${text}\n\n`, ''), SALES_VERIFIER_PROMPT, section);
+    assert.ok(only.indexOf(text) < only.indexOf('## Block material problems'), section);
     for (const other of VERIFIER_SECTIONS.filter((name) => name !== section))
       assert.ok(!only.includes(loadPrompt(`verifier-${other}`)), `${section} leaks ${other}`);
   }
