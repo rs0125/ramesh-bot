@@ -133,6 +133,7 @@ test('offline append deliveries use durable age, mention and deduplication check
   };
   const durableMessages = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue(_id, candidate, _payload, _maxAgeMs, _capacity, inbox) {
         if (archived.has(candidate.messageId)) return 'duplicate';
         archived.set(candidate.messageId, inbox!.replyEligible);

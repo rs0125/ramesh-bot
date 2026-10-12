@@ -168,9 +168,19 @@ export class WriteRepository implements WriteRepositoryPort {
       const candidate = toInboxCandidate(message as WAMessage, []);
       if (!candidate || candidate.fromMe || candidate.isGroup || candidate.chatId !== row.chat_id)
         return null;
+      const content = row.content_encrypted
+        ? (this.cipher.open('inbox', row.id, row.content_encrypted) as InboxContent)
+        : undefined;
+      const transcript =
+        candidate.kind === 'audio' &&
+        content?.kind === 'audio' &&
+        content.senderId === candidate.senderId &&
+        content.voiceTranscript?.version === 1
+          ? content.text
+          : undefined;
       return {
         id: row.id,
-        text: candidate.text ?? '',
+        text: transcript ?? candidate.text ?? '',
         kind: candidate.kind ?? 'text',
         receivedAtMs: row.created_at.getTime(),
         currentTurn,

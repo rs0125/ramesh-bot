@@ -190,6 +190,7 @@ test('durable location batch retains encrypted source metadata without treating 
   let outcome: string | undefined;
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue(id, _candidate, payload, _age, _capacity, inbox) {
         assert.equal(inbox?.replyEligible, true);
         saved.push({ id, payload, content: inbox!.content, receivedAt });

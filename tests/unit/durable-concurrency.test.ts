@@ -53,6 +53,7 @@ function fixture(prepareReply: PrepareReply, count = 4, leaseLost = false) {
   const stop = new AbortController();
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       enqueue: async () => 'queued',
       claimInbound: async () => null,
       claimOutbound: async () => null,

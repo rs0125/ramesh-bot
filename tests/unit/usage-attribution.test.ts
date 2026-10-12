@@ -113,6 +113,7 @@ async function durable(options: {
   const extracts: Array<UsageScope | undefined> = [],
     completions: Array<UsageScope | undefined> = [];
   const warnings: string[] = [];
+  const echoes: string[] = [];
   let row: MessageJob | undefined,
     claimed = false,
     handedOff = false,
@@ -138,14 +139,29 @@ async function durable(options: {
     async downloadMedia() {
       return media.upload;
     },
-    async reply() {
-      assert.fail('No delivery permitted');
+    async reply(_message, text) {
+      echoes.push(text);
     },
   };
   const queue = new DurableMessages(
     {
-      async enqueue(id, _candidate, payload) {
-        row = { id, payload, direction: 'inbound', token: 'fixture', attempts: 1 };
+      async updateInboundContent(job, id, update) {
+        assert.equal(job.token, row!.token);
+        assert.equal(id, row!.id);
+        const result = update(row!.content!);
+        row!.content = result.encrypted;
+        return result.value;
+      },
+      async enqueue(id, _candidate, payload, _age, _capacity, inbox) {
+        row = {
+          id,
+          payload,
+          content: inbox!.content,
+          direction: 'inbound',
+          token: 'fixture',
+          attempts: 1,
+          receivedAt: new Date(),
+        };
         return 'queued';
       },
       async claimInbound() {
@@ -201,6 +217,7 @@ async function durable(options: {
   );
   await queue.consume(session, controller.signal, () => {});
   await media.service.drain();
+  if (handedOff) assert.deepEqual(echoes, ['_"Fixture audio."_']);
   return { extracts, completions, warnings, identityCalls, runQueries, handedOff, id: row!.id };
 }
 

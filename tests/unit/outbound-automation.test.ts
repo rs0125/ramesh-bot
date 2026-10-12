@@ -50,6 +50,7 @@ function fixture() {
   const controller = new AbortController();
   const queue = {
     accountId: 'synthetic-account',
+    updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
     async enqueueAutomation(
       ...args: Parameters<MessageQueueRepository['enqueueAutomation']>
     ): Promise<AutomationEnqueueResult> {

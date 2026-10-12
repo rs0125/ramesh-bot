@@ -26,6 +26,7 @@ async function trustedFor(contextInfo: Record<string, unknown>) {
   let trusted: TrustedReplyContext | undefined;
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue(id, _candidate, payload, _age, _capacity, inbox) {
         saved.push({ id, payload, content: inbox!.content, receivedAt: new Date() });
         return 'queued';

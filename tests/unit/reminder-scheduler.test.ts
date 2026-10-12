@@ -355,6 +355,7 @@ async function deliver(options?: {
     state: string | undefined;
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue() {
         throw new Error('No inbound');
       },
@@ -503,6 +504,7 @@ test('debounced command members preserve individual trusted clocks and forward f
     context: TrustedReplyContext | undefined;
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue() {
         return 'queued';
       },

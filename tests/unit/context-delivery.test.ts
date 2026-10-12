@@ -28,6 +28,7 @@ async function deliver(f: ReturnType<typeof contextFixture>, afterHandoff = () =
   const sent: string[] = [];
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue(id, _candidate, payload) {
         stored = {
           id,

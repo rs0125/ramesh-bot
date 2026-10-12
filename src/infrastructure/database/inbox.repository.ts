@@ -17,6 +17,7 @@ import type { NativeLocation } from '../../modules/messaging/native-location.js'
 import { MediaRepository } from './media.repository.js';
 import { mediaOwner } from '../../modules/media/media.service.js';
 import type { MediaStore } from '../../modules/media/media.types.js';
+import { voiceInputReplies, type VoiceInput } from '../../modules/media/voice-input.js';
 
 export interface InboxContent {
   text: string;
@@ -27,6 +28,7 @@ export interface InboxContent {
   location?: NativeLocation;
   forwarded?: boolean;
   hasQuotedMessage?: boolean;
+  voiceTranscript?: VoiceInput;
 }
 interface InboxRow {
   id: string;
@@ -99,6 +101,7 @@ export class InboxRepository implements ContextSource {
     const data = this.content(row);
     if (
       message.isGroup ||
+      data.voiceTranscript?.version === 1 ||
       data.kind !== 'audio' ||
       !row.whatsapp_message_id ||
       row.created_at.getTime() + 86400000 <= Date.now()
@@ -160,6 +163,24 @@ export class InboxRepository implements ContextSource {
               kind: content.kind,
             },
           ];
+    if (content.voiceTranscript?.echo) {
+      const echo = content.voiceTranscript.echo;
+      voiceInputReplies(content.text).forEach((text, index) =>
+        messages.push({
+          id: `${row.id}:transcript:${index}`,
+          chatId: row.chat_id,
+          text,
+          senderId: null,
+          senderName: 'Ramesh',
+          direction: 'outbound',
+          source: 'assistant',
+          mentionsBot: false,
+          at: echo.at,
+          status: echo.state === 'SENT' ? 'SENT' : 'UNCERTAIN',
+          kind: 'text',
+        }),
+      );
+    }
     if (row.reply_encrypted) {
       let text =
         row.reply_kind === 'business' && visibility === 'redacted'
@@ -372,7 +393,11 @@ export class InboxRepository implements ContextSource {
       .reverse()
       .flatMap((row) =>
         this.messagesFor(row, 'redacted')
-          .filter((item) => item.direction === 'inbound' || item.status === 'SENT')
+          .filter(
+            (item) =>
+              !item.id.includes(':transcript:') &&
+              (item.direction === 'inbound' || item.status === 'SENT'),
+          )
           .map((item) =>
             row.reply_kind === 'business' && item.direction === 'outbound'
               ? {
@@ -405,10 +430,16 @@ export class InboxRepository implements ContextSource {
       const source =
         item.direction === 'inbound' ? rows.find((row) => row.id === item.id) : undefined;
       const voice = source ? await this.voiceContext(source, message) : undefined;
+      const sourceContent = source ? this.content(source) : undefined;
+      const input =
+        sourceContent?.voiceTranscript &&
+        (sourceContent.forwarded || sourceContent.hasQuotedMessage)
+          ? `[Forwarded or quoted source data]\n${item.text}`
+          : item.text;
       const content =
         message.isGroup && item.direction === 'inbound'
-          ? JSON.stringify({ sender: item.senderName, senderId: item.senderId, text: item.text })
-          : (voice?.text ?? item.text);
+          ? JSON.stringify({ sender: item.senderName, senderId: item.senderId, text: input })
+          : (voice?.text ?? input);
       const bounded = content.slice(0, 6000);
       if (size + bounded.length > MAX_HISTORY_CHARACTERS || result.length >= MAX_HISTORY_MESSAGES)
         break;

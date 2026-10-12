@@ -25,6 +25,7 @@ export interface MessageJob {
   id: string;
   token: string;
   payload: string;
+  content?: string;
   attempts: number;
   receivedAt?: Date;
   direction: QueueDirection;
@@ -35,7 +36,7 @@ export interface MessageJob {
   chatId?: string;
   replyKind?: 'conversation' | 'business';
   businessEvidence?: string;
-  members?: Array<{ id: string; payload: string; receivedAt?: Date }>;
+  members?: Array<{ id: string; payload: string; content?: string; receivedAt?: Date }>;
 }
 interface OwnedRow {
   id: string;
@@ -861,7 +862,7 @@ export class MessageQueueRepository {
       const directions = requested ? [requested] : (['inbound', 'outbound'] as const);
       const choices = directions.map(
         (direction) => `
-        SELECT m.id,m.payload_encrypted AS payload,j.attempts,m.origin,m.chat_id AS "chatId",m.created_at AS "receivedAt",
+        SELECT m.id,m.payload_encrypted AS payload,m.content_encrypted AS content,j.attempts,m.origin,m.chat_id AS "chatId",m.created_at AS "receivedAt",
           m.reply_kind AS "replyKind",m.business_evidence_encrypted AS "businessEvidence",
           ${direction === 'outbound' ? 'j.payload_encrypted' : 'NULL::text'} AS "replyPayload",
           ${direction === 'outbound' ? 'j.media_payload_encrypted' : 'NULL::text'} AS "mediaPayload",
@@ -913,7 +914,7 @@ export class MessageQueueRepository {
         direction === 'inbound'
           ? (
               await db.query(
-                `SELECT m.id,m.payload_encrypted AS payload,m.created_at AS "receivedAt" FROM public."ramesh-inbound-queue" j JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.batch_parent=$1 AND j.account_id=$2 AND m.payload_encrypted IS NOT NULL ORDER BY m.queue_order`,
+                `SELECT m.id,m.payload_encrypted AS payload,m.content_encrypted AS content,m.created_at AS "receivedAt" FROM public."ramesh-inbound-queue" j JOIN public."ramesh-messages" m ON m.id=j.message_id WHERE j.batch_parent=$1 AND j.account_id=$2 AND m.payload_encrypted IS NOT NULL ORDER BY m.queue_order`,
                 [row.id, this.accountId],
               )
             ).rows
@@ -1040,6 +1041,38 @@ export class MessageQueueRepository {
           [this.accountId, job.id, job.attempts],
         );
       return true;
+    });
+  }
+
+  /** Only the leased turn may enrich its own original messages with transcribed input. */
+  async updateInboundContent<T>(
+    job: MessageJob,
+    messageId: string,
+    update: (encrypted: string) => { encrypted: string; value: T },
+  ): Promise<T> {
+    return this.transaction(async (db) => {
+      if (job.direction !== 'inbound' || (await this.owned(db, job))?.state !== 'PROCESSING')
+        throw new Error('INBOUND_CONTENT_LEASE_LOST');
+      const row = (
+        await db.query<{ content: string }>(
+          `SELECT m.content_encrypted AS content FROM public."ramesh-messages" m
+           JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
+           WHERE m.id=$1 AND m.account_id=$2 AND m.origin='whatsapp'
+             AND (m.id=$3 OR q.batch_parent=$3) AND m.content_encrypted IS NOT NULL
+             AND m.chat_id=(SELECT chat_id FROM public."ramesh-messages" WHERE id=$3 AND account_id=$2)
+           FOR UPDATE OF m`,
+          [messageId, this.accountId, job.id],
+        )
+      ).rows[0];
+      if (!row) throw new Error('INBOUND_CONTENT_SOURCE_UNAVAILABLE');
+      const result = update(row.content);
+      if (result.encrypted !== row.content)
+        await db.query(
+          `UPDATE public."ramesh-messages" SET content_encrypted=$3,updated_at=clock_timestamp()
+           WHERE id=$1 AND account_id=$2`,
+          [messageId, this.accountId, result.encrypted],
+        );
+      return result.value;
     });
   }
 

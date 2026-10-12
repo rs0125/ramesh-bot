@@ -220,7 +220,7 @@ test(
             const gates = Array.from({ length: 3 }, gate);
             const allStarted = gate();
             let downloads = 0;
-            let delivered: string | undefined;
+            const delivered: string[] = [];
             const abort = new AbortController();
             const session = {
               botJids: [],
@@ -228,8 +228,8 @@ test(
               saveCredentials: async () => {},
               close: async () => {},
               reply: async (_message: WAMessage, text: string) => {
-                delivered = text;
-                abort.abort();
+                delivered.push(text);
+                if (!text.startsWith('_"')) abort.abort();
               },
               downloadMedia: async (message: WAMessage) => {
                 const index = Number(message.key.id!.split('-')[1]);
@@ -260,6 +260,11 @@ test(
                 businessPreflight: async () => !rejected,
                 prepareReply: async (candidate, _signal, trusted) => {
                   prepared++;
+                  assert.deepEqual(delivered, [
+                    '_"Voice note 1"_',
+                    '_"Voice note 2"_',
+                    '_"Voice note 3"_',
+                  ]);
                   captured = { text: candidate.text!, mediaContext: trusted!.mediaContext! };
                   return {
                     text: 'One ordered summary',
@@ -300,11 +305,12 @@ test(
             const answer = rejected
               ? "I couldn't verify the business data before sending this reply. Please try again."
               : 'One ordered summary';
-            assert.equal(
-              delivered,
-              'Voice note 1\n_"Voice note 1"_\n\nVoice note 2\n_"Voice note 2"_\n\nVoice note 3\n_"Voice note 3"_\n\n' +
-                answer,
-            );
+            assert.deepEqual(delivered, [
+              '_"Voice note 1"_',
+              '_"Voice note 2"_',
+              '_"Voice note 3"_',
+              answer,
+            ]);
             const savedRow = (
               await db.admin.query(
                 'SELECT id,reply_encrypted FROM public."ramesh-messages" WHERE account_id=$1 AND reply_encrypted IS NOT NULL',
@@ -315,19 +321,18 @@ test(
               'outbound-reply',
               savedRow.id,
               savedRow.reply_encrypted,
-            ) as { text: string; voice: { ids: string[] } };
-            assert.equal(payload.text, answer);
-            assert.equal(payload.voice.ids.length, 3);
+            ) as string | { text: string; voice?: { ids: string[] } };
+            assert.equal(typeof payload === 'string' ? payload : payload.text, answer);
+            assert.equal(typeof payload === 'string' ? undefined : payload.voice, undefined);
             assert.ok(!JSON.stringify(payload).includes('Voice note 1'));
 
             const burst = JSON.parse(captured!.text);
-            const context = JSON.parse(captured!.mediaContext);
-            assert.deepEqual(
-              context.attachments.map((a: { text: string }) => a.text),
-              ['Voice note 1', 'Voice note 2', 'Voice note 3'],
-            );
-            for (let i = 0; i < 3; i++)
-              assert.equal(burst.messages[i].attachments[0], context.attachments[i].attachment);
+            assert.equal(captured!.mediaContext, '');
+            for (let i = 0; i < 3; i++) {
+              assert.equal(burst.messages[i].attachments, undefined);
+              assert.equal(burst.messages[i].text, `Voice note ${i + 1}`);
+              assert.equal(burst.messages[i].forwarded, true);
+            }
             assert.equal(burst.messages[3].text, 'Summarize these three notes');
             const later = JSON.parse(
               await media.context(owner, [], 'the second voice note', AbortSignal.timeout(1000)),

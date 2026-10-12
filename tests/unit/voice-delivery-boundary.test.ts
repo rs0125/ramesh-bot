@@ -59,6 +59,7 @@ test('full-size protected voice reply sends once and completes without retrying 
   const sent: string[] = [];
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue() {
         assert.fail('already persisted');
       },

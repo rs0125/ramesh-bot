@@ -32,6 +32,7 @@ async function simulate(
   const cipher = authCipher(encryptionKey);
   const queue = new DurableMessages(
     {
+      updateInboundContent: async () => assert.fail('This fixture has no inbound audio'),
       async enqueue(id, _message, payload) {
         stored = {
           id,

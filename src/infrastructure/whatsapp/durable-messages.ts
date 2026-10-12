@@ -15,6 +15,8 @@ import { toGreetingCandidate } from './message.mapper.js';
 import { combinedTurn } from '../../modules/messaging/debounce.js';
 import { MediaService, mediaOwner } from '../../modules/media/media.service.js';
 import { toInboxCandidate } from './message.mapper.js';
+import type { InboxContent } from '../database/inbox.repository.js';
+import { voiceInputReplies } from '../../modules/media/voice-input.js';
 import { encodeReply, decodeReply } from '../../modules/messaging/reply-payload.js';
 import {
   MAX_REPLY_CHARACTERS,
@@ -84,6 +86,7 @@ type DurableRepository = Pick<
   | 'releaseUnsent'
   | 'complete'
   | 'beginSend'
+  | 'updateInboundContent'
 > &
   Partial<
     Pick<
@@ -133,6 +136,76 @@ export class DurableMessages {
 
   private get usageEnabled() {
     return this.options.usageMode === 'observe' || this.options.usageMode === 'enforce';
+  }
+
+  /** Persist once, echo before reasoning, and never replay an ambiguous transcript send. */
+  private async voiceInput(
+    job: MessageJob,
+    item: { id: string; message: WAMessage; candidate: GreetingCandidate },
+    transcript: string,
+    session: WhatsAppSession,
+    signal: AbortSignal,
+  ): Promise<string> {
+    signal.throwIfAborted();
+    const change = <T>(update: (content: InboxContent) => T) =>
+      this.repository.updateInboundContent(job, item.id, (encrypted) => {
+        const content = this.cipher.open('inbox', item.id, encrypted) as InboxContent;
+        if (content.kind !== 'audio' || content.senderId !== item.candidate.senderId)
+          throw new Error('VOICE_INPUT_SOURCE_MISMATCH');
+        const value = update(content);
+        return { encrypted: this.cipher.seal('inbox', item.id, content), value };
+      });
+    const input = await change((content) => {
+      if (!content.voiceTranscript) {
+        content.text = transcript;
+        content.voiceTranscript = { version: 1 };
+      }
+      return content.text;
+    });
+    signal.throwIfAborted();
+    const claimed = await change((content) => {
+      if (content.voiceTranscript!.echo) return false;
+      content.voiceTranscript!.echo = { state: 'SENDING', at: new Date().toISOString() };
+      return true;
+    });
+    if (!claimed) return input;
+    try {
+      for (const [index, text] of voiceInputReplies(input).entries()) {
+        signal.throwIfAborted();
+        const messageId = `3EB0${createHash('sha256')
+          .update(
+            JSON.stringify([
+              'voice-transcript',
+              this.options.accountId ?? 'primary',
+              item.id,
+              index,
+            ]),
+          )
+          .digest('hex')
+          .slice(0, 36)
+          .toUpperCase()}`;
+        await session.reply(item.message, text, { messageId });
+      }
+      await change((content) => {
+        content.voiceTranscript!.echo = { state: 'SENT', at: new Date().toISOString() };
+      });
+    } catch {
+      // Delivery feedback cannot erase a valid input or restart a committed operation.
+      try {
+        await change((content) => {
+          content.voiceTranscript!.echo!.state = 'UNCERTAIN';
+        });
+        this.options.onProcessingError?.({
+          runId: job.id,
+          direction: 'inbound',
+          phase: 'transcript_echo',
+          code: 'VOICE_TRANSCRIPT_ECHO_UNCERTAIN',
+        });
+      } catch {
+        /* A lost lease leaves SENDING visible as uncertain; never automatically resend. */
+      }
+    }
+    return input;
   }
 
   /** A committed API enqueue wakes the existing connected consumer without creating a sender. */
@@ -550,7 +623,9 @@ export class DurableMessages {
         )
           throw new Error('Agent run could not be claimed');
         phase = 'media';
-        const originals = [{ id: job.id, message, candidate, receivedAt: job.receivedAt }];
+        const originals = [
+          { id: job.id, message, candidate, content: job.content, receivedAt: job.receivedAt },
+        ];
         for (const member of job.members ?? []) {
           const wire = this.cipher.open('message', member.id, member.payload);
           if (!Buffer.isBuffer(wire)) throw new Error('INVALID_BATCH_PAYLOAD');
@@ -566,12 +641,29 @@ export class DurableMessages {
             id: member.id,
             message: item,
             candidate: mapped,
+            content: member.content,
             receivedAt: member.receivedAt,
           });
+        }
+        const retainedVoice = new Set<string>();
+        for (const item of originals) {
+          const content = item.content
+            ? (this.cipher.open('inbox', item.id, item.content) as InboxContent)
+            : undefined;
+          if (
+            item.candidate.kind === 'audio' &&
+            content?.kind === 'audio' &&
+            content.senderId === item.candidate.senderId &&
+            content.voiceTranscript?.version === 1
+          ) {
+            retainedVoice.add(item.id);
+            item.candidate = { ...item.candidate, text: content.text };
+          }
         }
         // Promise completion order must never become voice-note/conversation order.
         const attachments = await Promise.all(
           originals.map(async (item, index) => {
+            if (retainedVoice.has(item.id)) return {};
             try {
               const id = await this.ingest(
                 item.message,
@@ -588,21 +680,24 @@ export class DurableMessages {
         );
         const mediaIds = attachments.flatMap((item) => (item.id ? [item.id] : []));
         const failures = attachments.flatMap((item) => (item.failure ? [item.failure] : []));
-        if (originals.length > 1 || candidate.forwarded)
-          candidate = {
-            ...candidate,
-            text: combinedTurn(
-              originals.map((i, index) => ({
-                id: i.id,
-                text: i.candidate.text ?? '',
-                forwarded: i.candidate.forwarded,
-                mediaIds: attachments[index]?.id ? [attachments[index]!.id!] : [],
-              })),
-            ),
-            batchMessageIds: originals.map((i) => i.candidate.messageId),
-          };
-        const mediaContext =
-          (this.options.media
+        const turn = (): GreetingCandidate => ({
+          ...originals[0]!.candidate,
+          text: combinedTurn(
+            originals.map((i, index) => ({
+              id: i.id,
+              text: i.candidate.text ?? '',
+              forwarded: i.candidate.forwarded,
+              mediaIds:
+                !retainedVoice.has(i.id) && attachments[index]?.id ? [attachments[index]!.id!] : [],
+            })),
+          ),
+          ...(originals.length > 1 || originals[0]!.candidate.forwarded || retainedVoice.size
+            ? { batchMessageIds: originals.map((i) => i.candidate.messageId) }
+            : {}),
+        });
+        candidate = turn();
+        const extractionContext =
+          this.options.media && (mediaIds.length || !retainedVoice.size)
             ? await this.options.media.context(
                 mediaOwner(
                   this.options.accountId ?? 'primary',
@@ -614,7 +709,8 @@ export class DurableMessages {
                 signal,
                 Math.max(1, (candidate.sentAtMs + this.options.maxAgeMs - 15000 - Date.now()) / 3),
               )
-            : '') + (failures.length ? `\n${failures.join('\n')}` : '');
+            : '';
+        let mediaContext = extractionContext + (failures.length ? `\n${failures.join('\n')}` : '');
         const commandAudio =
           this.options.media && mediaIds.length
             ? await this.options.media.store.get(
@@ -626,23 +722,63 @@ export class DurableMessages {
                 mediaIds,
               )
             : [];
-        const commandMessages = originals.flatMap((item, index) => {
-          // Native pin names/addresses/captions are source material, never command authority.
-          if (item.candidate.kind === 'location') return [];
-          const receivedAtMs = item.receivedAt?.getTime();
-          if (receivedAtMs === undefined || !Number.isFinite(receivedAtMs)) return [];
+        let voiceInputUnavailable = false;
+        for (const [index, item] of originals.entries()) {
+          if (item.candidate.kind !== 'audio') continue;
           const audio = commandAudio.find(
             (record) =>
               record.id === attachments[index]?.id &&
+              record.source === item.candidate.messageId &&
               record.kind === 'audio' &&
               record.state === 'ready' &&
               !record.truncated &&
               record.expiresAt.getTime() > Date.now(),
           );
+          const text = retainedVoice.has(item.id) ? item.candidate.text : audio?.text;
+          if (!text?.trim()) {
+            voiceInputUnavailable = true;
+            item.candidate = { ...item.candidate, text: '[Voice transcript unavailable]' };
+            continue;
+          }
+          item.candidate = {
+            ...item.candidate,
+            text: await this.voiceInput(job, item, text, session, signal),
+          };
+          retainedVoice.add(item.id);
+        }
+        candidate = turn();
+        // A transcript has become the message input. Do not also pass an expiring copy
+        // as attachment context, or change the model request when this turn resumes.
+        if (extractionContext && mediaIds.length) {
+          const context = JSON.parse(extractionContext);
+          const normalized = new Set(
+            originals.flatMap((item, index) =>
+              retainedVoice.has(item.id) ? [attachments[index]?.id] : [],
+            ),
+          );
+          context.attachments = context.attachments.filter(
+            (item: { attachment: string }) => !normalized.has(item.attachment),
+          );
+          mediaContext =
+            (context.attachments.length || context.unavailable_or_expired.length
+              ? JSON.stringify(context)
+              : '') + (failures.length ? `\n${failures.join('\n')}` : '');
+        }
+        signal.throwIfAborted();
+        const onlyUnavailableVoice =
+          voiceInputUnavailable &&
+          originals.every((item) => item.candidate.kind === 'audio' && !retainedVoice.has(item.id));
+        const commandMessages = originals.flatMap((item) => {
+          // Native pin names/addresses/captions are source material, never command authority.
+          if (item.candidate.kind === 'location') return [];
+          // Unread or partial speech grants no authority. Other complete members remain usable.
+          if (item.candidate.kind === 'audio' && !retainedVoice.has(item.id)) return [];
+          const receivedAtMs = item.receivedAt?.getTime();
+          if (receivedAtMs === undefined || !Number.isFinite(receivedAtMs)) return [];
           return [
             {
               id: item.id,
-              text: audio?.text ?? item.candidate.text ?? '',
+              text: item.candidate.text ?? '',
               receivedAtMs,
               forwarded: item.candidate.forwarded === true,
               ...(item.candidate.quotedMessageId
@@ -680,58 +816,64 @@ export class DurableMessages {
         let toolAcknowledged = false;
         const feedbackFinished = new AbortController();
         phase = 'assistant';
-        const prepared = this.options.prepareReply
-          ? await this.options
-              .prepareReply(candidate, signal, {
-                runId: job.id,
-                checkpointLease: { leaseToken: job.token },
-                replyDeadlineAtMs: candidate.sentAtMs + this.options.maxAgeMs - 15000,
-                commandMessages,
-                locationMessages,
-                mediaContext,
-                onToolActivity: () => {
-                  if (toolAcknowledged || signal.aborted) return;
-                  toolAcknowledged = true;
-                  if (!session.acknowledgeToolUse) return;
-                  const feedbackSignal = AbortSignal.any([
-                    signal,
-                    feedbackFinished.signal,
-                    AbortSignal.timeout(2000),
-                  ]);
-                  void (async () => {
-                    if (
-                      this.repository.claimAcknowledgement &&
-                      !(await cancellable(
-                        () => this.repository.claimAcknowledgement!(job),
-                        feedbackSignal,
-                      ))
-                    )
-                      return;
-                    feedbackSignal.throwIfAborted();
-                    session.acknowledgeToolUse!(toolTarget.message);
-                  })().catch(() => {
-                    /* Progress feedback must never abort or repeat tool execution. */
-                  });
-                },
-                key: {
-                  remoteJid: message.key.remoteJid,
-                  participant: message.key.participant,
-                  fromMe: message.key.fromMe,
-                },
-                ...(this.options.agentRuns
-                  ? {
-                      record: async (kind, value) => {
-                        await this.repository.recordAgentEvent!(
-                          job,
-                          kind,
-                          this.cipher.seal(`agent-event:${kind}`, job.id, value),
-                        );
-                      },
-                    }
-                  : {}),
-              })
-              .finally(() => feedbackFinished.abort())
-          : { text: 'hello', onSent: undefined };
+        const prepared =
+          this.options.prepareReply && !onlyUnavailableVoice
+            ? await this.options
+                .prepareReply(candidate, signal, {
+                  runId: job.id,
+                  checkpointLease: { leaseToken: job.token },
+                  replyDeadlineAtMs: candidate.sentAtMs + this.options.maxAgeMs - 15000,
+                  commandMessages,
+                  locationMessages,
+                  mediaContext,
+                  onToolActivity: () => {
+                    if (toolAcknowledged || signal.aborted) return;
+                    toolAcknowledged = true;
+                    if (!session.acknowledgeToolUse) return;
+                    const feedbackSignal = AbortSignal.any([
+                      signal,
+                      feedbackFinished.signal,
+                      AbortSignal.timeout(2000),
+                    ]);
+                    void (async () => {
+                      if (
+                        this.repository.claimAcknowledgement &&
+                        !(await cancellable(
+                          () => this.repository.claimAcknowledgement!(job),
+                          feedbackSignal,
+                        ))
+                      )
+                        return;
+                      feedbackSignal.throwIfAborted();
+                      session.acknowledgeToolUse!(toolTarget.message);
+                    })().catch(() => {
+                      /* Progress feedback must never abort or repeat tool execution. */
+                    });
+                  },
+                  key: {
+                    remoteJid: message.key.remoteJid,
+                    participant: message.key.participant,
+                    fromMe: message.key.fromMe,
+                  },
+                  ...(this.options.agentRuns
+                    ? {
+                        record: async (kind, value) => {
+                          await this.repository.recordAgentEvent!(
+                            job,
+                            kind,
+                            this.cipher.seal(`agent-event:${kind}`, job.id, value),
+                          );
+                        },
+                      }
+                    : {}),
+                })
+                .finally(() => feedbackFinished.abort())
+            : {
+                text: onlyUnavailableVoice
+                  ? "I couldn't transcribe the complete voice note. Please resend it or type the details."
+                  : 'hello',
+                onSent: undefined,
+              };
         if (signal.aborted) {
           await this.repository.releaseUnsent(job, true);
           return;
@@ -749,18 +891,10 @@ export class DurableMessages {
         if (protectedReply && (!this.options.agentRuns || !this.options.businessPreflight))
           throw new Error('Business delivery is not configured');
         // Old senders accept only a string, so they fail closed on this versioned business payload.
-        const voice = await this.options.media?.voiceReferences(
-          mediaOwner(
-            this.options.accountId ?? 'primary',
-            candidate.chatId,
-            candidate.senderId ?? candidate.chatId,
-          ),
-          mediaIds,
-        );
         const payload = this.cipher.seal(
           'outbound-reply',
           job.id,
-          encodeReply(prepared.text, protectedReply, voice),
+          encodeReply(prepared.text, protectedReply),
         );
         const businessEvidence = protectedReply
           ? this.cipher.seal('business-delivery', job.id, prepared.businessEvidence)
