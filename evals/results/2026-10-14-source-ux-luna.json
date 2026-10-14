@@ -1,0 +1,247 @@
+{
+  "date": "2026-10-14",
+  "status": "complete",
+  "model": "gpt-6-luna",
+  "authorizedBudgetUsd": 2,
+  "scope": {
+    "corpus": "evals/source-ux-paths.json",
+    "paths": 6,
+    "turns": 13,
+    "fixture": "Actual local queue, encrypted inbox/media/context, write journal, application graph and delivery checks on disposable Podman PostgreSQL. Synthetic upstream CRM with current Context Engine schemas and payload mapping. No production writes or WhatsApp sends.",
+    "media": "Stored extractions and transcripts are supplied fixtures; OCR, transcription and real transport are not evaluated."
+  },
+  "changes": [
+    "Internal content bindings persist through clarification, restart and retry.",
+    "Whole messages or explicitly selected text/attachment parts are copied exactly.",
+    "Missing internal selection is recoverable without asking users for IDs.",
+    "Later complete replacements can supersede unfinished selections; completed bindings reuse their operation.",
+    "Aggregate size errors report the actual constraint; splitting does not evade the limit.",
+    "Receipt identity fields are projected explicitly.",
+    "Shared pending-media recovery guidance recommends retrying the retained source."
+  ],
+  "cases": [
+    {
+      "id": "brief-confirm-restart-repeat",
+      "completedTurns": 3,
+      "expectedTurns": 3,
+      "dataIntegrityPassed": true,
+      "checks": [[], [], []],
+      "writes": 1
+    },
+    {
+      "id": "competing-briefs",
+      "completedTurns": 2,
+      "expectedTurns": 2,
+      "dataIntegrityPassed": true,
+      "checks": [[], []],
+      "writes": 1
+    },
+    {
+      "id": "caption-only-unavailable-attachment",
+      "completedTurns": 1,
+      "expectedTurns": 1,
+      "dataIntegrityPassed": true,
+      "checks": [[]],
+      "writes": 1
+    },
+    {
+      "id": "pending-attachment-retry",
+      "completedTurns": 3,
+      "expectedTurns": 3,
+      "dataIntegrityPassed": true,
+      "checks": [[], [], []],
+      "writes": 1
+    },
+    {
+      "id": "truncated-brief-replacement",
+      "completedTurns": 2,
+      "expectedTurns": 2,
+      "dataIntegrityPassed": true,
+      "checks": [[], []],
+      "writes": 1
+    },
+    {
+      "id": "aggregate-length-recovery",
+      "completedTurns": 2,
+      "expectedTurns": 2,
+      "dataIntegrityPassed": true,
+      "checks": [[], []],
+      "writes": 1
+    }
+  ],
+  "initialFailures": {
+    "path": "luna-corpus",
+    "completedPaths": 0,
+    "attemptedPaths": 6,
+    "receiptFailure": "Synthetic employee profiles contained email and active fields. A spread copied these into a strict delivery receipt, causing serialization to fail. Production wiring already projects these fields; the receipt boundary is now robust independently.",
+    "voiceFixture": "Corrected seeded transcript marker from textOrigin to the persisted voiceTranscript contract.",
+    "preserved": true
+  },
+  "uxFindings": [
+    {
+      "case": "pending-attachment-retry",
+      "finding": "Pending processing incorrectly prompted a re-upload even though retry worked.",
+      "status": "Fixed and observed in the final pending-only retest. The initial recovery guidance prompted unnecessary reviewer retries; action=wait_for_processing distinguishes background processing from an immediate retry operation.",
+      "verifiedReply": "The *Kite Auto requirement* document is still processing, so its contents aren\u2019t available yet. Please retry shortly; you don\u2019t need to resend it.",
+      "finalChecks": []
+    },
+    {
+      "case": "caption-only-unavailable-attachment",
+      "finding": "Correct raw description, but title was the generic New RFQ because optional naming enrichment was omitted.",
+      "status": "remaining minor UX limitation"
+    },
+    {
+      "case": "pending-attachment-retry",
+      "finding": "First focused retest saved and deduplicated correctly but added a partial-answer footer after review treated retry guidance as immediately actionable.",
+      "status": "Preserved in luna-recovery-retest; final wait-state retest had no footer."
+    }
+  ],
+  "limitations": [
+    "A single corpus execution plus focused retest is a smoke evaluation, not a reliability or pass@k estimate.",
+    "Choosing the intended brief, target, scope and optional enrichment remains model judgment.",
+    "The complete corpus preceded the final pending-media guidance and multiple-binding ambiguity refinement; final deterministic tests cover both, with a paid pending-media retest.",
+    "The final waiting-turn retest needed an internal review repair to retrieve the source before answering; initial model source selection remains fallible. Its delivered answer passed verification."
+  ],
+  "artifacts": ".local/source-ux-implementation-20261014",
+  "runs": [
+    {
+      "artifacts": ".local/source-ux-implementation-20261014/luna-corpus",
+      "usage": {
+        "campaignId": "general-usage-1b22e868-9640-4fa9-8f6f-abfa605817e9",
+        "maxMicros": 2000000,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 53,
+        "settledRequests": 53,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 215064,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      },
+      "attemptedPaths": 6,
+      "completedPaths": 0,
+      "automatedDataChecksPassed": 0,
+      "completedTurns": 1
+    },
+    {
+      "artifacts": ".local/source-ux-implementation-20261014/luna-corpus-fixed",
+      "usage": {
+        "campaignId": "general-usage-c2b15897-51f3-4e50-bbb6-a4eacbbd438a",
+        "maxMicros": 1784936,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 79,
+        "settledRequests": 79,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 315331,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      },
+      "attemptedPaths": 6,
+      "completedPaths": 6,
+      "automatedDataChecksPassed": 6,
+      "completedTurns": 13
+    },
+    {
+      "artifacts": ".local/source-ux-implementation-20261014/luna-recovery-retest",
+      "usage": {
+        "campaignId": "source-ux-recovery-c362ae4c-60b1-4fb6-91cc-e928c207ec20",
+        "maxMicros": 1469605,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 20,
+        "settledRequests": 20,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 66577,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      },
+      "attemptedPaths": 1,
+      "completedPaths": 1,
+      "automatedDataChecksPassed": 1,
+      "completedTurns": 3
+    },
+    {
+      "artifacts": ".local/source-ux-implementation-20261014/luna-wait-retest",
+      "usage": {
+        "campaignId": "source-ux-recovery-17e27748-77dc-47f5-a7c9-3f02a056e2e2",
+        "maxMicros": 1403028,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 9,
+        "settledRequests": 9,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 35204,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      },
+      "attemptedPaths": 1,
+      "completedPaths": 1,
+      "automatedDataChecksPassed": 1,
+      "completedTurns": 1
+    }
+  ],
+  "totalAccountedMicros": 632176,
+  "totalAccountedUsd": 0.632176,
+  "heldMicros": 0,
+  "remainingBudgetUsd": 1.367824,
+  "accounting": "Conservative estimated model charges including failed attempts and focused retests; every reservation settled. This is not a provider invoice.",
+  "validation": {
+    "fullCheck": {
+      "command": "npm run check",
+      "testsPassed": 1248,
+      "testsFailed": 0,
+      "testsSkipped": 0,
+      "includes": [
+        "Prisma validation",
+        "TypeScript",
+        "unit and Podman PostgreSQL integration tests",
+        "build",
+        "format"
+      ],
+      "log": ".local/source-ux-implementation-20261014/full-check-final.log",
+      "revisionNote": "Full check included all code changes except the final recovery action/guidance wording. The affected 100 tests, typecheck, build and formatting passed again after that wording change."
+    },
+    "finalAffectedTests": {
+      "passed": 100,
+      "failed": 0,
+      "log": ".local/source-ux-implementation-20261014/recovery-final-tests.log"
+    },
+    "recordedReceiptReplay": {
+      "networkCalls": 0,
+      "passed": true,
+      "artifacts": ".local/source-ux-implementation-20261014/recorded-replay-fixed"
+    }
+  },
+  "finalSourceHashes": {
+    "src/modules/writes/write-tools.ts": "2b4f6390a2000d79c5ff3b29bbb00fba4e26dc977b1cd3e8075a30df60f297f0",
+    "src/modules/writes/write-source-bindings.ts": "5966b6d41f071a85d31c75fb129ec574652527c9f25d7f07d569f89b99bc50e3",
+    "src/modules/media/attachment-recovery.ts": "74751b54d7e2166591bf0f6c445d42caadfcae83040cb028f4d5807edb0d9548",
+    "src/modules/media/media.service.ts": "35d1958cea8c095054ec3411b901d4f11f83b34cc5458ac86f476ce5758dffbb",
+    "src/modules/assistant/chat-context.ts": "0b86a23cf2d84149e3ea1fb85415d854c018740af82573eec206c6f20efd01b4",
+    "src/modules/assistant/sales.graph.ts": "566c07458f7876afc3063b6c7e8277e60fc86db04c36c6384f4f0fbcde10e882",
+    "src/modules/assistant/task-plan.ts": "3852daa0a2d6b77883c4b93a83fd167b866407a8119e543497b1dc4d2c5ae719",
+    "src/prompts/worker.md": "9c2400dc100ed879113f347f085a95c20901ecdb4a02aef7b727d4aa3e5f65fc",
+    "src/prompts/planner.md": "1533adfecbe52d227876674d046fabf84facb39699343211048eb276ec471bc5",
+    "evals/source-ux-paths.json": "39858608d268143346f5725dfe1001f079412e0839e96f407e1912440f1f5bbe"
+  },
+  "deterministicCoverage": [
+    "Explicit whole/part copying and no fallback to confirmation text",
+    "Pending/truncated/unavailable source cannot be silently replaced during one action",
+    "Later corrected full brief supersedes unfinished selection",
+    "Persisted source selection survives restart and quoted older-source follow-up",
+    "Completed operation reuse and multiple-action ambiguity do not create extra writes",
+    "Source-memory persistence failure prevents dispatch",
+    "Owner change, expiry and forget clear retained bindings",
+    "Strict receipt serialization excludes extra employee profile fields",
+    "Pending-media state distinguishes waiting from replacement"
+  ]
+}

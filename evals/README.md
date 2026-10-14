@@ -55,6 +55,8 @@ Private HTTP evaluations are disabled until the server can enforce an authentica
 
 ## Coverage
 
+The separate [source UX corpus](source-ux-paths.json) has six paths and thirteen turns: confirmation after restart, repeated confirmation, competing briefs, explicit caption-only capture, pending attachment recovery, complete replacement text and aggregate length recovery. It exercises the real application and local PostgreSQL with synthetic upstream CRM and retained media fixtures. The [dated report](results/2026-10-14-source-ux-luna.json) preserves failed attempts, focused retests, shared budget accounting and remaining UX limitations. This is a focused smoke screen, separate from the registered suites below; it does not test OCR or transcription quality.
+
 | Area                        | Scenarios | What is exercised                                                                                                                                                                                                                                       |
 | --------------------------- | --------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Conversational recall       |         8 | Reported RFQ-to-five-options failure, ordinal references, native dates, 32-message window, intervening chat, changed/revoked data, corrected use and owner questions                                                                                    |

@@ -1,0 +1,237 @@
+{
+  "date": "2026-10-14",
+  "request": "are you sure its implemented the right way? run a few regular use case tests; 2 usd cap",
+  "conclusion": "All three ordinary workflows passed (10/10 turns). This is not a clean architectural sign-off: linked task/reminder batches and a new user retry after pre-approval interruption still have reproducible gaps.",
+  "scope": {
+    "model": "gpt-6-luna",
+    "scenarios": 3,
+    "repetitionsPerScenario": 1,
+    "turns": 10,
+    "separatePaidGrader": false,
+    "paidReruns": 0
+  },
+  "environment": {
+    "real": [
+      "AssistantService and model adapter",
+      "durable queue and scoped inbox",
+      "encrypted conversation state reloaded every turn",
+      "write journal",
+      "personal scheduling repository",
+      "delivery authorization",
+      "current Context Engine schemas and RFQ payload mapper"
+    ],
+    "simulated": ["external CRM and Gmail services", "WhatsApp transport (captured replies only)"],
+    "database": "Disposable databases on local Podman PostgreSQL",
+    "productionWrites": 0
+  },
+  "pricing": {
+    "budgetUsd": 2,
+    "accountedUsd": 0.204756,
+    "pricingBasis": "Conservative standard-tier long-context token rates verified against official pricing; not an invoice measurement.",
+    "source": "https://developers.openai.com/api/docs/pricing",
+    "usage": {
+      "campaignId": "regular-usage-15877443-c22e-40e8-ae71-972b926b6fdf",
+      "maxMicros": 2000000,
+      "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+      "models": ["gpt-6-luna"],
+      "requestCount": 61,
+      "settledRequests": 61,
+      "pendingRequests": 0,
+      "unknownRequests": 0,
+      "knownActualMicros": 204756,
+      "heldMicros": 0,
+      "unpricedRequests": 0,
+      "costComplete": true
+    }
+  },
+  "cases": [
+    {
+      "id": "rfq-create-edit-undo",
+      "passed": true,
+      "completedTurns": 3,
+      "faults": [],
+      "allPreparedRepliesDeliveredExactly": true,
+      "turns": [
+        {
+          "number": 1,
+          "input": "Save a new RFQ for Fixture Willow Components: 18,000\u201322,000 sq ft near Bhiwandi, warehouse plus small office, two trucks parking. Repeat client yes. Budget INR 28 per sq ft per month.",
+          "reply": "Saved RFQ: Fixture Willow Components - near Bhiwandi\nOpen in CRM: https://crm.wareongo.com/object/opportunity/97430961-8531-45a7-b107-694ddc93c9ba\nYou can ask me to edit it or undo this change.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 37585
+        },
+        {
+          "number": 2,
+          "input": "Correction on that RFQ: repeat client is No and remove the budget. Keep everything else.",
+          "reply": "Updated RFQ: Fixture Willow Components - near Bhiwandi\nBudget: cleared\nRepeat client: No\nThis edit left the description unchanged.\nOpen in CRM: https://crm.wareongo.com/object/opportunity/97430961-8531-45a7-b107-694ddc93c9ba\nYou can ask me to edit it or undo this change.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 69602
+        },
+        {
+          "number": 3,
+          "input": "Undo only that last edit.",
+          "reply": "Undid that RFQ change.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 47702
+        }
+      ]
+    },
+    {
+      "id": "gmail-draft-lifecycle",
+      "passed": true,
+      "completedTurns": 3,
+      "faults": [],
+      "allPreparedRepliesDeliveredExactly": true,
+      "turns": [
+        {
+          "number": 1,
+          "input": "Create an email draft to operations@example.com. Subject: Warehouse visit. Ask whether Tuesday morning works for a visit and request the fire documents.",
+          "reply": "Draft saved in fixture@example.com.\n\nTo: operations@example.com\nSubject: Warehouse visit\n\nHi,\n\nWould Tuesday morning work for a warehouse visit? Could you also please share the fire documents?\n\nThanks\n\nOpen it in Gmail to review and send when ready:\nhttps://mail.google.com/mail/#drafts",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 38595
+        },
+        {
+          "number": 2,
+          "input": "Edit that same draft: ask for Wednesday afternoon instead. Keep the recipient and request for fire documents.",
+          "reply": "Draft updated in fixture@example.com.\n\nTo: operations@example.com\nSubject: Warehouse visit\n\nHi,\n\nWould Wednesday afternoon work for a warehouse visit? Could you also please share the fire documents?\n\nThanks\n\nOpen it in Gmail to review and send when ready:\nhttps://mail.google.com/mail/#drafts",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 62655
+        },
+        {
+          "number": 3,
+          "input": "Can you send it now?",
+          "reply": "I can\u2019t send emails from here; the draft is saved in Gmail. Open [Drafts](https://mail.google.com/mail/#drafts) and tap *Send*.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 37956
+        }
+      ]
+    },
+    {
+      "id": "personal-task-reminder",
+      "passed": true,
+      "completedTurns": 4,
+      "faults": [],
+      "allPreparedRepliesDeliveredExactly": true,
+      "turns": [
+        {
+          "number": 1,
+          "input": "Add a task: Call the Chakan landlord. Also remind me tomorrow at 10 am IST to Call the Chakan landlord.",
+          "reply": "Saved task: Call the Chakan landlord..\nSaved reminder: Call the Chakan landlord.; 15 October 2026 at 10:00 am IST.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 17135
+        },
+        {
+          "number": 2,
+          "input": "Show my tasks and reminders.",
+          "reply": "Your tasks (this page):\n1. Call the Chakan landlord. [open]\n\nYour reminders (this page):\n1. Call the Chakan landlord.; next 15 October 2026 at 10:00 am IST [scheduled]",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 18814
+        },
+        {
+          "number": 3,
+          "input": "Move that reminder to tomorrow at 11 am IST.",
+          "reply": "Saved reminder: Call the Chakan landlord.; 15 October 2026 at 11:00 am IST.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 87722
+        },
+        {
+          "number": 4,
+          "input": "Mark the landlord call task complete and cancel its reminder.",
+          "reply": "Completed task: Call the Chakan landlord..\nCancelled reminder: Call the Chakan landlord.; 15 October 2026 at 11:00 am IST.",
+          "checks": [],
+          "outcome": "completed",
+          "durationMs": 24387
+        }
+      ]
+    }
+  ],
+  "fixedDuringAudit": [
+    {
+      "issue": "The new local tool name and source-binding argument could collide with external tool contracts.",
+      "fix": "Reserve write_prepare in read/write descriptor admission and reject an external _source_binding_id argument.",
+      "verification": "Existing descriptor tests extended for both collisions; paid scenarios evaluated this fix."
+    },
+    {
+      "issue": "After an interrupted DRAFT resumed and committed in the original turn, the model-facing tool result still reported ok=false and status=draft.",
+      "fix": "Return the current journal state after finalization rather than the pre-finalization snapshot.",
+      "verification": "Fault injection reproduced before the change. A unit regression now checks one successful dispatch, original operation identity, and a succeeded result. This fix was made after the paid run; verified without another model call.",
+      "afterArtifact": ".local/regular-usage-luna-20261014/source-binding-crash-after-result.json"
+    }
+  ],
+  "openFindings": [
+    {
+      "id": "PERSONAL_BATCH_SELF_CONFLICT",
+      "severity": "medium",
+      "status": "open",
+      "introducedBySourceUxChange": false,
+      "evidence": "A real Podman repository diagnostic completes a linked task and cancels the same reminder using versions read before the batch. Task-first raises PERSONAL_VERSION_CONFLICT and atomically rolls both changes back. Reminder-first and task-only both finish with task done and reminder cancelled.",
+      "cause": "A task completion implicitly cancels and versions linked reminders, but later operations in the same atomic batch validate against that changed version instead of the batch input state.",
+      "paidCoverage": "The paid task scenario passed with an unlinked task and reminder (taskId null), so it does not refute this failure.",
+      "artifact": ".local/regular-usage-luna-20261014/personal-overlap-result.json",
+      "nextStep": "Define batch-level preconditions and reconcile overlapping effects under the same transaction, preserving genuine stale-version detection and final-state receipts. Do not depend on model operation ordering."
+    },
+    {
+      "id": "SOURCE_BINDING_DRAFT_RETRY_STUCK",
+      "severity": "medium",
+      "status": "open",
+      "introducedBySourceUxChange": true,
+      "evidence": "A free service-level fault injection stops before durable approval. The original turn can resume its DRAFT, but a new user retry with the remembered binding returns WRITE_SOURCE_BINDING_UNAVAILABLE with no remote dispatch.",
+      "cause": "The binding remembers an operation ID at DRAFT creation, while only the original proposal run may approve that DRAFT. Later bindings cannot replace an entry with operationId. There is no safe transition transferring or abandoning the never-approved draft for a new retry.",
+      "limits": "Diagnostic uses the real BusinessWriteService and fake journal/writer; not a forced production process crash.",
+      "artifact": ".local/regular-usage-luna-20261014/source-binding-crash-result.json",
+      "nextStep": "Define and test a fenced transactional recovery transition for never-approved drafts, keeping approval checks and the approved/unknown operation identity guarantees intact.",
+      "afterArtifact": ".local/regular-usage-luna-20261014/source-binding-crash-after-result.json"
+    }
+  ],
+  "replyQualityNotes": [
+    "Personal receipts add punctuation to already punctuated user text, producing double periods and period-semicolon combinations.",
+    "The unsupported email-send reply used a Markdown link rather than a plain WhatsApp URL. The draft remained unchanged and no send was claimed."
+  ],
+  "verification": {
+    "focusedTests": {
+      "passed": 178,
+      "failed": 0,
+      "skipped": 0,
+      "artifact": ".local/regular-usage-luna-20261014/focused-tests.log"
+    },
+    "finalUnitTestsArtifact": ".local/regular-usage-luna-20261014/final-unit-tests.log",
+    "typecheckArtifact": ".local/regular-usage-luna-20261014/typecheck-final.log",
+    "buildArtifact": ".local/regular-usage-luna-20261014/build-final.log",
+    "formatArtifact": ".local/regular-usage-luna-20261014/format-final.log",
+    "preflight": "Local service-boundary contract preflight and network-disabled queue plumbing preflight passed; not counted as paid scenario passes.",
+    "finalUnitTests": {
+      "passed": 134,
+      "failed": 0,
+      "skipped": 0,
+      "artifact": ".local/regular-usage-luna-20261014/final-unit-tests.log"
+    },
+    "typecheck": "passed",
+    "build": "passed",
+    "format": "passed",
+    "diffCheck": "passed"
+  },
+  "artifacts": {
+    "root": ".local/regular-usage-luna-20261014",
+    "runner": ".local/regular-usage-luna-20261014/run.mts",
+    "predeclaredChecks": ".local/regular-usage-luna-20261014/checks.mts",
+    "caseSource": "evals/general-usage-paths.json",
+    "paidResults": ".local/regular-usage-luna-20261014/paid/results.json",
+    "paidSourceSnapshot": ".local/regular-usage-luna-20261014/source-snapshot.json"
+  },
+  "limits": [
+    "One sample per scenario, not a reliability estimate or pass@k study.",
+    "No OCR/audio transcription, CMS, live CRM, live Gmail, or real WhatsApp delivery tested in this run.",
+    "Remaining failures retained; no paid reruns to replace them."
+  ],
+  "committed": false,
+  "deployed": false,
+  "postPaidSourceChanges": ["src/modules/writes/write-tools.ts"]
+}
