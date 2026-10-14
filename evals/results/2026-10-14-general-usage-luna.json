@@ -1,0 +1,286 @@
+{
+  "date": "2026-10-14",
+  "model": "gpt-6-luna",
+  "judgeModel": "gpt-6-luna",
+  "maximumUsd": 3,
+  "conservativeAccountedUsd": 1.45079,
+  "heldMicros": 0,
+  "distinctPaths": 17,
+  "plannedTurns": 37,
+  "completedTurnsInSelectedAttempts": 36,
+  "totalPathAttemptsIncludingInvalidFixtures": 25,
+  "totalDeliveredTurnsIncludingInvalidFixtures": 43,
+  "stateAndToolChecksPassed": 14,
+  "productionSourcesUnchangedDuringCampaign": true,
+  "releaseAssessment": "Not ready to ship: attachment-to-write data loss, overlapping personal mutations, CMS preview delivery failure.",
+  "runs": [
+    {
+      "directory": ".local/general-usage-luna-20261014/paid-1",
+      "attemptedPaths": 17,
+      "deliveredTurns": 25,
+      "usage": {
+        "campaignId": "general-usage-5fefd7e2-99f0-4ef1-878b-f3a3291bb2a9",
+        "maxMicros": 3000000,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 202,
+        "settledRequests": 202,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 861325,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      }
+    },
+    {
+      "directory": ".local/general-usage-luna-20261014/paid-2",
+      "attemptedPaths": 7,
+      "deliveredTurns": 16,
+      "usage": {
+        "campaignId": "general-usage-a295b4ab-c5ff-4155-bfa7-3a1c260fd790",
+        "maxMicros": 2138675,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 115,
+        "settledRequests": 115,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 546246,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      }
+    },
+    {
+      "directory": ".local/general-usage-luna-20261014/paid-3",
+      "attemptedPaths": 1,
+      "deliveredTurns": 2,
+      "usage": {
+        "campaignId": "general-usage-96f0a0c3-3a22-4546-bbf3-6a1d531f8f2f",
+        "maxMicros": 1592429,
+        "priceVersion": "reviewed-conservative-upper-bounds-2026-10-14",
+        "models": ["gpt-6-luna"],
+        "requestCount": 7,
+        "settledRequests": 7,
+        "pendingRequests": 0,
+        "unknownRequests": 0,
+        "knownActualMicros": 43219,
+        "heldMicros": 0,
+        "unpricedRequests": 0,
+        "costComplete": true
+      }
+    }
+  ],
+  "paths": [
+    {
+      "id": "chat-advice",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Useful general help; no unnecessary source calls or writes.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "crm-followups",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Today versus overdue remained separate; named-deal context was retrieved.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "warehouse-comparison",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Correct displayed ordinals; recommendation qualified by missing truck-access evidence.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "client-shortlist-correction",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Search range changed without editing CRM; client/use preserved. Reviewed manually after grader input-size rejection.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "knowledge",
+      "selectedRun": "paid-1",
+      "plannedTurns": 1,
+      "completedTurns": 1,
+      "stateAndToolChecksPassed": true,
+      "notes": "Correct checklist; vague partial-answer notice instead of explaining that the source supplied no shareable URL.",
+      "faults": [],
+      "turnChecks": [[]],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "analytics-source-outage",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "GA4 denial did not suppress available Search Console facts or become zero traffic.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "public-research-and-cost",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Cited synthetic public page; 32,000 \u00d7 INR 24 = INR 768,000/month.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "rfq-create-edit-undo",
+      "selectedRun": "paid-2",
+      "plannedTurns": 3,
+      "completedTurns": 3,
+      "stateAndToolChecksPassed": true,
+      "notes": "One RFQ; explicit No and budget clear; edit undo restored fields; original description preserved.",
+      "faults": [],
+      "turnChecks": [[], [], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "rfq-uncertain-retry",
+      "selectedRun": "paid-3",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Two attempts reused one operation ID and frozen arguments; only one RFQ; uncertainty remained explicit.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "note-create-edit-undo",
+      "selectedRun": "paid-2",
+      "plannedTurns": 3,
+      "completedTurns": 3,
+      "stateAndToolChecksPassed": true,
+      "notes": "One note; two \u2192 three \u2192 two trucks; title and evening preference preserved.",
+      "faults": [],
+      "turnChecks": [[], [], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "gmail-draft-lifecycle",
+      "selectedRun": "paid-2",
+      "plannedTurns": 3,
+      "completedTurns": 3,
+      "stateAndToolChecksPassed": true,
+      "notes": "Same draft updated Tuesday \u2192 Wednesday; recipient/fire-document request preserved; sending refused.",
+      "faults": [],
+      "turnChecks": [[], [], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "gis-native-pin",
+      "selectedRun": "paid-2",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Exact native coordinates saved; point removed once. Undo receipt exposes raw JSON and awkward tool wording.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "cms-preview-confirm",
+      "selectedRun": "paid-2",
+      "plannedTurns": 2,
+      "completedTurns": 1,
+      "stateAndToolChecksPassed": false,
+      "notes": "Delivery replayed preview creation, allocated a different preview ID, then rejected SOURCE_CHANGED. Confirmation/save turn was not reached.",
+      "faults": [
+        {
+          "reason": "SOURCE_CHANGED",
+          "tool": "cms_prepare_import"
+        },
+        "confirmation_code_missing"
+      ],
+      "turnChecks": [[]],
+      "preparedVsDeliveredMismatch": true
+    },
+    {
+      "id": "personal-task-reminder",
+      "selectedRun": "paid-1",
+      "plannedTurns": 4,
+      "completedTurns": 4,
+      "stateAndToolChecksPassed": false,
+      "notes": "Creation/list/reschedule worked. Completing task auto-cancels reminder; explicit reminder cancellation then conflicts and rolls back both operations. Receipt also doubles punctuation.",
+      "faults": [],
+      "turnChecks": [[], [], [], ["task_not_completed", "reminder_not_cancelled"]],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "image-brief-to-rfq",
+      "selectedRun": "paid-2",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": false,
+      "notes": "Image read succeeded. Write sources exposed only its caption, so CRM description saved the read instruction and lost the extracted brief. Receipt falsely said full brief saved.",
+      "faults": [],
+      "turnChecks": [[], ["turn_not_completed", "image_brief_missing"]],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "revoked-private-recall",
+      "selectedRun": "paid-1",
+      "plannedTurns": 2,
+      "completedTurns": 2,
+      "stateAndToolChecksPassed": true,
+      "notes": "Protected details withheld; reply incorrectly described unavailable conversation details instead of the access restriction.",
+      "faults": [],
+      "turnChecks": [[], []],
+      "preparedVsDeliveredMismatch": false
+    },
+    {
+      "id": "pdf-requirement",
+      "selectedRun": "paid-1",
+      "plannedTurns": 1,
+      "completedTurns": 1,
+      "stateAndToolChecksPassed": true,
+      "notes": "Covered/open areas and unresolved power preserved. Extra extraction caveat was supported by actual media context, omitted from grader input.",
+      "faults": [],
+      "turnChecks": [[]],
+      "preparedVsDeliveredMismatch": false
+    }
+  ],
+  "graderCaveats": [
+    "Client shortlist exceeded grader input limit; inspected manually.",
+    "Personal reschedule was committed: stored 11 am schedule contradicts grader claim based only on staged tool output.",
+    "PDF extraction qualification was present in media context, which the grader input omitted.",
+    "CMS grader saw the prepared preview, but delivery actually sent a SOURCE_CHANGED fallback. State/delivery checks take precedence."
+  ],
+  "fixtureCorrections": [
+    "Extra email/active fields in test write identity violated strict receipt schema; production constructs the exact three-field identity.",
+    "Simulated extra read tools initially used invalid /fixture source paths; corrected to /api/v1 and checked through verifyToolEvidence.",
+    "Unknown RFQ outcome initially had read-style metadata outside its write schema; exception prevented attempt bookkeeping. Corrected and checked with a free complete retry before one final paid path."
+  ],
+  "latencySeconds": {
+    "medianPreparation": 45.2,
+    "maxPreparation": 112.6
+  },
+  "boundaries": "Real local Podman queue/database, media processing, graph, write/personal repositories and delivery checks. Synthetic CRM/Gmail/GIS/CMS/web; capture-only transport. No production mutations, real WhatsApp sends, deployments or commits. One valid attempt per path; not pass@k, a reliability percentage, full authorization matrix, or scheduler delivery test."
+}
