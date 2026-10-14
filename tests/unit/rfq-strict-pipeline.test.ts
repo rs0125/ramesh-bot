@@ -89,7 +89,8 @@ function harness(
       return message({
         objective: 'Save the requested RFQ',
         successCriteria: ['Preserve the complete source and report the real result.'],
-        responseMode: options.mixed || options.formatReceipt ? 'answer' : 'receipt_only',
+        responseMode:
+          options.mixed || options.repair || options.formatReceipt ? 'answer' : 'receipt_only',
         clarification: null,
         steps: [
           { id: 'save', goal: 'Capture the brief', dependsOn: [], toolNames: ['create_crm_rfq'] },
@@ -97,14 +98,13 @@ function harness(
       });
     if (name === 'ramesh_sales_review') {
       reviews++;
-      assert.equal(fixture.state.writes.length, 0, 'review precedes every dispatch');
+      assert.equal(fixture.state.writes.length, 1, 'reply review observes the recorded action');
       const input = JSON.parse(body.input[0].content);
       assert.ok(
         input.business_write_evidence.some(
           (entry: any) => entry.exact_arguments?.raw_text === requestText,
         ),
       );
-      if (options.revoked) fixture.state.active = false;
       const needsRepair = options.repair && reviews === 1;
       return message({
         supported: !options.reject && !needsRepair,
@@ -123,14 +123,15 @@ function harness(
         'plain saves must not depend on formatter inference',
       );
       return message({
-        additional_reply: options.formatReceipt
-          ? ''
-          : 'Parking and the deferred size/location are preserved in the original brief.',
+        additional_reply:
+          options.formatReceipt || (options.repair && reviews === 0)
+            ? ''
+            : 'Parking and the deferred size/location are preserved in the original brief.',
       });
     }
     assert.equal(name, 'worker');
     if (body.input.some((item: any) => item.type === 'function_call_output'))
-      return message('Prepared for independent review; no success claim yet.');
+      return message('The action result is recorded; use the application receipt.');
     const definitions = body.tools.flatMap((tool: any) =>
       tool.type === 'namespace'
         ? tool.tools.map((child: any) => ({ ...child, namespace: tool.name }))
@@ -145,6 +146,7 @@ function harness(
     const args = Object.fromEntries(
       Object.keys(create.parameters.properties).map((key) => [key, null]),
     );
+    if (options.revoked) fixture.state.active = false;
     return Response.json({
       id: randomUUID(),
       object: 'response',
@@ -242,7 +244,7 @@ test('strict receipt-only intake saves the untouched source once without a forma
   assert.equal(h.fixture.state.writes.length, 1);
   assert.equal(h.fixture.state.rfqs[0]!.args.raw_text, brief);
   assert.deepEqual(Object.keys(h.fixture.state.rfqs[0]!.args).sort(), ['operation_id', 'raw_text']);
-  assert.ok(h.stages.includes('ramesh_sales_review'));
+  assert.ok(!h.stages.includes('ramesh_sales_review'));
   assert.ok(!h.stages.includes('ramesh_action_supplement'));
 });
 
@@ -277,18 +279,22 @@ test('32K batched source survives empty-supplement formatting, review and delive
   );
 });
 
-test('receipt-only routing never bypasses rejection or authorization rechecking', async () => {
+test('reply rejection preserves receipts while revoked authorization still prevents dispatch', async () => {
   for (const options of [
-    { reject: true },
+    { reject: true, formatReceipt: true },
     { revoked: true },
-    { reject: true, history: 'both' as const },
+    { reject: true, formatReceipt: true, history: 'both' as const },
     { revoked: true, history: 'both' as const },
   ]) {
     const h = harness(options);
     const result = await h.run(brief);
-    assert.equal(h.fixture.state.writes.length, 0);
-    assert.equal(h.fixture.state.rfqs.length, 0);
-    assert.doesNotMatch(result.text, /Saved RFQ/);
+    assert.equal(h.fixture.state.writes.length, options.revoked ? 0 : 1);
+    assert.equal(h.fixture.state.rfqs.length, options.revoked ? 0 : 1);
+    if (options.revoked) assert.doesNotMatch(result.text, /Saved RFQ/);
+    else {
+      assert.match(result.text, /Saved RFQ/);
+      assert.ok(result.trace.events?.some((event) => event.code === 'WRITE_RECEIPT_PRESERVED'));
+    }
   }
 });
 

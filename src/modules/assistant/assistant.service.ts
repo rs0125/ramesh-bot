@@ -487,6 +487,28 @@ export class AssistantService {
             : 'RUN_FAILED';
         trace.failure = classifyFailure(error, 'graph');
         if (error instanceof ModelFailureError) trace.modelFailure = error.details;
+        // A model/deadline failure after a direct tool executed cannot replace its result
+        // with "try again". Recovery remains owner/lease bound and uses the same operation.
+        let executed = writes?.executionReply;
+        if (!executed && writes?.executionStarted && trusted) {
+          try {
+            const recoverySignal = AbortSignal.timeout(5000);
+            executed = await this.runtime.businessWrites?.recover(
+              trusted,
+              signal ? AbortSignal.any([signal, recoverySignal]) : recoverySignal,
+            );
+          } catch (recoveryError) {
+            if (recoveryError instanceof CheckpointError) throw recoveryError;
+            signal?.throwIfAborted();
+          }
+        }
+        if (executed) {
+          events.push({ stage: 'finish', code: 'WRITE_RECEIPT_PRESERVED', blocking: false });
+          return finish({
+            text: executed.text,
+            businessEvidence: writeDeliveryBundle(executed.delivery),
+          });
+        }
         const failureReply = writes?.unsubmittedReply ?? UNAVAILABLE_REPLY;
         const business = contextRun?.historyDelivery();
         const personalDelivery =

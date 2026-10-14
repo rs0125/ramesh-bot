@@ -85,10 +85,12 @@ function writeRun(
   const evidence: unknown[] = [];
   const invocations: unknown[] = [];
   let finalized = 0;
+  let executed: BusinessWriteReply | undefined;
   const preview = () =>
-    staged
+    executed?.text ??
+    (staged
       ? `Proposed create_example_record\n${JSON.stringify(staged)}\nNot yet saved.`
-      : undefined;
+      : undefined);
   const run = {
     employeeId: options.employeeId ?? 7,
     tools: [writeDefinition, definition('write_history')],
@@ -96,6 +98,12 @@ function writeRun(
     blocked: false,
     context: 'Authenticated tool metadata determines the write execution policy.',
     pendingExecutionMode: options.executionMode ?? 'confirmation',
+    get executionReply() {
+      return executed;
+    },
+    get executionStarted() {
+      return options.executionMode === 'direct_request' && finalized > 0;
+    },
     evidence,
     failures: [],
     get usedPrivateData() {
@@ -126,17 +134,25 @@ function writeRun(
         evidence.push(result);
         return result;
       }
+      if (executed) return { ok: false, code: 'WRITE_ALREADY_FINALIZED' };
       staged = args;
+      if (options.executionMode === 'direct_request') {
+        await this.finalize();
+        const result = { ok: true, status: 'succeeded', receipt: executed!.text };
+        evidence.push(result);
+        return result;
+      }
       const result = { ok: true, status: 'draft_not_confirmable', arguments: args };
       evidence.splice(0, evidence.length, result);
       return result;
     },
     preview,
     async finalize() {
+      if (executed) return executed;
       finalized++;
       events.push(options.executionMode === 'direct_request' ? 'dispatch' : 'publish');
       if (options.failFinalize) throw new Error('AUTHORIZATION_CHANGED');
-      return staged
+      const result = staged
         ? {
             text:
               options.executionMode === 'direct_request'
@@ -145,6 +161,8 @@ function writeRun(
             delivery: receipt,
           }
         : undefined;
+      if (options.executionMode === 'direct_request') executed = result;
+      return result;
     },
   };
   return { run: run as unknown as BusinessWriteRun, invocations, finalized: () => finalized };
@@ -438,7 +456,7 @@ test('dynamic writes can follow reads but publish exact proposals only after ind
   assert.ok(!reviewInstructions.includes('# Personal task and reminder review'));
 });
 
-test('direct writes dispatch after independent review and replace the unexecuted preview with the authoritative result', async () => {
+test('direct tools execute before answer review and return the authoritative result', async () => {
   events.length = 0;
   const writes = writeRun({ executionMode: 'direct_request' });
   const reads = readRun();
@@ -454,7 +472,7 @@ test('direct writes dispatch after independent review and replace the unexecuted
     },
   ).invoke(input);
   assert.equal(writes.finalized(), 1);
-  assert.ok(events.indexOf('verifier') < events.indexOf('dispatch'));
+  assert.ok(events.indexOf('dispatch') < events.indexOf('verifier'));
   assert.equal(result.reply, 'Saved the requested record.');
   assert.doesNotMatch(result.reply, /confirm|Not yet saved|Proposed/i);
   assert.equal(result.write?.delivery, receipt);
@@ -465,10 +483,10 @@ test('direct writes dispatch after independent review and replace the unexecuted
     'receipt-only delivery must not replay an old version invalidated by its own write',
   );
   assert.equal(payload(fake.requests, 'verifier').business_write_execution_mode, 'direct_request');
-  assert.match(payload(fake.requests, 'verifier').answer, /Not yet saved/);
+  assert.match(payload(fake.requests, 'verifier').answer, /Saved the requested record/);
 });
 
-test('a reviewed clarification never finalizes an earlier staged business or personal proposal', async () => {
+test('clarification preserves completed receipts and never commits pending proposals', async () => {
   for (const executionMode of ['direct_request', 'confirmation'] as const) {
     const writes = writeRun({ executionMode });
     await writes.run.execute(
@@ -521,18 +539,19 @@ test('a reviewed clarification never finalizes an earlier staged business or per
         personal,
       },
     ).invoke(input);
-    assert.equal(result.reply, 'Should this be for Acme or Beta?');
+    assert.ok(result.reply.startsWith('Should this be for Acme or Beta?'));
     assert.equal(result.approved, true);
-    assert.equal(writes.finalized(), 0);
+    assert.equal(writes.finalized(), executionMode === 'direct_request' ? 1 : 0);
     assert.equal(personalFinalized, 0);
     assert.equal(fake.sessions.length, 0);
     assert.deepEqual(reads.readCalls, []);
-    assert.equal(result.write, undefined);
+    assert.equal(!!result.write, executionMode === 'direct_request');
+    if (result.write) assert.match(result.reply, /Saved the requested record/);
   }
 });
 
-test('replanning after a rejected write delivers the new question and leaves the proposal uncommitted', async () => {
-  const writes = writeRun({ executionMode: 'direct_request' });
+test('replanning after a rejected confirmation proposal asks before publication', async () => {
+  const writes = writeRun();
   const reads = readRun();
   const fake = model([{ name: writeDefinition.name, args: exact }]);
   const complete = fake.fake.complete;
@@ -607,19 +626,21 @@ test('a separate read answer accompanying a direct write retains its full freshn
   assert.equal(result.write?.delivery, receipt);
 });
 
-test('direct policy cannot bypass an unsuccessful verifier review', async () => {
+test('rejected explanation cannot erase or repeat an executed direct action', async () => {
   const writes = writeRun({ executionMode: 'direct_request' });
   const fake = model([{ name: writeDefinition.name, args: exact }], { approved: false });
   const result = await buildSalesGraph(fake.fake, async () => ({ status: 'denied' }), {
     writes: writes.run,
   }).invoke(input);
-  assert.equal(writes.finalized(), 0);
-  assert.equal(result.write, undefined);
-  assert.doesNotMatch(result.reply, /Saved the requested record|78\.125/);
+  assert.equal(writes.finalized(), 1);
+  assert.equal(result.write?.delivery, receipt);
+  assert.match(result.reply, /Saved the requested record/);
+  assert.match(result.reply, /couldn’t complete the rest/);
+  assert.doesNotMatch(result.reply, /78\.125/);
 });
 
-test('a contradictory supported verdict with a blocking finding never dispatches a write', async () => {
-  const writes = writeRun({ executionMode: 'direct_request' });
+test('a contradictory review cannot publish a pending confirmation proposal', async () => {
+  const writes = writeRun();
   const fake = model([{ name: writeDefinition.name, args: exact }]);
   const complete = fake.fake.complete.bind(fake.fake);
   fake.fake.complete = async (request, signal) => {
@@ -898,6 +919,65 @@ test('formatter failures explain verified non-submission and retain safe diagnos
       httpStatus: 400,
     });
     assert.doesNotMatch(reply.text, /HTTP|INVALID_SCHEMA|RUN_FAILED/);
+  }
+});
+
+test('worker, formatter and verifier failures after execution preserve the actual receipt', async () => {
+  for (const failedStage of ['worker', 'formatter', 'verifier'] as const) {
+    const writes = writeRun({ executionMode: 'direct_request' });
+    const fake = model([{ name: writeDefinition.name, args: exact }]);
+    const failure = new ModelFailureError(
+      { stage: failedStage, code: 'INVALID_SCHEMA', httpStatus: 400 },
+      'Synthetic model failure',
+    );
+    const complete = fake.fake.complete.bind(fake.fake);
+    fake.fake.complete = (request, signal) => {
+      if (request.stage === failedStage) throw failure;
+      return complete(request, signal);
+    };
+    const start = fake.fake.startToolSession!;
+    fake.fake.startToolSession = (request) => {
+      const session = start(request);
+      const next = session.next;
+      session.next = async (...args) => {
+        if (failedStage === 'worker' && writes.finalized()) throw failure;
+        return next(...args);
+      };
+      return session;
+    };
+    let recoveries = 0;
+    const assistant = new AssistantService(
+      { model: 'offline-write-fake', timeoutMs: 5000 },
+      fake.fake,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        now: () => now,
+        businessWrites: {
+          async recover() {
+            recoveries++;
+            return undefined;
+          },
+          async open() {
+            return writes.run;
+          },
+        } as unknown as BusinessWriteService,
+      },
+    );
+    const reply = await assistant.prepare(message, undefined, trusted);
+    assert.equal(reply.text, 'Saved the requested record.', failedStage);
+    assert.deepEqual(getWriteDelivery(reply.businessEvidence), receipt);
+    assert.equal(writes.finalized(), 1);
+    assert.equal(writes.invocations.length, 1);
+    assert.equal(
+      recoveries,
+      1,
+      'only the initial recovery lookup; no redispatch after model failure',
+    );
+    assert.ok(reply.trace.events?.some((event) => event.code === 'WRITE_RECEIPT_PRESERVED'));
+    assert.equal(reply.trace.modelFailure?.stage, failedStage);
   }
 });
 

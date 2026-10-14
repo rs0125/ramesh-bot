@@ -137,7 +137,7 @@ async function scenario(options: {
         });
       if (request.stage === 'verifier') {
         reviews++;
-        assert.equal(fixture.state.writes.length, 0, 'review must precede dispatch');
+        assert.equal(fixture.state.writes.length, 1, 'reply review observes the actual result');
         return modelOutput({ supported: !options.reject, feedback: '', repair: 'none' });
       }
       return modelOutput(
@@ -151,7 +151,7 @@ async function scenario(options: {
         async next() {
           const call = calls[next++];
           return {
-            ...modelOutput('Prepared for independent review.'),
+            ...modelOutput('The action result is recorded; use the application receipt.'),
             calls: call
               ? [{ id: randomUUID(), name: call.name, arguments: JSON.stringify(call.args) }]
               : [],
@@ -242,8 +242,10 @@ test('a valid long direct note keeps the exact source and full note without a co
   assert.equal(await h.canDeliver(), true);
 });
 
-test('rejected mixed-history notes cannot dispatch', async () => {
+test('rejected mixed-history explanations retain the executed note receipt', async () => {
   const h = await scenario({ action: 'update', history: 'both', reject: true });
-  assert.equal(h.fixture.state.writes.length, 0);
-  assert.doesNotMatch(h.reply.text, /^Updated note/);
+  assert.equal(h.fixture.state.writes.length, 1);
+  assert.match(h.reply.text, /Updated note/);
+  assert.equal(await h.canDeliver(), true);
+  assert.ok(h.reply.trace.events?.some((event) => event.code === 'WRITE_RECEIPT_PRESERVED'));
 });

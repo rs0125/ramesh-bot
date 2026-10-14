@@ -531,12 +531,12 @@ test('an invalid direct RFQ can be cancelled in ordinary language before a sourc
     'Save this RFQ: Fixture Logistics needs space in Hoskote, parking for two trucks.',
   );
   const run = (await h.service.open(source, signal()))!;
-  await run.execute(rfqCreate.name, '{}', signal());
   h.useResult({
     outcome: 'not_dispatched',
     code: 'CRM_RFQ_INCOMPLETE',
     message: 'Please supply or correct: requirement (positive quantity and explicit unit).',
   });
+  await run.execute(rfqCreate.name, '{}', signal());
   const failed = (await run.finalize(signal()))!;
   assert.match(failed.text, /space requirement needs checking/);
   assert.doesNotMatch(failed.text, /CRM_RFQ|ABCDEF12/);
@@ -545,6 +545,7 @@ test('an invalid direct RFQ can be cancelled in ordinary language before a sourc
   assert.equal([...h.operations.values()][0]!.state, 'CANCELLED');
   assert.equal(h.calls.length, 1);
   const correction = h.trusted('Use 5000 sqft.');
+  h.useResult({ outcome: 'created', code: 'OK', message: 'Created' });
   const corrected = (await h.service.open(correction, signal()))!;
   await corrected.execute(
     rfqCreate.name,
@@ -912,7 +913,7 @@ test('WhatsApp rejects oversized email drafts before persistence without truncat
   const run = (await h.service.open(request, signal()))!;
   assert.match(
     run.tools.find((entry) => entry.name === draft.name)!.description!,
-    /4,800-character WhatsApp proposal budget/,
+    /4,800 characters/,
   );
   const result = await run.execute(
     draft.name,
@@ -1543,7 +1544,7 @@ const draftArgs = () => ({
   connection_version: 1,
 });
 
-async function stageDirect(
+async function executeDirect(
   h: ReturnType<typeof harness>,
   definition = directTool(create),
   args: Record<string, unknown> = { name: 'Example' },
@@ -1551,10 +1552,7 @@ async function stageDirect(
   h.changeDefinitions([definition]);
   const request = h.trusted('Save the requested change with these exact details.');
   const run = (await h.service.open(request, signal()))!;
-  assert.equal(
-    ((await run.execute(definition.name, JSON.stringify(args), signal())) as { ok: boolean }).ok,
-    true,
-  );
+  await run.execute(definition.name, JSON.stringify(args), signal());
   return { request, run, operation: [...h.operations.values()].at(-1)! };
 }
 
@@ -1567,10 +1565,10 @@ test('direct email drafts retain the full schema-valid body and use a concise re
     provider: 'gmail',
   });
   const args = { ...draftArgs(), body: 'Please review the fixture details. '.repeat(300) };
-  const { run, request } = await stageDirect(h, directTool(draft), args);
+  const { run, request } = await executeDirect(h, directTool(draft), args);
   assert.doesNotMatch(run.tools[0]!.description!, /4,800-character/);
-  assert.ok(run.preview()!.includes(args.body), 'independent review sees the complete body');
-  assert.equal(h.calls.length, 0);
+  assert.equal(h.calls[0]!.args.body, args.body, 'the tool receives the full body');
+  assert.equal(h.calls.length, 1);
   const reply = (await run.finalize(signal()))!;
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0]!.args.body, args.body);
@@ -1582,9 +1580,9 @@ test('direct email drafts retain the full schema-valid body and use a concise re
 
 test('business history distinguishes staging, confirmation, commit, uncertainty and a safe retry', async () => {
   const h = harness();
-  const { run, operation } = await stageDirect(h);
-  assert.equal(run.historyDelivery()!.history!.activity[0]!.status, 'staged');
   h.useUnknown(true);
+  const { run, operation } = await executeDirect(h);
+  assert.equal(run.historyDelivery()!.history!.activity[0]!.status, 'uncertain');
   const first = (await run.finalize(signal()))!;
   assert.deepEqual(
     run.historyDelivery()!.operations,
@@ -1593,7 +1591,7 @@ test('business history distinguishes staging, confirmation, commit, uncertainty 
   );
   assert.deepEqual(
     first.delivery.history!.activity.map((entry) => entry.status),
-    ['staged', 'uncertain'],
+    ['uncertain'],
   );
   assert.equal(first.delivery.history!.activity.at(-1)!.operationId, operation.operationId);
   const next = (await h.service.open(
@@ -1647,8 +1645,8 @@ test('business history distinguishes staging, confirmation, commit, uncertainty 
 
 test('write history retains definite non-dispatch and omits private recovery fields', async () => {
   const h = harness();
-  const { run } = await stageDirect(h);
   h.useResult({ outcome: 'not_dispatched', code: 'UNAVAILABLE', message: 'PRIVATE_UPSTREAM_BODY' });
+  const { run } = await executeDirect(h);
   const reply = (await run.finalize(signal()))!;
   assert.equal(reply.delivery.history!.activity.at(-1)!.status, 'not_dispatched');
   assert.doesNotMatch(JSON.stringify(reply.delivery.history), /PRIVATE_UPSTREAM_BODY/);
@@ -1674,7 +1672,7 @@ test('execution policy is authenticated metadata, never a heuristic or a model a
     'automatic';
   assert.equal(contextWriteDescriptor(direct), false);
   const h = harness();
-  const { run } = await stageDirect(h);
+  const { run } = await executeDirect(h);
   assert.equal(
     (
       (await run.execute(
@@ -1685,17 +1683,17 @@ test('execution policy is authenticated metadata, never a heuristic or a model a
     ).ok,
     false,
   );
-  assert.equal(run.preview(), undefined);
-  assert.equal(h.calls.length, 0);
+  assert.match(run.preview()!, /^Saved:/);
+  assert.equal(h.calls.length, 1, 'malformed follow-up cannot erase the receipt or redispatch');
 });
 
-test('direct request stages for review then approves and dispatches once without publishing a code', async () => {
+test('a direct tool returns its execution outcome and finalization never repeats it', async () => {
   const h = harness();
-  const { run, request, operation } = await stageDirect(h);
+  const { run, request, operation } = await executeDirect(h);
   assert.equal(run.pendingExecutionMode, 'direct_request');
-  assert.match(run.preview()!, /Not executed yet/);
+  assert.match(run.preview()!, /^Saved:/);
   assert.doesNotMatch(run.preview()!, /confirm [A-F0-9]{8}/);
-  assert.equal(h.calls.length, 0);
+  assert.equal(h.calls.length, 1);
   const reply = (await run.finalize(signal()))!;
   assert.match(reply.text, /^Saved:/);
   assert.equal(h.calls.length, 1);
@@ -1707,22 +1705,142 @@ test('direct request stages for review then approves and dispatches once without
   assert.equal(h.calls.length, 1, 'a completed same-turn operation is never executed again');
 });
 
-test('same-run restart resumes only an already approved direct request with frozen arguments', async () => {
+test('reply repair cannot repeat, replace or undo the action executed in this turn', async () => {
   const h = harness();
-  const { request, operation } = await stageDirect(h);
-  operation.state = 'APPROVED';
-  operation.approvalRunId = request.runId!;
-  operation.approvalSourceMessageId = operation.sourceMessageId;
+  h.changeDefinitions([directTool(create), directTool(rollback)]);
+  const run = (await h.service.open(h.trusted('Create Example.'), signal()))!;
+  const result = (await run.execute(
+    create.name,
+    JSON.stringify({ name: 'Example' }),
+    signal(),
+  )) as {
+    ok: boolean;
+    status: string;
+    operation_id: string;
+    receipt: string;
+  };
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'succeeded');
+  for (const [name, args] of [
+    [create.name, { name: 'Example' }],
+    [create.name, { name: 'Replacement' }],
+    [rollback.name, { original_operation_id: result.operation_id }],
+  ] as const) {
+    const denied = (await run.execute(name, JSON.stringify(args), signal())) as {
+      code: string;
+      receipt: string;
+    };
+    assert.equal(denied.code, 'WRITE_ALREADY_FINALIZED');
+    assert.equal(denied.receipt, result.receipt);
+  }
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.operations.size, 1);
+  assert.equal(run.executionReply?.text, result.receipt);
+});
+
+test('invalid direct arguments cannot create an operation or dispatch', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(create)]);
+  const run = (await h.service.open(h.trusted('Create Example.'), signal()))!;
+  const result = (await run.execute(
+    create.name,
+    JSON.stringify({ name: 'Example', executionMode: 'confirmation' }),
+    signal(),
+  )) as { ok: boolean };
+  assert.equal(result.ok, false);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.operations.size, 0);
+  assert.equal(run.executionStarted, false);
+  assert.equal(run.executionReply, undefined);
+});
+
+test('a lost journal result stays uncertain and recovery cannot substitute another operation', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(create)]);
+  const request = h.trusted('Create Example.');
+  const run = (await h.service.open(request, signal()))!;
+  const finish = h.repository.finish.bind(h.repository);
+  h.repository.finish = async () => {
+    throw new Error('Synthetic result storage failure');
+  };
+  await assert.rejects(
+    run.execute(create.name, JSON.stringify({ name: 'Example' }), signal()),
+    /Synthetic result storage failure/,
+  );
+  assert.equal(h.calls.length, 1);
+  assert.equal([...h.operations.values()][0]!.state, 'DISPATCHING');
+  assert.equal(run.executionReply, undefined);
+  assert.equal(run.unsubmittedReply, undefined);
+  assert.equal(run.toolHistory.snapshot().activity.at(-1)!.status, 'uncertain');
+  const second = (await run.execute(
+    create.name,
+    JSON.stringify({ name: 'Replacement' }),
+    signal(),
+  )) as { code: string };
+  assert.equal(second.code, 'WRITE_ALREADY_FINALIZED');
+  assert.equal(h.calls.length, 1);
+  h.repository.finish = finish;
+  const recovered = await h.service.recover(request, signal());
+  assert.match(recovered!.text, /^Saved:/);
+  assert.deepEqual(
+    h.calls[1],
+    h.calls[0],
+    'reconciliation uses the same idempotency key and payload',
+  );
+  assert.equal(h.operations.size, 1);
+});
+
+test('revocation after approval still prevents direct dispatch', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(create)]);
+  const approve = h.repository.approveDirect.bind(h.repository);
+  h.repository.approveDirect = async (...args) => {
+    const approved = await approve(...args);
+    h.revoke();
+    return approved;
+  };
+  const request = h.trusted('Create Example.');
+  const run = (await h.service.open(request, signal()))!;
+  const result = (await run.execute(
+    create.name,
+    JSON.stringify({ name: 'Example' }),
+    signal(),
+  )) as { ok: boolean; outcome: string; code: string };
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, 'not_dispatched');
+  assert.equal(result.code, 'ACCESS_CHANGED');
+  assert.equal(h.calls.length, 0);
+  assert.equal(
+    await h.service.canDeliver(request.key, run.executionReply!.delivery, signal()),
+    false,
+  );
+});
+
+test('restart after durable approval resumes the same direct operation once', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(create)]);
+  const request = h.trusted('Save the requested change.');
+  const run = (await h.service.open(request, signal()))!;
+  const approve = h.repository.approveDirect.bind(h.repository);
+  h.repository.approveDirect = async (...args) => {
+    await approve(...args);
+    throw new Error('Synthetic interruption after durable approval');
+  };
+  await assert.rejects(
+    run.execute(create.name, JSON.stringify({ name: 'Example' }), signal()),
+    /Synthetic interruption/,
+  );
+  const operation = [...h.operations.values()][0]!;
+  assert.equal(operation.state, 'APPROVED');
+  assert.equal(h.calls.length, 0);
   const frozen = structuredClone(operation.payload.arguments);
   const reply = (await h.service.recover(request, signal()))!;
   assert.match(reply.text, /^Saved:/);
   assert.deepEqual(h.calls[0]?.args, frozen);
   assert.equal(h.calls[0]?.operationId, operation.operationId);
-  assert.equal(
-    h.counts().approveCount,
-    0,
-    'restart reuses durable review rather than approving anew',
-  );
+  assert.equal(h.counts().approveCount, 1, 'recovery reuses durable approval');
+  await h.service.recover(request, signal());
+  assert.equal(h.calls.length, 1);
 });
 
 test('direct metadata changes cannot upgrade an old confirmation or dispatch a staged request', async () => {
@@ -1734,17 +1852,29 @@ test('direct metadata changes cannot upgrade an old confirmation or dispatch a s
   assert.equal(legacy.calls.length, 0);
   assert.equal(legacy.operations.get(operation.operationId)!.state, 'PROPOSED');
   const h = harness();
-  const { run } = await stageDirect(h);
+  h.changeDefinitions([directTool(create)]);
+  const run = (await h.service.open(h.trusted('Save this'), signal()))!;
   h.changeDefinitions([create]);
-  await assert.rejects(run.finalize(signal()), /WRITE_TOOL_CHANGED/);
+  const result = (await run.execute(
+    create.name,
+    JSON.stringify({ name: 'Example' }),
+    signal(),
+  )) as { code: string };
+  assert.equal(result.code, 'WRITE_TOOL_CHANGED');
   assert.equal(h.calls.length, 0);
 });
 
 test('revoked identity and a forwarded-only source cannot authorize direct writes', async () => {
   const h = harness();
-  const { run } = await stageDirect(h);
+  h.changeDefinitions([directTool(create)]);
+  const run = (await h.service.open(h.trusted('Save this'), signal()))!;
   h.revoke();
-  await assert.rejects(run.finalize(signal()), /WRITE_ACCESS_CHANGED/);
+  const result = (await run.execute(
+    create.name,
+    JSON.stringify({ name: 'Example' }),
+    signal(),
+  )) as { code: string };
+  assert.equal(result.code, 'WRITE_ACCESS_CHANGED');
   assert.equal(h.calls.length, 0);
   const forwarded = harness();
   forwarded.changeDefinitions([directTool(create)]);
@@ -1758,8 +1888,8 @@ test('explicit draft recovery preserves its operation and a retry without a pend
   const h = harness();
   for (const text of ['try again', 'retry', 'cancel that attempt'])
     assert.equal(await h.service.recover(h.trusted(text), signal()), undefined);
-  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
   h.useUnknown(true);
+  const { run, operation } = await executeDirect(h, directTool(draft), draftArgs());
   await run.finalize(signal());
   assert.equal(h.operations.get(operation.operationId)!.state, 'UNKNOWN');
   assert.equal(h.calls.length, 1);
@@ -1775,8 +1905,8 @@ test('explicit draft recovery preserves its operation and a retry without a pend
 
 test('code-free draft recovery rejects ambiguity, altered batches, forwarded commands and confirmation operations', async () => {
   const h = harness();
-  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
   h.useUnknown(true);
+  const { run, operation } = await executeDirect(h, directTool(draft), draftArgs());
   await run.finalize(signal());
   assert.equal(
     await h.service.recover(h.trusted('try that draft again', { forwarded: true }), signal()),
@@ -1805,7 +1935,8 @@ test('code-free draft recovery rejects ambiguity, altered batches, forwarded com
 test('an explicit RFQ or draft recovery command never acts on the other kind of pending action', async () => {
   for (const pendingDraft of [true, false]) {
     const h = harness();
-    const { run, operation } = await stageDirect(
+    h.useResult({ outcome: 'not_dispatched', code: 'TEMPORARY', message: 'Synthetic failure' });
+    const { run, operation } = await executeDirect(
       h,
       directTool(pendingDraft ? draft : rfqCreate),
       pendingDraft ? draftArgs() : {},
@@ -1824,14 +1955,19 @@ test('an explicit RFQ or draft recovery command never acts on the other kind of 
 
 test('direct expired drafts return a definite no-dispatch response and uncertain expiry never retries', async () => {
   const h = harness();
-  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
-  operation.expiresAt = new Date(now - 1).toISOString();
+  const propose = h.repository.propose.bind(h.repository);
+  h.repository.propose = async (...args) => {
+    const proposed = await propose(...args);
+    h.operations.get(proposed.operationId)!.expiresAt = new Date(now - 1).toISOString();
+    return proposed;
+  };
+  const { run } = await executeDirect(h, directTool(draft), draftArgs());
   const reply = (await run.finalize(signal()))!;
   assert.match(reply.text, /expired before a change was dispatched/);
   assert.equal(h.calls.length, 0);
   const uncertain = harness();
-  const staged = await stageDirect(uncertain, directTool(draft), draftArgs());
   uncertain.useUnknown(true);
+  const staged = await executeDirect(uncertain, directTool(draft), draftArgs());
   await staged.run.finalize(signal());
   uncertain.operations.get(staged.operation.operationId)!.expiresAt = new Date(
     now - 1,
@@ -1843,20 +1979,20 @@ test('direct expired drafts return a definite no-dispatch response and uncertain
 
 test('a definite unsent direct draft can be cancelled without a code, but an unknown attempt cannot', async () => {
   const h = harness();
-  const { run, operation } = await stageDirect(h, directTool(draft), draftArgs());
   h.useResult({
     outcome: 'not_dispatched',
     code: 'GMAIL_CONNECTION_CHANGED',
     message: 'Synthetic private detail',
   });
+  const { run, operation } = await executeDirect(h, directTool(draft), draftArgs());
   await run.finalize(signal());
   const cancelled = await h.service.recover(h.trusted('cancel that draft attempt'), signal());
   assert.match(cancelled!.text, /cancelled/i);
   assert.equal(h.operations.get(operation.operationId)!.state, 'CANCELLED');
   assert.equal(h.calls.length, 1);
   const unknown = harness();
-  const staged = await stageDirect(unknown, directTool(draft), draftArgs());
   unknown.useUnknown(true);
+  const staged = await executeDirect(unknown, directTool(draft), draftArgs());
   await staged.run.finalize(signal());
   await unknown.service.recover(unknown.trusted('cancel that draft attempt'), signal());
   assert.equal(unknown.operations.get(staged.operation.operationId)!.state, 'UNKNOWN');
@@ -1864,7 +2000,8 @@ test('a definite unsent direct draft can be cancelled without a code, but an unk
 
 test('updated direct results are persisted as successful completion', async () => {
   const h = harness();
-  const { run, operation } = await stageDirect(h, directTool(crm), {
+  h.useResult({ outcome: 'updated', code: 'UPDATED', message: 'Synthetic update' });
+  const { run, operation } = await executeDirect(h, directTool(crm), {
     record_id: randomUUID(),
     expected_version: 1,
     stage: 'review',
@@ -1875,32 +2012,33 @@ test('updated direct results are persisted as successful completion', async () =
   assert.equal(h.calls.length, 1);
 });
 
-test('an explicit RFQ create dispatches once after review, with exact stored source and no confirm loop', async () => {
+test('an explicit RFQ tool executes once with exact stored source and no confirm loop', async () => {
   const h = harness();
   h.changeDefinitions([directTool(rfqCreate)]);
   const text =
     'Create an RFQ: Test Logistics needs 50,000 sqft in Nelamangala, Bangalore at Rs20/sqft/month.';
   const request = h.trusted(text);
   const run = (await h.service.open(request, signal()))!;
-  const staged = (await run.execute(rfqCreate.name, '{}', signal())) as {
-    authorization_request: { text: string };
-    source_messages: Array<{ text: string }>;
+  const result = (await run.execute(rfqCreate.name, '{}', signal())) as {
+    outcome: string;
+    receipt: string;
   };
-  assert.equal(h.calls.length, 0);
-  assert.equal(staged.authorization_request.text, text);
-  assert.equal(staged.source_messages[0]!.text, text);
+  assert.equal(h.calls.length, 1);
+  assert.equal(result.outcome, 'created');
+  assert.match(result.receipt, /Saved/);
+  assert.equal(h.proposals[0]!.payload.arguments.raw_text, text);
   assert.doesNotMatch(run.preview()!, /confirm ABCDEF12/);
-  const result = (await run.finalize(signal()))!;
+  const receipt = (await run.finalize(signal()))!;
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0]!.args.raw_text, text);
-  assert.match(result.text, /Saved/);
-  assert.doesNotMatch(result.text, /confirm ABCDEF12|Review this change|raw text:/);
+  assert.match(receipt.text, /Saved/);
+  assert.doesNotMatch(receipt.text, /confirm ABCDEF12|Review this change|raw text:/);
   assert.equal(h.counts().publishCount, 0);
   assert.equal(h.counts().approveCount, 1);
   const operation = [...h.operations.values()][0]!;
   assert.equal(operation.approvalRunId, request.runId);
   assert.equal(operation.approvalSourceMessageId, request.commandMessages![0]!.id);
-  assert.equal(await h.service.canDeliver(request.key, result.delivery, signal()), true);
+  assert.equal(await h.service.canDeliver(request.key, receipt.delivery, signal()), true);
   await h.service.recover(request, signal());
   assert.equal(h.calls.length, 1);
 });
@@ -1923,7 +2061,7 @@ test('domain RFQ undo executes directly without enabling generic CRM journal dis
   const run = (await h.service.open(request, signal()))!;
   const original = randomUUID();
   await run.execute(undo.name, JSON.stringify({ original_operation_id: original }), signal());
-  assert.equal(h.calls.length, 0);
+  assert.equal(h.calls.length, 1);
   const reply = (await run.finalize(signal()))!;
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0]!.args.original_operation_id, original);
@@ -2010,7 +2148,7 @@ test('direct note receipts show verified CRM text once while recovery and generi
       ).ok,
       true,
     );
-    assert.equal(h.calls.length, 0);
+    assert.equal(h.calls.length, 1);
     const receipt = (await run.finalize(signal()))!;
     assert.ok(receipt.text.startsWith(`${headline} Verified CRM target deal`));
     assert.ok(receipt.text.includes(body));
@@ -2057,7 +2195,7 @@ function crmDeleteTool(kind: 'note' | 'rfq', direct = true) {
   return definition;
 }
 
-test('edited note and opportunity deletion dispatch once after review using the fresh sourced version', async () => {
+test('edited note and opportunity deletion dispatch once during the tool call using the fresh sourced version', async () => {
   for (const kind of ['note', 'rfq'] as const) {
     const h = harness();
     const definition = crmDeleteTool(kind);
@@ -2101,7 +2239,7 @@ test('edited note and opportunity deletion dispatch once after review using the 
       ok: boolean;
     };
     assert.equal(staged.ok, true);
-    assert.equal(h.calls.length, 0);
+    assert.equal(h.calls.length, 1);
     const receipt = (await run.finalize(signal()))!;
     assert.equal(h.calls.length, 1);
     assert.deepEqual(h.calls[0]!.args, {
@@ -2180,7 +2318,7 @@ test('stale, rejected and unknown deletions never claim a saved or deleted recor
   }
 });
 
-test('a saved then edited note can be deleted in one subsequent reviewed turn without an undo chain', async () => {
+test('a saved then edited note can be deleted in one subsequent requested turn without an undo chain', async () => {
   const h = harness();
   const dealId = randomUUID();
   const noteId = randomUUID();
@@ -2282,7 +2420,7 @@ test('a saved then edited note can be deleted in one subsequent reviewed turn wi
       ((await run.execute(step.tool, JSON.stringify(step.args), signal())) as { ok: boolean }).ok,
       true,
     );
-    assert.equal(h.calls.length, index);
+    assert.equal(h.calls.length, index + 1);
     const receipt = (await run.finalize(signal()))!;
     assert.equal(h.calls.length, index + 1);
     assert.equal(h.calls[index]!.tool, step.tool);

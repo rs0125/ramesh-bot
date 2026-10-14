@@ -418,7 +418,7 @@ test('a closing heading with nothing under it is dropped; other text blocks are 
   );
 });
 
-test('ordinary CRM insertion omits optional enrichment and saves once without extra confirmation', async () => {
+test('reply review cannot cancel an executed CRM insertion or force optional enrichment', async () => {
   for (const materialBlock of [false, true]) {
     const fixture = createTranscriptFixture('rfq', Date.now);
     const text = 'add to crm pls: need 5,000-10,000 sft around HSR / Bellandur, shed preferred';
@@ -437,7 +437,7 @@ test('ordinary CRM insertion omits optional enrichment and saves once without ex
               reason: materialBlock ? 'unsupported_claim' : 'incomplete_answer',
               repair: 'evidence',
               feedback: materialBlock
-                ? 'The staged values do not match the request.'
+                ? 'The reported values do not match the request.'
                 : 'Optional enrichment could be added later.',
               findings: [
                 {
@@ -500,8 +500,9 @@ test('ordinary CRM insertion omits optional enrichment and saves once without ex
       undefined,
       trusted,
     );
-    assert.equal(fixture.state.rfqs.length, materialBlock ? 0 : 1);
-    assert.equal(fixture.state.writes.length, materialBlock ? 0 : 1);
+    assert.equal(fixture.state.rfqs.length, 1);
+    assert.equal(fixture.state.writes.length, 1);
+    assert.match(reply.text, /Saved RFQ/);
     if (!materialBlock) {
       assert.equal(reply.trace.outcome, 'completed');
       assert.equal(fixture.state.rfqs[0]!.args.raw_text, text);

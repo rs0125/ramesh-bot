@@ -4,9 +4,9 @@ Implemented 3 October 2026. Deployment evidence is recorded separately; the defa
 
 ## Ownership
 
-Ramesh owns proposal review, durable intent, the employee/chat boundary, policy enforcement and outcome presentation. Context Engine owns the dynamically discovered tool catalogue, schemas, execution policy, permissions and signed domain adapters. The dashboard or CRM command handler owns validation, transactional mutations, authoritative receipts and domain-specific compensation. A model never receives a database credential, chooses the caller identity, constructs an authorization header or sends arbitrary SQL.
+Ramesh owns intent resolution, durable operations, the employee/chat boundary, policy enforcement and outcome presentation. Context Engine owns the dynamically discovered tool catalogue, schemas, execution policy, permissions and signed domain adapters. The dashboard or CRM command handler owns validation, transactional mutations, authoritative receipts and domain-specific compensation. A model never receives a database credential, chooses the caller identity, constructs an authorization header or sends arbitrary SQL.
 
-Reads and writes use separate ports. `ContextToolRun`, conversation recall, evidence refresh, verifier checks and outbound delivery preflight never execute a write. `BusinessWriteRun.execute` only stages a proposal. After verifier review, `BusinessWriteRun.finalize` selects the path declared by authenticated tool metadata. Both paths share durable approval, dispatch, audit and recovery code.
+Reads and writes use separate ports. `ContextToolRun`, conversation recall, evidence refresh, verifier checks and outbound delivery preflight never execute a write. `BusinessWriteRun.execute` follows authenticated tool metadata: direct calls execute and return the recorded outcome; confirmation calls stage a proposal for review and later user confirmation. Both paths share durable approval, dispatch, audit and recovery code. Reply review happens after a direct action and cannot veto, repeat or compensate it. Code-generated receipts survive rejected explanations and later model failures; separate answers retain their evidence checks.
 
 ## Extensible execution policies
 
@@ -14,7 +14,7 @@ Reads and writes use separate ports. `ContextToolRun`, conversation recall, evid
 
 | Policy           | User experience                                                | Runtime boundary                                                                             |
 | ---------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `direct_request` | An explicit current request executes in the same turn.         | Review, freeze and durably approve the exact operation before dispatch.                      |
+| `direct_request` | An explicit current request executes in the same turn.         | Validate, freeze and durably approve the exact tool call before dispatch.                    |
 | `confirmation`   | Show the proposed change and wait for a separate confirmation. | A delivered preview and matching current employee confirmation are required before approval. |
 
 Omitted policy defaults to `confirmation`. The model cannot choose the policy, downgrade it from source content or infer it from a tool name. The frozen operation includes its policy and authenticated tool contract; a changed live contract requires review of a fresh operation, never silent promotion of an old proposal. New tools can use either path without a new agent or graph branch. Policy is an owner decision per capability, not a claim that every create or update is low risk.
@@ -26,11 +26,11 @@ Current Context Engine actions declare `direct_request`: GIS point creation, its
 ```mermaid
 flowchart TD
   A[Current employee request] --> B[Discover current permitted write tools]
-  B --> C[Worker stages encrypted DRAFT]
-  C --> D[Verifier reviews exact proposal]
-  D --> P{Authenticated tool execution policy}
-  P -->|confirmation| E[Publish PROPOSED and deliver preview]
-  P -->|direct_request| R[Revalidate current explicit request and run lease]
+  B --> C[Worker resolves intent, target and conditions]
+  C --> P{Authenticated tool execution policy}
+  P -->|confirmation| D[Stage and review exact proposal]
+  D --> E[Publish PROPOSED and deliver preview]
+  P -->|direct_request| R[Freeze call; validate identity, schema, sources and run lease]
   R --> H
   E --> F[Later direct confirm CODE]
   F --> G[Verify actor, delivery, expiry and current tool contract]
@@ -43,9 +43,9 @@ flowchart TD
 
 For `confirmation`, the user receives exact material fields and `confirm CODE` / `cancel CODE`. The proposal lasts one hour. The runtime requires a later, standalone, directly typed command in the same private conversation, from the same currently active employee and phone binding. The original proposal must already be recorded as sent, with an encrypted delivery receipt naming this operation and its published version, and the actual reply containing the confirmation code. A sent fallback or stale draft does not satisfy this proof. The final confirmation must be typed.
 
-For `direct_request`, the same verified current employee request authorizes approval after independent review, without a code. Forwarded text, image captions, quoted instructions, native-location labels and historical messages cannot authorize either path. A direct voice request can supply intent through its trusted transcript. Permission, source provenance, lease ownership, frozen arguments and duplicate prevention apply to both policies.
+For `direct_request`, the current employee request authorizes the tool call, without a separate model verdict or confirmation code. The agent resolves semantic intent, the target and any conditions before calling; code checks identity, permission, schema, source provenance, record preconditions and the operation journal. These checks do not prove that the agent interpreted the request correctly. Forwarded text, image captions, quoted instructions, native-location labels and historical messages cannot authorize either path. A direct voice request can supply intent through its trusted transcript. Permission, source provenance, lease ownership, frozen arguments and duplicate prevention apply to both policies.
 
-A draft can be revised during verifier repair; every revision is audited and invalidates its earlier unpublished code. Once directly approved or published, its payload is immutable. A changed request needs a new reviewed operation. No capture queue or playground identity has production journal access, and the live-data playground does not compose the writer.
+An uncommitted confirmation draft can be revised during verifier repair; every revision is audited and invalidates its earlier unpublished code. Once directly approved or published, its payload is immutable. A later changed request needs a new operation. Reply repair cannot mutate an operation already finalized in the current turn. No capture queue or playground identity has production journal access, and the live-data playground does not compose the writer.
 
 Cancelling an owned pending proposal is a local journal action. It remains
 available when the remote write catalogue is empty or discovery is unavailable;

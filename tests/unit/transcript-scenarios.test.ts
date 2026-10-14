@@ -112,7 +112,7 @@ test('yes uses exact earlier source; a separate RFQ keeps its own absent fields 
     JSON.stringify({ ...base, _source_message_ids: [source.commandMessages![0]!.id] }),
     signal(),
   );
-  assert.equal(fixture.state.rfqs.length, 0, 'staging cannot dispatch');
+  assert.equal(fixture.state.rfqs.length, 1, 'a direct tool call executes immediately');
   const receipt = await run.finalize(signal());
   assert.equal(fixture.state.rfqs.length, 1);
   assert.equal(fixture.state.rfqs[0]!.args.raw_text, VISAKHAPATNAM_RFQ);

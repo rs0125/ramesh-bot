@@ -15,24 +15,24 @@ const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 // all roles lowered when the shared evidence policy became core principles (v48).
 const COMPOSED: Record<string, number> = {
   ROUTER_PROMPT: 2084,
-  PLANNER_PROMPT: 3378,
-  WORKER_PROMPT: 5675,
-  SALES_VERIFIER_PROMPT: 2832,
+  PLANNER_PROMPT: 3354,
+  WORKER_PROMPT: 5667,
+  SALES_VERIFIER_PROMPT: 2808,
   // Core plus every domain section; the per-turn review loads a subset.
-  SALES_VERIFIER_FULL_PROMPT: 4781,
-  BUSINESS_FORMATTER_PROMPT: 2512,
-  EVIDENCE_REPAIR_PROMPT: 1495,
+  SALES_VERIFIER_FULL_PROMPT: 4442,
+  BUSINESS_FORMATTER_PROMPT: 2440,
+  EVIDENCE_REPAIR_PROMPT: 1479,
 };
 const FILES: Record<string, number> = {
-  'business-formatter.md': 1693,
+  'business-formatter.md': 1621,
   'chief-of-staff.md': 1730,
   'converser.md': 452,
   'evidence-policy.md': 642,
-  'evidence-repair.md': 244,
+  'evidence-repair.md': 228,
   'formatter.md': 247,
   'legacy-read-converser.md': 247,
   'media-extractor.md': 107,
-  'planner.md': 1080,
+  'planner.md': 1056,
   'planning-reference.md': 1224,
   'requirement-interpretation.md': 432,
   'router.md': 1442,
@@ -41,9 +41,9 @@ const FILES: Record<string, number> = {
   'verifier-personal.md': 168,
   'verifier-recall.md': 238,
   'verifier-supply.md': 238,
-  'verifier-writes.md': 869,
-  'verifier.md': 1758,
-  'worker.md': 1470,
+  'verifier-writes.md': 554,
+  'verifier.md': 1734,
+  'worker.md': 1462,
 };
 
 test('composed role prompts do not grow', () => {
