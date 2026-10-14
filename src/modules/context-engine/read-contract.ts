@@ -21,6 +21,7 @@ const reserved = new Set([
   'read_webpage',
   'write_history',
   'write_sources',
+  'write_prepare',
 ]);
 const contract = z
   .object({

@@ -1,6 +1,7 @@
 /** Typed outcome contract shared by planner, worker and verifier. Never an authorization grant. */
 import { z } from 'zod';
 import { GateRejection } from './failure.js';
+import { sourceReferenceSchema } from '../writes/write-source-bindings.js';
 export const routeSchema = z
   .object({
     route: z.enum(['direct', 'work']),
@@ -21,6 +22,14 @@ export const taskPlanSchema = z
       .object({
         question: z.string().trim().min(1).max(600),
         missingDecision: z.string().trim().min(1).max(600),
+        writeSources: z
+          .object({
+            tool_name: z.string().min(1).max(128),
+            source_message_ids: z.array(sourceReferenceSchema).min(1).max(16),
+          })
+          .strict()
+          .nullable()
+          .optional(),
       })
       .strict()
       .nullable()

@@ -203,7 +203,8 @@ test('compaction validates provenance and atomically advances a cursor while ret
   assert.equal(next!.history.at(-1)!.content, 'Context 46');
   const before = (await f.store.load(scope))!.state.cursor;
   const restarted = await f.create().prepare(...f.turn(47, 'Continue'));
-  assert.deepEqual(restarted, next);
+  assert.deepEqual({ ...restarted, writeSources: undefined }, { ...next, writeSources: undefined });
+  assert.deepEqual(restarted?.writeSources?.list(), next?.writeSources?.list());
   assert.equal((await f.store.load(scope))!.state.cursor, before);
   assert.equal(f.requests.length, 1);
 });
@@ -284,4 +285,56 @@ test('local state is encrypted, private, restartable and rejects racing saves', 
   assert.equal(await b.load(scope), null);
   assert.equal(await b.save(scope, 0, { ...current.state, pins: [] }), true);
   assert.deepEqual((await a.load(scope))!.state.pins, []);
+});
+
+test('prepared write selections persist across restart and disappear on expiry, forget or owner change', async () => {
+  for (const transition of ['restart', 'expiry', 'forget', 'owner'] as const) {
+    const directory = await mkdtemp(join(tmpdir(), 'source-bindings-'));
+    const key = randomBytes(32).toString('base64url');
+    const f = setup(new LocalChatContextStore(directory, key));
+    const first = await f.create().prepare(...f.turn(1, 'Hold this request until I confirm.'));
+    const binding = {
+      id: '00000000-0000-4000-8000-000000000001',
+      preparedBy: '00000000-0000-4000-8000-000000000002',
+      references: ['00000000-0000-4000-8000-000000000003:text'],
+      tool: 'create_crm_rfq',
+      label: 'Cedar Pune',
+      expiresAt: Date.now() + 86400000,
+    };
+    await first!.writeSources!.save(binding);
+    const restarted = setup(new LocalChatContextStore(directory, key));
+    if (transition === 'expiry') restarted.expire();
+    if (transition === 'owner') restarted.owner();
+    if (transition === 'forget')
+      await restarted.create().prepare(...restarted.turn(2, '/forget context'));
+    const next = await restarted.create().prepare(...restarted.turn(3, 'Yes, save it.'));
+    assert.deepEqual(next!.writeSources!.list(), transition === 'restart' ? [binding] : []);
+  }
+});
+
+test('source replacement is atomic and a failed save preserves the prior in-memory selection', async () => {
+  const store = new Store();
+  const f = setup(store);
+  const first = await f.create().prepare(...f.turn(1, 'Keep this brief.'));
+  const old = {
+    id: '00000000-0000-4000-8000-000000000001',
+    preparedBy: '00000000-0000-4000-8000-000000000002',
+    references: ['00000000-0000-4000-8000-000000000003'],
+    tool: 'create_crm_rfq',
+    label: 'Original',
+    expiresAt: Date.now() + 86400000,
+  };
+  await first!.writeSources!.save(old);
+  const replacement = { ...old, id: '00000000-0000-4000-8000-000000000004', label: 'Replacement' };
+  const save = store.save.bind(store);
+  store.save = async () => false;
+  await assert.rejects(first!.writeSources!.save(replacement, old.id));
+  assert.deepEqual(first!.writeSources!.list(), [old]);
+  assert.deepEqual((await store.load(scope))!.state.writeSources, [old]);
+  store.save = save;
+  await first!.writeSources!.save(replacement, old.id);
+  assert.deepEqual(first!.writeSources!.list(), [
+    { ...old, replacedBy: replacement.id },
+    replacement,
+  ]);
 });

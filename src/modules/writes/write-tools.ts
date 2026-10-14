@@ -1,6 +1,7 @@
 import { toolDiscovery } from '../context-engine/tool-discovery.js';
 /** Authenticated writes: direct tools execute here; confirmation tools publish frozen proposals. */
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import type { TrustedReplyContext } from '../greetings/greeting.types.js';
 import type { ToolSessionRequest } from '../assistant/assistant.types.js';
 import { notifyToolActivity } from '../assistant/tool-activity.js';
@@ -19,6 +20,12 @@ import { contextWriteDescriptor, writeContract } from '../context-engine/write-c
 import { rfqWriteRecoveryText, rfqWriteResultText } from './rfq-write-presentation.js';
 import { attachmentKind } from '../media/attachment-source.js';
 import { attachmentRecovery } from '../media/attachment-recovery.js';
+import {
+  sourceReference,
+  SOURCE_REFERENCE_PATTERN,
+  type WriteSourceBinding,
+  type WriteSourceBindings,
+} from './write-source-bindings.js';
 import { crmNoteResultText } from './crm-note-presentation.js';
 import {
   mailDraftProposalText,
@@ -126,19 +133,21 @@ function directContext(
 }
 // The selected or replied-to source message is not available, so the brief cannot be copied.
 const SOURCE_FAILURES = new Set([
-  'WRITE_QUOTED_SOURCE_UNAVAILABLE',
   'WRITE_SOURCE_UNAVAILABLE',
   'WRITE_ATTACHMENT_UNAVAILABLE',
   'WRITE_ATTACHMENT_PENDING',
   'WRITE_ATTACHMENT_INCOMPLETE',
+  'WRITE_SOURCE_TOO_LONG',
 ]);
 export const SOURCE_NEEDED_REPLY =
   'I can’t read the selected source message, so nothing was saved. Please forward it or paste the brief here.';
-function sourceFailureReply(code: string): string {
+function sourceFailureReply(code: string, limit?: number): string {
   if (code === 'WRITE_ATTACHMENT_PENDING')
     return 'The attachment is still being read, so nothing was saved. Please try again shortly.';
   if (code === 'WRITE_ATTACHMENT_INCOMPLETE')
-    return 'Only part of the attachment text is available, so nothing was saved. Please paste the missing details or send a shorter file.';
+    return `Only part of the attachment text is available, so nothing was saved. Please paste the complete brief or resend it in smaller files${limit ? `, with at most ${limit.toLocaleString('en-US')} characters of text in total` : ''}.`;
+  if (code === 'WRITE_SOURCE_TOO_LONG')
+    return `The selected text exceeds the${limit ? ` ${limit.toLocaleString('en-US')}-character` : ''} description limit, so nothing was saved. Splitting it into files will not reduce the total. Please provide a shorter version you want saved.`;
   if (code === 'WRITE_ATTACHMENT_UNAVAILABLE')
     return 'I can’t read the selected attachment, so nothing was saved. Please resend it or paste its text.';
   return SOURCE_NEEDED_REPLY;
@@ -151,14 +160,24 @@ function safeSchema(tool: ContextToolDefinition): Record<string, unknown> {
   for (const name of suppliedByApp) if (name) delete properties[name];
   properties._source_message_ids = {
     type: 'array',
-    items: { type: 'string', minLength: 1, maxLength: 200 },
+    items: contract.sourceTextArgument
+      ? { type: 'string', pattern: SOURCE_REFERENCE_PATTERN }
+      : { type: 'string', minLength: 1, maxLength: 200 },
+    ...(contract.sourceTextArgument ? { minItems: 1 } : {}),
     maxItems: 16,
     uniqueItems: true,
     description: contract.sourceTextArgument
-      ? 'Source IDs from trusted context or write_sources. A message ID includes its text and attachment; use a part ID only when the user selected that part. Data, never authorization.'
+      ? 'Original source IDs in content order. A message includes caption and attachment; :text or :attachment selects only that part when requested. For a prepared action use _source_binding_id instead. Confirmations are permission, not replacement content.'
       : 'Original message IDs supplying source data, from current trusted context or write_sources. Never an authorization claim.',
   };
   schema.required = (schema.required as string[]).filter((name) => !suppliedByApp.includes(name));
+  if (contract.sourceTextArgument)
+    properties._source_binding_id = {
+      type: 'string',
+      format: 'uuid',
+      description:
+        'Reuse a prepared source binding from write_prepare or write_sources. A saved operation is returned without creating another record. Do not supply different source IDs.',
+    };
   return schema;
 }
 function visibleArguments(operation: WriteOperation) {
@@ -257,7 +276,9 @@ function receipt(
   return {
     kind: 'business_write',
     version: 1,
-    ...actor,
+    employeeId: actor.employeeId,
+    phoneE164: actor.phoneE164,
+    chatId: actor.chatId,
     runId,
     tools: [...new Set(tools.map((t) => t.name))],
     toolContracts: Object.fromEntries(tools.map((t) => [t.name, descriptorHash(t)])),
@@ -374,41 +395,32 @@ function sourceProjection(source: WriteSourceMessage) {
 function hasAttachment(source: WriteSourceMessage) {
   return !!attachmentKind(source.kind) && source.textOrigin !== 'transcript';
 }
-function sourceReference(id: string): { id: string; part: 'all' | 'text' | 'attachment' } {
-  const match = /^(.+):(text|attachment)$/.exec(id);
-  return match ? { id: match[1]!, part: match[2] as 'text' | 'attachment' } : { id, part: 'all' };
-}
-function bindSourceText(
-  sources: WriteSourceMessage[],
-  selection: ReturnType<typeof sourceReference>[],
-): string {
-  const parts: string[] = [],
-    seen = new Set<string>();
-  for (const reference of selection) {
-    const source = sources.find((item) => item.id === reference.id);
-    if (!source) throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
-    const selected =
-      reference.part === 'all'
-        ? ['text', ...(hasAttachment(source) ? ['attachment'] : [])]
-        : [reference.part];
-    for (const part of selected) {
-      const id = `${source.id}:${part}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      let text = source.text;
-      if (part === 'attachment') {
-        const attachment = source.attachment;
-        if (attachment?.state === 'pending' || attachment?.state === 'processing')
-          throw new WriteStorageError('WRITE_ATTACHMENT_PENDING');
-        if (attachment?.state !== 'ready' || !attachment.text?.trim())
-          throw new WriteStorageError('WRITE_ATTACHMENT_UNAVAILABLE');
-        if (attachment.truncated) throw new WriteStorageError('WRITE_ATTACHMENT_INCOMPLETE');
-        text = attachment.text;
-      }
-      if (text.trim()) parts.push(text);
-      else if (reference.part !== 'all' || !hasAttachment(source))
+function bindSourceText(sources: WriteSourceMessage[], references: string[]): string {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  for (const reference of references) {
+    const { id, part } = sourceReference(reference);
+    const source = sources.find((item) => item.id === id)!;
+    if (part !== 'attachment' && !seen.has(`${id}:text`)) {
+      if (source.text.trim()) parts.push(source.text);
+      else if (part === 'text' || !hasAttachment(source))
         throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
+      seen.add(`${id}:text`);
     }
+    if (
+      part === 'text' ||
+      (part === 'all' && !hasAttachment(source)) ||
+      seen.has(`${id}:attachment`)
+    )
+      continue;
+    const attachment = source.attachment;
+    if (attachment?.state === 'pending' || attachment?.state === 'processing')
+      throw new WriteStorageError('WRITE_ATTACHMENT_PENDING');
+    if (attachment?.state !== 'ready' || !attachment.text?.trim())
+      throw new WriteStorageError('WRITE_ATTACHMENT_UNAVAILABLE');
+    if (attachment.truncated) throw new WriteStorageError('WRITE_ATTACHMENT_INCOMPLETE');
+    parts.push(attachment.text);
+    seen.add(`${id}:attachment`);
   }
   if (!parts.length) throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
   return parts.join('\n\n');
@@ -500,6 +512,7 @@ export class BusinessWriteService {
   async open(
     trusted: TrustedReplyContext | undefined,
     signal: AbortSignal,
+    sourceBindings?: WriteSourceBindings,
   ): Promise<BusinessWriteRun | undefined> {
     if (!trusted) return undefined;
     const access = await this.resolve(trusted.key, signal);
@@ -523,6 +536,7 @@ export class BusinessWriteService {
       command,
       definitions,
       this.now,
+      sourceBindings,
     );
   }
 
@@ -794,6 +808,9 @@ export class BusinessWriteRun {
   private executed?: BusinessWriteReply;
   private history: WriteOperation[] = [];
   private privateRead = false;
+  private bindings: WriteSourceBinding[];
+  private activeSourceBinding?: WriteSourceBinding;
+  private sourceProblem?: string;
   constructor(
     private readonly repository: WriteRepositoryPort,
     private readonly resolve: Resolver,
@@ -802,12 +819,14 @@ export class BusinessWriteRun {
     private readonly command: WriteCommandContext,
     private readonly definitions: ContextToolDefinition[],
     private readonly now: () => number,
+    private readonly bindingStore?: WriteSourceBindings,
   ) {
+    this.bindings = [...(bindingStore?.list() ?? [])].filter((item) => item.expiresAt > now());
     this.tools = [
       ...definitions.map((tool) => {
         const sourceText = writeContract(tool)!.sourceTextArgument;
         const sourceInstruction = sourceText
-          ? ` The application fills ${sourceText} from stored source text and attachment extractions; do not supply it. Select message or part IDs from write_sources through _source_message_ids. Whole messages include attachments; unread selected parts prevent saving. By default, use the replied-to message and current request.`
+          ? ` The application fills ${sourceText} from stored sources. Supply _source_message_ids or reuse _source_binding_id. Use write_sources to find earlier briefs; never ask users for internal IDs. Whole messages include attachments; select parts only when requested. Use write_prepare to remember unfinished requests before asking a clarification. Direct requests execute without another confirmation.`
           : '';
         return {
           name: tool.name,
@@ -822,6 +841,48 @@ export class BusinessWriteRun {
         };
       }),
       ...structuredClone(localTools),
+      ...(bindingStore && definitions.some((tool) => writeContract(tool)?.sourceTextArgument)
+        ? [
+            {
+              name: 'write_prepare',
+              description:
+                'Remember content for clarification, or distinguish an explicitly requested new action using earlier content. No CRM change or approval. Reuse its binding on follow-ups; complete requests with new content need no preparation. Replace an unexecuted binding only after a later user correction or scope change, never to bypass a tool failure.',
+              inputSchema: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  tool_name: {
+                    type: 'string',
+                    enum: definitions
+                      .filter((tool) => writeContract(tool)?.sourceTextArgument)
+                      .map((tool) => tool.name),
+                  },
+                  label: {
+                    type: 'string',
+                    minLength: 1,
+                    maxLength: 240,
+                    description: 'Brief label identifying the requested action and client/target.',
+                  },
+                  source_message_ids: {
+                    type: 'array',
+                    items: { type: 'string', pattern: SOURCE_REFERENCE_PATTERN },
+                    minItems: 1,
+                    maxItems: 16,
+                    uniqueItems: true,
+                  },
+                  replaces_binding_id: {
+                    type: 'string',
+                    format: 'uuid',
+                    description:
+                      'Unexecuted binding superseded by a later user correction or explicit scope change. Omit for a new action.',
+                  },
+                },
+                required: ['tool_name', 'label', 'source_message_ids'],
+              },
+              annotations: { readOnlyHint: false, idempotentHint: true },
+            },
+          ]
+        : []),
     ];
   }
   get employeeId() {
@@ -886,6 +947,7 @@ export class BusinessWriteRun {
         messages: this.trusted.commandMessages,
         native_locations: this.trusted.locationMessages,
       },
+      prepared_sources: this.bindings.filter((item) => !item.replacedBy),
     });
   }
   hasTool(name: string) {
@@ -909,10 +971,7 @@ export class BusinessWriteRun {
   /** Never infer non-submission from an interrupted or uncertain commit. */
   /** A requested write could not read its source message; the user should forward or paste it. */
   get sourceNeededReply(): string | undefined {
-    const failure = [...this.failures]
-      .reverse()
-      .find((failure) => SOURCE_FAILURES.has(failure.code));
-    return !this.staged && failure ? sourceFailureReply(failure.code) : undefined;
+    return !this.staged ? this.sourceProblem : undefined;
   }
   get unsubmittedReply(): string | undefined {
     const operation = this.staged;
@@ -959,8 +1018,76 @@ export class BusinessWriteRun {
       } else this.toolHistory.record(name, rawArgs, result);
     }
   }
+  private async rememberBinding(binding: WriteSourceBinding, replaces?: string) {
+    await this.bindingStore?.save(binding, replaces);
+    this.bindings = this.bindingStore
+      ? [...this.bindingStore.list()]
+      : [
+          ...this.bindings
+            .filter((item) => item.id !== binding.id)
+            .map((item) => (item.id === replaces ? { ...item, replacedBy: binding.id } : item)),
+          binding,
+        ];
+  }
+  private async selectedSources(references: string[], retainedSelection = false) {
+    const ids = [...new Set(references.map((value) => sourceReference(value).id))];
+    const sources = await this.repository.readSources(this.command, ids, retainedSelection);
+    if (ids.some((id) => !sources.some((source) => source.id === id)))
+      throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
+    return sources;
+  }
+  private async prepareSources(
+    tool: string,
+    references: string[],
+    label: string,
+    replaces?: string,
+  ) {
+    const normalized = references.map((value) => {
+      const { id, part } = sourceReference(value);
+      return part === 'all' ? id : `${id}:${part}`;
+    });
+    const active = this.activeSourceBinding;
+    if (
+      active &&
+      (active.tool !== tool || canonicalJson(active.references) !== canonicalJson(normalized))
+    )
+      throw new WriteStorageError('WRITE_SOURCE_SELECTION_CHANGED');
+    const prior = replaces ? this.bindings.find((item) => item.id === replaces) : undefined;
+    if (
+      replaces &&
+      (!prior ||
+        prior.operationId ||
+        prior.replacedBy ||
+        prior.preparedBy === this.command.sourceMessageId)
+    )
+      throw new WriteStorageError('WRITE_SOURCE_REPLACEMENT_INVALID');
+    const retainedIds = new Set(prior?.references.map((value) => sourceReference(value).id));
+    const retained = normalized.filter((value) => retainedIds.has(sourceReference(value).id));
+    const fresh = normalized.filter((value) => !retainedIds.has(sourceReference(value).id));
+    if (retained.length) await this.selectedSources(retained, true);
+    if (fresh.length) await this.selectedSources(fresh);
+    const existing = this.bindings.find(
+      (item) =>
+        !item.replacedBy &&
+        item.preparedBy === this.command.sourceMessageId &&
+        item.tool === tool &&
+        canonicalJson(item.references) === canonicalJson(normalized),
+    );
+    if (existing) return existing;
+    const binding: WriteSourceBinding = {
+      id: randomUUID(),
+      tool,
+      label,
+      references: normalized,
+      preparedBy: this.command.sourceMessageId,
+      expiresAt: this.now() + 7 * 86400000,
+    };
+    await this.rememberBinding(binding, prior?.id);
+    return binding;
+  }
   private async executeTool(name: string, rawArgs: string, signal: AbortSignal): Promise<unknown> {
     let committing = false;
+    let sourceLimit: number | undefined;
     try {
       if (!this.remaining || !this.hasTool(name))
         throw new WriteStorageError('WRITE_TOOL_UNAVAILABLE');
@@ -1018,9 +1145,26 @@ export class BusinessWriteRun {
         const result = {
           ok: true,
           sources: (await this.repository.readSources(this.command)).map(sourceProjection),
+          prepared_sources: this.bindings.filter((item) => !item.replacedBy),
         };
         this.evidence.push(result);
         return result;
+      }
+      if (name === 'write_prepare') {
+        if (this.finalizationStarted) throw new WriteStorageError('WRITE_ALREADY_FINALIZED');
+        await this.repository.authorizeSource(this.command);
+        const binding = await this.prepareSources(
+          args.tool_name as string,
+          args.source_message_ids as string[],
+          args.label as string,
+          args.replaces_binding_id as string | undefined,
+        );
+        this.privateRead = true;
+        return {
+          ok: true,
+          binding,
+          message: 'Content selection remembered. Nothing submitted; this is not authorization.',
+        };
       }
       const tool = this.definitions.find((t) => t.name === name)!;
       if (this.finalizationStarted)
@@ -1034,8 +1178,80 @@ export class BusinessWriteRun {
       const contract = writeContract(tool)!;
       let ids = args._source_message_ids as string[] | undefined;
       delete args._source_message_ids;
+      const bindingId = args._source_binding_id as string | undefined;
+      delete args._source_binding_id;
       args = normalizeMailDraftArguments(tool, args);
       const source = await this.repository.authorizeSource(this.command);
+      if (contract.sourceTextArgument) {
+        const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
+        sourceLimit =
+          typeof properties[contract.sourceTextArgument]?.maxLength === 'number'
+            ? (properties[contract.sourceTextArgument]!.maxLength as number)
+            : undefined;
+        const matching = ids
+          ? this.bindings.filter(
+              (item) =>
+                !item.replacedBy &&
+                item.tool === name &&
+                canonicalJson(item.references) === canonicalJson(ids),
+            )
+          : [];
+        if (!bindingId && !this.activeSourceBinding && matching.length > 1)
+          throw new WriteStorageError('WRITE_SOURCE_SELECTION_AMBIGUOUS');
+        const selected = bindingId
+          ? this.bindings.find(
+              (item) => item.id === bindingId && !item.replacedBy && item.expiresAt > this.now(),
+            )
+          : (this.activeSourceBinding ?? (matching.length === 1 ? matching[0] : undefined));
+        if (bindingId && (!selected || selected.tool !== name))
+          throw new WriteStorageError('WRITE_SOURCE_BINDING_UNAVAILABLE');
+        if (selected && ids && canonicalJson(ids) !== canonicalJson(selected.references))
+          throw new WriteStorageError('WRITE_SOURCE_SELECTION_CHANGED');
+        if (this.activeSourceBinding && selected && selected.id !== this.activeSourceBinding.id)
+          throw new WriteStorageError('WRITE_SOURCE_SELECTION_CHANGED');
+        ids = selected?.references ?? ids;
+        if (!ids?.length) throw new WriteStorageError('WRITE_SOURCE_SELECTION_REQUIRED');
+        this.activeSourceBinding =
+          selected ??
+          (await this.prepareSources(
+            name,
+            ids,
+            `${title(name)}: ${String(args.name ?? args.title ?? source.text).slice(0, 180)}`,
+          ));
+        if (this.activeSourceBinding.operationId) {
+          const previous = await this.repository.receiptLookup(
+            this.actor,
+            this.activeSourceBinding.operationId,
+          );
+          if (!previous || !contractMatches(tool, previous))
+            throw new WriteStorageError('WRITE_SOURCE_BINDING_UNAVAILABLE');
+          if (
+            Object.entries(args).some(
+              ([key, value]) =>
+                canonicalJson(value) !== canonicalJson(previous.payload.arguments[key]),
+            )
+          )
+            throw new WriteStorageError('WRITE_ALREADY_FINALIZED');
+          if (previous.state === 'DRAFT' && previous.proposalRunId !== this.command.runId)
+            throw new WriteStorageError('WRITE_SOURCE_BINDING_UNAVAILABLE');
+          this.staged = previous;
+          this.finalizationStarted = previous.state !== 'DRAFT';
+          this.executed =
+            previous.state === 'DRAFT'
+              ? await this.finalize(signal)
+              : {
+                  text: resultText(previous, this.now(), this.definitions),
+                  delivery: this.deliveryReference,
+                };
+          return {
+            ok: this.staged.state === 'SUCCEEDED',
+            status: this.staged.state.toLowerCase(),
+            operation_id: previous.operationId,
+            receipt: this.executionReply?.text,
+            replayed: true,
+          };
+        }
+      }
       const coordinates = (
         contract as typeof contract & {
           coordinateArguments?: { latitude: string; longitude: string };
@@ -1046,31 +1262,17 @@ export class BusinessWriteRun {
           throw new WriteStorageError('WRITE_LOCATION_SELECTION_REQUIRED');
         ids = [source.id, this.trusted.locationMessages[0]!.id];
       }
-      const selection = ids?.map((id) =>
-        contract.sourceTextArgument ? sourceReference(id) : { id, part: 'all' as const },
-      );
-      let sources = selection?.length
-        ? await this.repository.readSources(this.command, [...new Set(selection.map((s) => s.id))])
-        : contract.sourceTextArgument
-          ? await this.repository.readSources(this.command, [source.id])
-          : [source];
-      if (selection?.some(({ id }) => !sources.some((s) => s.id === id)))
-        throw new WriteStorageError('WRITE_SOURCE_UNAVAILABLE');
-      // "Add this to CRM" sent as a reply names the replied-to message as the brief. Never let
-      // the bare request text stand in for a brief the user pointed at but we cannot read.
-      if (!ids?.length && contract.sourceTextArgument && this.command.quotedWhatsappId) {
-        const quoted = (await this.repository.readSources(this.command)).find((s) => s.quoted);
-        if (!quoted) throw new WriteStorageError('WRITE_QUOTED_SOURCE_UNAVAILABLE');
-        sources = [quoted, ...sources.filter((s) => s.id !== quoted.id)];
-      }
+      const sources = ids?.length
+        ? await this.selectedSources(ids, !!this.activeSourceBinding)
+        : [source];
       if (contract.sourceTextArgument) {
-        // Copy from the trusted store, never from model-transcribed text. Bind
-        // before hashing, persistence, review and confirmation.
-        const text = bindSourceText(
-          sources,
-          selection?.length ? selection : sources.map((s) => ({ id: s.id, part: 'all' })),
-        );
+        this.sourceProblem = undefined;
+        // The model must select content explicitly, independently of the authorization
+        // message. Copy each complete source from storage before hashing or dispatch.
+        const text = bindSourceText(sources, ids!);
         const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
+        if (sourceLimit !== undefined && text.length > sourceLimit)
+          throw new WriteStorageError('WRITE_SOURCE_TOO_LONG');
         if (!schemaAccepts(properties[contract.sourceTextArgument]!, text))
           throw new WriteStorageError('WRITE_SOURCE_TEXT_INVALID');
         args[contract.sourceTextArgument] = text;
@@ -1139,9 +1341,8 @@ export class BusinessWriteRun {
           evidence: sources.map(sourceProjection),
           ...(contract.sourceTextArgument
             ? {
-                selection: selection?.length
-                  ? selection
-                  : sources.map((s) => ({ id: s.id, part: 'all' })),
+                selection: ids!.map(sourceReference),
+                binding_id: this.activeSourceBinding?.id,
               }
             : {}),
           input_arguments_sha256: argumentsSha256(args),
@@ -1159,6 +1360,11 @@ export class BusinessWriteRun {
           : {}),
       });
       this.staged = proposed;
+      if (this.activeSourceBinding) {
+        const bound = { ...this.activeSourceBinding, operationId: proposed.operationId };
+        await this.rememberBinding(bound);
+        this.activeSourceBinding = bound;
+      }
       if (contract.executionMode === 'direct_request') {
         committing = true;
         const reply = await this.finalize(signal);
@@ -1197,6 +1403,7 @@ export class BusinessWriteRun {
       // never turn an interrupted commit into a false "nothing was dispatched" tool result.
       if (committing) throw error;
       const code = publicFailure(error);
+      if (SOURCE_FAILURES.has(code)) this.sourceProblem = sourceFailureReply(code, sourceLimit);
       // A failed correction must never leave an earlier draft available for publication.
       // Its durable audit remains; a later successful proposal can revise that same DRAFT.
       if (!this.finalizationStarted && this.definitions.some((tool) => tool.name === name))
@@ -1209,9 +1416,27 @@ export class BusinessWriteRun {
           'No new business write was dispatched. Resolve the error or ask the user for missing information.',
         ...(SOURCE_FAILURES.has(code)
           ? {
-              guidance: `${sourceFailureReply(code)} Do not replace a missing attachment with its caption or an assistant summary. Select a text-only part only when the user explicitly requests it.`,
+              guidance: `${sourceFailureReply(code, sourceLimit)} Keep this action's source binding. Retry it when content is available. A later user correction can replace the binding through write_prepare.`,
             }
           : {}),
+        ...([
+          'WRITE_SOURCE_SELECTION_REQUIRED',
+          'WRITE_ARGUMENTS_INVALID',
+          'WRITE_SOURCE_BINDING_UNAVAILABLE',
+          'WRITE_SOURCE_SELECTION_AMBIGUOUS',
+        ].includes(code)
+          ? {
+              guidance:
+                'Repair the internal source selection using write_sources or prepared_sources, then call again. Do not ask the user for IDs, confirmation or details already in the conversation.',
+            }
+          : {}),
+        ...(code === 'WRITE_SOURCE_SELECTION_CHANGED'
+          ? {
+              guidance:
+                'This action already selected its content. Reuse its binding; a tool failure cannot remove or substitute sources. A later user correction can prepare a replacement.',
+            }
+          : {}),
+        ...(this.activeSourceBinding ? { source_binding: this.activeSourceBinding } : {}),
       };
     }
   }

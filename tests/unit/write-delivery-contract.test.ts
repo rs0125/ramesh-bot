@@ -96,6 +96,7 @@ async function scenario(options: {
     {
       name: writeName,
       args: {
+        _source_message_ids: [trusted.commandMessages![0]!.id],
         deal_id: FIXTURE_LEAD_ID,
         ...(options.action === 'undo'
           ? { original_operation_id: note.operation }

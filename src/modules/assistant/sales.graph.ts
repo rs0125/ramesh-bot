@@ -902,6 +902,18 @@ export function buildSalesGraph(
       if (attempt.limited) return { researchExhausted: true };
       const result = attempt.result;
       const plan = validateTaskPlan(JSON.parse(result.text), tools);
+      if (plan.clarification?.writeSources && writes?.hasTool('write_prepare')) {
+        const selection = (await writes.execute(
+          'write_prepare',
+          JSON.stringify({
+            ...plan.clarification.writeSources,
+            label: plan.objective.slice(0, 240),
+          }),
+          config.signal ?? AbortSignal.timeout(5000),
+        )) as { ok?: boolean };
+        if (!selection.ok)
+          gate({ stage: 'planner', code: 'WRITE_SOURCE_PREPARATION_UNAVAILABLE', blocking: false });
+      }
       // Reached from a direct or personal-only route only after review asked for more work.
       const widened = value.route === 'direct' || value.personalOnly;
       if (!plan.clarification)

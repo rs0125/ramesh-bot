@@ -467,6 +467,7 @@ test('reply review cannot cancel an executed CRM insertion or force optional enr
                       id: 'create',
                       name: 'create_crm_rfq',
                       arguments: JSON.stringify({
+                        _source_message_ids: [trusted.commandMessages![0]!.id],
                         location: 'HSR / Bellandur',
                         requirement: '5,000-10,000 sft',
                       }),

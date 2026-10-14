@@ -110,8 +110,16 @@ test('missing, contradictory and malformed dynamic metadata cannot grant a tool'
   }
 });
 
-test('remote tool names cannot shadow local recall and utility dispatch', () => {
-  for (const reserved of ['recall_business_context', 'calculate', 'web_search', 'read_webpage'])
+test('remote tool names cannot shadow local recall, source selection and utility dispatch', () => {
+  for (const reserved of [
+    'recall_business_context',
+    'calculate',
+    'web_search',
+    'read_webpage',
+    'write_history',
+    'write_sources',
+    'write_prepare',
+  ])
     assert.equal(admittedReadTool({ ...definition(), name: reserved }, ['documents:read']), false);
 });
 

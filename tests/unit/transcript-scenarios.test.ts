@@ -57,7 +57,9 @@ test('a brief-only RFQ survives confirmation with exact stored source and no que
   const trusted = fixture.trusted('yes, save this requirement');
   const run = (await fixture.writes.open(trusted, signal()))!;
   const tool = run.tools.find((item) => item.name === 'create_crm_rfq')!;
-  assert.deepEqual(tool.inputSchema.required ?? [], []);
+  assert.deepEqual(tool.inputSchema.required, []);
+  assert.ok(Object.hasOwn(tool.inputSchema.properties ?? {}, '_source_message_ids'));
+  assert.ok(Object.hasOwn(tool.inputSchema.properties ?? {}, '_source_binding_id'));
   await run.execute(
     'create_crm_rfq',
     JSON.stringify({ _source_message_ids: [source.commandMessages![0]!.id] }),
@@ -124,6 +126,7 @@ test('yes uses exact earlier source; a separate RFQ keeps its own absent fields 
   await second.execute(
     'create_crm_rfq',
     JSON.stringify({
+      _source_message_ids: [secondTrusted.commandMessages![0]!.id],
       company_name: base.company_name,
       location: 'Coimbatore',
       requirement: '30,000 sft',
@@ -173,6 +176,7 @@ test('Both edits the existing note; a single versioned undo restores exact text 
   await run.execute(
     'update_crm_note',
     JSON.stringify({
+      _source_message_ids: [trusted.commandMessages![0]!.id],
       deal_id: FIXTURE_LEAD_ID,
       note_id: TRANSCRIPT_NOTE_ID,
       expected_updated_at: fixture.state.notes.get(TRANSCRIPT_NOTE_ID)!.updated_at,
@@ -198,7 +202,11 @@ test('Both edits the existing note; a single versioned undo restores exact text 
   const undo = (await fixture.writes.open(undoTrusted, signal()))!;
   await undo.execute(
     'undo_crm_note',
-    JSON.stringify({ deal_id: FIXTURE_LEAD_ID, original_operation_id: note.operation }),
+    JSON.stringify({
+      _source_message_ids: [undoTrusted.commandMessages![0]!.id],
+      deal_id: FIXTURE_LEAD_ID,
+      original_operation_id: note.operation,
+    }),
     signal(),
   );
   const receipt = await undo.finalize(signal());
@@ -220,10 +228,12 @@ test('Both edits the existing note; a single versioned undo restores exact text 
 
 test('a stale note version cannot overwrite current text; forwarding and revoked access grant no write', async () => {
   const fixture = createTranscriptFixture('notes', () => Date.parse('2026-10-06T09:00:00Z'));
-  const run = (await fixture.writes.open(fixture.trusted('Change both fields'), signal()))!;
+  const request = fixture.trusted('Change both fields');
+  const run = (await fixture.writes.open(request, signal()))!;
   await run.execute(
     'update_crm_note',
     JSON.stringify({
+      _source_message_ids: [request.commandMessages![0]!.id],
       deal_id: FIXTURE_LEAD_ID,
       note_id: TRANSCRIPT_NOTE_ID,
       expected_updated_at: '2026-10-03T08:00:00.000Z',

@@ -142,11 +142,13 @@ test('stable recall handles do not rebind when an older task is evicted', async 
 test('remembered selections survive prose expiry but always require fresh permissions and reads', async () => {
   const { fixture, run } = await warehouseHistory();
   const now = Date.now();
+  const turnId = 'turn-105000000000000000000000';
   const history: ChatMessage[] = [
     {
       role: 'assistant',
       content: PRIVATE_HISTORY_REPLY,
       businessReferences: {
+        turnId,
         employeeId: run.employeeId,
         expiresAt: now + 86400000,
         records: [{ kind: 'warehouse', id: 105, position: 2 }],
@@ -155,7 +157,9 @@ test('remembered selections survive prose expiry but always require fresh permis
   ];
   const recall = businessRecall(history, run, now);
   assert.ok(recall.available);
-  assert.ok(!JSON.stringify(recall.messages).includes('105'));
+  // A stable opaque handle may itself contain the digits of a record ID.
+  const visible = JSON.stringify(recall.messages).replaceAll(turnId, 'turn-handle');
+  assert.ok(!visible.includes('105'));
   const result = await executeRecall(recall, '{}', signal());
   assert.equal(result.selection_source, 'remembered_selection');
   assert.equal(result.previous_reply, undefined);

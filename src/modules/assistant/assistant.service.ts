@@ -242,6 +242,7 @@ export class AssistantService {
     let contextHistory: ChatMessage[] | undefined;
     let durableContextEnabled = false;
     let writes: BusinessWriteRun | undefined;
+    let writeSources: import('../writes/write-source-bindings.js').WriteSourceBindings | undefined;
     let recoveredWrite: BusinessWriteReply | undefined;
     try {
       let writeSignal: AbortSignal | undefined;
@@ -297,11 +298,12 @@ export class AssistantService {
         contextHistory = prepared?.history;
         contextDelivery = prepared?.delivery;
         durableContextEnabled = prepared?.enabled === true;
+        writeSources = prepared?.writeSources;
         if (prepared?.reply !== undefined) return finish({ text: prepared.reply });
       }
       if (writeSignal && trusted) {
         try {
-          writes = await this.runtime.businessWrites?.open(trusted, writeSignal);
+          writes = await this.runtime.businessWrites?.open(trusted, writeSignal, writeSources);
         } catch (error) {
           if (error instanceof CheckpointError) throw error;
           signal?.throwIfAborted();

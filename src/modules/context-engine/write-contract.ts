@@ -8,6 +8,7 @@ const reserved = new Set([
   'get_context',
   'write_history',
   'write_sources',
+  'write_prepare',
   '_source_message_ids',
   'recall_business_context',
   'calculate',
@@ -140,7 +141,7 @@ export function contextWriteDescriptor(tool: ContextToolDefinition): boolean {
   if (!contract || (contract.effect === 'delete' && tool.annotations.destructiveHint !== true))
     return false;
   const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
-  if ('_source_message_ids' in properties) return false;
+  if ('_source_message_ids' in properties || '_source_binding_id' in properties) return false;
   if (
     contract.sourceTextArgument &&
     (contract.sourceTextArgument === contract.idempotencyArgument ||

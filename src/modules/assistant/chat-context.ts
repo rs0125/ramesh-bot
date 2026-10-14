@@ -34,6 +34,10 @@ import {
   historyRequest,
 } from './business-history.js';
 import { GateRejection } from './failure.js';
+import {
+  writeSourceBindingSchema,
+  type WriteSourceBindings,
+} from '../writes/write-source-bindings.js';
 
 const DAY = 86400000;
 let encoding: ReturnType<typeof getEncoding> | undefined;
@@ -97,6 +101,7 @@ export const contextStateSchema = z
       )
       .max(24),
     selections: z.array(selection).max(4),
+    writeSources: z.array(writeSourceBindingSchema).max(8).optional(),
     /** Exact delivered text and tool trail, separately retained from model-generated notes. */
     businessReplies: z
       .array(
@@ -280,7 +285,13 @@ export class ChatContext {
     signal: AbortSignal,
     onSummary?: (metric: StageMetric) => void,
   ): Promise<
-    | { history: ChatMessage[]; reply?: string; enabled?: boolean; delivery?: ContextDelivery }
+    | {
+        history: ChatMessage[];
+        reply?: string;
+        enabled?: boolean;
+        delivery?: ContextDelivery;
+        writeSources?: WriteSourceBindings;
+      }
     | undefined
   > {
     // Group memory needs a membership-aware policy. Keep the existing bounded group history.
@@ -334,6 +345,7 @@ export class ChatContext {
     )
       return { history: [], reply: state.command.reply, enabled: true, delivery };
     state = structuredClone(state);
+    state.writeSources = (state.writeSources ?? []).filter((entry) => entry.expiresAt > now);
     state.selections = state.selections.filter(
       (entry) => entry.expiresAt > now && entry.employeeId === scope.employeeId,
     );
@@ -596,7 +608,31 @@ export class ChatContext {
             : {}),
         })),
     );
-    return { history, enabled: true, delivery };
+    const writeSources: WriteSourceBindings = {
+      list: () => structuredClone(state.writeSources ?? []),
+      save: async (binding, replaces) => {
+        const next = [
+          ...(state.writeSources ?? [])
+            .filter((item) => item.id !== binding.id)
+            .map((item) => (item.id === replaces ? { ...item, replacedBy: binding.id } : item)),
+          binding,
+        ];
+        if (next.length > 8) {
+          const discard = next.findIndex((item) => item.operationId || item.replacedBy);
+          if (discard < 0) throw new GateRejection('WRITE_SOURCE_BINDINGS_FULL');
+          next.splice(discard, 1);
+        }
+        const previous = state.writeSources;
+        state.writeSources = next;
+        try {
+          await save();
+        } catch (error) {
+          state.writeSources = previous;
+          throw error;
+        }
+      },
+    };
+    return { history, enabled: true, delivery, writeSources };
   }
 
   private command(
@@ -625,6 +661,7 @@ export class ChatContext {
       state.summary = { notes: [] };
       state.selections = [];
       state.businessReplies = [];
+      state.writeSources = [];
       state.cursor = before;
       state.floor = before;
       state.summaryAt = now;

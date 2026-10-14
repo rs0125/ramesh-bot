@@ -25,6 +25,10 @@ import type { TrustedReplyContext } from '../../src/modules/greetings/greeting.t
 import { businessRecall } from '../../src/modules/assistant/business-recall.js';
 import { writeDeliveryBundle } from '../../src/modules/messaging/delivery-evidence.js';
 import { PRIVATE_HISTORY_REPLY } from '../../src/modules/assistant/conversation-memory.js';
+import type {
+  WriteSourceBinding,
+  WriteSourceBindings,
+} from '../../src/modules/writes/write-source-bindings.js';
 
 const now = Date.parse('2026-10-03T06:00:00Z');
 const actor: WriteActor = {
@@ -114,6 +118,31 @@ const draft = tool(
   { requiredScopes: ['mail:drafts'], sourceFamily: 'mail' },
 );
 const signal = () => AbortSignal.timeout(5000);
+/** Model-visible current message IDs, selected explicitly for self-contained requests. */
+function currentSourceArgs(run: { context: string }, args: Record<string, unknown> = {}) {
+  const context = JSON.parse(run.context) as {
+    current_sources: { messages: Array<{ id: string }> };
+  };
+  return JSON.stringify({
+    ...args,
+    _source_message_ids: context.current_sources.messages.map((source) => source.id),
+  });
+}
+const sourceArgs = (...ids: string[]) => JSON.stringify({ _source_message_ids: ids });
+function bindingStore(): WriteSourceBindings {
+  let values: WriteSourceBinding[] = [];
+  return {
+    list: () => structuredClone(values),
+    async save(binding, replaces) {
+      values = [
+        ...values
+          .filter((item) => item.id !== binding.id)
+          .map((item) => (item.id === replaces ? { ...item, replacedBy: binding.id } : item)),
+        structuredClone(binding),
+      ];
+    },
+  };
+}
 
 function harness(resultData?: Record<string, unknown>, onToolActivity?: () => void) {
   const operations = new Map<string, WriteOperation>();
@@ -417,6 +446,17 @@ function harness(resultData?: Record<string, unknown>, onToolActivity?: () => vo
   };
 }
 
+test('write receipts project actor identity without extra profile fields', async () => {
+  const h = harness();
+  const profile = { ...actor, email: 'synthetic@example.invalid', active: true };
+  h.changeActor(profile);
+  const { request, reply } = await h.proposed();
+  assert.doesNotThrow(() => writeDeliveryBundle(reply.delivery));
+  assert.equal(Object.hasOwn(reply.delivery, 'email'), false);
+  assert.equal(Object.hasOwn(reply.delivery, 'active'), false);
+  assert.equal(await h.service.canDeliver(request.key, reply.delivery, signal()), true);
+});
+
 const rfqCreate = tool(
   'create_crm_rfq',
   'create',
@@ -430,7 +470,7 @@ test('a failure before RFQ review can truthfully say nothing was submitted witho
     'Save this RFQ: 3,000-5,000sft in Devanahalli, office cum warehouse, parking for 2-3 trucks.';
   const run = (await h.service.open(h.trusted(brief), signal()))!;
   assert.equal(run.unsubmittedReply, undefined);
-  await run.execute(rfqCreate.name, '{}', signal());
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   assert.match(run.unsubmittedReply!, /requirement wasn’t submitted to CRM/);
   assert.match(run.unsubmittedReply!, /don’t need to resend/);
   assert.equal(h.proposals[0]!.payload.arguments.raw_text, brief);
@@ -439,7 +479,7 @@ test('a failure before RFQ review can truthfully say nothing was submitted witho
   assert.equal(run.unsubmittedReply, undefined);
 });
 
-test('a reply to an older brief saves that brief with the request, not the request alone', async () => {
+test('a replied-to brief can be selected with the current request', async () => {
   const h = harness();
   h.changeDefinitions([rfqCreate]);
   const brief =
@@ -449,22 +489,30 @@ test('a reply to an older brief saves that brief with the request, not the reque
     h.trusted('Add to crm', { quotedUserMessageId: 'WA-BRIEF' }),
     signal(),
   ))!;
-  const result = await run.execute(rfqCreate.name, '{}', signal());
+  const listing = (await run.execute('write_sources', '{}', signal())) as {
+    sources: Array<{ id: string; quoted?: boolean }>;
+  };
+  const quoted = listing.sources.find((source) => source.quoted)!;
+  const requestId = JSON.parse(run.context).current_sources.messages[0].id as string;
+  const result = await run.execute(rfqCreate.name, sourceArgs(quoted.id, requestId), signal());
   assert.equal((result as { ok: boolean }).ok, true);
   assert.equal(h.proposals[0]!.payload.arguments.raw_text, `${brief}\n\nAdd to crm`);
   assert.equal(run.sourceNeededReply, undefined);
 });
 
-test('a reply to a message that cannot be read asks for the brief instead of saving the request', async () => {
+test('an unavailable selected brief asks for the brief instead of saving the request', async () => {
   const h = harness();
   h.changeDefinitions([rfqCreate]);
   const run = (await h.service.open(
     h.trusted('Add to crm', { quotedUserMessageId: 'WA-NOT-STORED' }),
     signal(),
   ))!;
-  const result = (await run.execute(rfqCreate.name, '{}', signal())) as Record<string, unknown>;
+  const result = (await run.execute(rfqCreate.name, sourceArgs(randomUUID()), signal())) as Record<
+    string,
+    unknown
+  >;
   assert.equal(result.ok, false);
-  assert.equal(result.code, 'WRITE_QUOTED_SOURCE_UNAVAILABLE');
+  assert.equal(result.code, 'WRITE_SOURCE_UNAVAILABLE');
   assert.match(String(result.guidance), /forward it or paste the brief/);
   assert.equal(h.proposals.length, 0);
   assert.equal(run.sourceNeededReply, SOURCE_NEEDED_REPLY);
@@ -487,7 +535,7 @@ test('an interrupted finalization never claims the requirement was not submitted
   const h = harness();
   h.changeDefinitions([rfqCreate]);
   const run = (await h.service.open(h.trusted('Save an RFQ for 5000 sqft in Hoskote'), signal()))!;
-  await run.execute(rfqCreate.name, '{}', signal());
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   h.repository.publish = async () => {
     throw new Error('Synthetic lost commit response');
   };
@@ -516,7 +564,7 @@ test('a submitted or uncertain RFQ never gets the preparation-failure reply', as
       h.trusted('Save an RFQ for 5000 sqft in Hoskote'),
       signal(),
     ))!;
-    await run.execute(rfqCreate.name, '{}', signal());
+    await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
     await run.finalize(signal());
     assert.equal(h.calls.length, 1);
     assert.equal([...h.operations.values()][0]!.state, uncertain ? 'UNKNOWN' : 'SUCCEEDED');
@@ -536,7 +584,7 @@ test('an invalid direct RFQ can be cancelled in ordinary language before a sourc
     code: 'CRM_RFQ_INCOMPLETE',
     message: 'Please supply or correct: requirement (positive quantity and explicit unit).',
   });
-  await run.execute(rfqCreate.name, '{}', signal());
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   const failed = (await run.finalize(signal()))!;
   assert.match(failed.text, /space requirement needs checking/);
   assert.doesNotMatch(failed.text, /CRM_RFQ|ABCDEF12/);
@@ -570,7 +618,7 @@ test('an RFQ validation failure offers correction without redisclosing stored bu
     h.trusted('Save this RFQ: a large warehouse in Hoskote'),
     signal(),
   ))!;
-  await run.execute(rfqCreate.name, '{}', signal());
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   await run.finalize(signal());
   h.useResult({
     outcome: 'not_dispatched',
@@ -593,7 +641,7 @@ test('an RFQ with an earlier uncertain attempt never suggests cancellation or re
   const h = harness();
   h.changeDefinitions([rfqCreate]);
   const run = (await h.service.open(h.trusted('Save an RFQ for 5000 sqft in Hoskote'), signal()))!;
-  await run.execute(rfqCreate.name, '{}', signal());
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   await run.finalize(signal());
   h.useUnknown(true);
   await h.service.recover(h.trusted('confirm ABCDEF12'), signal());
@@ -627,7 +675,7 @@ test('RFQ proposals preserve original source text and keep the normal confirmati
   );
   assert.equal((mismatch as { code: string }).code, 'WRITE_ARGUMENTS_INVALID');
   assert.equal(h.proposals.length, 0);
-  const accepted = await run.execute(rfqCreate.name, '{}', signal());
+  const accepted = await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   assert.equal((accepted as { ok: boolean }).ok, true);
   assert.equal(h.calls.length, 0);
   assert.equal(h.proposals[0]!.payload.arguments.raw_text, raw);
@@ -710,7 +758,11 @@ for (const [label, text] of [
     );
     assert.equal(
       (result as { code: string }).code,
-      label === 'empty' ? 'WRITE_SOURCE_UNAVAILABLE' : 'WRITE_SOURCE_TEXT_INVALID',
+      label === 'empty'
+        ? 'WRITE_SOURCE_UNAVAILABLE'
+        : label === 'oversized'
+          ? 'WRITE_SOURCE_TOO_LONG'
+          : 'WRITE_SOURCE_TEXT_INVALID',
     );
     assert.equal(h.proposals.length, 0);
     assert.equal(h.calls.length, 0);
@@ -722,11 +774,111 @@ test('RFQ source selection cannot invent or import inaccessible messages', async
   const run = (await h.service.open(h.trusted('Save the RFQ'), signal()))!;
   const result = await run.execute(
     rfqCreate.name,
-    JSON.stringify({ _source_message_ids: ['inaccessible-message'] }),
+    JSON.stringify({ _source_message_ids: [randomUUID()] }),
     signal(),
   );
   assert.equal((result as { code: string }).code, 'WRITE_SOURCE_UNAVAILABLE');
   assert.equal(h.proposals.length, 0);
+});
+
+test('source-backed calls cannot silently save a confirmation when selection is omitted or empty', async () => {
+  for (const args of [{}, { _source_message_ids: [] }]) {
+    const h = harness();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    const brief = h.stored('  Client Orchid needs 18,000 sqft in Tumakuru.\n', 'ORIGINAL');
+    const run = (await h.service.open(h.trusted('Yes, save that requirement in CRM.'), signal()))!;
+    const result = (await run.execute(rfqCreate.name, JSON.stringify(args), signal())) as {
+      ok: boolean;
+    };
+    assert.equal(result.ok, false);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.proposals.length, 0);
+    assert.equal(run.executionStarted, false);
+    const sources = (await run.execute('write_sources', '{}', signal())) as {
+      sources: Array<{ id: string }>;
+    };
+    assert.ok(sources.sources.some((source) => source.id === brief));
+    await run.execute(rfqCreate.name, JSON.stringify({ _source_message_ids: [brief] }), signal());
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0]!.args.raw_text, h.sources.get(brief)!.text);
+  }
+});
+
+test('an attachment error cannot be bypassed by switching the same source to a part ID', async () => {
+  for (const part of ['text', 'attachment']) {
+    const h = harness();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    const source = h.stored('Read this image first. Do not save yet.', 'ORIGINAL');
+    Object.assign(h.sources.get(source)!, {
+      kind: 'image',
+      attachment: { kind: 'image', state: 'ready', text: 'Partial brief', truncated: true },
+    });
+    const run = (await h.service.open(h.trusted('Save the full image requirement.'), signal()))!;
+    const initial = (await run.execute(
+      rfqCreate.name,
+      JSON.stringify({ _source_message_ids: [source] }),
+      signal(),
+    )) as { code: string };
+    assert.equal(initial.code, 'WRITE_ATTACHMENT_INCOMPLETE');
+    const retry = (await run.execute(
+      rfqCreate.name,
+      JSON.stringify({ _source_message_ids: [`${source}:${part}`] }),
+      signal(),
+    )) as { ok: boolean };
+    assert.equal(retry.ok, false);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.proposals.length, 0);
+    assert.equal(await run.finalize(signal()), undefined);
+  }
+});
+
+test('a pending attachment can finish and be saved with the same explicit whole source', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const source = h.stored('  Please capture this image.\n', 'PENDING');
+  const message = h.sources.get(source)!;
+  Object.assign(message, { kind: 'image', attachment: { kind: 'image', state: 'pending' } });
+  const run = (await h.service.open(h.trusted('Save the full brief.'), signal()))!;
+  const listed = (await run.execute('write_sources', '{}', signal())) as {
+    sources: Array<{ id: string; attachment?: { recovery: { action: string; guidance: string } } }>;
+  };
+  const pending = listed.sources.find((item) => item.id === source)!.attachment!;
+  assert.equal(pending.recovery.action, 'wait_for_processing');
+  assert.match(pending.recovery.guidance, /no resend is needed/);
+  const first = (await run.execute(rfqCreate.name, sourceArgs(source), signal())) as {
+    code: string;
+  };
+  assert.equal(first.code, 'WRITE_ATTACHMENT_PENDING');
+  assert.equal(h.calls.length, 0);
+  message.attachment = {
+    kind: 'image',
+    state: 'ready',
+    text: '  Original brief, details later.\n',
+  };
+  await run.execute(rfqCreate.name, sourceArgs(source), signal());
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, `${message.text}\n\n${message.attachment.text}`);
+  assert.equal(run.sourceNeededReply, undefined);
+});
+
+test('source-backed schemas accept a binding or unique message/part references without requiring business fields', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const request = h.trusted('Client details later.');
+  const run = (await h.service.open(request, signal()))!;
+  const definition = run.tools.find((tool) => tool.name === rfqCreate.name)!;
+  assert.deepEqual(definition.inputSchema.required, []);
+  const id = request.commandMessages![0]!.id;
+  for (const ids of [null, [], [id, id], ['fabricated'], [`${id}:invalid`]]) {
+    const result = (await run.execute(
+      rfqCreate.name,
+      JSON.stringify({ _source_message_ids: ids }),
+      signal(),
+    )) as { code: string };
+    assert.equal(result.code, 'WRITE_ARGUMENTS_INVALID');
+    assert.equal(h.proposals.length, 0);
+    assert.equal(h.calls.length, 0);
+  }
 });
 
 test('direct source capture preserves selected attachment text, captions and clarifications exactly', async () => {
@@ -783,7 +935,7 @@ test('unread or incomplete selected attachments cannot become caption-only write
     const source = h.trusted('Please save the attached requirement.', { kind: 'document' });
     h.sources.get(source.commandMessages![0]!.id)!.attachment = { kind: 'document', ...attachment };
     const run = (await h.service.open(source, signal()))!;
-    const result = await run.execute(rfqCreate.name, '{}', signal());
+    const result = await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
     assert.equal((result as { code: string }).code, code);
     assert.equal(h.calls.length, 0);
     assert.equal(
@@ -797,7 +949,7 @@ test('unread or incomplete selected attachments cannot become caption-only write
   }
 });
 
-test('part references support an explicit caption-only or attachment-only request', async () => {
+test('explicit caption-only and attachment-only requests preserve exactly the requested part', async () => {
   for (const part of ['text', 'attachment'] as const) {
     const h = harness();
     h.changeDefinitions([directTool(rfqCreate)]);
@@ -812,12 +964,17 @@ test('part references support an explicit caption-only or attachment-only reques
       signal(),
     ))!;
     const listing = (await run.execute('write_sources', '{}', signal())) as {
-      sources: Array<{ id: string; text_source_id: string; attachment_source_id: string }>;
+      sources: Array<{ id: string; text_source_id?: string; attachment_source_id?: string }>;
     };
     const listed = listing.sources.find((s) => s.id === source.id)!;
-    const id = part === 'text' ? listed.text_source_id : listed.attachment_source_id;
-    assert.equal(id, `${source.id}:${part}`);
-    await run.execute(rfqCreate.name, JSON.stringify({ _source_message_ids: [id] }), signal());
+    assert.equal(listed.text_source_id, `${source.id}:text`);
+    assert.equal(listed.attachment_source_id, `${source.id}:attachment`);
+    const result = (await run.execute(
+      rfqCreate.name,
+      sourceArgs(`${source.id}:${part}`),
+      signal(),
+    )) as { ok: boolean };
+    assert.equal(result.ok, true);
     assert.equal(h.calls.length, 1);
     assert.equal(
       h.calls[0]!.args.raw_text,
@@ -835,12 +992,12 @@ test('unselected attachments cannot block a text requirement, and completed tran
   });
   h.sources.get(transcript.commandMessages![0]!.id)!.textOrigin = 'transcript';
   const run = (await h.service.open(transcript, signal()))!;
-  await run.execute(rfqCreate.name, '{}', signal());
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0]!.args.raw_text, transcript.commandMessages![0]!.text);
 });
 
-test('captionless attachments, duplicate part references and missing extraction metadata are handled explicitly', async () => {
+test('captionless attachments and missing extraction metadata are handled explicitly', async () => {
   for (const available of [true, false]) {
     const h = harness();
     h.changeDefinitions([directTool(rfqCreate)]);
@@ -857,7 +1014,7 @@ test('captionless attachments, duplicate part references and missing extraction 
     const result = await run.execute(
       rfqCreate.name,
       JSON.stringify({
-        _source_message_ids: [source.id, `${source.id}:attachment`],
+        _source_message_ids: [source.id],
       }),
       signal(),
     );
@@ -1798,7 +1955,7 @@ test('write history retains definite non-dispatch and omits private recovery fie
     rfq.trusted('Save an RFQ for the PRIVATE_RECOVERY_CITY'),
     signal(),
   ))!;
-  await crmRun.execute(rfqCreate.name, '{}', signal());
+  await crmRun.execute(rfqCreate.name, currentSourceArgs(crmRun), signal());
   await crmRun.finalize(signal());
   const recovered = (await rfq.service.recover(rfq.trusted('confirm ABCDEF12'), signal()))!;
   assert.equal(recovered.delivery.history!.activity[0]!.argumentsOmitted, true);
@@ -2081,7 +2238,9 @@ test('an explicit RFQ or draft recovery command never acts on the other kind of 
     const { run, operation } = await executeDirect(
       h,
       directTool(pendingDraft ? draft : rfqCreate),
-      pendingDraft ? draftArgs() : {},
+      pendingDraft
+        ? draftArgs()
+        : { _source_message_ids: [h.stored('Client Orchid needs a warehouse.', 'RFQ-BRIEF')] },
     );
     h.useResult({ outcome: 'not_dispatched', code: 'TEMPORARY', message: 'Synthetic failure' });
     await run.finalize(signal());
@@ -2161,7 +2320,7 @@ test('an explicit RFQ tool executes once with exact stored source and no confirm
     'Create an RFQ: Test Logistics needs 50,000 sqft in Nelamangala, Bangalore at Rs20/sqft/month.';
   const request = h.trusted(text);
   const run = (await h.service.open(request, signal()))!;
-  const result = (await run.execute(rfqCreate.name, '{}', signal())) as {
+  const result = (await run.execute(rfqCreate.name, currentSourceArgs(run), signal())) as {
     outcome: string;
     receipt: string;
   };
@@ -2202,7 +2361,11 @@ test('domain RFQ undo executes directly without enabling generic CRM journal dis
   const request = h.trusted('Undo the RFQ change you just made.');
   const run = (await h.service.open(request, signal()))!;
   const original = randomUUID();
-  await run.execute(undo.name, JSON.stringify({ original_operation_id: original }), signal());
+  await run.execute(
+    undo.name,
+    currentSourceArgs(run, { original_operation_id: original }),
+    signal(),
+  );
   assert.equal(h.calls.length, 1);
   const reply = (await run.finalize(signal()))!;
   assert.equal(h.calls.length, 1);
@@ -2227,7 +2390,11 @@ test('a destructive update without direct policy retains separate confirmation',
   destructive.annotations!.destructiveHint = true;
   h.changeDefinitions([destructive]);
   const run = (await h.service.open(h.trusted('Replace these details.'), signal()))!;
-  await run.execute(destructive.name, JSON.stringify({ record_id: randomUUID() }), signal());
+  await run.execute(
+    destructive.name,
+    currentSourceArgs(run, { record_id: randomUUID() }),
+    signal(),
+  );
   const reply = (await run.finalize(signal()))!;
   assert.equal(h.calls.length, 0);
   assert.equal(h.counts().publishCount, 1);
@@ -2284,7 +2451,10 @@ test('direct note receipts show verified CRM text once while recovery and generi
       (
         (await run.execute(
           name,
-          JSON.stringify({ title: 'Unverified model title', body: 'Unverified model body' }),
+          currentSourceArgs(run, {
+            title: 'Unverified model title',
+            body: 'Unverified model body',
+          }),
           signal(),
         )) as { ok: boolean }
       ).ok,
@@ -2377,7 +2547,7 @@ test('edited note and opportunity deletion dispatch once during the tool call us
       `Delete that ${kind === 'note' ? 'note' : 'opportunity'} you edited for me.`,
     );
     const run = (await h.service.open(request, signal()))!;
-    const staged = (await run.execute(definition.name, JSON.stringify(args), signal())) as {
+    const staged = (await run.execute(definition.name, currentSourceArgs(run, args), signal())) as {
       ok: boolean;
     };
     assert.equal(staged.ok, true);
@@ -2410,7 +2580,7 @@ test('destructive deletion does not imply direct authorization when metadata omi
   const run = (await h.service.open(h.trusted('Delete that note.'), signal()))!;
   await run.execute(
     definition.name,
-    JSON.stringify({
+    currentSourceArgs(run, {
       deal_id: randomUUID(),
       note_id: randomUUID(),
       expected_updated_at: '2026-10-05T10:20:30.123Z',
@@ -2436,7 +2606,7 @@ test('stale, rejected and unknown deletions never claim a saved or deleted recor
     const run = (await h.service.open(h.trusted('Delete that edited note.'), signal()))!;
     await run.execute(
       definition.name,
-      JSON.stringify({
+      currentSourceArgs(run, {
         deal_id: randomUUID(),
         note_id: randomUUID(),
         expected_updated_at: '2026-10-05T10:20:30.123Z',
@@ -2559,7 +2729,11 @@ test('a saved then edited note can be deleted in one subsequent requested turn w
     const request = h.trusted(step.request);
     const run = (await h.service.open(request, signal()))!;
     assert.equal(
-      ((await run.execute(step.tool, JSON.stringify(step.args), signal())) as { ok: boolean }).ok,
+      (
+        (await run.execute(step.tool, currentSourceArgs(run, step.args), signal())) as {
+          ok: boolean;
+        }
+      ).ok,
       true,
     );
     assert.equal(h.calls.length, index + 1);
@@ -2579,4 +2753,354 @@ test('a saved then edited note can be deleted in one subsequent requested turn w
   assert.equal(h.counts().publishCount, 0);
   assert.equal(h.counts().approveCount, 3);
   assert.equal(new Set(h.calls.map((call) => call.operationId)).size, 3);
+});
+
+test('prepared content survives a new turn and repeated confirmation reuses the saved operation', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const original = h.trusted(
+    'Orchid Foods needs 18,000 sqft in Tumakuru. Create the RFQ once I confirm.',
+  );
+  const first = (await h.service.open(original, signal(), store))!;
+  const prepared = (await first.execute(
+    'write_prepare',
+    JSON.stringify({
+      tool_name: rfqCreate.name,
+      label: 'Orchid Foods RFQ',
+      source_message_ids: [original.commandMessages![0]!.id],
+    }),
+    signal(),
+  )) as { binding: WriteSourceBinding };
+  assert.equal(h.proposals.length, 0);
+  assert.equal(h.calls.length, 0);
+  const followup = (await h.service.open(h.trusted('Yes, save it.'), signal(), store))!;
+  assert.equal(JSON.parse(followup.context).prepared_sources[0].id, prepared.binding.id);
+  await followup.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: prepared.binding.id }),
+    signal(),
+  );
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, original.commandMessages![0]!.text);
+  const repeated = (await h.service.open(h.trusted('Yes, save it.'), signal(), store))!;
+  const replay = (await repeated.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: prepared.binding.id }),
+    signal(),
+  )) as { replayed: boolean };
+  assert.equal(replay.replayed, true);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.proposals.length, 1);
+  assert.equal(repeated.executionStarted, true);
+});
+
+test('distinct actions can share content but ambiguous source-only reuse cannot create a third action', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const original = h.trusted('Create an RFQ: Orchid Foods needs 18,000 sqft in Tumakuru.');
+  const sourceId = original.commandMessages![0]!.id;
+  const first = (await h.service.open(original, signal(), store))!;
+  await first.execute(rfqCreate.name, sourceArgs(sourceId), signal());
+  const second = (await h.service.open(
+    h.trusted('Create a separate second RFQ from the same brief.'),
+    signal(),
+    store,
+  ))!;
+  const prepared = (await second.execute(
+    'write_prepare',
+    JSON.stringify({
+      tool_name: rfqCreate.name,
+      label: 'Explicit second Orchid RFQ',
+      source_message_ids: [sourceId],
+    }),
+    signal(),
+  )) as { binding: WriteSourceBinding };
+  await second.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: prepared.binding.id }),
+    signal(),
+  );
+  assert.equal(h.calls.length, 2);
+  assert.notEqual(h.calls[0]!.operationId, h.calls[1]!.operationId);
+  const followup = (await h.service.open(h.trusted('Yes, save it.'), signal(), store))!;
+  const ambiguous = (await followup.execute(rfqCreate.name, sourceArgs(sourceId), signal())) as {
+    code: string;
+  };
+  assert.equal(ambiguous.code, 'WRITE_SOURCE_SELECTION_AMBIGUOUS');
+  assert.equal(h.calls.length, 2);
+  const resolved = (await followup.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: prepared.binding.id }),
+    signal(),
+  )) as { replayed: boolean };
+  assert.equal(resolved.replayed, true);
+  assert.equal(h.calls.length, 2);
+});
+
+test('failed full capture retains its scope across retry and cannot substitute a confirmation or caption', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const original = h.trusted('Original caption', { kind: 'image' }).commandMessages![0]!;
+  h.sources.get(original.id)!.attachment = { kind: 'image', state: 'pending' };
+  const command = h.trusted('Save the full requirement.'),
+    currentId = command.commandMessages![0]!.id;
+  const run = (await h.service.open(command, signal(), store))!;
+  const failed = (await run.execute(rfqCreate.name, sourceArgs(original.id), signal())) as {
+    code: string;
+    source_binding: WriteSourceBinding;
+  };
+  assert.equal(failed.code, 'WRITE_ATTACHMENT_PENDING');
+  for (const reference of [currentId, `${original.id}:text`]) {
+    const attempt = (await run.execute(rfqCreate.name, sourceArgs(reference), signal())) as {
+      code: string;
+    };
+    assert.equal(attempt.code, 'WRITE_SOURCE_SELECTION_CHANGED');
+  }
+  assert.equal(h.calls.length, 0);
+  h.sources.get(original.id)!.attachment = {
+    kind: 'image',
+    state: 'ready',
+    text: 'Full extracted brief',
+  };
+  const retry = (await h.service.open(h.trusted('Retry'), signal(), store))!;
+  await retry.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: failed.source_binding.id }),
+    signal(),
+  );
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, 'Original caption\n\nFull extracted brief');
+});
+
+test('a later complete replacement retires the unavailable source without requiring another confirmation', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const old = h.trusted('Save attached brief', { kind: 'document' });
+  h.sources.get(old.commandMessages![0]!.id)!.attachment = {
+    kind: 'document',
+    state: 'unavailable',
+  };
+  const first = (await h.service.open(old, signal(), store))!;
+  const failure = (await first.execute(rfqCreate.name, currentSourceArgs(first), signal())) as {
+    source_binding: WriteSourceBinding;
+  };
+  const replacement = h.trusted(
+    'Ignore the old file. Complete replacement: Cedar needs 5,000 sqft in Pune. Save this.',
+  );
+  const next = (await h.service.open(replacement, signal(), store))!;
+  const prepared = (await next.execute(
+    'write_prepare',
+    JSON.stringify({
+      tool_name: rfqCreate.name,
+      label: 'Cedar replacement',
+      source_message_ids: [replacement.commandMessages![0]!.id],
+      replaces_binding_id: failure.source_binding.id,
+    }),
+    signal(),
+  )) as { binding: WriteSourceBinding };
+  assert.equal(
+    store.list().find((item) => item.id === failure.source_binding.id)!.replacedBy,
+    prepared.binding.id,
+  );
+  const retired = (await next.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: failure.source_binding.id }),
+    signal(),
+  )) as { code: string };
+  assert.equal(retired.code, 'WRITE_SOURCE_BINDING_UNAVAILABLE');
+  await next.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: prepared.binding.id }),
+    signal(),
+  );
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, replacement.commandMessages![0]!.text);
+});
+
+test('a later clarification can extend a prepared brief without losing its original text', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const original = h.trusted('Cedar, 5,000 sqft. I will tell you the city.');
+  const first = (await h.service.open(original, signal(), store))!;
+  const prepared = (await first.execute(
+    'write_prepare',
+    JSON.stringify({
+      tool_name: rfqCreate.name,
+      label: 'Cedar RFQ',
+      source_message_ids: [original.commandMessages![0]!.id],
+    }),
+    signal(),
+  )) as { binding: WriteSourceBinding };
+  const correction = h.trusted('Pune. Repeat client. Save it.');
+  const next = (await h.service.open(correction, signal(), store))!;
+  const revised = (await next.execute(
+    'write_prepare',
+    JSON.stringify({
+      tool_name: rfqCreate.name,
+      label: 'Cedar Pune RFQ',
+      source_message_ids: [original.commandMessages![0]!.id, correction.commandMessages![0]!.id],
+      replaces_binding_id: prepared.binding.id,
+    }),
+    signal(),
+  )) as { binding: WriteSourceBinding };
+  await next.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: revised.binding.id }),
+    signal(),
+  );
+  assert.equal(
+    h.calls[0]!.args.raw_text,
+    `${original.commandMessages![0]!.text}\n\n${correction.commandMessages![0]!.text}`,
+  );
+});
+
+test('two prepared briefs require an explicit internal selection and do not default to the newest', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const a = h.stored('Cedar: Pune, 5,000 sqft.', 'A'),
+    b = h.stored('Orchid: Tumakuru, 18,000 sqft.', 'B');
+  const first = (await h.service.open(
+    h.trusted('Hold both requirements for now.'),
+    signal(),
+    store,
+  ))!;
+  const prepared: WriteSourceBinding[] = [];
+  for (const id of [a, b]) {
+    const result = (await first.execute(
+      'write_prepare',
+      JSON.stringify({
+        tool_name: rfqCreate.name,
+        label: h.sources.get(id)!.text,
+        source_message_ids: [id],
+      }),
+      signal(),
+    )) as { binding: WriteSourceBinding };
+    prepared.push(result.binding);
+  }
+  const next = (await h.service.open(h.trusted('Save Cedar.'), signal(), store))!;
+  const missing = (await next.execute(rfqCreate.name, '{}', signal())) as {
+    code: string;
+    guidance: string;
+  };
+  assert.equal(missing.code, 'WRITE_SOURCE_SELECTION_REQUIRED');
+  assert.match(missing.guidance, /Repair the internal source selection/);
+  assert.equal(h.calls.length, 0);
+  await next.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: prepared[0]!.id }),
+    signal(),
+  );
+  assert.equal(h.calls[0]!.args.raw_text, h.sources.get(a)!.text);
+});
+
+test('a binding persistence failure cannot dispatch, including when the operation was already prepared', async () => {
+  for (const failAt of [1, 2]) {
+    const h = harness(),
+      store = bindingStore();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    let saves = 0;
+    const failing: WriteSourceBindings = {
+      list: () => store.list(),
+      async save(binding, replaces) {
+        if (++saves === failAt) throw new Error('SYNTHETIC_STORAGE_FAILURE');
+        await store.save(binding, replaces);
+      },
+    };
+    const run = (await h.service.open(
+      h.trusted('Create RFQ: Cedar, Pune, 5,000 sqft.'),
+      signal(),
+      failing,
+    ))!;
+    const failed = (await run.execute(rfqCreate.name, currentSourceArgs(run), signal())) as {
+      ok: boolean;
+    };
+    assert.equal(failed.ok, false);
+    assert.equal(h.calls.length, 0);
+    await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
+    assert.equal(h.calls.length, 1);
+    assert.ok(store.list()[0]!.operationId);
+  }
+});
+
+test('resuming a bound draft reports the committed state after a pre-approval interruption', async () => {
+  const h = harness(),
+    store = bindingStore();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const request = h.trusted('Save RFQ: Cedar needs 5,000 sqft in Pune.');
+  const first = (await h.service.open(request, signal(), store))!;
+  const approve = h.repository.approveDirect.bind(h.repository);
+  h.repository.approveDirect = async () => {
+    throw new Error('Synthetic interruption before approval');
+  };
+  await assert.rejects(
+    first.execute(rfqCreate.name, currentSourceArgs(first), signal()),
+    /Synthetic interruption before approval/,
+  );
+  assert.equal(h.calls.length, 0);
+  const operationId = store.list()[0]!.operationId!;
+  assert.equal(h.operations.get(operationId)!.state, 'DRAFT');
+  h.repository.approveDirect = approve;
+  const resumed = (await h.service.open(request, signal(), store))!;
+  const result = (await resumed.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: store.list()[0]!.id }),
+    signal(),
+  )) as { ok: boolean; status: string; operation_id: string };
+  assert.equal(h.operations.get(operationId)!.state, 'SUCCEEDED');
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.operationId, operationId);
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(result.operation_id, operationId);
+});
+
+test('a completed binding cannot silently accept different action arguments', async () => {
+  const h = harness(),
+    store = bindingStore();
+  const definition = directTool(rfqCreate);
+  (definition.inputSchema.properties as Record<string, unknown>).company_name = { type: 'string' };
+  h.changeDefinitions([definition]);
+  const run = (await h.service.open(
+    h.trusted('Create RFQ: Cedar, Pune, 5,000 sqft.'),
+    signal(),
+    store,
+  ))!;
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
+  const next = (await h.service.open(
+    h.trusted('Actually change the company name.'),
+    signal(),
+    store,
+  ))!;
+  const rejected = (await next.execute(
+    rfqCreate.name,
+    JSON.stringify({ _source_binding_id: store.list()[0]!.id, company_name: 'Different Client' }),
+    signal(),
+  )) as { code: string };
+  assert.equal(rejected.code, 'WRITE_ALREADY_FINALIZED');
+  assert.equal(h.calls.length, 1);
+});
+
+test('a newly complete extraction reports its aggregate size limit instead of stale truncation advice', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  const original = h.trusted('Save this image.', { kind: 'image' });
+  const source = h.sources.get(original.commandMessages![0]!.id)!;
+  source.attachment = { kind: 'image', state: 'ready', text: 'Partial', truncated: true };
+  const run = (await h.service.open(original, signal()))!;
+  await run.execute(rfqCreate.name, currentSourceArgs(run), signal());
+  assert.match(run.sourceNeededReply!, /Only part/);
+  source.attachment = { kind: 'image', state: 'ready', text: 'x'.repeat(3001) };
+  const tooLong = (await run.execute(rfqCreate.name, currentSourceArgs(run), signal())) as {
+    code: string;
+  };
+  assert.equal(tooLong.code, 'WRITE_SOURCE_TOO_LONG');
+  assert.match(run.sourceNeededReply!, /3,000-character/);
+  assert.doesNotMatch(run.sourceNeededReply!, /Only part|smaller files/);
+  assert.equal(h.calls.length, 0);
 });

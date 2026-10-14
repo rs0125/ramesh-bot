@@ -85,7 +85,11 @@ export interface WriteDispatchClaim {
 }
 export interface WriteRepositoryPort {
   authorizeSource(ctx: WriteCommandContext): Promise<WriteSourceMessage>;
-  readSources(ctx: WriteCommandContext, ids?: readonly string[]): Promise<WriteSourceMessage[]>;
+  readSources(
+    ctx: WriteCommandContext,
+    ids?: readonly string[],
+    retainedSelection?: boolean,
+  ): Promise<WriteSourceMessage[]>;
   propose(ctx: WriteCommandContext, payload: WriteProposalPayload): Promise<WriteOperation>;
   findByRun(ctx: WriteCommandContext): Promise<WriteOperation | null>;
   publish(ctx: WriteCommandContext, id: string, expectedVersion: number): Promise<WriteOperation>;

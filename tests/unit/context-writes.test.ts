@@ -373,10 +373,16 @@ test('descriptor rejects open schemas, conflicts, model identity headers, reserv
       t.name = 'write_sources';
     },
     (t) => {
+      t.name = 'write_prepare';
+    },
+    (t) => {
       t.inputSchema['x-header-map'] = {};
     },
     (t) => {
       (t.inputSchema.properties as Record<string, unknown>)._source_message_ids = { type: 'array' };
+    },
+    (t) => {
+      (t.inputSchema.properties as Record<string, unknown>)._source_binding_id = { type: 'string' };
     },
     (t) => {
       (t.inputSchema.properties as Record<string, unknown>).nested = { type: ['object', 'null'] };

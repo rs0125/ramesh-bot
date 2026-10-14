@@ -240,6 +240,7 @@ export class WriteRepository implements WriteRepositoryPort {
   async readSources(
     ctx: WriteCommandContext,
     ids?: readonly string[],
+    retainedSelection = false,
   ): Promise<WriteSourceMessage[]> {
     if (ids && (ids.length > 32 || ids.some((id) => !uuid(id))))
       throw new WriteStorageError('WRITE_SOURCE_LIMIT');
@@ -261,11 +262,17 @@ export class WriteRepository implements WriteRepositoryPort {
         await db.query(
           `SELECT m.*, (m.id=$4 OR q.batch_parent=$4) AS current_turn FROM public."ramesh-messages" m
         LEFT JOIN public."ramesh-inbound-queue" q ON q.message_id=m.id AND q.account_id=m.account_id
-        WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp' AND m.created_at>clock_timestamp()-interval '7 days'
+        WHERE m.account_id=$1 AND m.chat_id=$2 AND m.origin='whatsapp' AND m.created_at>clock_timestamp()-(CASE WHEN $5 THEN interval '30 days' ELSE interval '7 days' END)
         AND ($3::uuid[] IS NULL OR m.id=ANY($3::uuid[]))
         AND (m.queue_order <= (SELECT max(mm.queue_order) FROM public."ramesh-messages" mm JOIN public."ramesh-inbound-queue" qq ON qq.message_id=mm.id WHERE mm.account_id=$1 AND (mm.id=$4 OR qq.batch_parent=$4)))
         ORDER BY m.queue_order DESC LIMIT 32`,
-          [this.accountId, ctx.chatId, ids ? [...ids] : null, ctx.runId],
+          [
+            this.accountId,
+            ctx.chatId,
+            ids ? [...ids] : null,
+            ctx.runId,
+            !!ids?.length && retainedSelection,
+          ],
         )
       ).rows.filter((row) => !quotedRows.some((quoted) => quoted.id === row.id));
       return [

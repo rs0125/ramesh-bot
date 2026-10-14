@@ -35,6 +35,7 @@ function harness(
     revoked?: boolean;
     history?: 'personal' | 'business' | 'both';
     formatReceipt?: boolean;
+    invalidSelection?: 'omitted' | 'null' | 'empty' | 'partial';
   } = {},
 ) {
   const fixture = createTranscriptFixture('rfq', () => now);
@@ -49,6 +50,8 @@ function harness(
   const stages: string[] = [];
   let reviews = 0;
   let requestText = brief;
+  let sourceId: string;
+  let writeAttempts = 0;
   const provider = new OpenAITextModel(config, async (_url, init) => {
     const body = JSON.parse(String(init?.body));
     const name = body.text?.format?.name ?? 'worker';
@@ -130,7 +133,10 @@ function harness(
       });
     }
     assert.equal(name, 'worker');
-    if (body.input.some((item: any) => item.type === 'function_call_output'))
+    if (
+      body.input.some((item: any) => item.type === 'function_call_output') &&
+      (!options.invalidSelection || fixture.state.writes.length)
+    )
       return message('The action result is recorded; use the application receipt.');
     const definitions = body.tools.flatMap((tool: any) =>
       tool.type === 'namespace'
@@ -143,9 +149,20 @@ function harness(
     }
     const create = definitions.find((tool: any) => tool.name === 'create_crm_rfq');
     assert.ok(create);
-    const args = Object.fromEntries(
+    const args: Record<string, unknown> = Object.fromEntries(
       Object.keys(create.parameters.properties).map((key) => [key, null]),
     );
+    args._source_message_ids = [sourceId];
+    if (options.invalidSelection && writeAttempts++ === 0) {
+      if (options.invalidSelection === 'omitted') delete args._source_message_ids;
+      else
+        args._source_message_ids =
+          options.invalidSelection === 'null'
+            ? null
+            : options.invalidSelection === 'empty'
+              ? []
+              : [`${sourceId}:invalid`];
+    }
     if (options.revoked) fixture.state.active = false;
     return Response.json({
       id: randomUUID(),
@@ -218,6 +235,8 @@ function harness(
   );
   const run = (text: string, batched = false) => {
     requestText = text;
+    const trusted = fixture.trusted(text);
+    sourceId = trusted.commandMessages![0]!.id;
     return assistant.prepare(
       {
         chatId: FIXTURE_JID,
@@ -230,7 +249,7 @@ function harness(
         ...(batched ? { batchMessageIds: [randomUUID(), randomUUID()] } : {}),
       },
       undefined,
-      fixture.trusted(text),
+      trusted,
     );
   };
   return { fixture, stages, run };
@@ -246,6 +265,17 @@ test('strict receipt-only intake saves the untouched source once without a forma
   assert.deepEqual(Object.keys(h.fixture.state.rfqs[0]!.args).sort(), ['operation_id', 'raw_text']);
   assert.ok(!h.stages.includes('ramesh_sales_review'));
   assert.ok(!h.stages.includes('ramesh_action_supplement'));
+});
+
+test('strict tool argument repair selects the original source without a duplicate or extra confirmation', async () => {
+  for (const invalidSelection of ['omitted', 'null', 'empty', 'partial'] as const) {
+    const h = harness({ invalidSelection });
+    const result = await h.run(brief);
+    assert.match(result.text, /^Saved RFQ:/, invalidSelection);
+    assert.equal(h.fixture.state.writes.length, 1, invalidSelection);
+    assert.equal(h.fixture.state.rfqs[0]!.args.raw_text, brief);
+    assert.doesNotMatch(result.text, /confirm|resend|paste/i);
+  }
 });
 
 test('32K batched source survives empty-supplement formatting, review and delivery with mixed history', async () => {

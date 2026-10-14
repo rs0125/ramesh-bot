@@ -15,8 +15,8 @@ const words = (text: string) => text.split(/\s+/).filter(Boolean).length;
 // all roles lowered when the shared evidence policy became core principles (v48).
 const COMPOSED: Record<string, number> = {
   ROUTER_PROMPT: 2084,
-  PLANNER_PROMPT: 3354,
-  WORKER_PROMPT: 5667,
+  PLANNER_PROMPT: 3333,
+  WORKER_PROMPT: 5648,
   SALES_VERIFIER_PROMPT: 2808,
   // Core plus every domain section; the per-turn review loads a subset.
   SALES_VERIFIER_FULL_PROMPT: 4442,
@@ -32,7 +32,7 @@ const FILES: Record<string, number> = {
   'formatter.md': 247,
   'legacy-read-converser.md': 247,
   'media-extractor.md': 107,
-  'planner.md': 1056,
+  'planner.md': 1035,
   'planning-reference.md': 1224,
   'requirement-interpretation.md': 432,
   'router.md': 1442,
@@ -43,7 +43,7 @@ const FILES: Record<string, number> = {
   'verifier-supply.md': 238,
   'verifier-writes.md': 554,
   'verifier.md': 1734,
-  'worker.md': 1462,
+  'worker.md': 1443,
 };
 
 test('composed role prompts do not grow', () => {
