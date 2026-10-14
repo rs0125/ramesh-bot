@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { cancellable } from '../../lib/cancellable.js';
+import { attachmentRecovery } from './attachment-recovery.js';
 import {
   MAX_MEDIA_BYTES,
   MAX_MEDIA_ITEMS,
@@ -209,6 +210,7 @@ export class MediaService {
         received_at: r.createdAt.toISOString(),
         expires_at: r.expiresAt.toISOString(),
         status: r.state,
+        recovery: attachmentRecovery(r.state, r.truncated),
         kind: r.kind,
         text,
         ...(r.truncated || (r.text && text.length < r.text.length) ? { truncated: true } : {}),

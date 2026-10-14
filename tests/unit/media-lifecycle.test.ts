@@ -168,6 +168,8 @@ test('context deadline does not enqueue pending extraction behind occupied slots
     await media.context('owner', [pending], 'summarize', AbortSignal.timeout(1000)),
   );
   assert.equal(result.attachments[0].status, 'pending');
+  assert.equal(result.attachments[0].recovery.action, 'wait_for_processing');
+  assert.match(result.attachments[0].recovery.guidance, /no resend is needed/);
   assert.equal(calls, 3);
   assert.equal(store.claims.has(pending), false);
   finish.resolve();
