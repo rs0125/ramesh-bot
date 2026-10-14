@@ -132,6 +132,10 @@ export interface WriteSourceMessage {
   id: string;
   text: string;
   kind: string;
+  /** Complete speech already persisted as ordinary input; no separate expiring copy is needed. */
+  textOrigin?: 'transcript';
+  /** Extraction is source data, separate from the caption that can carry a direct request. */
+  attachment?: import('../media/attachment-source.js').AttachmentSource;
   receivedAtMs: number;
   currentTurn: boolean;
   /** Historical inbox rows did not retain forwarding metadata. Unknown must never mean direct. */

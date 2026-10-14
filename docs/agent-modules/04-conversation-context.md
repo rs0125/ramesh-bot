@@ -16,6 +16,8 @@ Late replies become ordinary history for subsequent inputs that arrive after del
 
 Memory commands and model replies carry an encrypted owner binding through the existing protected outbox. Delivery freshly resolves that binding; revocation, reassignment, changed owner attributes or disabled memory authorization suppress the private reply. Mixed responses retain their business, personal and committed-write checks, with another memory identity check after remote preflight. Memory-only historical reply text is restored only after the current context owner matches the saved binding. Legacy history readers cannot unwrap these replies.
 
+Historical image, document and legacy audio extractions use the same exact-message, owner-scoped reader as business-write sources. They remain transient for the existing 24-hour media retention and are never new command authority. Persisted voice transcripts remain ordinary inbox text for the inbox retention period. Context character limits may shorten an extraction shown to the model; source-bound writes still copy the stored extraction and separately check its extraction-level truncation flag.
+
 ## User commands
 
 | Command             | Behavior                                                                                                                                                              |

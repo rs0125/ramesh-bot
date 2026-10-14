@@ -240,7 +240,7 @@ test('strict receipt-only intake saves the untouched source once without a forma
   const h = harness();
   const result = await h.run(brief);
   assert.match(result.text, /^Saved RFQ:/);
-  assert.match(result.text, /Full brief saved in the description/);
+  assert.doesNotMatch(result.text, /Full brief saved/);
   assert.equal(h.fixture.state.writes.length, 1);
   assert.equal(h.fixture.state.rfqs[0]!.args.raw_text, brief);
   assert.deepEqual(Object.keys(h.fixture.state.rfqs[0]!.args).sort(), ['operation_id', 'raw_text']);

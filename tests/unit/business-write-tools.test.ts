@@ -465,7 +465,7 @@ test('a reply to a message that cannot be read asks for the brief instead of sav
   const result = (await run.execute(rfqCreate.name, '{}', signal())) as Record<string, unknown>;
   assert.equal(result.ok, false);
   assert.equal(result.code, 'WRITE_QUOTED_SOURCE_UNAVAILABLE');
-  assert.match(String(result.guidance), /forward that message or paste the brief/);
+  assert.match(String(result.guidance), /forward it or paste the brief/);
   assert.equal(h.proposals.length, 0);
   assert.equal(run.sourceNeededReply, SOURCE_NEEDED_REPLY);
 });
@@ -727,6 +727,148 @@ test('RFQ source selection cannot invent or import inaccessible messages', async
   );
   assert.equal((result as { code: string }).code, 'WRITE_SOURCE_UNAVAILABLE');
   assert.equal(h.proposals.length, 0);
+});
+
+test('direct source capture preserves selected attachment text, captions and clarifications exactly', async () => {
+  for (const kind of ['image', 'document', 'audio'] as const) {
+    const h = harness();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    const original = h.trusted('Please capture this.', { kind, forwarded: true });
+    const source = h.sources.get(original.commandMessages![0]!.id)!;
+    const extracted =
+      '  Fixture Orchid Foods\n16,000–18,000 sq ft, Tumakuru.\nFire docs; 2 trucks.\n';
+    source.attachment = { kind, state: 'ready', text: extracted };
+    const request = h.trusted('Save this as an RFQ. Repeat client: no.');
+    const run = (await h.service.open(request, signal()))!;
+    const result = await run.execute(
+      rfqCreate.name,
+      JSON.stringify({
+        _source_message_ids: [source.id, request.commandMessages![0]!.id],
+      }),
+      signal(),
+    );
+    assert.equal((result as { ok: boolean }).ok, true);
+    assert.equal(h.calls.length, 1);
+    assert.equal(
+      h.calls[0]!.args.raw_text,
+      `${source.text}\n\n${extracted}\n\n${request.commandMessages![0]!.text}`,
+    );
+    assert.equal(
+      await h.service.open(original, signal()),
+      undefined,
+      'forwarded extraction supplies data, never authority',
+    );
+    await run.finalize(signal());
+    assert.equal(h.calls.length, 1);
+  }
+});
+
+test('unread or incomplete selected attachments cannot become caption-only writes', async () => {
+  const cases = [
+    { state: 'pending' as const, code: 'WRITE_ATTACHMENT_PENDING' },
+    { state: 'processing' as const, code: 'WRITE_ATTACHMENT_PENDING' },
+    { state: 'failed' as const, code: 'WRITE_ATTACHMENT_UNAVAILABLE' },
+    { state: 'unavailable' as const, code: 'WRITE_ATTACHMENT_UNAVAILABLE' },
+    { state: 'ready' as const, text: ' \n ', code: 'WRITE_ATTACHMENT_UNAVAILABLE' },
+    {
+      state: 'ready' as const,
+      text: 'Only the first page',
+      truncated: true as const,
+      code: 'WRITE_ATTACHMENT_INCOMPLETE',
+    },
+  ];
+  for (const { code, ...attachment } of cases) {
+    const h = harness();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    const source = h.trusted('Please save the attached requirement.', { kind: 'document' });
+    h.sources.get(source.commandMessages![0]!.id)!.attachment = { kind: 'document', ...attachment };
+    const run = (await h.service.open(source, signal()))!;
+    const result = await run.execute(rfqCreate.name, '{}', signal());
+    assert.equal((result as { code: string }).code, code);
+    assert.equal(h.calls.length, 0);
+    assert.equal(
+      h.proposals.length,
+      0,
+      'failed source binding never journals an executable action',
+    );
+    assert.match(run.sourceNeededReply!, /nothing was saved/i);
+    assert.doesNotMatch(run.sourceNeededReply!, /message you replied to/);
+    assert.equal(await run.finalize(signal()), undefined);
+  }
+});
+
+test('part references support an explicit caption-only or attachment-only request', async () => {
+  for (const part of ['text', 'attachment'] as const) {
+    const h = harness();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    const source = h.trusted('  Client Cedar, details later.\n', { kind: 'image' })
+      .commandMessages![0]!;
+    h.sources.get(source.id)!.attachment =
+      part === 'text'
+        ? { kind: 'image', state: 'unavailable' }
+        : { kind: 'image', state: 'ready', text: '  Client Orchid, 18,000 sqft.\n' };
+    const run = (await h.service.open(
+      h.trusted(`Save only the ${part === 'text' ? 'caption' : 'image text'} as an RFQ.`),
+      signal(),
+    ))!;
+    const listing = (await run.execute('write_sources', '{}', signal())) as {
+      sources: Array<{ id: string; text_source_id: string; attachment_source_id: string }>;
+    };
+    const listed = listing.sources.find((s) => s.id === source.id)!;
+    const id = part === 'text' ? listed.text_source_id : listed.attachment_source_id;
+    assert.equal(id, `${source.id}:${part}`);
+    await run.execute(rfqCreate.name, JSON.stringify({ _source_message_ids: [id] }), signal());
+    assert.equal(h.calls.length, 1);
+    assert.equal(
+      h.calls[0]!.args.raw_text,
+      part === 'text' ? source.text : h.sources.get(source.id)!.attachment!.text,
+    );
+  }
+});
+
+test('unselected attachments cannot block a text requirement, and completed transcripts need no media', async () => {
+  const h = harness();
+  h.changeDefinitions([directTool(rfqCreate)]);
+  h.trusted('Unrelated photo', { kind: 'image' });
+  const transcript = h.trusted('  Save an RFQ: client and location to follow.\n', {
+    kind: 'audio',
+  });
+  h.sources.get(transcript.commandMessages![0]!.id)!.textOrigin = 'transcript';
+  const run = (await h.service.open(transcript, signal()))!;
+  await run.execute(rfqCreate.name, '{}', signal());
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0]!.args.raw_text, transcript.commandMessages![0]!.text);
+});
+
+test('captionless attachments, duplicate part references and missing extraction metadata are handled explicitly', async () => {
+  for (const available of [true, false]) {
+    const h = harness();
+    h.changeDefinitions([directTool(rfqCreate)]);
+    const source = h.trusted(available ? '' : 'Read this image first. Do not save yet.', {
+      kind: 'image',
+    }).commandMessages![0]!;
+    if (available)
+      h.sources.get(source.id)!.attachment = {
+        kind: 'image',
+        state: 'ready',
+        text: 'Original complete requirement',
+      };
+    const run = (await h.service.open(h.trusted('Save the image as an RFQ'), signal()))!;
+    const result = await run.execute(
+      rfqCreate.name,
+      JSON.stringify({
+        _source_message_ids: [source.id, `${source.id}:attachment`],
+      }),
+      signal(),
+    );
+    if (available) {
+      assert.equal(h.calls[0]!.args.raw_text, 'Original complete requirement');
+      assert.equal(h.calls.length, 1);
+    } else {
+      assert.equal((result as { code: string }).code, 'WRITE_ATTACHMENT_UNAVAILABLE');
+      assert.equal(h.calls.length, 0);
+    }
+  }
 });
 
 test('staging, reviewed publication and delivery checks never call the remote write port', async () => {

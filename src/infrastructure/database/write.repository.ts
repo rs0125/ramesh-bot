@@ -5,6 +5,9 @@ import type { Pool, PoolClient } from 'pg';
 import { authCipher } from './auth-store.js';
 import { toInboxCandidate } from '../whatsapp/message.mapper.js';
 import type { InboxContent } from './inbox.repository.js';
+import { MediaRepository } from './media.repository.js';
+import type { MediaStore } from '../../modules/media/media.types.js';
+import { readAttachmentSource } from '../../modules/media/attachment-source.js';
 import { decodeReply } from '../../modules/messaging/reply-payload.js';
 import { writeContract } from '../../modules/context-engine/write-contract.js';
 import {
@@ -93,12 +96,15 @@ export async function appendWriteAudit(
 
 export class WriteRepository implements WriteRepositoryPort {
   private readonly cipher: Cipher;
+  private readonly media: Pick<MediaStore, 'findSource' | 'get'>;
   constructor(
     private readonly pool: Pool,
     readonly accountId: string,
     key: string,
+    media?: Pick<MediaStore, 'findSource' | 'get'>,
   ) {
     this.cipher = authCipher(key);
+    this.media = media ?? new MediaRepository(pool, accountId, key, 'production');
   }
   private actor(actor: WriteActor): void {
     if (
@@ -182,6 +188,7 @@ export class WriteRepository implements WriteRepositoryPort {
         id: row.id,
         text: transcript ?? candidate.text ?? '',
         kind: candidate.kind ?? 'text',
+        ...(transcript !== undefined ? { textOrigin: 'transcript' as const } : {}),
         receivedAtMs: row.created_at.getTime(),
         currentTurn,
         forwarded: candidate.forwarded === true,
@@ -201,6 +208,9 @@ export class WriteRepository implements WriteRepositoryPort {
       id: row.id,
       text: content.text,
       kind: content.kind,
+      ...(content.kind === 'audio' && content.voiceTranscript?.version === 1
+        ? { textOrigin: 'transcript' as const }
+        : {}),
       receivedAtMs: row.created_at.getTime(),
       currentTurn: false,
       forwarded: null,
@@ -233,7 +243,7 @@ export class WriteRepository implements WriteRepositoryPort {
   ): Promise<WriteSourceMessage[]> {
     if (ids && (ids.length > 32 || ids.some((id) => !uuid(id))))
       throw new WriteStorageError('WRITE_SOURCE_LIMIT');
-    return this.tx(ctx, async (db) => {
+    const candidates = await this.tx(ctx, async (db) => {
       // The message the request replies to is named explicitly, so it stays available for the
       // whole 30-day message retention. Same chat, WhatsApp origin and owner checks apply.
       const quotedRows = ctx.quotedWhatsappId
@@ -258,24 +268,37 @@ export class WriteRepository implements WriteRepositoryPort {
           [this.accountId, ctx.chatId, ids ? [...ids] : null, ctx.runId],
         )
       ).rows.filter((row) => !quotedRows.some((quoted) => quoted.id === row.id));
-      const sources: WriteSourceMessage[] = [];
-      let bytes = 0;
-      // The replied-to message is decoded first so it always fits the byte budget.
-      for (const [row, quoted] of [
+      return [
         ...quotedRows.map((row) => [row, true] as const),
         ...rows.map((row) => [row, false] as const),
-      ]) {
+      ].flatMap(([row, quoted]) => {
         const decoded = this.decodeSource(row, row.current_turn === true);
-        if (!decoded) continue;
+        if (!decoded) return [];
         const source: WriteSourceMessage = quoted ? { ...decoded, quoted: true } : decoded;
-        const size = Buffer.byteLength(JSON.stringify(source));
-        if (bytes + size > 256 * 1024) continue;
-        bytes += size;
-        sources.push(source);
-      }
-      // Source order, oldest first.
-      return sources.sort((a, b) => a.receivedAtMs - b.receivedAtMs);
+        return [{ source, messageId: row.whatsapp_message_id as string }];
+      });
     });
+    // Read extraction outside the journal transaction: no nested pool checkout while holding
+    // the inbound lease lock. Propose/approve fence the lease again before any dispatch.
+    const sources: WriteSourceMessage[] = [];
+    let bytes = 0;
+    for (const { source, messageId } of candidates) {
+      if (source.textOrigin !== 'transcript') {
+        const attachment = await readAttachmentSource(this.media, {
+          accountId: this.accountId,
+          chatId: ctx.chatId,
+          senderId: ctx.chatId,
+          messageId,
+          kind: source.kind,
+        });
+        if (attachment) source.attachment = attachment;
+      }
+      const size = Buffer.byteLength(JSON.stringify(source));
+      if (bytes + size > 256 * 1024) continue;
+      bytes += size;
+      sources.push(source);
+    }
+    return sources.sort((a, b) => a.receivedAtMs - b.receivedAtMs);
   }
   private codeHash(actor: WriteActor, code: string): string {
     return sha(

@@ -70,7 +70,7 @@ test('a brief-only RFQ survives confirmation with exact stored source and no que
     operation_id: fixture.state.rfqs[0]!.operation_id,
   });
   assert.match(receipt!.text, /^Saved RFQ: New RFQ/);
-  assert.match(receipt!.text, /Full brief saved in the description/);
+  assert.doesNotMatch(receipt!.text, /Full brief saved/);
   assert.doesNotMatch(receipt!.text, /Location:|Requirement:|Phone:|confirm|cancel/i);
 });
 

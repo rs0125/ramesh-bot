@@ -57,13 +57,12 @@ function operation(): WriteOperation {
   };
 }
 
-test('RFQ receipt shows the authoritative title, full-brief confirmation and verified server link', () => {
+test('RFQ receipt shows the authoritative title and server link without asserting source completeness', () => {
   const text = rfqWriteResultText(operation(), allTools)!;
   assert.equal(
     text,
     [
       'Saved RFQ: Test Logistics',
-      'Full brief saved in the description.',
       `Open in CRM: ${recordUrl}`,
       'You can ask me to edit it or undo this change.',
     ].join('\n'),
@@ -75,6 +74,7 @@ test('RFQ receipt shows the authoritative title, full-brief confirmation and ver
     '9A814C06',
     operationId,
     'audit',
+    'Full brief',
   ])
     assert.ok(!text.includes(hidden), hidden);
 });
@@ -363,10 +363,7 @@ test('a brief-only save is acknowledged without exposing source text or inventin
     raw_text: 'Private, incomplete original brief',
   };
   op.result!.data = { id: recordId, name: 'New RFQ', url: recordUrl };
-  assert.equal(
-    rfqWriteResultText(op),
-    `Saved RFQ: New RFQ\nFull brief saved in the description.\nOpen in CRM: ${recordUrl}`,
-  );
+  assert.equal(rfqWriteResultText(op), `Saved RFQ: New RFQ\nOpen in CRM: ${recordUrl}`);
 });
 
 test('unconfirmed, mismatched, unrelated, or contradictory receipts never look successful', () => {

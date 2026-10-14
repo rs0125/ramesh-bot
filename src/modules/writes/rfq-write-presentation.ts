@@ -210,7 +210,6 @@ export function rfqWriteResultText(
     const name = field(data.name, 500);
     return [
       `${replayed ? 'This RFQ was already saved' : 'Saved RFQ'}${name ? `: ${name}` : '.'}`,
-      ...(!replayed ? ['Full brief saved in the description.'] : []),
       ...(url ? [`Open in CRM: ${url}`] : []),
       offers(availableToolNames, data),
     ]
