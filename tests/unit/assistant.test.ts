@@ -7,7 +7,10 @@ import {
 } from '../../src/modules/assistant/assistant.service.js';
 import type { ModelRequest, TextModel } from '../../src/modules/assistant/assistant.types.js';
 import type { GreetingCandidate } from '../../src/modules/greetings/greeting.types.js';
-import { ConversationMemory } from '../../src/modules/assistant/conversation-memory.js';
+import {
+  ConversationMemory,
+  QUEUED_REPLY_PREFIX,
+} from '../../src/modules/assistant/conversation-memory.js';
 import { loadAssistantConfig } from '../../src/config/assistant.js';
 
 const message = (patch: Partial<GreetingCandidate> = {}): GreetingCandidate => ({
@@ -35,6 +38,31 @@ function fake() {
   return { model, calls };
 }
 const config = { model: 'gpt-5.6-terra', timeoutMs: 2000 };
+
+test('ordinary assistant receives late context without changing the current user input', async () => {
+  const { model, calls } = fake();
+  const timing = {
+    currentMessageReceivedAt: '2026-10-13T10:00:00.000Z',
+    replySentAt: '2026-10-13T10:01:00.000Z',
+  };
+  const agent = new AssistantService(config, model, undefined, undefined, async () => [
+    {
+      role: 'assistant',
+      content: 'The meeting time is 10am.',
+      businessRequest: 'When is the meeting?',
+      queuedReply: timing,
+    },
+  ]);
+  await agent.prepare(message({ text: 'And where?' }));
+  const history = calls[0]!.messages[0]!.content;
+  assert.ok(history.startsWith(QUEUED_REPLY_PREFIX));
+  const rendered = JSON.parse(history.slice(QUEUED_REPLY_PREFIX.length));
+  assert.equal(rendered.current_message_received_at, timing.currentMessageReceivedAt);
+  assert.equal(rendered.reply_sent_at, timing.replySentAt);
+  assert.equal(rendered.original_request, 'When is the meeting?');
+  assert.equal(rendered.reply, 'The meeting time is 10am.');
+  assert.deepEqual(calls[0]!.messages.at(-1), { role: 'user', content: 'And where?' });
+});
 
 test('both graph stages execute, formatter receives draft, and the final em-dash guard applies', async () => {
   const { model, calls } = fake();

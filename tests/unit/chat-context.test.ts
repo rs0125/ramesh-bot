@@ -46,6 +46,9 @@ function setup(store: ContextStore = new Store()) {
   const requests: ModelRequest[] = [];
   let invalid = false;
   const source = {
+    async queuedReplies() {
+      return [];
+    },
     async anchor(message: GreetingCandidate) {
       return { before: message.messageId, start: id(Number(message.messageId) - 1) };
     },

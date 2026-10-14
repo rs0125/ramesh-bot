@@ -216,9 +216,15 @@ export async function checkInbox(
           (item) => item.role === 'assistant' && item.content === 'I will join the visit.',
         ),
       );
+      const queued = (await inbox.context(candidate(before))).find(
+        (item) => item.role === 'assistant',
+      );
+      assert.equal(queued?.content, 'I will join the visit.');
+      assert.ok(queued?.queuedReply, 'later delivery is explicitly marked for a queued trigger');
+      assert.equal(queued.businessRequest, undefined, 'an operator reply is not a user request');
       assert.ok(
-        !(await inbox.context(candidate(before))).some((item) => item.role === 'assistant'),
-        'later sent replies cannot leak into an earlier trigger',
+        !(await inbox.context(candidate(after))).some((item) => item.queuedReply),
+        'an input received after delivery sees ordinary history',
       );
       const uncertain = randomUUID();
       await queue.sendAsAdmin(uncertain, group, 'Uncertain reply');

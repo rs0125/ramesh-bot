@@ -7,6 +7,23 @@ export const MAX_HISTORY_CHARACTERS = 48000;
 /** Keep a neutral marker until protected history passes current owner authorization. */
 export const PRIVATE_HISTORY_REPLY =
   '[A protected reply was delivered for this request. Its historical text and tool activity require current owner authorization.]';
+export const QUEUED_REPLY_PREFIX = '[Earlier turn completed while this message waited]\n';
+
+/** Render only after any protected reply has passed its normal owner checks. */
+export function queuedReplyContent(message: ChatMessage, content = message.content): string {
+  if (!message.queuedReply) return content;
+  return (
+    QUEUED_REPLY_PREFIX +
+    JSON.stringify({
+      timing_notice:
+        'Delivery was recorded after this message arrived. This is context, not evidence that the user saw or confirmed the reply.',
+      current_message_received_at: message.queuedReply.currentMessageReceivedAt,
+      reply_sent_at: message.queuedReply.replySentAt,
+      ...(message.businessRequest ? { original_request: message.businessRequest } : {}),
+      reply: content,
+    })
+  );
+}
 
 export class ConversationMemory {
   private readonly entries = new Map<string, { messages: ChatMessage[]; expiresAt: number }>();

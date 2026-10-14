@@ -14,7 +14,11 @@ import { ModelFailureError } from './model-failure.js';
 import { classifyFailure, type GateEvent } from './failure.js';
 import { traceTurn, tracedModel } from '../../infrastructure/observability/tracing.js';
 import { buildAssistantGraph } from './assistant.graph.js';
-import { ConversationMemory, PRIVATE_HISTORY_REPLY } from './conversation-memory.js';
+import {
+  ConversationMemory,
+  PRIVATE_HISTORY_REPLY,
+  queuedReplyContent,
+} from './conversation-memory.js';
 import { PROMPT_VERSION } from './prompts.js';
 import { buildBusinessGraph, READ_PROMPT_VERSION } from './business.graph.js';
 import type { BusinessReadService } from './business-reads.js';
@@ -375,7 +379,10 @@ export class AssistantService {
           input:
             this.input(message) +
             (trusted?.mediaContext ? `\nAttachment source data:\n${trusted.mediaContext}` : ''),
-          history,
+          history:
+            this.businessReads?.toolLoop || personal || writes
+              ? history
+              : history.map((entry) => ({ role: entry.role, content: queuedReplyContent(entry) })),
           audience: message.isGroup ? ('group' as const) : ('dm' as const),
         };
         const graphConfig = { signal: combined, recursionLimit: 6 };

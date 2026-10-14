@@ -20,7 +20,11 @@ import {
 } from './tool-history-recall.js';
 import { contextDeliverySchema, type ContextDelivery } from '../messaging/context-delivery.js';
 import { MAX_REPLY_CHARACTERS } from '../media/voice-reply.js';
-import { PRIVATE_HISTORY_REPLY } from './conversation-memory.js';
+import {
+  PRIVATE_HISTORY_REPLY,
+  QUEUED_REPLY_PREFIX,
+  queuedReplyContent,
+} from './conversation-memory.js';
 import {
   BUSINESS_HISTORY_PREFIX,
   BUSINESS_HISTORY_DAYS,
@@ -147,6 +151,8 @@ export interface ContextEntry extends ChatMessage {
   transientContent?: { text: string; expiresAt: number };
 }
 export interface ContextSource {
+  /** Delivered earlier turns that completed after this input arrived; excluded from arrival-time memory. */
+  queuedReplies(message: GreetingCandidate, floor: string): Promise<ContextEntry[]>;
   /** Stable database ordering, including microseconds. The current input is excluded. */
   anchor(message: GreetingCandidate): Promise<{ before: string; start: string }>;
   page(
@@ -203,7 +209,9 @@ function pinsPage(pins: ContextState['pins'], page: number): string {
 export function historyForStage(history: ChatMessage[], stage: AgentStage): ChatMessage[] {
   if (!['formatter', 'verifier', 'judge'].includes(stage)) return history;
   const isMemory = (item: ChatMessage) =>
-    item.content.startsWith(PREFIX) || item.content.startsWith(BUSINESS_HISTORY_PREFIX);
+    item.content.startsWith(PREFIX) ||
+    item.content.startsWith(BUSINESS_HISTORY_PREFIX) ||
+    item.content.startsWith(QUEUED_REPLY_PREFIX);
   const memory = history.filter(isMemory);
   return [...memory, ...history.filter((item) => !isMemory(item)).slice(-8)];
 }
@@ -347,6 +355,45 @@ export class ChatContext {
       await save();
       return { history: [], reply: command, enabled: true, delivery };
     }
+    const prepareEntry = (entry: ContextEntry): ContextEntry => {
+      const receipt = contextDeliveryBundleSchema.safeParse(entry.protectedReply?.receipt);
+      if (receipt.success) {
+        const owner = receipt.data.context;
+        if (
+          owner.key !== scope.key ||
+          owner.owner !== scope.owner ||
+          owner.employeeId !== scope.employeeId ||
+          owner.chatId !== message.chatId
+        )
+          return { ...entry, content: PRIVATE_HISTORY_REPLY, protectedReply: undefined };
+        // A memory-only reply may be read only by the same current owner. Mixed
+        // replies keep their business/personal envelope and existing fresh-read rules.
+        entry =
+          receipt.data.other === undefined
+            ? { ...entry, content: entry.protectedReply!.text, protectedReply: undefined }
+            : {
+                ...entry,
+                protectedReply: { ...entry.protectedReply!, receipt: receipt.data.other },
+              };
+      }
+      if (entry.at + 30 * DAY <= now)
+        return { ...entry, content: '[Historical message expired.]', protectedReply: undefined };
+      const transient = entry.transientContent;
+      return boundedEntry({
+        ...entry,
+        transientContent:
+          transient && transient.expiresAt > now && transient.expiresAt <= entry.at + DAY + 60000
+            ? {
+                ...transient,
+                text: boundedEntry({
+                  ...entry,
+                  content: transient.text,
+                  transientContent: undefined,
+                }).content,
+              }
+            : undefined,
+      });
+    };
     let entries: ContextEntry[] = [];
     for (let page = 0; page < 8; page++) {
       signal.throwIfAborted();
@@ -370,45 +417,7 @@ export class ChatContext {
         )
       )
         throw new GateRejection('CONTEXT_SOURCE_ORDER_INVALID');
-      entries = entries.map((entry) => {
-        const receipt = contextDeliveryBundleSchema.safeParse(entry.protectedReply?.receipt);
-        if (receipt.success) {
-          const owner = receipt.data.context;
-          if (
-            owner.key !== scope.key ||
-            owner.owner !== scope.owner ||
-            owner.employeeId !== scope.employeeId ||
-            owner.chatId !== message.chatId
-          )
-            return { ...entry, content: PRIVATE_HISTORY_REPLY, protectedReply: undefined };
-          // A memory-only reply may be read only by the same current owner. Mixed
-          // replies keep their business/personal envelope and existing fresh-read rules.
-          entry =
-            receipt.data.other === undefined
-              ? { ...entry, content: entry.protectedReply!.text, protectedReply: undefined }
-              : {
-                  ...entry,
-                  protectedReply: { ...entry.protectedReply!, receipt: receipt.data.other },
-                };
-        }
-        if (entry.at + 30 * DAY <= now)
-          return { ...entry, content: '[Historical message expired.]', protectedReply: undefined };
-        const transient = entry.transientContent;
-        return boundedEntry({
-          ...entry,
-          transientContent:
-            transient && transient.expiresAt > now && transient.expiresAt <= entry.at + DAY + 60000
-              ? {
-                  ...transient,
-                  text: boundedEntry({
-                    ...entry,
-                    content: transient.text,
-                    transientContent: undefined,
-                  }).content,
-                }
-              : undefined,
-        });
-      });
+      entries = entries.map(prepareEntry);
       const tokens = new Map(
         entries.map((entry) => [
           entry.id,
@@ -493,6 +502,35 @@ export class ChatContext {
     }
     // Includes expiry pruning and references from the uncompressed tail.
     await save();
+    // Keep the arrival-time cursor intact: advancing it past a late reply could skip
+    // another already-queued user message. These updates are for this run only.
+    const queued = await this.options.source.queuedReplies(message, state.floor);
+    if (
+      queued.length > 32 ||
+      queued.some(
+        (entry) =>
+          entry.role !== 'assistant' ||
+          !entry.queuedReply ||
+          entry.id < anchor.before ||
+          !Number.isSafeInteger(entry.at) ||
+          entry.at > now + 60000,
+      )
+    )
+      throw new GateRejection('CONTEXT_SOURCE_ORDER_INVALID');
+    entries = [...entries, ...queued.map(prepareEntry)];
+    while (
+      entries.length > 32 ||
+      entries.reduce(
+        (sum, entry) =>
+          sum +
+          sourceTokens({
+            ...entry,
+            content: queuedReplyContent(entry, entry.transientContent?.text ?? entry.content),
+          }),
+        0,
+      ) > 10000
+    )
+      entries.shift();
     const history: ChatMessage[] = [];
     if (state.pins.length || state.summary.notes.length)
       history.push({
@@ -544,6 +582,12 @@ export class ChatContext {
         .map((entry) => ({
           role: entry.role,
           content: entry.transientContent?.text ?? entry.content,
+          ...(entry.queuedReply
+            ? {
+                queuedReply: entry.queuedReply,
+                businessRequest: this.requestFor(entry, entries, state),
+              }
+            : {}),
           ...(entry.protectedReply
             ? {
                 protectedReply: entry.protectedReply,

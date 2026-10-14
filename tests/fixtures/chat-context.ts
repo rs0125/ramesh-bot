@@ -69,6 +69,9 @@ export function contextFixture() {
       now: () => now,
       resolve: async () => actor,
       source: {
+        async queuedReplies() {
+          return [];
+        },
         async anchor(message) {
           return { before: message.messageId, start: contextId(Number(message.messageId) - 1) };
         },

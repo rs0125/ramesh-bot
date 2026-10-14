@@ -11,7 +11,9 @@ import { ModelFailureError } from '../../src/modules/assistant/model-failure.js'
 import {
   ConversationMemory,
   PRIVATE_HISTORY_REPLY,
+  QUEUED_REPLY_PREFIX,
 } from '../../src/modules/assistant/conversation-memory.js';
+import { BUSINESS_HISTORY_PREFIX } from '../../src/modules/assistant/business-history.js';
 import {
   getWriteDelivery,
   getPersonalDelivery,
@@ -24,6 +26,7 @@ import { CheckpointError } from '../../src/modules/assistant/checkpoint.types.js
 import { buildSalesGraph } from '../../src/modules/assistant/sales.graph.js';
 import type {
   ModelRequest,
+  ChatMessage,
   TextModel,
   ToolSessionRequest,
 } from '../../src/modules/assistant/assistant.types.js';
@@ -269,6 +272,115 @@ function model(
 
 const payload = (requests: ModelRequest[], stage: string) =>
   JSON.parse(requests.find((request) => request.stage === stage)!.messages[0]!.content);
+
+test('late save and undo receipts reach every model stage with timing and current write authorization', async () => {
+  for (const authorized of [true, false]) {
+    const writes = writeRun();
+    let remembered = 0;
+    Object.assign(writes.run, {
+      canRecall: () => authorized,
+      rememberHistoricalReply: () => remembered++,
+    });
+    const reads = readRun();
+    const fake = model([{ name: 'read_example_reference' }]);
+    // Request a formatter pass instead of the usual completed-worker prose shortcut.
+    const start = fake.fake.startToolSession!;
+    fake.fake.startToolSession = (request) => {
+      const session = start(request);
+      const next = session.next;
+      session.next = async (...args) => {
+        const result = await next(...args);
+        return result.calls.length ? result : { ...result, text: '' };
+      };
+      return session;
+    };
+    const currentMessageReceivedAt = new Date(now - 10000).toISOString();
+    const history: ChatMessage[] = ['save', 'undo'].map((action, index) => {
+      const at = new Date(now - 5000 + index * 1000).toISOString();
+      return {
+        role: 'assistant',
+        content: PRIVATE_HISTORY_REPLY,
+        businessRequest: `Please ${action} the Example Storage record.`,
+        queuedReply: { currentMessageReceivedAt, replySentAt: at },
+        protectedReply: {
+          text: `PRIVATE_${action}_RECEIPT`,
+          receipt: {
+            kind: 'write_bundle',
+            version: 1,
+            write: {
+              ...receipt,
+              history: {
+                at,
+                activity: [
+                  {
+                    tool: writeDefinition.name,
+                    at,
+                    status: 'committed',
+                    phase: 'commit',
+                    operationId: `operation-${action}`,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      };
+    });
+    // Even a busy queued history must retain late action outcomes in the shorter
+    // formatter/reviewer view, alongside the ordinary recent conversation tail.
+    history.push(
+      ...Array.from(
+        { length: 10 },
+        (_, i): ChatMessage => ({
+          role: 'assistant',
+          content: `Ordinary prior reply ${i}`,
+        }),
+      ),
+    );
+    await buildSalesGraph(fake.fake, async () => ({ status: 'available', run: reads.run }), {
+      writes: writes.run,
+      now: () => now,
+    }).invoke({ ...input, history });
+    assert.equal(fake.sessions.length, 1);
+    for (const request of [...fake.requests, ...fake.sessions]) {
+      const projected: ChatMessage[] =
+        !('stage' in request) || request.stage === 'converser'
+          ? request.messages
+          : JSON.parse(request.messages[0]!.content).history;
+      const late = projected.filter((entry) => entry.content.startsWith(QUEUED_REPLY_PREFIX));
+      assert.equal(
+        late.length,
+        2,
+        `${'stage' in request ? request.stage : 'worker'}: both completed earlier turns survive`,
+      );
+      for (const [index, action] of ['save', 'undo'].entries()) {
+        const update = JSON.parse(late[index]!.content.slice(QUEUED_REPLY_PREFIX.length));
+        assert.equal(update.current_message_received_at, currentMessageReceivedAt);
+        assert.equal(update.reply_sent_at, history[index]!.queuedReply!.replySentAt);
+        assert.equal(update.original_request, `Please ${action} the Example Storage record.`);
+        assert.match(update.timing_notice, /not evidence that the user saw or confirmed/);
+        if (authorized) {
+          const saved = JSON.parse(update.reply.slice(BUSINESS_HISTORY_PREFIX.length));
+          assert.equal(saved.reply, `PRIVATE_${action}_RECEIPT`);
+          assert.equal(saved.tool_activity[0].status, 'committed');
+          assert.equal(saved.tool_activity[0].operationId, `operation-${action}`);
+        } else {
+          assert.equal(update.reply, PRIVATE_HISTORY_REPLY);
+          assert.doesNotMatch(
+            JSON.stringify(request),
+            /PRIVATE_(save|undo)_RECEIPT|operation-(save|undo)/,
+          );
+        }
+      }
+    }
+    assert.deepEqual(
+      fake.requests.map((request) => request.stage),
+      ['converser', 'planner', 'formatter', 'verifier'],
+    );
+    assert.equal(remembered, authorized ? 2 : 0);
+    assert.deepEqual(writes.invocations, [], 'history projection itself cannot repeat a write');
+  }
+});
 
 test('dynamic writes can follow reads but publish exact proposals only after independent review', async () => {
   events.length = 0;

@@ -41,6 +41,10 @@ export class LocalContextConversation implements ContextSource {
       start: String(Number(message.messageId) - 1).padStart(12, '0'),
     };
   }
+  // This driver submits each input only after its predecessor has replied.
+  async queuedReplies(): Promise<ContextEntry[]> {
+    return [];
+  }
   async page(_message: GreetingCandidate, after: string, before: string) {
     const entries = this.entries.filter((item) => item.id > after && item.id < before);
     return { entries: structuredClone(entries.slice(0, 128)), more: entries.length > 128 };

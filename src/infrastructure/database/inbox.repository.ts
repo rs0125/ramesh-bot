@@ -48,6 +48,8 @@ interface InboxRow {
   updated_cursor: string;
   reply_created_at: Date | null;
   finished_at: Date | null;
+  current_received_at?: Date;
+  queued_after_arrival?: boolean;
 }
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 export function validChatId(value: unknown): value is string {
@@ -305,6 +307,69 @@ export class InboxRepository implements ContextSource {
     return { before: `${row.at}:${row.id}:0`, start: row.at };
   }
 
+  private replyEntry(
+    row: InboxRow & { context_cursor: string },
+    message: GreetingCandidate,
+  ): ContextEntry {
+    const business = row.reply_kind === 'business';
+    return {
+      id: row.context_cursor,
+      at: row.finished_at!.getTime(),
+      role: 'assistant',
+      content: business
+        ? PRIVATE_HISTORY_REPLY
+        : decodeReply(
+            this.cipher.open('outbound-reply', row.id, row.reply_encrypted!),
+            'conversation',
+          ).text,
+      ...(business && !message.isGroup && row.business_evidence_encrypted
+        ? {
+            businessRequest: this.historicalRequest(row),
+            protectedReply: {
+              text: decodeReply(
+                this.cipher.open('outbound-reply', row.id, row.reply_encrypted!),
+                'business',
+              ).text,
+              receipt: this.cipher.open(
+                'business-delivery',
+                row.id,
+                row.business_evidence_encrypted,
+              ),
+            },
+          }
+        : {}),
+    };
+  }
+
+  /** A separate overlay preserves the admission-time cursor and confirmation boundary. */
+  async queuedReplies(message: GreetingCandidate, floor: string): Promise<ContextEntry[]> {
+    const rows = (
+      await this.pool.query<InboxRow & { context_cursor: string; current_received_at: Date }>(
+        `WITH anchor AS (
+        SELECT created_at,id FROM public."ramesh-messages"
+        WHERE account_id=$1 AND chat_id=$2 AND whatsapp_message_id=$3
+      ) SELECT m.*,a.created_at AS current_received_at,
+        to_char(m.finished_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||':'||m.id::text||':1' AS context_cursor
+      FROM public."ramesh-messages" m,anchor a
+      WHERE m.account_id=$1 AND m.chat_id=$2 AND m.content_encrypted IS NOT NULL
+        AND (m.created_at,m.id)<(a.created_at,a.id)
+        AND (to_char(m.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')||':'||m.id::text||':0')>=$4
+        AND m.state='SENT' AND m.reply_encrypted IS NOT NULL
+        AND m.finished_at>a.created_at AND m.finished_at<=clock_timestamp()
+      ORDER BY m.finished_at DESC,m.id DESC LIMIT 32`,
+        [this.accountId, message.chatId, message.messageId, floor],
+      )
+    ).rows;
+    return rows.reverse().map((row) => ({
+      ...this.replyEntry(row, message),
+      businessRequest: row.origin === 'whatsapp' ? this.historicalRequest(row) : undefined,
+      queuedReply: {
+        currentMessageReceivedAt: row.current_received_at.toISOString(),
+        replySentAt: row.finished_at!.toISOString(),
+      },
+    }));
+  }
+
   /** Event ordering also captures replies delivered after a prior summary boundary. */
   async page(message: GreetingCandidate, after: string, before: string, floor: string = after) {
     const rows = (
@@ -340,34 +405,7 @@ export class InboxRepository implements ContextSource {
                 : data.text,
           };
         }
-        const business = row.reply_kind === 'business';
-        return {
-          id: row.context_cursor,
-          at: row.finished_at!.getTime(),
-          role: 'assistant',
-          content: business
-            ? PRIVATE_HISTORY_REPLY
-            : decodeReply(
-                this.cipher.open('outbound-reply', row.id, row.reply_encrypted!),
-                'conversation',
-              ).text,
-          ...(business && !message.isGroup && row.business_evidence_encrypted
-            ? {
-                businessRequest: this.historicalRequest(row),
-                protectedReply: {
-                  text: decodeReply(
-                    this.cipher.open('outbound-reply', row.id, row.reply_encrypted!),
-                    'business',
-                  ).text,
-                  receipt: this.cipher.open(
-                    'business-delivery',
-                    row.id,
-                    row.business_evidence_encrypted,
-                  ),
-                },
-              }
-            : {}),
-        };
+        return this.replyEntry(row, message);
       }),
     );
     return { entries, more: rows.length > 128 };
@@ -380,7 +418,8 @@ export class InboxRepository implements ContextSource {
         `WITH anchor AS (
         SELECT created_at,id FROM public."ramesh-messages"
         WHERE account_id=$1 AND chat_id=$2 AND whatsapp_message_id=$3
-      ) SELECT m.*,CASE WHEN m.state='SENT' AND m.finished_at<=a.created_at THEN m.reply_encrypted ELSE NULL END AS reply_encrypted
+      ) SELECT m.*,a.created_at AS current_received_at,m.finished_at>a.created_at AS queued_after_arrival,
+        CASE WHEN m.state='SENT' THEN m.reply_encrypted ELSE NULL END AS reply_encrypted
       FROM public."ramesh-messages" m,anchor a
       WHERE m.account_id=$1 AND m.chat_id=$2 AND m.content_encrypted IS NOT NULL
         AND (m.created_at,m.id)<(a.created_at,a.id)
@@ -427,6 +466,10 @@ export class InboxRepository implements ContextSource {
     const result: ChatMessage[] = [];
     let size = 0;
     for (const item of history.reverse()) {
+      const replied =
+        item.direction === 'outbound'
+          ? rows.find((row) => item.id === row.id + ':reply')
+          : undefined;
       const source =
         item.direction === 'inbound' ? rows.find((row) => row.id === item.id) : undefined;
       const voice = source ? await this.voiceContext(source, message) : undefined;
@@ -446,6 +489,16 @@ export class InboxRepository implements ContextSource {
       result.unshift({
         role: item.direction === 'inbound' ? 'user' : 'assistant',
         content: bounded,
+        ...(replied?.queued_after_arrival && replied.current_received_at && replied.finished_at
+          ? {
+              queuedReply: {
+                currentMessageReceivedAt: replied.current_received_at.toISOString(),
+                replySentAt: replied.finished_at.toISOString(),
+              },
+              businessRequest:
+                replied.origin === 'whatsapp' ? this.historicalRequest(replied) : undefined,
+            }
+          : {}),
         ...('protectedReply' in item
           ? {
               protectedReply: item.protectedReply as ChatMessage['protectedReply'],

@@ -27,6 +27,7 @@ import {
 } from './business-history.js';
 import type { PersonalToolRun } from '../scheduling/personal-tools.js';
 import type { BusinessWriteRun } from '../writes/write-tools.js';
+import { queuedReplyContent } from './conversation-memory.js';
 
 export const RECALL_TOOL = 'recall_business_context';
 const input = z
@@ -188,9 +189,9 @@ export function businessRecall(
     .sort(([, a], [, b]) => a.index - b.index)
     .map(([turn_id]) => ({ turn_id }));
   // Explicit projection also strips any future server-only ChatMessage fields.
-  const messages = history.map(({ role, content }, index) => ({
-    role,
-    content: visible.get(index) ?? content,
+  const messages = history.map((message, index) => ({
+    role: message.role,
+    content: queuedReplyContent(message, visible.get(index) ?? message.content),
   }));
   const attempted = new Map<string, number>();
   const retryable = new Set<string>();

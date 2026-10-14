@@ -10,6 +10,8 @@ export interface ChatMessage {
   protectedReply?: { text: string; receipt: unknown };
   /** Server-owned association with the user request that produced this protected answer. */
   businessRequest?: string;
+  /** Earlier turn delivered while this input was queued; never evidence the user had seen it. */
+  queuedReply?: { currentMessageReceivedAt: string; replySentAt: string };
   /** Identities only, never serialized; recall reauthorizes and refreshes every record. */
   businessReferences?: import('./chat-context.js').RememberedSelection;
 }

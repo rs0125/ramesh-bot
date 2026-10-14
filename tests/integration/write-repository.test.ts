@@ -1182,6 +1182,18 @@ test(
             f.repo.approve(conf.ctx, op.operationId, op.version, op.confirmationCode),
             hasCode('WRITE_PROPOSAL_NOT_DELIVERED'),
           );
+          // A queued input may see this reply by processing time, but cannot authorize
+          // a proposal that had not been delivered when the input actually arrived.
+          await db.admin.query(
+            `UPDATE public."ramesh-messages" SET state='SENT',finished_at=(
+              SELECT created_at + interval '1 second' FROM public."ramesh-messages" WHERE id=$2
+            ) WHERE id=$1`,
+            [c.ctx.runId, conf.ctx.runId],
+          );
+          await assert.rejects(
+            f.repo.approve(conf.ctx, op.operationId, op.version, op.confirmationCode),
+            hasCode('WRITE_PROPOSAL_NOT_DELIVERED'),
+          );
           await db.admin.query(
             'UPDATE public."ramesh-messages" SET state=\'SENT\',finished_at=created_at WHERE id=$1',
             [c.ctx.runId],
