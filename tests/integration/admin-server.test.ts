@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 
 test('worker API protects QR data and serializes named controls', async () => {
   const actions: string[] = [];
+  let backupFails = false;
   const status: BotStatus = {
     state: 'pairing',
     qr: 'private-test-qr',
@@ -26,6 +27,12 @@ test('worker API protects QR data and serializes named controls', async () => {
       },
     },
     'test-token',
+    {
+      resetAuth: async () => {
+        actions.push('backup-and-reset');
+        if (backupFails) throw new Error('simulated backup failure');
+      },
+    },
   );
   await api.start('127.0.0.1', 0);
   try {
@@ -53,6 +60,49 @@ test('worker API protects QR data and serializes named controls', async () => {
     });
     assert.equal(response.status, 200);
     assert.deepEqual(actions, ['stop', 'start']);
+    actions.length = 0;
+    assert.equal(
+      (
+        await fetch(`${base}/v1/control`, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'relink' }),
+        })
+      ).status,
+      401,
+    );
+    assert.deepEqual(actions, []);
+    const relink = await fetch(`${base}/v1/control`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'relink' }),
+    });
+    assert.equal(relink.status, 200);
+    assert.equal((await relink.json()).canRelink, true);
+    assert.deepEqual(actions, ['stop', 'backup-and-reset', 'start']);
+    actions.length = 0;
+    backupFails = true;
+    assert.equal(
+      (
+        await fetch(`${base}/v1/control`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ action: 'relink' }),
+        })
+      ).status,
+      503,
+    );
+    assert.deepEqual(actions, ['stop', 'backup-and-reset']);
+    assert.equal(
+      (
+        await fetch(`${base}/v1/control`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ action: 'connect' }),
+        })
+      ).status,
+      200,
+      'failed relink must not block later controls',
+    );
   } finally {
     await api.stop();
   }

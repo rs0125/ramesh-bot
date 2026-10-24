@@ -5,6 +5,7 @@ import qrcode from 'qrcode-terminal';
 import type { Logger } from 'pino';
 import type { AppConfig } from '../config/env.js';
 import { createPrismaClient } from '../infrastructure/database/prisma.js';
+import { resetWhatsAppAuth } from '../infrastructure/database/relink-auth.js';
 import { PrismaGreetingRepository } from '../infrastructure/database/greeting.repository.js';
 import { createAdminServer } from '../infrastructure/http/admin-server.js';
 import { BaileysClient } from '../infrastructure/whatsapp/baileys-client.js';
@@ -362,6 +363,15 @@ export function createApplication(
     config.api.token,
     {
       adminAccess,
+      resetAuth: async () => {
+        try {
+          const backup = await resetWhatsAppAuth(db);
+          logger.info({ backup }, 'WhatsApp session backed up and reset for relinking');
+        } catch (error) {
+          logger.error('WhatsApp relink failed; check worker storage and backup permissions');
+          throw error;
+        }
+      },
       automation:
         config.api.automationKey && messageRepository && durableMessages
           ? {

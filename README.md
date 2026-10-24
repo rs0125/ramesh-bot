@@ -114,6 +114,10 @@ The worker listens on `127.0.0.1:3011` and starts disconnected. `setup:local` fi
 
 When ready for a real-account test, use **Connect WhatsApp** in the admin and scan the QR in WhatsApp's Linked devices screen. Current automated checks use simulated events only. Disconnect retains the paired credentials and remains in effect across restarts; reconnect reuses those credentials. `WHATSAPP_AUTO_CONNECT` controls startup only until an operator preference is saved.
 
+If the saved login has ended, use **Connection → Relink WhatsApp → Get a new QR code**. The worker
+backs up and verifies SQLite before clearing only WhatsApp authentication, then starts pairing.
+Scan with the same account. See [relink recovery and backup locations](docs/ec2-operations.md#relink-a-logged-out-whatsapp-account).
+
 ## Structure
 
 ```text

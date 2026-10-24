@@ -7,13 +7,14 @@ export type BotState =
   | 'reconnecting'
   | 'disconnecting'
   | 'error';
-export type BotAction = 'connect' | 'disconnect' | 'reconnect';
+export type BotAction = 'connect' | 'disconnect' | 'reconnect' | 'relink';
 export interface BotEvent {
   at: string;
   level: 'info' | 'error';
   message: string;
 }
 export interface BotStatus {
+  canRelink?: boolean;
   scheduling?: {
     toolsEnabled: boolean;
     schedulerEnabled: boolean;

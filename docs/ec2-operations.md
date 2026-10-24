@@ -92,6 +92,33 @@ Supabase migrations are separate from release automation. Migrations `2026100100
 
 ## State and recovery
 
+### Relink a logged-out WhatsApp account
+
+In the production-connected admin, open **Connection → Relink WhatsApp → Get a new QR code**.
+Scan with the same account using WhatsApp **Linked devices → Link a device**. Ordinary Connect
+and Reconnect preserve the existing login; Relink replaces it when that login no longer works.
+
+The authenticated `POST /v1/control` action `relink` drains and closes the old socket, flushes
+credentials, saves a consistent SQLite backup including WAL state, verifies its integrity, and
+then deletes only `WhatsAppAuthEntry`. Inbox, message queues, admin sessions and settings are
+preserved. Pairing starts immediately; status polling supplies the new QR. If backup or reset
+fails, the worker stays disconnected and does not start a new session. Check worker storage and
+permissions before retrying. `canRelink` in `/v1/status` advertises support, allowing the worker
+and admin to deploy independently; deploy the worker first.
+
+Backups are private files in `/var/lib/wareongo-sales-bot/whatsapp-auth-backups/`; the latest three
+are retained. These on-host recovery snapshots are separate from the daily S3 backup. Keep the
+original encryption key. Never restore a snapshot over a live or newly paired session.
+
+The pre-change operator backup on 24 October 2026 passed SQLite integrity verification and was
+uploaded with AES256 server-side encryption to
+`s3://ramesh-bot-backups-111206816712-ap-south-1/daily/pre-relink-20261024T055857Z-bz11avg3.db`
+(2,805,760 bytes; SHA-256 `ef034ed661eb3ed87d805c17f919d7dfea453001e394d827c19d815333b04374`).
+The same file remains under `/var/backups/wareongo-sales-bot/` on EC2. S3's existing daily-prefix
+retention applies to the off-instance copy.
+
+### Stored state
+
 - Live SQLite database: `/var/lib/wareongo-sales-bot/bot.db`, private to `wareongo-bot`.
 - The retained optional OAuth adapter has encrypted `ContextOAuthGrant`, `ContextOAuthEnrollment`, and `ContextOAuthRevocation` tables through the normal additive Prisma migration. Preserve the existing encryption key and account namespace. After restoring an old grant snapshot, revoke/re-enroll instead of replaying potentially consumed refresh tokens.
 - Supabase: `ramesh-messages`, `ramesh-inbound-queue`, `ramesh-outbound-queue`, `ramesh-message-events`, `ramesh-schema-migrations`, and migration 004’s `ramesh-agent-runs` / `ramesh-agent-events`; these are outside the EC2 SQLite snapshots.

@@ -27,6 +27,7 @@ if (!stateDir || !stateDir.includes('wareongo-e2e-'))
 const db = createPrismaClient(config.databaseUrl);
 let active: { events: EventEmitter; pair(): Promise<void> } | undefined;
 let uncertainSend = false;
+let loggedOut = false;
 
 const app = createApplication(config, pino({ level: 'silent' }), {
   createSession: async (onFatal) => {
@@ -39,7 +40,9 @@ const app = createApplication(config, pino({ level: 'silent' }), {
         events.emit(
           'connection.update',
           auth.state.creds.registered
-            ? { connection: 'open' }
+            ? loggedOut
+              ? { connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } }
+              : { connection: 'open' }
             : { qr: 'synthetic-local-test-qr-never-valid-for-whatsapp' },
         ),
       20,
@@ -47,6 +50,7 @@ const app = createApplication(config, pino({ level: 'silent' }), {
     active = {
       events,
       async pair() {
+        loggedOut = false;
         auth.state.creds.registered = true;
         auth.state.creds.me = { id: '10000000000@s.whatsapp.net', name: 'Simulated bot' };
         await auth.saveCredentials();
@@ -93,7 +97,13 @@ const server = createServer((request, response) => {
     const body = await jsonBody(request, 32_768);
     if (!active) throw new Error('No simulated session');
     if (body.action === 'pair') await active.pair();
-    else if (body.action === 'messages') {
+    else if (body.action === 'logout') {
+      loggedOut = true;
+      active.events.emit('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 401 } } },
+      });
+    } else if (body.action === 'messages') {
       uncertainSend = body.uncertainSend === true;
       active.events.emit('messages.upsert', {
         type: body.type ?? 'notify',

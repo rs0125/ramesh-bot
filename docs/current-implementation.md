@@ -172,10 +172,14 @@ An HTTP readiness success does not require the WhatsApp socket to have reached `
 | `connect`    | Persists `whatsapp-enabled=true`, then starts the client; a running client is not opened again                 |
 | `disconnect` | Persists `whatsapp-enabled=false`, cancels pending replies, and closes the socket while preserving credentials |
 | `reconnect`  | Executes disconnect followed by connect; reuses saved authentication                                           |
+| `relink`     | Stops the client, verifies a SQLite backup, clears only WhatsApp auth, and starts fresh QR pairing             |
 
 The stored preference overrides `WHATSAPP_AUTO_CONNECT` after the operator has used a control. A manual disconnect therefore survives a process restart or deployment.
 
-Disconnect does not log the device out of WhatsApp or delete its saved keys. There is no implemented HTTP action that deletes/replaces the account's auth state.
+Disconnect does not log the device out of WhatsApp or delete its saved keys. The separate `relink`
+action replaces saved WhatsApp authentication after a verified backup; it preserves admin sessions,
+settings, inbox and queue state. `/v1/status` advertises support with `canRelink`. See
+[relink recovery](ec2-operations.md#relink-a-logged-out-whatsapp-account).
 
 ### Shutdown
 
@@ -431,13 +435,13 @@ Authorization: Bearer <WORKER_API_TOKEN>
 
 The worker compares hashed authorization-header values with `timingSafeEqual`. The API deliberately exposes only status, lifecycle controls, and admin-session operations. There is no arbitrary-send, recipient-selection, credential-export, or shell-execution endpoint.
 
-| Method and path          | Request                                                 | Successful response                                                             |
-| ------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `GET /healthz`           | No authentication                                       | `{ "status": "ok", "release": "development" }`, or the deployed full commit SHA |
-| `GET /v1/status`         | Bearer token                                            | `BotStatus`                                                                     |
-| `POST /v1/control`       | `{ "action": "connect" }`, `disconnect`, or `reconnect` | Current `BotStatus` after the control operation                                 |
-| `POST /v1/admin/attempt` | `{ "key": "<64 lowercase hex characters>" }`            | `{ "allowed": true, "retryAfter": 60 }`                                         |
-| `POST /v1/admin/session` | `create`, `verify`, or `revoke`; see below              | `{ "ok": true }` or `{ "active": true }`                                        |
+| Method and path          | Request                                                           | Successful response                                                             |
+| ------------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `GET /healthz`           | No authentication                                                 | `{ "status": "ok", "release": "development" }`, or the deployed full commit SHA |
+| `GET /v1/status`         | Bearer token                                                      | `BotStatus`                                                                     |
+| `POST /v1/control`       | `{ "action": "connect" }`, `disconnect`, `reconnect`, or `relink` | Current `BotStatus` after the control operation                                 |
+| `POST /v1/admin/attempt` | `{ "key": "<64 lowercase hex characters>" }`                      | `{ "allowed": true, "retryAfter": 60 }`                                         |
+| `POST /v1/admin/session` | `create`, `verify`, or `revoke`; see below                        | `{ "ok": true }` or `{ "active": true }`                                        |
 
 `/healthz` checks application readiness, SQLite connectivity, and the configured PostgreSQL schema/runtime login. It can return 200 while WhatsApp is deliberately disconnected. Use `/v1/status` to inspect the WhatsApp connection. The supplied public Caddy route list does not expose `/healthz`.
 

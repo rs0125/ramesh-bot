@@ -20,6 +20,7 @@ export interface BotControl {
 }
 
 interface ServerOptions {
+  resetAuth?: () => Promise<void>;
   automation?: OutboundApiOptions;
   adminAccess?: AdminAccess;
   health?: () => Promise<{ release: string }>;
@@ -28,6 +29,7 @@ interface ServerOptions {
 }
 
 export function createAdminServer(bot: BotControl, token: string, options: ServerOptions = {}) {
+  const status = () => ({ ...bot.getStatus(), canRelink: !!options.resetAuth });
   let controls = Promise.resolve();
   let pendingControls = 0;
   const outbound = createOutboundApi(options.automation);
@@ -59,7 +61,7 @@ export function createAdminServer(bot: BotControl, token: string, options: Serve
       return;
     }
     if (request.method === 'GET' && request.url === '/v1/status') {
-      send(response, 200, bot.getStatus());
+      send(response, 200, status());
       return;
     }
     const url = new URL(request.url ?? '/', 'http://worker.local');
@@ -140,13 +142,22 @@ export function createAdminServer(bot: BotControl, token: string, options: Serve
       return;
     }
     const { action } = await jsonBody(request, 1024);
-    if (action !== 'connect' && action !== 'disconnect' && action !== 'reconnect')
+    if (
+      action !== 'connect' &&
+      action !== 'disconnect' &&
+      action !== 'reconnect' &&
+      action !== 'relink'
+    )
       throw new HttpError(400, 'Invalid action');
+    if (action === 'relink' && !options.resetAuth)
+      throw new HttpError(503, 'WhatsApp relinking is unavailable');
     if (pendingControls >= 8) throw new HttpError(503, 'Worker busy; check status before retrying');
     pendingControls++;
     const work = controls.then(async () => {
-      if (action === 'disconnect' || action === 'reconnect') await bot.stop();
-      if (action === 'connect' || action === 'reconnect') await bot.start();
+      if (action === 'disconnect' || action === 'reconnect' || action === 'relink')
+        await bot.stop();
+      if (action === 'relink') await options.resetAuth!();
+      if (action === 'connect' || action === 'reconnect' || action === 'relink') await bot.start();
     });
     controls = work
       .catch(() => undefined)
@@ -154,7 +165,7 @@ export function createAdminServer(bot: BotControl, token: string, options: Serve
         pendingControls--;
       });
     await work;
-    send(response, 200, bot.getStatus());
+    send(response, 200, status());
   }
 
   return {
