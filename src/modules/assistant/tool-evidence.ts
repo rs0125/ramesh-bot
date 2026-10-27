@@ -289,6 +289,10 @@ export function toolEvidenceFingerprint(evidence: ContextEvidence, tool?: Contex
     tool ?? (typeof evidence.meta.toolName === 'string' ? evidence.meta.toolName : undefined);
   if (name !== undefined && !isContextReadTool(name)) {
     const value = structuredClone(evidence);
+    // Dynamically discovered analytics tools use the same retrieval clocks as
+    // the original reports. Keep their business values and request binding.
+    if (value.source_path.startsWith('/api/v1/analytics/'))
+      removeAnalyticsRetrievalClocks(value.data);
     const metadata: Record<string, unknown> = { ...value.meta };
     delete metadata.requestId;
     delete metadata.generatedAt;

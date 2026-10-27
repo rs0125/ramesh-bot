@@ -419,7 +419,7 @@ export function analyticsFixture(
       'form_submissions',
       'form_performance',
     ];
-    return {
+    const capability: ContextEvidence = {
       source_path: path,
       status: 200,
       data: {
@@ -448,6 +448,20 @@ export function analyticsFixture(
       },
       meta: { requestId: randomUUID(), generatedAt: new Date(now).toISOString() },
     };
+    if (args.source !== undefined) {
+      const scoped = capability.data as Record<string, unknown>;
+      scoped.google_ads = {
+        status: 'available',
+        account: { id: '1234567890', currency: 'INR', timezone: 'Asia/Kolkata' },
+        source_fetched_at: new Date(now).toISOString(),
+        error_code: null,
+        reports: [],
+      };
+      scoped.requested_source = args.source;
+      for (const name of ['ga4', 'search_console', 'google_ads'])
+        if (name !== args.source) scoped[name] = null;
+    }
+    return capability;
   }
   const citation = Object.entries(args).filter(([key]) => ANALYTICS_CITATION_FIELDS.has(key));
   if (citation.length) path += '?' + new URLSearchParams(citation.map(([k, v]) => [k, String(v)]));

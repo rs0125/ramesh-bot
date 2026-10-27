@@ -341,6 +341,84 @@ test('dynamic receipt schemas preserve new tool bindings while keeping malformed
   );
 });
 
+test('dynamic Ads fingerprints ignore only analytics retrieval clocks and retain material changes', () => {
+  for (const tool of ['google_ads_filters', 'google_ads_report', 'read_google_ads_campaign']) {
+    const original: ContextEvidence = {
+      ...evidence(),
+      source_path: '/api/v1/analytics/google-ads',
+      meta: { ...evidence().meta, toolName: tool },
+      data: {
+        source: { system: 'google_ads', property: '1234567890', currency: 'INR' },
+        source_status: { status: 'available' },
+        served_at: new Date(now).toISOString(),
+        source_fetched_at: new Date(now - 1000).toISOString(),
+        cache: { hit: false, age_seconds: 1, max_age_seconds: 300 },
+        quality: { warnings: [], data_truncated: false },
+        components: [
+          {
+            name: 'campaign',
+            source_fetched_at: new Date(now - 1000).toISOString(),
+            cache: { hit: false, age_seconds: 1 },
+            data_truncated: false,
+          },
+        ],
+        items: [{ metrics: { cost: 100 }, values: { changed_at: '2026-10-02 10:00:00' } }],
+        comparison: {
+          baseline: {
+            source_fetched_at: new Date(now - 1000).toISOString(),
+            cache: { age_seconds: 1 },
+            query_context: { date_from: '2026-09-01' },
+          },
+        },
+      },
+    };
+    const refreshed = structuredClone(original);
+    refreshed.meta.requestId = 'refreshed';
+    refreshed.meta.generatedAt = new Date(now + 5000).toISOString();
+    refreshed.data.served_at = new Date(now + 5000).toISOString();
+    refreshed.data.source_fetched_at = new Date(now).toISOString();
+    refreshed.data.cache = { hit: true, age_seconds: 5, max_age_seconds: 300 };
+    (refreshed.data.components as any[])[0].source_fetched_at = new Date(now).toISOString();
+    (refreshed.data.components as any[])[0].cache = { hit: true, age_seconds: 5 };
+    (refreshed.data.comparison as any).baseline.cache.age_seconds = 6;
+    assert.equal(toolEvidenceFingerprint(original, tool), toolEvidenceFingerprint(refreshed, tool));
+    assert.ok(original.data.served_at);
+    for (const mutate of [
+      (value: ContextEvidence) => {
+        (value.data.components as any[])[0].data_truncated = true;
+      },
+      (value: ContextEvidence) => {
+        (value.data.items as any[])[0].metrics.cost++;
+      },
+      (value: ContextEvidence) => {
+        (value.data.items as any[])[0].values.changed_at = '2026-10-03 10:00:00';
+      },
+      (value: ContextEvidence) => {
+        (value.data.quality as any).data_truncated = true;
+      },
+      (value: ContextEvidence) => {
+        (value.data.source as any).property = '9999999999';
+      },
+      (value: ContextEvidence) => {
+        (value.data.source_status as any).status = 'unavailable';
+      },
+      (value: ContextEvidence) => {
+        (value.data.comparison as any).baseline.query_context.date_from = '2026-08-01';
+      },
+      (value: ContextEvidence) => {
+        value.meta.argumentsSha256 = argumentsSha256({ campaign_id: '999' });
+      },
+    ]) {
+      const changed = structuredClone(refreshed);
+      mutate(changed);
+      assert.notEqual(
+        toolEvidenceFingerprint(original, tool),
+        toolEvidenceFingerprint(changed, tool),
+      );
+    }
+  }
+});
+
 test('known CRM specialized checks still reject widened sources and misleading pagination', () => {
   const query = { view: 'accessible', limit: 1 };
   const source = salesEvidence('search_crm_leads', query, now);

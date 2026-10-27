@@ -77,14 +77,30 @@ export function verifyAnalyticsEvidence(
 ) {
   if (tool === 'analytics_capabilities') {
     fresh(data.served_at, now, 120_000);
-    if (
-      data.read_only !== true ||
+    if (data.read_only !== true) invalid();
+    if (args.source !== undefined) {
+      const selected = args.source;
+      if (
+        !['ga4', 'search_console', 'google_ads'].includes(String(selected)) ||
+        data.requested_source !== selected ||
+        !object(data[String(selected)]) ||
+        ['ga4', 'search_console', 'google_ads'].some(
+          (name) => name !== selected && data[name] !== null,
+        ) ||
+        !Array.isArray(
+          object(data[String(selected)])![selected === 'search_console' ? 'groups' : 'reports'],
+        )
+      )
+        invalid();
+    } else if (
       !object(data.ga4) ||
       !object(data.search_console) ||
       !Array.isArray(object(data.ga4)!.reports) ||
       !Array.isArray(object(data.search_console)!.groups)
     )
       invalid();
+    // Legacy unscoped receipts retain their full dependency until they expire.
+    // New discovery selects one source upstream; no health/data checks are removed.
     return;
   }
   const source = object(data.source),
@@ -196,7 +212,10 @@ export function removeAnalyticsRetrievalClocks(data: Record<string, unknown>) {
   };
   clean(data);
   clean(object(data.ga4));
+  clean(object(data.google_ads));
   clean(object(object(data.comparison)?.baseline));
+  if (object(data.source)?.system === 'google_ads' && Array.isArray(data.components))
+    for (const component of data.components) clean(object(component));
   const form = object(data.form_performance);
   if (Array.isArray(form?.components))
     for (const component of form.components) clean(object(component));

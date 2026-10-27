@@ -156,7 +156,7 @@ const analytics: ConversationCase[] = [
     ],
     setup: (s) => {
       s.mutate = (e, t) => {
-        if (t === 'analytics_capabilities')
+        if (t === 'analytics_capabilities' && e.data.ga4)
           (e.data.ga4 as any) = {
             status: 'unavailable',
             reports: [],
@@ -220,7 +220,7 @@ const analytics: ConversationCase[] = [
     ],
     setup: (s) => {
       s.mutate = (e, t, a) => {
-        if (t === 'analytics_capabilities') {
+        if (t === 'analytics_capabilities' && e.data.ga4) {
           const ga4 = e.data.ga4 as { reports: Array<{ name: string; available: boolean }> };
           const report = ga4.reports.find((item) => item.name === 'warehouse_interest');
           if (report) report.available = false;

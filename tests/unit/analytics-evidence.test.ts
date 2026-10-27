@@ -60,6 +60,23 @@ test('reread provenance changes are harmless but changed metrics or quality are 
   (third.data.quality as any).provisional = !(third.data.quality as any).provisional;
   assert.notEqual(toolEvidenceFingerprint(first), toolEvidenceFingerprint(third));
 });
+test('Ads capability refreshes preserve account identity and availability in the fingerprint', () => {
+  const first = analyticsFixture('analytics_capabilities', {}, now);
+  first.data.google_ads = {
+    status: 'available',
+    account: { id: '1234567890', currency: 'INR' },
+    source_fetched_at: new Date(now).toISOString(),
+  };
+  const refreshed = structuredClone(first);
+  (refreshed.data.google_ads as any).source_fetched_at = new Date(now + 5000).toISOString();
+  assert.equal(toolEvidenceFingerprint(first), toolEvidenceFingerprint(refreshed));
+  (refreshed.data.google_ads as any).status = 'unavailable';
+  assert.notEqual(toolEvidenceFingerprint(first), toolEvidenceFingerprint(refreshed));
+  const otherSourceChanged = structuredClone(first);
+  (otherSourceChanged.data.ga4 as any).status = 'unavailable';
+  (otherSourceChanged.data.ga4 as any).error_code = 'ANALYTICS_SOURCE_TIMEOUT';
+  assert.notEqual(toolEvidenceFingerprint(first), toolEvidenceFingerprint(otherSourceChanged));
+});
 test('invalid analytics envelope, filter, comparison and component evidence fail closed', () => {
   const args = { report: 'overview', period: 'last_7_days', compare_to: 'previous_period' };
   const mutations = [
@@ -126,4 +143,62 @@ test('analytics delivery and recall receipts survive harmless retrieval clock ch
   assert.equal(await fixture.service.canDeliver(key, receipt, signal), false);
   fixture.state.active = false;
   assert.equal(await fixture.service.canDeliver(key, receipt, signal), false);
+});
+
+test('scoped capability receipts ignore unrelated source health and retain selected-source changes', async () => {
+  const fixture = createSalesFixture(() => now),
+    signal = AbortSignal.timeout(5000),
+    key = { remoteJid: FIXTURE_JID };
+  const opened = await fixture.service.openTools({ key, runId: 'scoped-ads' }, signal);
+  assert(opened.run);
+  assert.equal(
+    (
+      await opened.run.execute(
+        'analytics_capabilities',
+        JSON.stringify({ source: 'google_ads' }),
+        signal,
+      )
+    ).ok,
+    true,
+  );
+  const receipt = opened.run.delivery();
+  assert.equal(await fixture.service.canDeliver(key, receipt, signal), true);
+  fixture.state.mutate = (evidence, tool, args) => {
+    if (tool === 'analytics_capabilities' && args.source === 'ga4') {
+      (evidence.data.ga4 as any).status = 'unavailable';
+      (evidence.data.ga4 as any).error_code = 'ANALYTICS_SOURCE_TIMEOUT';
+    }
+  };
+  assert.equal(await fixture.service.canDeliver(key, receipt, signal), true);
+  fixture.state.mutate = (evidence, tool) => {
+    if (tool === 'analytics_capabilities') (evidence.data.google_ads as any).status = 'unavailable';
+  };
+  let failure: unknown;
+  assert.equal(
+    await fixture.service.canDeliver(key, receipt, signal, (reason, tool) => {
+      failure = { reason, tool };
+    }),
+    false,
+  );
+  assert.deepEqual(failure, { reason: 'SOURCE_CHANGED', tool: 'analytics_capabilities' });
+  fixture.state.mutate = undefined;
+  fixture.state.active = false;
+  assert.equal(await fixture.service.canDeliver(key, receipt, signal), false);
+});
+test('scoped capabilities bind the selected source and reject mixed-source payloads', () => {
+  for (const source of ['ga4', 'search_console', 'google_ads']) {
+    const args = { source },
+      evidence = analyticsFixture('analytics_capabilities', args, now);
+    assert.doesNotThrow(() => verifyToolEvidence('analytics_capabilities', args, evidence, now));
+    const changed = structuredClone(evidence);
+    changed.data.requested_source = source === 'ga4' ? 'google_ads' : 'ga4';
+    assert.throws(() => verifyToolEvidence('analytics_capabilities', args, changed, now));
+    const mixed = structuredClone(evidence);
+    mixed.data[source === 'ga4' ? 'google_ads' : 'ga4'] = { status: 'available', reports: [] };
+    assert.throws(() => verifyToolEvidence('analytics_capabilities', args, mixed, now));
+    const refreshed = analyticsFixture('analytics_capabilities', args, now + 5000);
+    assert.equal(toolEvidenceFingerprint(evidence), toolEvidenceFingerprint(refreshed));
+    (refreshed.data[source] as any).status = 'unavailable';
+    assert.notEqual(toolEvidenceFingerprint(evidence), toolEvidenceFingerprint(refreshed));
+  }
 });

@@ -11,12 +11,19 @@
   },
   {
     "name": "analytics_capabilities",
-    "description": "Analyst access: discover available GA4 reports, their returned metrics, metric definitions/calculations, registered custom fields, event definitions and Search Console capabilities. Engagement rates and timing are included in traffic reports by default. Check before warehouse-interest or lead-source reports; missing custom dimensions are unavailable, not zero activity. Configuration health is separate for each source. Does not grant broader property access.",
+    "description": "Analyst access: select source=ga4, search_console or google_ads to discover only that source. Other entries are null and are not checked. Returns reports, supported filters and definitions. Call separately for source comparisons. Missing fields or failed reads are unavailable, not zero activity. Does not grant broader account access.",
     "inputSchema": {
       "type": "object",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {},
-      "additionalProperties": false
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["ga4", "search_console", "google_ads"],
+          "description": "The single analytics source needed for this question."
+        }
+      },
+      "additionalProperties": false,
+      "required": ["source"]
     }
   },
   {
@@ -1016,7 +1023,7 @@
   },
   {
     "name": "search_crm_leads",
-    "description": "Find permitted leads by company/name, city, requirement area, exact micromarket, source, duration, industry, repeat-client flag, stage, priority or dates. For \"leads needing 10,000–50,000 sqft\", use requirement_sqft_min=10000, requirement_sqft_max=50000. For \"leads I created this month\", use view=created, date_field=created, period=this_month; for \"follow-ups tomorrow\", use date_field=follow_up, period=tomorrow. All filters combine with AND. Structured details, activity timestamps and stage_entered_at for current-stage TAT are included from the same lead row. Use read_crm_lead_context with section=stage_history for previous stage-change timestamps. Every lead flagged verification_required needs an explicit verification caveat, even for an exact parsed area. Never infer missing monetary units. Inspect access_scope, source_status, activity_status, read_consistency and query_context; each page takes a new snapshot. Use crm_summary for totals.",
+    "description": "Find permitted leads by company/name, city, requirement area, exact micromarket, source, duration, industry, repeat-client flag, stage, priority or dates. For \"leads needing 10,000\u201350,000 sqft\", use requirement_sqft_min=10000, requirement_sqft_max=50000. For \"leads I created this month\", use view=created, date_field=created, period=this_month; for \"follow-ups tomorrow\", use date_field=follow_up, period=tomorrow. All filters combine with AND. Structured details, activity timestamps and stage_entered_at for current-stage TAT are included from the same lead row. Use read_crm_lead_context with section=stage_history for previous stage-change timestamps. Every lead flagged verification_required needs an explicit verification caveat, even for an exact parsed area. Never infer missing monetary units. Inspect access_scope, source_status, activity_status, read_consistency and query_context; each page takes a new snapshot. Use crm_summary for totals.",
     "inputSchema": {
       "type": "object",
       "$schema": "https://json-schema.org/draft/2020-12/schema",

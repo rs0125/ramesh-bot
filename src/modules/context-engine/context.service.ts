@@ -85,7 +85,8 @@ export class ContextEngineServices {
           read('warehouse_summary', input, signal),
       },
       analytics: {
-        capabilities: (signal?: AbortSignal) => read('analytics_capabilities', {}, signal),
+        capabilities: (source: 'ga4' | 'search_console' | 'google_ads', signal?: AbortSignal) =>
+          read('analytics_capabilities', { source }, signal),
         ga4: (input: ReadFilters = {}, signal?: AbortSignal) => read('ga4_report', input, signal),
         searchConsole: (input: ReadFilters = {}, signal?: AbortSignal) =>
           read('search_console_report', input, signal),
