@@ -13,8 +13,8 @@ import type { ChatMessage, ModelRequest } from '../../src/modules/assistant/assi
 export const CONTEXT_DAY = 86400000;
 export const contextId = (n: number) => String(n).padStart(12, '0');
 export const CONTEXT_CHAT = '20000000000@s.whatsapp.net';
-export function contextFixture() {
-  let now = Date.now(),
+export function contextFixture(initialNow = Date.now()) {
+  let now = initialNow,
     reply = 'Synthetic reply.';
   const original = contextScope('synthetic', CONTEXT_CHAT, {
     employeeId: 1,

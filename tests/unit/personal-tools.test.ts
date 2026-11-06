@@ -266,7 +266,7 @@ test('personal call, committed result and delivered text survive compaction with
     ['staged', 'committed'],
   );
   assert.deepEqual(receipt.history?.activity[0]?.arguments, batch);
-  const memory = contextFixture();
+  const memory = contextFixture(now);
   memory.reassign(actor.employeeId);
   await memory.context.prepare(...memory.turn(1, '/pins'));
   memory.add(2, {
