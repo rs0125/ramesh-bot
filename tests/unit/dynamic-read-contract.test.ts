@@ -419,6 +419,74 @@ test('dynamic Ads fingerprints ignore only analytics retrieval clocks and retain
   }
 });
 
+test('call report replay ignores its snapshot clock but retains facts, coverage and binding', () => {
+  for (const tool of [
+    'call_performance_capabilities',
+    'call_performance_summary',
+    'search_call_assignments',
+    'read_call_assignment',
+  ]) {
+    const original: ContextEvidence = {
+      ...evidence(),
+      source_path: '/api/v1/calls/summary',
+      meta: { ...evidence().meta, toolName: tool },
+      data: {
+        source: 'callongo',
+        snapshot_at: new Date(now).toISOString(),
+        totals: { open: 5 },
+        coverage: { callyzer_status: 'stale', manual_attempts: 2 },
+        query_context: { date_from: '2026-10-01' },
+        nextCursor: null,
+        history: [{ changed_at: '2026-10-01T00:00:00Z', after: { state: 'done' } }],
+      },
+    };
+    const refreshed = structuredClone(original);
+    refreshed.meta.requestId = 'new-read';
+    refreshed.meta.generatedAt = new Date(now + 5000).toISOString();
+    refreshed.data.snapshot_at = new Date(now + 5000).toISOString();
+    assert.equal(toolEvidenceFingerprint(original, tool), toolEvidenceFingerprint(refreshed, tool));
+    assert.equal(original.data.snapshot_at, new Date(now).toISOString());
+    for (const mutate of [
+      (value: ContextEvidence) => {
+        (value.data.totals as any).open++;
+      },
+      (value: ContextEvidence) => {
+        (value.data.coverage as any).callyzer_status = 'recent_import';
+      },
+      (value: ContextEvidence) => {
+        (value.data.coverage as any).manual_attempts++;
+      },
+      (value: ContextEvidence) => {
+        (value.data.query_context as any).date_from = '2026-09-01';
+      },
+      (value: ContextEvidence) => {
+        (value.data.history as any[])[0].changed_at = '2026-10-02T00:00:00Z';
+      },
+      (value: ContextEvidence) => {
+        (value.data.history as any[])[0].after.state = 'open';
+      },
+      (value: ContextEvidence) => {
+        value.data.nextCursor = 'another-page';
+      },
+      (value: ContextEvidence) => {
+        value.meta.argumentsSha256 = argumentsSha256({ caller: 'other@example.test' });
+      },
+    ]) {
+      const changed = structuredClone(refreshed);
+      mutate(changed);
+      assert.notEqual(
+        toolEvidenceFingerprint(original, tool),
+        toolEvidenceFingerprint(changed, tool),
+      );
+    }
+    original.source_path = refreshed.source_path = '/api/v1/documents/summary';
+    assert.notEqual(
+      toolEvidenceFingerprint(original, tool),
+      toolEvidenceFingerprint(refreshed, tool),
+    );
+  }
+});
+
 test('known CRM specialized checks still reject widened sources and misleading pagination', () => {
   const query = { view: 'accessible', limit: 1 };
   const source = salesEvidence('search_crm_leads', query, now);

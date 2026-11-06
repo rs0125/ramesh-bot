@@ -293,6 +293,10 @@ export function toolEvidenceFingerprint(evidence: ContextEvidence, tool?: Contex
     // the original reports. Keep their business values and request binding.
     if (value.source_path.startsWith('/api/v1/analytics/'))
       removeAnalyticsRetrievalClocks(value.data);
+    // Call reports take a fresh read-only snapshot on replay. The snapshot clock
+    // changes even when assignments, history and source coverage are identical.
+    if (value.source_path.startsWith('/api/v1/calls/') && value.data.source === 'callongo')
+      delete value.data.snapshot_at;
     const metadata: Record<string, unknown> = { ...value.meta };
     delete metadata.requestId;
     delete metadata.generatedAt;
